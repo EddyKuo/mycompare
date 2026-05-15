@@ -181,7 +181,7 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 | `copyFile(src, dest)` | `copy-file` | fs.copyFile |
 | `deleteFile(path)` | `delete-file` | fs.unlink |
 | `renameFile(old, new)` | `rename-file` | fs.rename |
-| `mkdir(path)` | `mkdir` | fs.mkdir |
+| `mkdirFolder(parent, name)` | `mkdir-folder` | fs.mkdir |
 | `showInExplorer(path)` | `show-in-explorer` | shell.showItemInFolder |
 | `onOpenFiles(cb)` | `open-files` | CLI 引數傳入檔案路徑 |
 
@@ -248,6 +248,16 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 - T50 Over/Under 佈局（side-by-side ↔ 上下堆疊，CSS grid 切換 + 按鈕文字 `⬛ Side` ↔ `⊟ Over`）
 - **測試**：431 passing（↑ 8 整合測試，原 38 個既存單元測試）、BC 功能覆蓋率 ~99.5%
 
+### Sprint 9 ✅ — 資料夾比對強化
+- T51 選取進階（Select Newer Left/Right/Both、Select Orphans Left/Right、Invert Selection；下拉選單 UI）
+- T52 Rename 檔案（右鍵 `重新命名…` → `prompt` → `renameFile` IPC；失敗 alert + 不 refresh）
+- T53 New Folder（右鍵 `新建資料夾（左/右側）…` → `mkdirFolder` IPC；雙側獨立）
+- T54 Find Filename（即時 find bar，F3/Shift+F3 跳轉，`.fc-row--match` 高亮）
+- T55 View 篩選擴充（`_showLeftNewer` / `_showRightNewer` 獨立切換，整合 `_isRowVisible`）
+- T56 Expand/Collapse All（工具列按鈕、`_expanded: Set<string>` 全展開 / 全收合）
+- **新增 IPC**：`rename-file`、`mkdir-folder`（main + preload + electronAPI 三層串接）
+- **測試**：441 passing（↑ 10 邊角測試，原 46 個既存測試）
+
 ---
 
 ## 已實作功能總覽
@@ -280,17 +290,6 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 ---
 
 ## 後續 Sprint 規劃
-
-### Sprint 9 — 資料夾比對強化（計劃中）
-
-| ID | 功能 |
-|----|------|
-| T51 | 選取進階（Newer / Orphans / Invert） |
-| T52 | Rename 檔案（右鍵 → inline 編輯） |
-| T53 | New Folder（右鍵 → 建立子目錄） |
-| T54 | Find Filename（Ctrl+F + F3 跳轉） |
-| T55 | View 篩選擴充（獨立 Left/Right Newer 按鈕） |
-| T56 | Expand/Collapse All（工具列按鈕） |
 
 ### Sprint 10 — 圖片比對強化（計劃中）
 
@@ -325,7 +324,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 8 完成）**：431 / 431 unit tests passing；7 / 7 e2e tests passing
+**目前狀態（Sprint 9 完成）**：441 / 441 unit tests passing；7 / 7 e2e tests passing
 
 ### E2E 測試注意事項
 
