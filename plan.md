@@ -1,7 +1,7 @@
 # MyCompare — 功能規劃文件
 
 > 基於 BeyondCompare 功能分析，以 Electron + Vite 實作的桌面應用開發計劃。
-> 最後更新：2026-05-14（所有 P2/P3 功能完成）
+> 最後更新：2026-05-15（Sprint 6 完成，286 unit + 7 e2e tests passing）
 
 ---
 
@@ -42,8 +42,8 @@ execution_mode:
   base: standard
 ```
 
-啟用角色：**Orchestrator → RD（主力）→ QA（單元測試審查）**
-Sprint 流程：功能 → 單元測試通過 → Orchestrator review → 合併
+啟用角色：**Orchestrator → RD（主力）→ QA（單元測試 + E2E 審查）**
+Sprint 流程：功能 → 單元測試通過 → E2E 驗收 → Orchestrator review → 合併
 
 ---
 
@@ -63,20 +63,37 @@ Sprint 流程：功能 → 單元測試通過 → Orchestrator review → 合併
 
 ## 測試策略
 
-> E2E 測試（Playwright）已移除。原因：Electron smoke test 回饋慢（10–30s/run），核心正確性已由單元測試覆蓋。
-
 | 層級 | 工具 | 覆蓋目標 |
 |------|------|---------|
-| **單元測試** | Vitest | diff 算法、session 邏輯、utility functions |
-| **元件測試** | Vitest + jsdom（日後加入） | UI 元件的 DOM 行為、按鈕狀態、diff 渲染結果 |
+| **單元測試** | Vitest 1 | diff 算法、session 邏輯、utility functions |
+| **E2E 測試** | Playwright 1 + Electron | 視圖掛載、資料注入、跨進程 IPC 驗收 |
 
 ```bash
-npm test              # 跑所有單元測試
+npm test              # 單元測試（Vitest）
 npm run test:watch    # watch mode
-npm run test:coverage # 覆蓋率報告（需 ≥ 80%）
+npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
+npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態**：53 / 53 tests passing（diff-engine 27、session 26）
+**目前狀態（Sprint 6）**：286 / 286 unit tests passing、7 / 7 e2e tests passing
+
+### E2E 測試架構
+- 測試對象為**生產版本**（`out/main/index.js`），每次執行前先 `npm run build`
+- 透過 `window.__testAPI` 直接注入測試資料（繞過 file dialog）
+- 涵蓋：Hex 比對視圖掛載、虛擬捲動、byte diff 著色、文字比對、主題切換、smoke
+
+### 已知注意事項（esbuild TDZ）
+禁止在獨立行使用 JSDoc 類型轉換：
+```js
+// ❌ 錯誤：esbuild 將 (variable) 解析為上一行的函式呼叫，造成 TDZ ReferenceError
+const x = el('input', ...)
+/** @type {HTMLInputElement} */ (x).checked = true
+
+// ✅ 正確：將 @type 寫在 const 宣告同一行，.prop 設定另起一行
+/** @type {HTMLInputElement} */
+const x = el('input', ...)
+x.checked = true
+```
 
 ---
 
@@ -277,9 +294,11 @@ npm run test:coverage # 覆蓋率報告（需 ≥ 80%）
 - [x] 支援大型檔案（虛擬化捲動，ROW_HEIGHT=20px，只渲染可見列）
 - [x] 最大支援 10MB
 - [x] 同步捲動（左右窗格連動）
+- [x] Ctrl+F 搜尋（Hex 模式 `FF 00 1A` / ASCII 模式，▲▼ 跳轉）
+- [x] Offset 跳轉（goto input，輸入 hex offset 後 Enter）
+- [x] 點擊 hex byte 同步高亮對應 ASCII 欄位（雙向）
+- [x] 右鍵選單（複製 Hex / ASCII / Offset）
 - [ ] 比對算法切換：Fast（線性）/ Complete（LCS-based）
-- [ ] 依 Offset 跳轉
-- [ ] 點擊 hex byte 同步到 ASCII 欄位
 
 ---
 
@@ -317,9 +336,11 @@ npm run test:coverage # 覆蓋率報告（需 ≥ 80%）
 | 儲存左側 | Ctrl+S | ✅ |
 | 儲存右側 | Ctrl+Shift+S | ✅ |
 | 關閉分頁 | Ctrl+W | ✅ |
-| 復原 | Ctrl+Z | ⬜ |
-| 重做 | Ctrl+Y | ⬜ |
-| 尋找 | Ctrl+F | ⬜ |
+| 搜尋（Hex / 文字視圖） | Ctrl+F | ✅ |
+| 復原 | Ctrl+Z | ⬜ Sprint 7+ |
+| 重做 | Ctrl+Y | ⬜ Sprint 7+ |
+| 跳至行號 | Ctrl+G | ⬜ T44 Sprint 7 |
+| Bookmark 切換 | Ctrl+F2 | ⬜ T43 Sprint 7 |
 
 - [ ] 快捷鍵可由使用者自訂（Settings 頁面）
 
@@ -386,8 +407,31 @@ UX 強化：右鍵選單（全視圖）✅
 | 套件 | 用途 | 狀態 |
 |------|------|------|
 | highlight.js | 語法高亮 | ✅ 已整合（lazy load） |
-| JSZip | Zip 虛擬資料夾 | ✅ 已整合（main process dynamic import） |
+| JSZip | Zip 虛擬資料夾 | ✅ 已整合（dynamic import） |
+| chardet | 檔案編碼自動偵測 | ✅ 已整合（main process） |
+| iconv-lite | 編碼轉換（Big5 / GBK 等） | ✅ 已整合（main process） |
+| xlsx | CSV / Excel 解析（表格比對） | ✅ 已整合 |
 | electron-vite | 開發/打包工具 | ✅ 已使用 |
-| Vitest | 單元測試 | ✅ 已整合（53/53 passing） |
+| electron-builder | 安裝程式打包（NSIS/DMG/AppImage） | ✅ 已設定 |
+| Vitest | 單元測試 | ✅ 已整合（286/286 passing） |
+| Playwright | E2E 測試（Electron） | ✅ 已整合（7/7 passing） |
 
-> 核心 diff 算法、UI 元件、Session 管理皆自行實作，不依賴外部 diff 庫。
+> 核心 diff 算法、UI 元件、Virtual Scroll、Session 管理皆自行實作，不依賴外部 diff 庫。
+
+---
+
+## Sprint 歷程摘要
+
+| Sprint | 完成時間 | 測試數 | BC 功能覆蓋率 | 主要成果 |
+|--------|---------|--------|-------------|---------|
+| Sprint 1 | 2026-04 | 53 | ~65% | P0 文字比對 MVP |
+| Sprint 2 | 2026-04 | 89 | ~78% | 資料夾比對、Session、Minimap、語法高亮、主題 |
+| Sprint 3 | 2026-04 | 170 | ~87% | 三向合併、表格比對、圖片比對、HTML 匯出 |
+| Sprint 4 | 2026-05 | 198 | ~93% | 文字編輯模式、忽略規則、編碼偵測 |
+| Sprint 5 | 2026-05 | 220 | ~96% | Hex 比對、資料夾同步、ZIP、多分頁、快捷鍵 |
+| Sprint 6 | 2026-05-14 | 286 | ~98% | Center Gutter、Smart Routing、右鍵選單、互動式三向合併 |
+| Sprint 7 | 計劃中 | ~315 | ~99% | Find & Replace、Bookmarks、Go To Line、Convert File |
+| Sprint 8 | 計劃中 | ~330 | ~99.5% | Show Filters、Visible Whitespace、字型大小、Over/Under |
+| Sprint 9 | 計劃中 | ~355 | — | 資料夾：Rename/New Folder/Find/Select Newer |
+| Sprint 10 | 計劃中 | ~370 | — | 圖片：Zoom/Rotate/Flip/Blend/Full Screen |
+| Sprint 11 | 計劃中 | ~390 | — | Session Settings、HTML Report、Workspaces |
