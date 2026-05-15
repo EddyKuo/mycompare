@@ -233,6 +233,13 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 - 全視圖右鍵選單（文字/資料夾/表格/Hex 各自定制選單項目）
 - **測試**：286 passing（↑ 66）、BC 功能覆蓋率 ~98%
 
+### Sprint 7 ✅ — 文字比對搜尋 & 編輯進階
+- T42 Find & Replace（Ctrl+H 切換 replace bar、Regex 支援含 backreference、Replace One / All）
+- T43 Bookmarks（Ctrl+F2 切換、F2/Shift+F2 next/prev、Set 持久化、行號欄藍色標記）
+- T44 Go To Line（Ctrl+G dialog、Enter 跳轉、Escape 關閉）
+- T45 Convert File（Trim Trailing Whitespace、Tabs↔Spaces、CRLF/LF/CR 三向轉換）
+- **測試**：423 passing（↑ 137；其中 30 個為 Sprint 7 新增）、BC 功能覆蓋率 ~99%
+
 ---
 
 ## 已實作功能總覽
@@ -265,15 +272,6 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 ---
 
 ## 後續 Sprint 規劃
-
-### Sprint 7 — 文字比對：搜尋 & 編輯進階（計劃中）
-
-| ID | 功能 | 說明 |
-|----|------|------|
-| T42 | Find & Replace | Replace One（Ctrl+H）/ Replace All；Regex 支援 |
-| T43 | Bookmarks | Ctrl+F2 標記行；F2/Shift+F2 跳轉；行號欄藍色標記 |
-| T44 | Go To Line | Ctrl+G 開啟 dialog，跳至指定行號 |
-| T45 | Convert File | Trim Trailing Whitespace、Tabs↔Spaces、CRLF/LF/CR 互轉 |
 
 ### Sprint 8 — 文字比對：View & Display 控制（計劃中）
 
@@ -329,7 +327,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 6 完成）**：286 / 286 unit tests passing；7 / 7 e2e tests passing
+**目前狀態（Sprint 7 完成）**：423 / 423 unit tests passing；7 / 7 e2e tests passing
 
 ### E2E 測試注意事項
 
