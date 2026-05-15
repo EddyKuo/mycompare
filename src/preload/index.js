@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readExcel: (path) => ipcRenderer.invoke('read-excel', path),
   renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
   mkdirFolder: (dirPath) => ipcRenderer.invoke('mkdir-folder', dirPath),
+  // T60: Toggle window full-screen mode
+  toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),
   onOpenFiles: (cb) => ipcRenderer.on('open-files', (_e, data) => cb(data)),
   // T33: File Watcher
   watchFile: (path) => ipcRenderer.invoke('watch-file', path),

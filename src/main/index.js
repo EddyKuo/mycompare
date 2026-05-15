@@ -232,6 +232,15 @@ ipcMain.handle('mkdir-folder', async (_e, dirPath) => {
   await mkdir(dirPath, { recursive: true })
 })
 
+// IPC: T60 — 切換全螢幕模式
+ipcMain.handle('toggle-fullscreen', () => {
+  const win = BrowserWindow.getFocusedWindow()
+  if (!win) return false
+  const next = !win.isFullScreen()
+  win.setFullScreen(next)
+  return next
+})
+
 // IPC: 讀取 Excel (.xlsx/.xls) 並回傳每個工作表的 CSV 字串
 ipcMain.handle('read-excel', async (_event, filePath) => {
   try {

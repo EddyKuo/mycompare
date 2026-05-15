@@ -1,7 +1,7 @@
 # MyCompare — 功能規劃文件
 
 > 基於 BeyondCompare 功能分析，以 Electron + Vite 實作的桌面應用開發計劃。
-> 最後更新：2026-05-15（Sprint 9 完成，441 unit + 7 e2e tests passing）
+> 最後更新：2026-05-15（Sprint 10 完成，462 unit + 7 e2e tests passing）
 
 ---
 
@@ -75,7 +75,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 9）**：441 / 441 unit tests passing、7 / 7 e2e tests passing
+**目前狀態（Sprint 10）**：462 / 462 unit tests passing、7 / 7 e2e tests passing
 
 ### E2E 測試架構
 - 測試對象為**生產版本**（`out/main/index.js`），每次執行前先 `npm run build`
@@ -253,6 +253,9 @@ x.checked = true
 - [x] 差異敏感度調整（threshold slider）
 - [x] 顯示圖片基本資訊（寬高、檔案大小）
 - [x] 支援格式：JPEG, PNG, GIF, WebP, BMP
+- [x] **T57** Zoom 鍵盤控制（Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+Shift+F、工具列按鈕、MIN=0.1 / MAX=10）
+- [x] **T58** Rotate & Flip（CW / CCW 90°、Flip Horizontal / Vertical、Reset、左右同步）
+- [x] **T59** Blend Mode（Normal / Difference / Blend；mix-blend-mode CSS）
 - [ ] 差異通道視圖（只顯示有差異的像素）
 - [ ] SVG 支援
 
@@ -337,6 +340,9 @@ x.checked = true
 | 儲存右側 | Ctrl+Shift+S | ✅ |
 | 關閉分頁 | Ctrl+W | ✅ |
 | 搜尋（Hex / 文字視圖） | Ctrl+F | ✅ |
+| 全螢幕（全視圖） | F11 | ✅ T60 Sprint 10 |
+| 圖片 Zoom In / Out / Reset | Ctrl+= / Ctrl+- / Ctrl+0 | ✅ T57 Sprint 10 |
+| 圖片 Fit to Window | Ctrl+Shift+F | ✅ T57 Sprint 10 |
 | 復原 | Ctrl+Z | ⬜ Sprint 7+ |
 | 重做 | Ctrl+Y | ⬜ Sprint 7+ |
 | 跳至行號 | Ctrl+G | ⬜ T44 Sprint 7 |
@@ -413,7 +419,7 @@ UX 強化：右鍵選單（全視圖）✅
 | xlsx | CSV / Excel 解析（表格比對） | ✅ 已整合 |
 | electron-vite | 開發/打包工具 | ✅ 已使用 |
 | electron-builder | 安裝程式打包（NSIS/DMG/AppImage） | ✅ 已設定 |
-| Vitest | 單元測試 | ✅ 已整合（441/441 passing） |
+| Vitest | 單元測試 | ✅ 已整合（462/462 passing） |
 | Playwright | E2E 測試（Electron） | ✅ 已整合（7/7 passing） |
 
 > 核心 diff 算法、UI 元件、Virtual Scroll、Session 管理皆自行實作，不依賴外部 diff 庫。
@@ -433,5 +439,5 @@ UX 強化：右鍵選單（全視圖）✅
 | Sprint 7 | 2026-05-15 | 423 | ~99% | Find & Replace、Bookmarks、Go To Line、Convert File（+30 tests）|
 | Sprint 8 | 2026-05-15 | 431 | ~99.5% | Show Filters、Visible Whitespace、Line Numbers、字型大小、Over/Under（+8 integration tests）|
 | Sprint 9 | 2026-05-15 | 441 | — | 資料夾：Rename/New Folder/Find/Select Newer（+10 edge tests）|
-| Sprint 10 | 計劃中 | ~370 | — | 圖片：Zoom/Rotate/Flip/Blend/Full Screen |
+| Sprint 10 | 2026-05-15 | 462 | — | **圖片：Zoom/Rotate/Flip/Blend/F11 全螢幕（+21 tests，首次真正新功能開發）**|
 | Sprint 11 | 計劃中 | ~390 | — | Session Settings、HTML Report、Workspaces |

@@ -910,6 +910,12 @@ function setupKeyboardShortcuts() {
         e.preventDefault()
         if (currentView === 'text') textCompare?.saveRight()
         break
+
+      // T60: F11 toggles application full-screen (works in all views)
+      case e.key === 'F11':
+        e.preventDefault()
+        window.electronAPI?.toggleFullScreen?.()
+        break
     }
   })
 }

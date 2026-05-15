@@ -147,25 +147,44 @@ function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, th
 
 // ── Zoom/Pan sync ─────────────────────────────────────────────────────────────
 
+const MIN_ZOOM = 0.1
+const MAX_ZOOM = 10
+
 /**
- * 為多個 wrap 元素建立同步縮放/平移控制器。
+ * @typedef {object} SyncTransformController
+ * @property {() => void} destroy
+ * @property {() => number} getZoom
+ * @property {() => number} getRotation
+ * @property {() => { h: boolean, v: boolean }} getFlip
+ * @property {(z: number) => void} setZoom
+ * @property {(deg: number) => void} setRotation
+ * @property {(h: boolean, v: boolean) => void} setFlip
+ * @property {() => void} reset
+ */
+
+/**
+ * 為多個 wrap 元素建立同步縮放/平移/旋轉/翻轉控制器。
  *
  * @param {HTMLElement[]} wraps - .ic-canvas-wrap 元素陣列
- * @returns {{ destroy: () => void }}
+ * @returns {SyncTransformController}
  */
 function createSyncTransform(wraps) {
   let zoom = 1
   let panX = 0
   let panY = 0
-
-  const MIN_ZOOM = 0.1
-  const MAX_ZOOM = 10
+  let rotation = 0
+  let flipH = false
+  let flipV = false
 
   /** 套用 transform 到所有 wrap */
   function applyTransform() {
+    const sx = flipH ? -1 : 1
+    const sy = flipV ? -1 : 1
     for (const w of wraps) {
       w.style.transformOrigin = '0 0'
-      w.style.transform = `scale(${zoom}) translate(${panX}px, ${panY}px)`
+      // Order: translate (pan) → scale (zoom) → rotate → flip (scale±1)
+      w.style.transform =
+        `scale(${zoom}) translate(${panX}px, ${panY}px) rotate(${rotation}deg) scale(${sx}, ${sy})`
     }
   }
 
@@ -191,8 +210,6 @@ function createSyncTransform(wraps) {
     if (newZoom === zoom) return
 
     // 以滑鼠位置為縮放中心：調整 panX/panY 使畫面不跳動
-    // 縮放前：mouse = scale * (pan + mouse_in_content)
-    // 縮放後保持 mouse 不動：newPan = mouse/newZoom - mouse_in_content
     const mouseInContentX = mouseX / zoom - panX
     const mouseInContentY = mouseY / zoom - panY
     panX = mouseX / newZoom - mouseInContentX
@@ -223,7 +240,7 @@ function createSyncTransform(wraps) {
     applyTransform()
   }
 
-  function onMouseUp(e) {
+  function onMouseUp() {
     if (!dragging) return
     dragging = false
     for (const w of wraps) w.style.cursor = 'grab'
@@ -248,6 +265,36 @@ function createSyncTransform(wraps) {
       document.removeEventListener('mousemove', onMouseMove)
       document.removeEventListener('mouseup', onMouseUp)
     },
+    getZoom() { return zoom },
+    getRotation() { return rotation },
+    getFlip() { return { h: flipH, v: flipV } },
+    setZoom(z) {
+      const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z))
+      if (clamped === zoom) return
+      zoom = clamped
+      applyTransform()
+    },
+    setRotation(deg) {
+      // Normalize into [0, 360)
+      let d = deg % 360
+      if (d < 0) d += 360
+      rotation = d
+      applyTransform()
+    },
+    setFlip(h, v) {
+      flipH = !!h
+      flipV = !!v
+      applyTransform()
+    },
+    reset() {
+      zoom = 1
+      panX = 0
+      panY = 0
+      rotation = 0
+      flipH = false
+      flipV = false
+      applyTransform()
+    },
   }
 }
 
@@ -268,8 +315,20 @@ export class ImageCompare {
      */
     this._algorithm = 'exact'
 
-    /** @type {boolean} */
-    this._showDiffOverlay = true
+    /**
+     * Blend mode for the diff overlay panel.
+     *   'normal'     — diff canvas hidden
+     *   'difference' — diff canvas visible (pixel diff highlighting, original behaviour)
+     *   'blend'      — diff canvas visible with CSS mix-blend-mode: difference
+     * @type {'normal'|'difference'|'blend'}
+     */
+    this._blendMode = 'difference'
+
+    /**
+     * Mounted flag for keyboard shortcut guard.
+     * @type {boolean}
+     */
+    this._mounted = false
 
     // 圖片資料
     /** @type {{ path: string, base64: string, ext: string, img: HTMLImageElement } | null} */
@@ -306,6 +365,9 @@ export class ImageCompare {
     this._styleInjected = false
     /** @type {HTMLLinkElement | null} */
     this._injectedStyleEl = null
+
+    /** @type {((e: KeyboardEvent) => void) | null} */
+    this._onKeyDownImage = null
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -318,10 +380,14 @@ export class ImageCompare {
     this._container = containerEl
     this._render()
     this._bindEvents()
+    this._bindKeyboardShortcuts()
+    this._mounted = true
   }
 
   /** 銷毀元件，清除 DOM 與事件 */
   destroy() {
+    this._mounted = false
+    this._unbindKeyboardShortcuts()
     this._magCleanup?.()
     this._magCleanup = null
     if (this._syncTransform) {
@@ -342,6 +408,99 @@ export class ImageCompare {
     this._leftCtx = null
     this._rightCtx = null
     this._diffCtx = null
+  }
+
+  // ── Public API: T57 Zoom ────────────────────────────────────────────────────
+
+  /** Zoom in by 1.25× (clamped to MAX_ZOOM). */
+  zoomIn() {
+    if (!this._syncTransform) return
+    const next = Math.min(MAX_ZOOM, this._syncTransform.getZoom() * 1.25)
+    this._syncTransform.setZoom(next)
+  }
+
+  /** Zoom out by 1/1.25× (clamped to MIN_ZOOM). */
+  zoomOut() {
+    if (!this._syncTransform) return
+    const next = Math.max(MIN_ZOOM, this._syncTransform.getZoom() / 1.25)
+    this._syncTransform.setZoom(next)
+  }
+
+  /** Reset zoom to 1× (actual size). */
+  resetZoom() {
+    if (!this._syncTransform) return
+    this._syncTransform.setZoom(1)
+  }
+
+  /**
+   * Fit the loaded image inside the wrap container.
+   * Uses the first wrap that has a loaded image as reference.
+   */
+  fitToWindow() {
+    if (!this._syncTransform) return
+    /** @type {HTMLImageElement | null} */
+    const img = this._left?.img ?? this._right?.img ?? null
+    if (!img || img.naturalWidth === 0 || img.naturalHeight === 0) return
+    const wrap = this._dom.wrapLeft ?? this._dom.wrapRight ?? this._dom.wrapDiff
+    if (!wrap) return
+    const ww = /** @type {HTMLElement} */ (wrap).clientWidth || 0
+    const wh = /** @type {HTMLElement} */ (wrap).clientHeight || 0
+    if (ww <= 0 || wh <= 0) return
+    const scale = Math.min(ww / img.naturalWidth, wh / img.naturalHeight)
+    if (!Number.isFinite(scale) || scale <= 0) return
+    this._syncTransform.setZoom(scale)
+  }
+
+  // ── Public API: T58 Rotate & Flip ───────────────────────────────────────────
+
+  /** Rotate clockwise by 90°. */
+  rotateCW() {
+    if (!this._syncTransform) return
+    this._syncTransform.setRotation(this._syncTransform.getRotation() + 90)
+  }
+
+  /** Rotate counter-clockwise by 90°. */
+  rotateCCW() {
+    if (!this._syncTransform) return
+    this._syncTransform.setRotation(this._syncTransform.getRotation() - 90)
+  }
+
+  /** Toggle horizontal flip. */
+  flipHorizontal() {
+    if (!this._syncTransform) return
+    const cur = this._syncTransform.getFlip()
+    this._syncTransform.setFlip(!cur.h, cur.v)
+  }
+
+  /** Toggle vertical flip. */
+  flipVertical() {
+    if (!this._syncTransform) return
+    const cur = this._syncTransform.getFlip()
+    this._syncTransform.setFlip(cur.h, !cur.v)
+  }
+
+  /** Reset zoom, pan, rotation and flips back to defaults. */
+  resetTransform() {
+    if (!this._syncTransform) return
+    this._syncTransform.reset()
+  }
+
+  // ── Public API: T59 Blend Mode ──────────────────────────────────────────────
+
+  /**
+   * @param {'normal'|'difference'|'blend'} mode
+   */
+  setBlendMode(mode) {
+    if (mode !== 'normal' && mode !== 'difference' && mode !== 'blend') return
+    this._blendMode = mode
+    const sel = /** @type {HTMLSelectElement | undefined} */ (this._dom.overlaySelect)
+    if (sel && sel.value !== mode) sel.value = mode
+    this._toggleDiffOverlay()
+  }
+
+  /** @returns {'normal'|'difference'|'blend'} */
+  getBlendMode() {
+    return this._blendMode
   }
 
   /**
@@ -525,17 +684,88 @@ export class ImageCompare {
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
 
-    // Overlay checkbox
-    const overlayLabel = el('label', { className: 'ic-toolbar-label' })
-    const overlayCheckbox = el('input', {
-      type: 'checkbox',
-      className: 'ic-overlay-checkbox',
+    // T59: Blend Mode 3-way selector (replaces overlay checkbox)
+    const blendLabel = el('label', { className: 'ic-toolbar-label', textContent: '疊加模式：' })
+    toolbar.appendChild(blendLabel)
+    const overlaySelect = /** @type {HTMLSelectElement} */ (el('select', {
+      className: 'ic-overlay-select',
+      title: '差異疊加顯示模式',
+    }))
+    for (const [val, text] of /** @type {Array<['normal'|'difference'|'blend', string]>} */ ([
+      ['normal',     '無'],
+      ['difference', '差異'],
+      ['blend',      '混合'],
+    ])) {
+      const opt = document.createElement('option')
+      opt.value = val
+      opt.textContent = text
+      overlaySelect.appendChild(opt)
+    }
+    overlaySelect.value = this._blendMode
+    this._dom.overlaySelect = overlaySelect
+    toolbar.appendChild(overlaySelect)
+
+    // Separator
+    toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
+
+    // T57: Zoom controls
+    const btnZoomIn = el('button', {
+      className: 'ic-btn-refresh', title: '放大 (Ctrl++)', textContent: '🔍+',
     })
-    overlayCheckbox.checked = this._showDiffOverlay
-    this._dom.overlayCheckbox = overlayCheckbox
-    overlayLabel.appendChild(overlayCheckbox)
-    overlayLabel.appendChild(document.createTextNode(' 顯示差異疊加層'))
-    toolbar.appendChild(overlayLabel)
+    this._dom.btnZoomIn = btnZoomIn
+    toolbar.appendChild(btnZoomIn)
+
+    const btnZoomOut = el('button', {
+      className: 'ic-btn-refresh', title: '縮小 (Ctrl+-)', textContent: '🔍-',
+    })
+    this._dom.btnZoomOut = btnZoomOut
+    toolbar.appendChild(btnZoomOut)
+
+    const btnActualSize = el('button', {
+      className: 'ic-btn-refresh', title: '實際大小 (Ctrl+0)', textContent: '1:1',
+    })
+    this._dom.btnActualSize = btnActualSize
+    toolbar.appendChild(btnActualSize)
+
+    const btnFit = el('button', {
+      className: 'ic-btn-refresh', title: '符合視窗 (Ctrl+Shift+F)', textContent: '⬜',
+    })
+    this._dom.btnFit = btnFit
+    toolbar.appendChild(btnFit)
+
+    // Separator
+    toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
+
+    // T58: Rotate & Flip controls
+    const btnRotateCW = el('button', {
+      className: 'ic-btn-refresh', title: '順時針旋轉 90°', textContent: '↻',
+    })
+    this._dom.btnRotateCW = btnRotateCW
+    toolbar.appendChild(btnRotateCW)
+
+    const btnRotateCCW = el('button', {
+      className: 'ic-btn-refresh', title: '逆時針旋轉 90°', textContent: '↺',
+    })
+    this._dom.btnRotateCCW = btnRotateCCW
+    toolbar.appendChild(btnRotateCCW)
+
+    const btnFlipH = el('button', {
+      className: 'ic-btn-refresh', title: '水平翻轉', textContent: '↔',
+    })
+    this._dom.btnFlipH = btnFlipH
+    toolbar.appendChild(btnFlipH)
+
+    const btnFlipV = el('button', {
+      className: 'ic-btn-refresh', title: '垂直翻轉', textContent: '↕',
+    })
+    this._dom.btnFlipV = btnFlipV
+    toolbar.appendChild(btnFlipV)
+
+    const btnResetTransform = el('button', {
+      className: 'ic-btn-refresh', title: '重設旋轉與縮放', textContent: '⟲',
+    })
+    this._dom.btnResetTransform = btnResetTransform
+    toolbar.appendChild(btnResetTransform)
 
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
@@ -632,29 +862,57 @@ export class ImageCompare {
       btnRefresh,
       thresholdSlider,
       thresholdVal,
-      overlayCheckbox,
+      overlaySelect,
+      btnZoomIn,
+      btnZoomOut,
+      btnActualSize,
+      btnFit,
+      btnRotateCW,
+      btnRotateCCW,
+      btnFlipH,
+      btnFlipV,
+      btnResetTransform,
     } = this._dom
 
-    btnOpenLeft.addEventListener('click', () => this.openLeft())
-    btnOpenRight.addEventListener('click', () => this.openRight())
-    btnRefresh.addEventListener('click', () => this.refresh())
+    /** @type {HTMLElement} */ (btnOpenLeft).addEventListener('click', () => this.openLeft())
+    /** @type {HTMLElement} */ (btnOpenRight).addEventListener('click', () => this.openRight())
+    /** @type {HTMLElement} */ (btnRefresh).addEventListener('click', () => this.refresh())
 
-    thresholdSlider.addEventListener('input', () => {
-      this._threshold = parseFloat(thresholdSlider.value)
-      thresholdVal.textContent = this._threshold.toFixed(2)
+    /** @type {HTMLInputElement} */ (thresholdSlider).addEventListener('input', () => {
+      const slider = /** @type {HTMLInputElement} */ (thresholdSlider)
+      this._threshold = parseFloat(slider.value)
+      ;/** @type {HTMLElement} */ (thresholdVal).textContent = this._threshold.toFixed(2)
     })
 
     // 拖放釋放後才觸發 diff 計算（避免拖拉中持續重算）
-    thresholdSlider.addEventListener('change', () => {
-      this._threshold = parseFloat(thresholdSlider.value)
-      thresholdVal.textContent = this._threshold.toFixed(2)
+    /** @type {HTMLInputElement} */ (thresholdSlider).addEventListener('change', () => {
+      const slider = /** @type {HTMLInputElement} */ (thresholdSlider)
+      this._threshold = parseFloat(slider.value)
+      ;/** @type {HTMLElement} */ (thresholdVal).textContent = this._threshold.toFixed(2)
       this.refresh()
     })
 
-    overlayCheckbox.addEventListener('change', () => {
-      this._showDiffOverlay = overlayCheckbox.checked
-      this._toggleDiffOverlay()
+    // T59 Blend Mode select
+    /** @type {HTMLSelectElement} */ (overlaySelect).addEventListener('change', () => {
+      const sel = /** @type {HTMLSelectElement} */ (overlaySelect)
+      const v = sel.value
+      if (v === 'normal' || v === 'difference' || v === 'blend') {
+        this.setBlendMode(v)
+      }
     })
+
+    // T57 Zoom buttons
+    /** @type {HTMLElement} */ (btnZoomIn).addEventListener('click', () => this.zoomIn())
+    /** @type {HTMLElement} */ (btnZoomOut).addEventListener('click', () => this.zoomOut())
+    /** @type {HTMLElement} */ (btnActualSize).addEventListener('click', () => this.resetZoom())
+    /** @type {HTMLElement} */ (btnFit).addEventListener('click', () => this.fitToWindow())
+
+    // T58 Rotate / Flip buttons
+    /** @type {HTMLElement} */ (btnRotateCW).addEventListener('click', () => this.rotateCW())
+    /** @type {HTMLElement} */ (btnRotateCCW).addEventListener('click', () => this.rotateCCW())
+    /** @type {HTMLElement} */ (btnFlipH).addEventListener('click', () => this.flipHorizontal())
+    /** @type {HTMLElement} */ (btnFlipV).addEventListener('click', () => this.flipVertical())
+    /** @type {HTMLElement} */ (btnResetTransform).addEventListener('click', () => this.resetTransform())
 
     // Magnifier
     const MAG_ZOOM = 4
@@ -865,9 +1123,64 @@ export class ImageCompare {
   // ── Private: Overlay toggle ─────────────────────────────────────────────────
 
   _toggleDiffOverlay() {
-    const wrapDiff = this._dom.wrapDiff
+    const wrapDiff = /** @type {HTMLElement | undefined} */ (this._dom.wrapDiff)
     if (!wrapDiff) return
-    wrapDiff.style.visibility = this._showDiffOverlay ? '' : 'hidden'
+    if (this._blendMode === 'normal') {
+      wrapDiff.style.visibility = 'hidden'
+      wrapDiff.style.mixBlendMode = ''
+    } else if (this._blendMode === 'blend') {
+      wrapDiff.style.visibility = ''
+      wrapDiff.style.mixBlendMode = 'difference'
+    } else {
+      // 'difference' (default): show diff canvas without blend
+      wrapDiff.style.visibility = ''
+      wrapDiff.style.mixBlendMode = ''
+    }
+  }
+
+  // ── Private: T57 Keyboard shortcuts ─────────────────────────────────────────
+
+  _bindKeyboardShortcuts() {
+    /** @param {KeyboardEvent} e */
+    this._onKeyDownImage = (e) => {
+      if (!this._mounted) return
+      // Ignore when typing into editable input/textarea
+      const target = /** @type {HTMLElement | null} */ (e.target)
+      if (target && target.matches && target.matches('input, textarea, select')) return
+
+      // Ctrl++ / Ctrl+= → Zoom in
+      if (e.ctrlKey && !e.shiftKey && (e.key === '+' || e.key === '=')) {
+        e.preventDefault()
+        this.zoomIn()
+        return
+      }
+      // Ctrl+- → Zoom out
+      if (e.ctrlKey && !e.shiftKey && (e.key === '-' || e.key === '_')) {
+        e.preventDefault()
+        this.zoomOut()
+        return
+      }
+      // Ctrl+0 → Reset zoom
+      if (e.ctrlKey && !e.shiftKey && e.key === '0') {
+        e.preventDefault()
+        this.resetZoom()
+        return
+      }
+      // Ctrl+Shift+F → Fit to window
+      if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+        e.preventDefault()
+        this.fitToWindow()
+        return
+      }
+    }
+    document.addEventListener('keydown', this._onKeyDownImage)
+  }
+
+  _unbindKeyboardShortcuts() {
+    if (this._onKeyDownImage) {
+      document.removeEventListener('keydown', this._onKeyDownImage)
+      this._onKeyDownImage = null
+    }
   }
 
   // ── Private: Path display ───────────────────────────────────────────────────

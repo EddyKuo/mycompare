@@ -183,6 +183,7 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 | `renameFile(old, new)` | `rename-file` | fs.rename |
 | `mkdirFolder(parent, name)` | `mkdir-folder` | fs.mkdir |
 | `showInExplorer(path)` | `show-in-explorer` | shell.showItemInFolder |
+| `toggleFullScreen()` | `toggle-fullscreen` | BrowserWindow.setFullScreen 切換 |
 | `onOpenFiles(cb)` | `open-files` | CLI 引數傳入檔案路徑 |
 
 ---
@@ -258,6 +259,15 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 - **新增 IPC**：`rename-file`、`mkdir-folder`（main + preload + electronAPI 三層串接）
 - **測試**：441 passing（↑ 10 邊角測試，原 46 個既存測試）
 
+### Sprint 10 ✅ — 圖片比對強化（首次純新功能開發）
+- T57 Zoom 鍵盤控制（Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+Shift+F；MIN=0.1 / MAX=10；工具列 🔍+ 🔍- 1:1 ⬜）
+- T58 Rotate & Flip（rotateCW/CCW 90°、flipHorizontal/Vertical、resetTransform；CSS 合成 `scale rotate scaleX scaleY`；左右同步）
+- T59 Blend Mode（廢除 `_showDiffOverlay`，改為 `_blendMode ∈ {'normal','difference','blend'}` 三態 select；`mix-blend-mode: difference` CSS）
+- T60 Full Screen（F11 全域，新增 `toggle-fullscreen` IPC、`electronAPI.toggleFullScreen`、`BrowserWindow.setFullScreen()`）
+- **新增 IPC**：`toggle-fullscreen`
+- **檔案影響**：`image-compare.js` 887 → 1200 行（+313）、`image-compare.css`、`main/index.js`、`preload/index.js`、`app.js`
+- **測試**：462 passing（↑ 21 新測試；首次有 image-compare 測試覆蓋）
+
 ---
 
 ## 已實作功能總覽
@@ -291,15 +301,6 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 
 ## 後續 Sprint 規劃
 
-### Sprint 10 — 圖片比對強化（計劃中）
-
-| ID | 功能 |
-|----|------|
-| T57 | Zoom 控制（Ctrl+滾輪 / Ctrl+=/-/0 / Fit to Window） |
-| T58 | Rotate & Flip（CW / CCW / 水平翻轉 / 垂直翻轉） |
-| T59 | Blend Mode（Normal / Difference / Blend overlay） |
-| T60 | Full Screen（F11） |
-
 ### Sprint 11 — Session & Report（選用）
 
 | ID | 功能 |
@@ -324,7 +325,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 9 完成）**：441 / 441 unit tests passing；7 / 7 e2e tests passing
+**目前狀態（Sprint 10 完成）**：462 / 462 unit tests passing；7 / 7 e2e tests passing
 
 ### E2E 測試注意事項
 
