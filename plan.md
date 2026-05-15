@@ -1,7 +1,7 @@
 # MyCompare — 功能規劃文件
 
 > 基於 BeyondCompare 功能分析，以 Electron + Vite 實作的桌面應用開發計劃。
-> 最後更新：2026-05-15（Sprint 7 完成，423 unit + 7 e2e tests passing）
+> 最後更新：2026-05-15（Sprint 8 完成，431 unit + 7 e2e tests passing）
 
 ---
 
@@ -75,7 +75,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 7）**：423 / 423 unit tests passing、7 / 7 e2e tests passing
+**目前狀態（Sprint 8）**：431 / 431 unit tests passing、7 / 7 e2e tests passing
 
 ### E2E 測試架構
 - 測試對象為**生產版本**（`out/main/index.js`），每次執行前先 `npm run build`
@@ -413,7 +413,7 @@ UX 強化：右鍵選單（全視圖）✅
 | xlsx | CSV / Excel 解析（表格比對） | ✅ 已整合 |
 | electron-vite | 開發/打包工具 | ✅ 已使用 |
 | electron-builder | 安裝程式打包（NSIS/DMG/AppImage） | ✅ 已設定 |
-| Vitest | 單元測試 | ✅ 已整合（423/423 passing） |
+| Vitest | 單元測試 | ✅ 已整合（431/431 passing） |
 | Playwright | E2E 測試（Electron） | ✅ 已整合（7/7 passing） |
 
 > 核心 diff 算法、UI 元件、Virtual Scroll、Session 管理皆自行實作，不依賴外部 diff 庫。
@@ -431,7 +431,7 @@ UX 強化：右鍵選單（全視圖）✅
 | Sprint 5 | 2026-05 | 220 | ~96% | Hex 比對、資料夾同步、ZIP、多分頁、快捷鍵 |
 | Sprint 6 | 2026-05-14 | 286 | ~98% | Center Gutter、Smart Routing、右鍵選單、互動式三向合併 |
 | Sprint 7 | 2026-05-15 | 423 | ~99% | Find & Replace、Bookmarks、Go To Line、Convert File（+30 tests）|
-| Sprint 8 | 計劃中 | ~330 | ~99.5% | Show Filters、Visible Whitespace、字型大小、Over/Under |
+| Sprint 8 | 2026-05-15 | 431 | ~99.5% | Show Filters、Visible Whitespace、Line Numbers、字型大小、Over/Under（+8 integration tests）|
 | Sprint 9 | 計劃中 | ~355 | — | 資料夾：Rename/New Folder/Find/Select Newer |
 | Sprint 10 | 計劃中 | ~370 | — | 圖片：Zoom/Rotate/Flip/Blend/Full Screen |
 | Sprint 11 | 計劃中 | ~390 | — | Session Settings、HTML Report、Workspaces |

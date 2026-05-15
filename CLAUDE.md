@@ -240,6 +240,14 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 - T45 Convert File（Trim Trailing Whitespace、Tabs↔Spaces、CRLF/LF/CR 三向轉換）
 - **測試**：423 passing（↑ 137；其中 30 個為 Sprint 7 新增）、BC 功能覆蓋率 ~99%
 
+### Sprint 8 ✅ — 文字比對 View & Display 控制
+- T46 Show 篩選按鈕（All / Diff / Same / None，toolbar 4 按鈕同步 active）
+- T47 Visible Whitespace（空格 → `·`、Tab → `→`，純函式 `applyVisibleWhitespace`）
+- T48 Line Numbers 開關（toggle `.hide-line-numbers` class）
+- T49 字型大小控制（Ctrl+=/-/0，CSS 變數 `--tc-font-size` + `--tc-row-height`，[10, 24] 鉗制）
+- T50 Over/Under 佈局（side-by-side ↔ 上下堆疊，CSS grid 切換 + 按鈕文字 `⬛ Side` ↔ `⊟ Over`）
+- **測試**：431 passing（↑ 8 整合測試，原 38 個既存單元測試）、BC 功能覆蓋率 ~99.5%
+
 ---
 
 ## 已實作功能總覽
@@ -272,16 +280,6 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 ---
 
 ## 後續 Sprint 規劃
-
-### Sprint 8 — 文字比對：View & Display 控制（計劃中）
-
-| ID | 功能 | 說明 |
-|----|------|------|
-| T46 | Show 篩選按鈕 | Show All / Differences / Same / None |
-| T47 | Visible Whitespace | 顯示空格（·）、Tab（→）、換行（↵） |
-| T48 | Line Numbers 開關 | Toolbar 切換行號顯示 |
-| T49 | 字型大小控制 | Ctrl+= / Ctrl+- / Ctrl+0 |
-| T50 | Over/Under 佈局 | Side-by-side ↔ 上下堆疊切換 |
 
 ### Sprint 9 — 資料夾比對強化（計劃中）
 
@@ -327,7 +325,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 7 完成）**：423 / 423 unit tests passing；7 / 7 e2e tests passing
+**目前狀態（Sprint 8 完成）**：431 / 431 unit tests passing；7 / 7 e2e tests passing
 
 ### E2E 測試注意事項
 
