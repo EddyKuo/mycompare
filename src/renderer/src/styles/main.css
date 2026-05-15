@@ -454,6 +454,34 @@ body {
 }
 #btn-modal-apply:hover { background: #0052a3; }
 
+/* T61/T63: Named-config / Workspaces list inside modal */
+.config-list {
+  max-height: 240px; overflow-y: auto;
+  border: 1px solid var(--border-color); border-radius: 3px;
+  background: var(--bg-secondary);
+  display: flex; flex-direction: column;
+}
+.config-list-empty {
+  padding: 12px; font-size: 12px; color: var(--text-secondary);
+  text-align: center; font-style: italic;
+}
+.config-list-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+.config-list-item:last-child { border-bottom: none; }
+.config-list-item .name { flex: 1; color: var(--text-primary); }
+.config-list-item .meta { color: var(--text-secondary); font-size: 11px; }
+.config-list-item button {
+  padding: 2px 8px; font-size: 11px;
+  background: var(--bg-primary); color: var(--text-primary);
+  border: 1px solid var(--border-color); border-radius: 3px; cursor: pointer;
+}
+.config-list-item button:hover { background: var(--bg-tertiary, var(--bg-primary)); }
+.config-list-item button.danger { color: #c33; }
+
 /* ── Tab Bar ── */
 .tab-bar {
   display: flex;

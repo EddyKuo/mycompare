@@ -69,7 +69,10 @@
 
       <!-- Export & Ignore Rules -->
       <button class="toolbar-btn" id="btn-export" title="匯出 HTML 報告" disabled>⬇</button>
+      <button class="toolbar-btn" id="btn-print-report" title="列印 / 匯出 PDF (Ctrl+P)">🖨</button>
       <button class="toolbar-btn" id="btn-ignore-rules" title="忽略規則設定">⚙</button>
+      <button class="toolbar-btn" id="btn-config-modal" title="設定管理（命名儲存）">🔧</button>
+      <button class="toolbar-btn" id="btn-workspaces" title="工作區（多分頁組合）">📂</button>
 
       <!-- Theme toggle (right side) -->
       <div style="margin-left:auto">
@@ -246,6 +249,58 @@
       <div class="modal-footer">
         <button id="btn-modal-cancel">取消</button>
         <button id="btn-modal-apply">套用</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- T61: Named Config (Session Settings) Modal -->
+  <div id="config-modal" class="modal-overlay" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>設定管理</h3>
+        <button id="btn-config-modal-close" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <label>已儲存的設定：</label>
+        <div id="config-list" class="config-list"></div>
+        <label style="margin-top:8px">儲存目前設定為：</label>
+        <div style="display:flex;gap:6px">
+          <input id="input-config-name" type="text" placeholder="設定名稱"
+                 style="flex:1;padding:4px 8px;border:1px solid var(--border-color);
+                        background:var(--bg-secondary);color:var(--text-primary);
+                        border-radius:3px;font-size:12px" />
+          <button id="btn-config-save">儲存</button>
+        </div>
+        <div id="config-modal-status" style="font-size:11px;color:var(--text-secondary);min-height:14px"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-config-modal-cancel">關閉</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- T63: Workspaces Modal -->
+  <div id="workspaces-modal" class="modal-overlay" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>工作區</h3>
+        <button id="btn-workspaces-modal-close" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <label>已儲存的工作區：</label>
+        <div id="workspaces-list" class="config-list"></div>
+        <label style="margin-top:8px">儲存目前所有分頁為工作區：</label>
+        <div style="display:flex;gap:6px">
+          <input id="input-workspace-name" type="text" placeholder="工作區名稱"
+                 style="flex:1;padding:4px 8px;border:1px solid var(--border-color);
+                        background:var(--bg-secondary);color:var(--text-primary);
+                        border-radius:3px;font-size:12px" />
+          <button id="btn-workspace-save">儲存</button>
+        </div>
+        <div id="workspace-modal-status" style="font-size:11px;color:var(--text-secondary);min-height:14px"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-workspaces-modal-cancel">關閉</button>
       </div>
     </div>
   </div>

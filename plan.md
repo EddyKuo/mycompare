@@ -1,7 +1,7 @@
 # MyCompare — 功能規劃文件
 
 > 基於 BeyondCompare 功能分析，以 Electron + Vite 實作的桌面應用開發計劃。
-> 最後更新：2026-05-15（Sprint 10 完成，462 unit + 7 e2e tests passing）
+> 最後更新：2026-05-15（Sprint 11 完成 — 全部 plan 落地，484 unit + 7 e2e tests passing）
 
 ---
 
@@ -75,7 +75,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 10）**：462 / 462 unit tests passing、7 / 7 e2e tests passing
+**目前狀態（Sprint 11 — 全部 plan 完成）**：484 / 484 unit tests passing、7 / 7 e2e tests passing
 
 ### E2E 測試架構
 - 測試對象為**生產版本**（`out/main/index.js`），每次執行前先 `npm run build`
@@ -419,7 +419,7 @@ UX 強化：右鍵選單（全視圖）✅
 | xlsx | CSV / Excel 解析（表格比對） | ✅ 已整合 |
 | electron-vite | 開發/打包工具 | ✅ 已使用 |
 | electron-builder | 安裝程式打包（NSIS/DMG/AppImage） | ✅ 已設定 |
-| Vitest | 單元測試 | ✅ 已整合（462/462 passing） |
+| Vitest | 單元測試 | ✅ 已整合（484/484 passing） |
 | Playwright | E2E 測試（Electron） | ✅ 已整合（7/7 passing） |
 
 > 核心 diff 算法、UI 元件、Virtual Scroll、Session 管理皆自行實作，不依賴外部 diff 庫。
@@ -440,4 +440,4 @@ UX 強化：右鍵選單（全視圖）✅
 | Sprint 8 | 2026-05-15 | 431 | ~99.5% | Show Filters、Visible Whitespace、Line Numbers、字型大小、Over/Under（+8 integration tests）|
 | Sprint 9 | 2026-05-15 | 441 | — | 資料夾：Rename/New Folder/Find/Select Newer（+10 edge tests）|
 | Sprint 10 | 2026-05-15 | 462 | — | **圖片：Zoom/Rotate/Flip/Blend/F11 全螢幕（+21 tests，首次真正新功能開發）**|
-| Sprint 11 | 計劃中 | ~390 | — | Session Settings、HTML Report、Workspaces |
+| Sprint 11 | 2026-05-15 | 484 | — | **Session Settings 命名設定、HTML Report stats + PDF 列印、Workspaces 多分頁組合（+22 tests）**|

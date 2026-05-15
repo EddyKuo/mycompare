@@ -288,9 +288,26 @@ export class FolderCompare {
     return this._syncMode
   }
 
-  /** Export folder diff as self-contained HTML report */
-  async exportHtml() {
-    if (!this._rows.length) return
+  /**
+   * Compute folder-compare row statistics by status.
+   * @returns {{ same: number, different: number, left_only: number, right_only: number, left_newer: number, right_newer: number, total: number }}
+   */
+  getRowStats() {
+    const stats = { same: 0, different: 0, left_only: 0, right_only: 0, left_newer: 0, right_newer: 0, total: 0 }
+    for (const row of (this._rows ?? [])) {
+      if (row && Object.prototype.hasOwnProperty.call(stats, row.status)) {
+        stats[row.status]++
+      }
+    }
+    stats.total = stats.same + stats.different + stats.left_only + stats.right_only + stats.left_newer + stats.right_newer
+    return stats
+  }
+
+  /**
+   * Build the folder-compare HTML report string.
+   * @returns {string}
+   */
+  buildHtmlReport() {
     const esc = (s) => (s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     const statusLabel = {
       same: '相同', different: '不同', left_only: '僅左側',
@@ -300,11 +317,13 @@ export class FolderCompare {
       same: '#fff', different: '#fffad7', left_only: '#d7ffd7',
       right_only: '#ffd7d7', left_newer: '#e8f0fe', right_newer: '#ffe8d7'
     }
+    const stats = this.getRowStats()
+    const timestamp = new Date().toLocaleString('zh-TW')
 
     const fmtSize = (n) => n == null ? '' : n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(1)} KB` : `${(n/1048576).toFixed(1)} MB`
     const fmtDate = (s) => s ? new Date(s).toLocaleString('zh-TW') : ''
 
-    const rows = this._rows.map(row => {
+    const rows = (this._rows ?? []).map(row => {
       const bg = statusColor[row.status] ?? '#fff'
       const indent = '  '.repeat((row.depth ?? 0))
       const name = indent + esc(row.name ?? '')
@@ -319,21 +338,44 @@ export class FolderCompare {
 </tr>`
     }).join('\n')
 
-    const html = `<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html lang="zh-TW"><head><meta charset="UTF-8">
 <title>MyCompare — 資料夾比對報告</title>
 <style>
 body{font-family:sans-serif;font-size:13px;background:#fff;color:#222;margin:16px}
 h2{margin-bottom:4px}
 .paths{font-size:12px;color:#666;margin-bottom:12px}
+.report-stats{font-size:12px;display:flex;flex-wrap:wrap;gap:10px;padding:8px 12px;
+  background:#f5f5f5;border:1px solid #ddd;border-radius:4px;margin-bottom:12px}
+.report-stats .stat-diff{color:#996c00;font-weight:600}
+.report-stats .stat-leftonly{color:#067d39;font-weight:600}
+.report-stats .stat-rightonly{color:#b3261e;font-weight:600}
+.report-stats .stat-newer{color:#0052a3;font-weight:600}
+.report-stats .ts{margin-left:auto;color:#888}
 table{border-collapse:collapse;width:100%;font-size:12px}
 th,td{padding:3px 8px;border:1px solid #ddd;text-align:left}
 th{background:#f5f5f5;font-weight:600}
 td:first-child{font-family:monospace;white-space:pre}
+@media print{
+  body{margin:8mm;font-size:10px}
+  .no-print{display:none !important}
+  table{page-break-inside:auto;font-size:10px}
+  tr{page-break-inside:avoid;page-break-after:auto}
+  thead{display:table-header-group}
+}
 </style>
 </head><body>
 <h2>資料夾比對報告</h2>
 <div class="paths">左：${esc(this._leftPath || '（未知）')} &nbsp;|&nbsp; 右：${esc(this._rightPath || '（未知）')}</div>
+<div class="report-stats">
+  <div>相同: <span>${stats.same}</span></div>
+  <div>不同: <span class="stat-diff">${stats.different}</span></div>
+  <div>僅左側: <span class="stat-leftonly">${stats.left_only}</span></div>
+  <div>僅右側: <span class="stat-rightonly">${stats.right_only}</span></div>
+  <div>左側較新: <span class="stat-newer">${stats.left_newer}</span></div>
+  <div>右側較新: <span class="stat-newer">${stats.right_newer}</span></div>
+  <div class="ts">生成時間: ${esc(timestamp)}</div>
+</div>
 <table>
 <thead><tr><th>名稱</th><th>狀態</th><th>左 大小</th><th>左 修改時間</th><th>右 大小</th><th>右 修改時間</th></tr></thead>
 <tbody>
@@ -341,7 +383,30 @@ ${rows}
 </tbody>
 </table>
 </body></html>`
+  }
 
+  /**
+   * Export folder diff as self-contained HTML report.
+   * @param {{ print?: boolean }} [opts]
+   */
+  async exportHtml(opts = {}) {
+    if (!this._rows.length) return
+    const html = this.buildHtmlReport()
+    if (opts.print) {
+      try {
+        const blob = new Blob([html], { type: 'text/html' })
+        const url = URL.createObjectURL(blob)
+        const win = window.open(url, '_blank')
+        if (win) {
+          win.addEventListener('load', () => {
+            try { win.print() } catch { /* user cancelled */ }
+          })
+        }
+      } catch {
+        await window.electronAPI.saveFile('folder-report.html', html)
+      }
+      return
+    }
     await window.electronAPI.saveFile('folder-report.html', html)
   }
 

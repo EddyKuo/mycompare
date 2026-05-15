@@ -6,6 +6,8 @@ import { HexCompare } from './views/hex-compare.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { getViewTypeForPath } from './core/file-type.js'
+import { NamedConfigStore } from './core/named-config-store.js'
+import { WorkspaceStore } from './core/workspace-store.js'
 
 // ---------------------------------------------------------------------------
 // TabManager — session-record-based tab bar
@@ -96,6 +98,25 @@ class TabManager {
   }
 
   get count() { return this._tabs.length }
+
+  /** All tab records (read-only access — do not mutate). */
+  get tabs() { return this._tabs }
+
+  /**
+   * Return a lightweight, JSON-serialisable snapshot of all tabs.
+   * The heavy `state` field is stripped so the result is safe to persist
+   * to localStorage. Used by T63 Workspace save.
+   * @returns {Array<{ type: string, title: string, leftPath: string, rightPath: string, basePath: string }>}
+   */
+  getSerialisableTabs() {
+    return this._tabs.map(t => ({
+      type: t.type,
+      title: t.title,
+      leftPath: t.leftPath,
+      rightPath: t.rightPath,
+      basePath: t.basePath,
+    }))
+  }
 
   /** Show or hide the tab bar depending on whether there are any tabs. */
   _render() {
@@ -772,6 +793,406 @@ function setupToolbarButtons() {
     textCompare?.setIgnorePatterns(ignorePatterns, unimportantPatterns)
     closeIgnoreRulesModal()
   })
+
+  // T62: Print / PDF export
+  el('btn-print-report')?.addEventListener('click', () => {
+    if (currentView === 'text') textCompare?.exportHtml({ print: true })
+    else if (currentView === 'folder') folderCompare?.exportHtml({ print: true })
+  })
+
+  // T61: Session Settings Dialog (Named Configs)
+  el('btn-config-modal')?.addEventListener('click', openConfigModal)
+  el('btn-config-modal-close')?.addEventListener('click', closeConfigModal)
+  el('btn-config-modal-cancel')?.addEventListener('click', closeConfigModal)
+  el('btn-config-save')?.addEventListener('click', handleConfigSave)
+
+  // T63: Workspaces
+  el('btn-workspaces')?.addEventListener('click', openWorkspacesModal)
+  el('btn-workspaces-modal-close')?.addEventListener('click', closeWorkspacesModal)
+  el('btn-workspaces-modal-cancel')?.addEventListener('click', closeWorkspacesModal)
+  el('btn-workspace-save')?.addEventListener('click', handleWorkspaceSave)
+}
+
+// ---------------------------------------------------------------------------
+// T61: Named Config Store + modal handlers
+// ---------------------------------------------------------------------------
+
+const namedConfigStore = new NamedConfigStore()
+const workspaceStore = new WorkspaceStore()
+
+/**
+ * Return the active view object that supports getConfig/applyConfig.
+ * Currently only TextCompare implements the contract.
+ * @returns {{ view: object, type: 'text' | null }}
+ */
+function _getActiveConfigurableView() {
+  if (currentView === 'text' && textCompare) return { view: textCompare, type: 'text' }
+  return { view: null, type: null }
+}
+
+function openConfigModal() {
+  const overlay = el('config-modal')
+  if (!overlay) return
+  overlay.style.display = 'flex'
+  refreshConfigList()
+  const status = el('config-modal-status')
+  if (status) status.textContent = ''
+  const input = el('input-config-name')
+  if (input) input.value = ''
+}
+
+function closeConfigModal() {
+  const overlay = el('config-modal')
+  if (overlay) overlay.style.display = 'none'
+}
+
+function refreshConfigList() {
+  const list = el('config-list')
+  if (!list) return
+  const { type } = _getActiveConfigurableView()
+  const items = namedConfigStore.list(type ?? undefined)
+  list.replaceChildren()
+  if (items.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'config-list-empty'
+    empty.textContent = type === null
+      ? '（請先進入文字比對視圖以管理設定）'
+      : '（尚未儲存任何設定）'
+    list.appendChild(empty)
+    return
+  }
+  for (const entry of items) {
+    list.appendChild(_buildConfigListItem(entry))
+  }
+}
+
+/**
+ * @param {{ name: string, viewType: string, createdAt: string, settings: object }} entry
+ * @returns {HTMLElement}
+ */
+function _buildConfigListItem(entry) {
+  const row = document.createElement('div')
+  row.className = 'config-list-item'
+
+  const nameEl = document.createElement('span')
+  nameEl.className = 'name'
+  nameEl.textContent = entry.name
+
+  const metaEl = document.createElement('span')
+  metaEl.className = 'meta'
+  const created = (() => {
+    try { return new Date(entry.createdAt).toLocaleString('zh-TW') } catch { return entry.createdAt }
+  })()
+  metaEl.textContent = `${entry.viewType} · ${created}`
+
+  const btnLoad = document.createElement('button')
+  btnLoad.textContent = '載入'
+  btnLoad.addEventListener('click', () => {
+    const { view } = _getActiveConfigurableView()
+    if (!view) return
+    view.applyConfig(entry.settings)
+    _setConfigStatus(`已套用設定「${entry.name}」`)
+  })
+
+  const btnDelete = document.createElement('button')
+  btnDelete.className = 'danger'
+  btnDelete.textContent = '刪除'
+  btnDelete.addEventListener('click', () => {
+    namedConfigStore.remove(entry.name)
+    refreshConfigList()
+    _setConfigStatus(`已刪除設定「${entry.name}」`)
+  })
+
+  row.appendChild(nameEl)
+  row.appendChild(metaEl)
+  row.appendChild(btnLoad)
+  row.appendChild(btnDelete)
+  return row
+}
+
+function handleConfigSave() {
+  const input = el('input-config-name')
+  const name = (input?.value ?? '').trim()
+  if (!name) {
+    _setConfigStatus('請輸入設定名稱')
+    return
+  }
+  const { view, type } = _getActiveConfigurableView()
+  if (!view || !type) {
+    _setConfigStatus('目前視圖不支援設定管理')
+    return
+  }
+  const settings = view.getConfig()
+  namedConfigStore.save(name, type, settings)
+  if (input) input.value = ''
+  refreshConfigList()
+  _setConfigStatus(`已儲存設定「${name}」`)
+}
+
+function _setConfigStatus(msg) {
+  const status = el('config-modal-status')
+  if (status) status.textContent = msg
+}
+
+// ---------------------------------------------------------------------------
+// T63: Workspaces modal handlers
+// ---------------------------------------------------------------------------
+
+function openWorkspacesModal() {
+  const overlay = el('workspaces-modal')
+  if (!overlay) return
+  overlay.style.display = 'flex'
+  refreshWorkspacesList()
+  const status = el('workspace-modal-status')
+  if (status) status.textContent = ''
+  const input = el('input-workspace-name')
+  if (input) input.value = ''
+}
+
+function closeWorkspacesModal() {
+  const overlay = el('workspaces-modal')
+  if (overlay) overlay.style.display = 'none'
+}
+
+function refreshWorkspacesList() {
+  const list = el('workspaces-list')
+  if (!list) return
+  const items = workspaceStore.list()
+  list.replaceChildren()
+  if (items.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'config-list-empty'
+    empty.textContent = '（尚未儲存任何工作區）'
+    list.appendChild(empty)
+    return
+  }
+  for (const entry of items) {
+    list.appendChild(_buildWorkspaceListItem(entry))
+  }
+}
+
+function _buildWorkspaceListItem(entry) {
+  const row = document.createElement('div')
+  row.className = 'config-list-item'
+
+  const nameEl = document.createElement('span')
+  nameEl.className = 'name'
+  nameEl.textContent = entry.name
+
+  const metaEl = document.createElement('span')
+  metaEl.className = 'meta'
+  const count = Array.isArray(entry.tabs) ? entry.tabs.length : 0
+  const created = (() => {
+    try { return new Date(entry.createdAt).toLocaleString('zh-TW') } catch { return entry.createdAt }
+  })()
+  metaEl.textContent = `${count} 個分頁 · ${created}`
+
+  const btnLoad = document.createElement('button')
+  btnLoad.textContent = '載入'
+  btnLoad.addEventListener('click', async () => {
+    closeWorkspacesModal()
+    await loadWorkspace(entry)
+  })
+
+  const btnDelete = document.createElement('button')
+  btnDelete.className = 'danger'
+  btnDelete.textContent = '刪除'
+  btnDelete.addEventListener('click', () => {
+    workspaceStore.remove(entry.name)
+    refreshWorkspacesList()
+    _setWorkspaceStatus(`已刪除工作區「${entry.name}」`)
+  })
+
+  row.appendChild(nameEl)
+  row.appendChild(metaEl)
+  row.appendChild(btnLoad)
+  row.appendChild(btnDelete)
+  return row
+}
+
+function handleWorkspaceSave() {
+  const input = el('input-workspace-name')
+  const name = (input?.value ?? '').trim()
+  if (!name) {
+    _setWorkspaceStatus('請輸入工作區名稱')
+    return
+  }
+  const tabs = tabMgr.getSerialisableTabs()
+  if (tabs.length === 0) {
+    _setWorkspaceStatus('目前沒有分頁可儲存')
+    return
+  }
+  workspaceStore.save(name, tabs)
+  if (input) input.value = ''
+  refreshWorkspacesList()
+  _setWorkspaceStatus(`已儲存工作區「${name}」（${tabs.length} 個分頁）`)
+}
+
+function _setWorkspaceStatus(msg) {
+  const status = el('workspace-modal-status')
+  if (status) status.textContent = msg
+}
+
+/**
+ * Restore tabs from a workspace entry. Closes all current tabs, then opens
+ * each saved tab and re-reads its files. Missing/failed files are skipped.
+ * @param {{ tabs: Array<{ type: string, title: string, leftPath: string, rightPath: string, basePath: string }> }} entry
+ */
+async function loadWorkspace(entry) {
+  if (!entry || !Array.isArray(entry.tabs)) return
+  // Close all current tabs (iterate over a copy of ids)
+  const currentIds = tabMgr.tabs.map(t => t.id)
+  for (const id of currentIds) tabMgr.closeTab(id)
+
+  let failures = 0
+  for (const saved of entry.tabs) {
+    try {
+      await _restoreOneWorkspaceTab(saved)
+    } catch {
+      failures++
+    }
+  }
+
+  // Activate the first restored tab (if any)
+  const first = tabMgr.tabs[0]
+  if (first) {
+    _handleActivateTab(first.id, true)
+  } else {
+    showHome()
+  }
+
+  if (failures > 0) {
+    showStatus(`工作區載入：${failures} 個分頁無法還原`)
+  }
+}
+
+/**
+ * @param {{ type: string, title: string, leftPath: string, rightPath: string, basePath: string }} saved
+ */
+async function _restoreOneWorkspaceTab(saved) {
+  const type = saved.type
+  const title = saved.title || _titleFromPaths(saved.leftPath, saved.rightPath) || _defaultTitleForType(type)
+
+  switch (type) {
+    case 'text': {
+      tabMgr.addTab('text', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showTextCompare()
+      if (textCompare) {
+        if (saved.leftPath) {
+          try {
+            const r = await window.electronAPI.readFile(saved.leftPath)
+            if (r) textCompare.setLeft(r.path, r.content)
+          } catch { /* skip */ }
+        }
+        if (saved.rightPath) {
+          try {
+            const r = await window.electronAPI.readFile(saved.rightPath)
+            if (r) textCompare.setRight(r.path, r.content)
+          } catch { /* skip */ }
+        }
+      }
+      break
+    }
+    case 'folder': {
+      tabMgr.addTab('folder', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showFolderCompare()
+      if (folderCompare) {
+        if (saved.leftPath)  await folderCompare.setLeft(saved.leftPath).catch(() => {})
+        if (saved.rightPath) await folderCompare.setRight(saved.rightPath).catch(() => {})
+      }
+      break
+    }
+    case 'table': {
+      tabMgr.addTab('table', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showTableCompare()
+      if (tableCompare) {
+        if (saved.leftPath) {
+          try {
+            const r = await window.electronAPI.readFile(saved.leftPath)
+            if (r) tableCompare.setLeft(r.path, r.content)
+          } catch { /* skip */ }
+        }
+        if (saved.rightPath) {
+          try {
+            const r = await window.electronAPI.readFile(saved.rightPath)
+            if (r) tableCompare.setRight(r.path, r.content)
+          } catch { /* skip */ }
+        }
+      }
+      break
+    }
+    case 'image': {
+      tabMgr.addTab('image', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showImageCompare()
+      if (imageCompare) {
+        if (saved.leftPath) {
+          try {
+            const r = await window.electronAPI.readFileBinary(saved.leftPath)
+            if (r) await imageCompare.setLeft(r.path, r.base64, r.ext)
+          } catch { /* skip */ }
+        }
+        if (saved.rightPath) {
+          try {
+            const r = await window.electronAPI.readFileBinary(saved.rightPath)
+            if (r) await imageCompare.setRight(r.path, r.base64, r.ext)
+          } catch { /* skip */ }
+        }
+      }
+      break
+    }
+    case 'hex': {
+      tabMgr.addTab('hex', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showHexCompare()
+      if (hexCompare) {
+        if (saved.leftPath) {
+          try {
+            const r = await window.electronAPI.readFileBinary(saved.leftPath)
+            if (r) hexCompare.setLeft(r.path, r.base64)
+          } catch { /* skip */ }
+        }
+        if (saved.rightPath) {
+          try {
+            const r = await window.electronAPI.readFileBinary(saved.rightPath)
+            if (r) hexCompare.setRight(r.path, r.base64)
+          } catch { /* skip */ }
+        }
+      }
+      break
+    }
+    case 'merge3': {
+      tabMgr.addTab('merge3', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath, basePath: saved.basePath })
+      showMerge3()
+      // 3-way restore requires base+left+right files; we skip silently if any missing
+      break
+    }
+    default:
+      // Unknown type — skip
+      break
+  }
+}
+
+function _titleFromPaths(left, right) {
+  if (!left && !right) return ''
+  const name = (p) => p ? p.replace(/\\/g, '/').split('/').pop() : ''
+  return `${name(left)} ↔ ${name(right)}`
+}
+
+function _defaultTitleForType(type) {
+  switch (type) {
+    case 'text':   return '文字比對'
+    case 'folder': return '資料夾比對'
+    case 'table':  return '表格比對'
+    case 'image':  return '圖片比對'
+    case 'hex':    return 'Hex 比對'
+    case 'merge3': return '三向合併'
+    default:       return '分頁'
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +1336,13 @@ function setupKeyboardShortcuts() {
       case e.key === 'F11':
         e.preventDefault()
         window.electronAPI?.toggleFullScreen?.()
+        break
+
+      // T62: Ctrl+P opens print preview of the current view's HTML report
+      case e.key === 'p' && e.ctrlKey && !e.shiftKey:
+        e.preventDefault()
+        if (currentView === 'text') textCompare?.exportHtml({ print: true })
+        else if (currentView === 'folder') folderCompare?.exportHtml({ print: true })
         break
     }
   })

@@ -268,6 +268,14 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 - **檔案影響**：`image-compare.js` 887 → 1200 行（+313）、`image-compare.css`、`main/index.js`、`preload/index.js`、`app.js`
 - **測試**：462 passing（↑ 21 新測試；首次有 image-compare 測試覆蓋）
 
+### Sprint 11 ✅ — Session 設定 / HTML 報告強化 / Workspaces（全 plan 落地）
+- T61 Session Settings Dialog（命名設定儲存/載入；新 `core/named-config-store.js`、`mycompare:namedConfigs` localStorage；`getConfig()` / `applyConfig()` on TextCompare；🔧 工具列 + `#config-modal`）
+- T62 HTML Report 強化（stats 摘要：text `新增 / 刪除 / 變更 / 相同`；folder `相同 / 不同 / 左右側獨有 / 較新`；`@media print` + `Ctrl+P` blob 列印 / PDF）
+- T63 Workspaces（新 `core/workspace-store.js`、`mycompare:workspaces` localStorage；`TabManager.getSerialisableTabs()` 過濾 heavy state；批次關閉 → 重建 tabs 並重讀檔案；merge3 暫未支援）
+- **新增 localStorage keys**：`mycompare:namedConfigs`、`mycompare:workspaces`
+- **檔案影響**：~705 production + ~265 test LOC，新檔 `named-config-store.js`、`workspace-store.js`、`sprint11.test.js`
+- **測試**：484 passing（↑ 22 新測試）
+
 ---
 
 ## 已實作功能總覽
@@ -299,15 +307,14 @@ Renderer 透過 `window.electronAPI.*` 呼叫，所有 IPC 定義於 `preload/in
 
 ---
 
-## 後續 Sprint 規劃
+## 後續工作（plan.md sprint 1–11 全部完成後）
 
-### Sprint 11 — Session & Report（選用）
-
-| ID | 功能 |
-|----|------|
-| T61 | Session Settings Dialog（設定命名儲存） |
-| T62 | 完整 HTML/PDF 報告（含統計摘要） |
-| T63 | Workspaces（多 Tab 組合儲存與載入） |
+| 方向 | 說明 |
+|------|------|
+| **e2e 測試擴充** | image / table / merge3 目前無 e2e 覆蓋；hex / text / folder / theme / smoke 已覆蓋 |
+| **plan.md 殘餘 ⬜ 項目** | P0-3 Undo/Redo、P1-2 Session 群組分類、P3-1 Hex 比對算法切換、T49 可由使用者自訂快捷鍵 |
+| **跨視圖一致性** | T61 `getConfig/applyConfig` 目前只 TextCompare 實作，可擴展至其他 view |
+| **新需求** | 待討論 |
 
 ---
 
@@ -325,7 +332,7 @@ npm run test:coverage # 覆蓋率報告（目標 ≥ 80%）
 npm run test:e2e      # E2E 測試（先 build，再跑 Playwright）
 ```
 
-**目前狀態（Sprint 10 完成）**：462 / 462 unit tests passing；7 / 7 e2e tests passing
+**目前狀態（Sprint 11 完成 — 全部 plan 落地）**：484 / 484 unit tests passing；7 / 7 e2e tests passing
 
 ### E2E 測試注意事項
 

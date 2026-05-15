@@ -1234,12 +1234,34 @@ export class TextCompare {
     if (this._leftContent && this._rightContent) this._runDiff();
   }
 
-  /** Export diff as self-contained HTML report */
-  async exportHtml() {
+  /**
+   * Compute aggregate diff statistics from the current _diffResult.
+   * @returns {{ equal: number, insert: number, delete: number, replace: number, total: number }}
+   */
+  getDiffStats() {
+    const stats = { equal: 0, insert: 0, delete: 0, replace: 0, total: 0 }
+    for (const dl of (this._diffResult ?? [])) {
+      if (dl && Object.prototype.hasOwnProperty.call(stats, dl.type)) {
+        stats[dl.type]++
+      }
+    }
+    stats.total = stats.equal + stats.insert + stats.delete + stats.replace
+    return stats
+  }
+
+  /**
+   * Build the self-contained HTML report string.
+   * Pure-function helper extracted from exportHtml so callers (e.g. print
+   * preview) can obtain the same payload without writing to disk.
+   * @returns {string}
+   */
+  buildHtmlReport() {
     const esc = (s) => (s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     const typeClass = { equal: 'eq', insert: 'ins', delete: 'del', replace: 'rep' }
+    const stats = this.getDiffStats()
+    const timestamp = new Date().toLocaleString('zh-TW')
 
-    const rows = this._diffResult.map(dl => {
+    const rows = (this._diffResult ?? []).map(dl => {
       const cls = typeClass[dl.type] ?? 'eq'
       const ln = (n) => `<td class="ln">${n ?? ''}</td>`
       return `<tr class="${cls}">
@@ -1248,13 +1270,22 @@ export class TextCompare {
 </tr>`
     }).join('\n')
 
-    const html = `<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html lang="zh-TW"><head><meta charset="UTF-8">
 <title>MyCompare — 比對報告</title>
 <style>
 body{font-family:monospace;font-size:13px;background:#fff;color:#222;margin:16px}
 h2{font-family:sans-serif;margin-bottom:4px}
 .paths{font-family:sans-serif;font-size:12px;color:#666;margin-bottom:12px}
+.report-stats{font-family:sans-serif;font-size:12px;display:flex;flex-wrap:wrap;
+  gap:10px;padding:8px 12px;background:#f5f5f5;border:1px solid #ddd;
+  border-radius:4px;margin-bottom:12px}
+.report-stats > div{padding:2px 0}
+.report-stats .stat-add{color:#067d39;font-weight:600}
+.report-stats .stat-del{color:#b3261e;font-weight:600}
+.report-stats .stat-mod{color:#996c00;font-weight:600}
+.report-stats .stat-eq{color:#666;font-weight:600}
+.report-stats .ts{margin-left:auto;color:#888}
 table{border-collapse:collapse;width:100%}
 td{padding:1px 6px;white-space:pre-wrap;word-break:break-all}
 .ln{color:#888;text-align:right;min-width:3em;user-select:none;border-right:1px solid #ddd;padding-right:6px}
@@ -1262,10 +1293,25 @@ td{padding:1px 6px;white-space:pre-wrap;word-break:break-all}
 .del td{background:#ffd7d7}
 .ins td{background:#d7ffd7}
 .rep td{background:#fffad7}
+@media print{
+  body{margin:8mm;font-size:11px}
+  .no-print{display:none !important}
+  h2{font-size:14px}
+  .paths,.report-stats{font-size:10px}
+  table{page-break-inside:auto}
+  tr{page-break-inside:avoid;page-break-after:auto}
+}
 </style>
 </head><body>
 <h2>比對報告</h2>
 <div class="paths">左：${esc(this._leftPath || '（未知）')} &nbsp;|&nbsp; 右：${esc(this._rightPath || '（未知）')}</div>
+<div class="report-stats">
+  <div>新增: <span class="stat-add">${stats.insert}</span> 行</div>
+  <div>刪除: <span class="stat-del">${stats.delete}</span> 行</div>
+  <div>變更: <span class="stat-mod">${stats.replace}</span> 行</div>
+  <div>相同: <span class="stat-eq">${stats.equal}</span> 行</div>
+  <div class="ts">生成時間: ${esc(timestamp)}</div>
+</div>
 <table>
 <thead><tr><th colspan="2">左側</th><th colspan="2">右側</th></tr></thead>
 <tbody>
@@ -1273,7 +1319,31 @@ ${rows}
 </tbody>
 </table>
 </body></html>`
+  }
 
+  /**
+   * Export the diff as a self-contained HTML report.
+   * @param {{ print?: boolean }} [opts] When print=true, opens the HTML in a
+   *   blob URL window and triggers window.print() instead of saving to disk.
+   */
+  async exportHtml(opts = {}) {
+    const html = this.buildHtmlReport()
+    if (opts.print) {
+      try {
+        const blob = new Blob([html], { type: 'text/html' })
+        const url = URL.createObjectURL(blob)
+        const win = window.open(url, '_blank')
+        if (win) {
+          win.addEventListener('load', () => {
+            try { win.print() } catch { /* user cancelled */ }
+          })
+        }
+      } catch {
+        // Fallback to save if blob/window.open unavailable
+        await window.electronAPI.saveFile('compare-report.html', html)
+      }
+      return
+    }
     await window.electronAPI.saveFile('compare-report.html', html)
   }
 
@@ -1496,6 +1566,46 @@ ${rows}
     this._opts.ignorePatterns = ignorePatterns ?? []
     this._opts.unimportantPatterns = unimportantPatterns ?? []
     this._runDiff()
+  }
+
+  /**
+   * Return the current view settings as a plain JSON-serialisable object.
+   * Used by T61 Session Settings Dialog to persist a snapshot under a name.
+   * @returns {Record<string, unknown>}
+   */
+  getConfig() {
+    return {
+      algorithm:          this._opts.algorithm,
+      ignoreWhitespace:   this._opts.ignoreWhitespace,
+      ignoreCase:         this._opts.ignoreCase,
+      ignoreLineEndings:  this._opts.ignoreLineEndings,
+      contextLines:       this._opts.contextLines,
+      ignorePatterns:     Array.isArray(this._opts.ignorePatterns) ? [...this._opts.ignorePatterns] : [],
+      unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
+    }
+  }
+
+  /**
+   * Apply a previously captured settings snapshot.
+   * Unknown keys are ignored. Triggers a diff re-run if content is loaded.
+   * @param {Record<string, unknown>} settings
+   */
+  applyConfig(settings) {
+    if (!settings || typeof settings !== 'object') return
+    const known = ['algorithm','ignoreWhitespace','ignoreCase','ignoreLineEndings','contextLines','ignorePatterns','unimportantPatterns']
+    for (const key of known) {
+      if (Object.prototype.hasOwnProperty.call(settings, key)) {
+        const value = settings[key]
+        if ((key === 'ignorePatterns' || key === 'unimportantPatterns')) {
+          this._opts[key] = Array.isArray(value) ? [...value] : []
+        } else {
+          this._opts[key] = value
+        }
+      }
+    }
+    if (this._leftContent || this._rightContent) {
+      this._runDiff()
+    }
   }
 
   /**
