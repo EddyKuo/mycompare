@@ -1,0 +1,347 @@
+/* hex-compare.css — Hex 二進位比對視圖樣式
+ * 所有顏色使用 variables.css 中定義的 CSS 變數，無硬編碼顏色。
+ */
+
+/* ── Root Container ──────────────────────────────────────────────────────────── */
+
+.hex-compare {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+/* ── Toolbar ─────────────────────────────────────────────────────────────────── */
+
+.hx-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  height: var(--toolbar-height, 36px);
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+/* ── Find bar (inside toolbar) ───────────────────────────────────────────────── */
+
+.hx-find-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+}
+
+.hx-find-mode-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hx-find-input {
+  width: 180px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.hx-find-btn {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 2px 6px;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.hx-find-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.hx-find-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-width: 50px;
+  white-space: nowrap;
+}
+
+.hx-goto-input {
+  width: 140px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  margin-left: 8px;
+}
+
+.hx-toolbar label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.hx-toolbar select {
+  font-size: 12px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.hx-toolbar button {
+  font-size: 12px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hx-toolbar button:hover {
+  background: var(--bg-toolbar);
+}
+
+.hx-size-info {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-left: 4px;
+}
+
+.hx-warning {
+  font-size: 12px;
+  color: var(--diff-delete-border);
+  margin-left: 4px;
+}
+
+/* ── Body (two panes side-by-side) ───────────────────────────────────────────── */
+
+.hx-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Pane ────────────────────────────────────────────────────────────────────── */
+
+.hx-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border-color);
+}
+
+.hx-pane:last-child {
+  border-right: none;
+}
+
+/* ── Pane Header ─────────────────────────────────────────────────────────────── */
+
+.hx-header {
+  display: grid;
+  grid-template-columns: 80px 1fr 120px;
+  padding: 2px 0;
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  user-select: none;
+}
+
+.hx-header-offset,
+.hx-header-hex,
+.hx-header-ascii {
+  padding: 0 4px;
+}
+
+.hx-header-hex {
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+}
+
+/* ── Scroll Container (virtual scroll) ──────────────────────────────────────── */
+
+.hx-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  position: relative;
+}
+
+.hx-inner {
+  position: relative;
+  /* height set dynamically via JS: totalRows * ROW_HEIGHT */
+}
+
+/* ── Hex Row ─────────────────────────────────────────────────────────────────── */
+
+.hx-row {
+  display: grid;
+  grid-template-columns: 80px 1fr 120px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 20px;
+  line-height: 20px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.hx-row:hover {
+  background: var(--bg-secondary);
+}
+
+/* Offset column */
+.hx-offset {
+  padding: 0 4px;
+  color: var(--text-secondary);
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Hex bytes column */
+.hx-hex {
+  padding: 0 4px;
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+/* ASCII column */
+.hx-ascii {
+  padding: 0 4px;
+  overflow: hidden;
+  color: var(--text-secondary);
+}
+
+/* ── Byte spans ──────────────────────────────────────────────────────────────── */
+
+.hx-byte {
+  display: inline-block;
+  /* width managed via JS spacing */
+}
+
+/* Diff states */
+.hx-byte.diff {
+  background: var(--diff-replace-bg);
+  color: var(--diff-replace-border);
+}
+
+.hx-byte.left-only {
+  background: var(--diff-insert-bg);
+}
+
+.hx-byte.right-only {
+  background: var(--diff-delete-bg);
+}
+
+/* ASCII char spans mirror the byte state */
+.hx-ascii-char.diff {
+  background: var(--diff-replace-bg);
+  color: var(--diff-replace-border);
+}
+
+.hx-ascii-char.left-only {
+  background: var(--diff-insert-bg);
+}
+
+.hx-ascii-char.right-only {
+  background: var(--diff-delete-bg);
+}
+
+/* ── Empty / Loading States ──────────────────────────────────────────────────── */
+
+.hx-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  user-select: none;
+}
+
+.hx-empty-icon {
+  font-size: 32px;
+}
+
+.hx-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* ── Scrollbar styling (WebKit) ─────────────────────────────────────────────── */
+
+.hx-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.hx-scroll::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+
+.hx-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+
+.hx-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* ── Find highlights (T10) ───────────────────────────────────────────────────── */
+
+.hx-byte.hx-find-match,
+.hx-ascii-char.hx-find-match {
+  outline: 1px solid #fbc02d;
+  background: rgba(251, 192, 45, 0.3);
+}
+
+.hx-byte.hx-find-match-active,
+.hx-ascii-char.hx-find-match-active {
+  outline: 1px solid #e65100;
+  background: rgba(230, 81, 0, 0.3);
+}
+
+/* ── Selected byte highlight (T27) ──────────────────────────────────────────── */
+
+.hx-byte.hx-selected,
+.hx-ascii-char.hx-selected {
+  outline: 1px solid #007acc;
+  background: rgba(0, 122, 204, 0.25);
+}

@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+out/
+dist/
+
+# Test outputs
+playwright-report/
+test-results/
+coverage/
+
+# Vite / electron-vite temp files
+electron.vite.config.*.mjs
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temporary test files
+test-left.*
+test-right.*
+
+# Screenshots (root-level only, keep resources/)
+/*.png
+/*.jpg
+/*.jpeg

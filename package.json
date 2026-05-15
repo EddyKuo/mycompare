@@ -1,0 +1,79 @@
+{
+  "name": "mycompare",
+  "version": "0.1.0",
+  "description": "BeyondCompare clone built with Electron + Vite",
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "npm run build && playwright test",
+    "lint": "eslint src",
+    "dist": "npm run build && electron-builder",
+    "dist:dir": "npm run build && electron-builder --dir"
+  },
+  "build": {
+    "appId": "com.mycompare.app",
+    "productName": "MyCompare",
+    "copyright": "Copyright (c) 2026",
+    "directories": {
+      "buildResources": "resources",
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "!out/**/*.map"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "MyCompare"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "resources/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "resources/icon.png",
+      "category": "Development"
+    }
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@vitest/coverage-v8": "^1.6.0",
+    "electron": "^31.0.0",
+    "electron-builder": "^26.8.1",
+    "electron-vite": "^2.3.0",
+    "eslint": "^9.0.0",
+    "jsdom": "^29.1.1",
+    "png-to-ico": "^3.0.1",
+    "vite": "^5.3.0",
+    "vitest": "^1.6.0"
+  },
+  "dependencies": {
+    "chardet": "^2.1.1",
+    "highlight.js": "^11.11.1",
+    "iconv-lite": "^0.7.2",
+    "jszip": "^3.10.1",
+    "xlsx": "^0.18.5"
+  }
+}

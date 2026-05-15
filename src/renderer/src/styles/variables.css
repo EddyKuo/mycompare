@@ -1,0 +1,53 @@
+:root {
+  /* Colors - Light Theme */
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-toolbar: #e8e8e8;
+  --bg-statusbar: #007acc;
+  --text-primary: #1e1e1e;
+  --text-secondary: #555555;
+  --text-statusbar: #ffffff;
+  --border-color: #d0d0d0;
+
+  /* Diff Colors */
+  --diff-equal-bg: transparent;
+  --diff-insert-bg: #e6ffec;
+  --diff-insert-border: #2da44e;
+  --diff-delete-bg: #ffebe9;
+  --diff-delete-border: #cf222e;
+  --diff-replace-bg: #fff8c5;
+  --diff-replace-border: #9a6700;
+  --diff-unimportant-bg: #ddf4ff;
+  --diff-unimportant-border: #0969da;
+  --diff-char-insert: #acf2bd;
+  --diff-char-delete: #fdb8c0;
+
+  /* Sizes */
+  --toolbar-height: 36px;
+  --pathbar-height: 32px;
+  --statusbar-height: 24px;
+  --gutter-width: 4px;
+  --linenum-width: 48px;
+  --minimap-width: 80px;
+}
+
+[data-theme="dark"] {
+  --bg-primary: #1e1e1e;
+  --bg-secondary: #252526;
+  --bg-toolbar: #3c3c3c;
+  --bg-statusbar: #007acc;
+  --text-primary: #d4d4d4;
+  --text-secondary: #9d9d9d;
+  --border-color: #444444;
+
+  --diff-insert-bg: #1a3320;
+  --diff-insert-border: #2da44e;
+  --diff-delete-bg: #3b1719;
+  --diff-delete-border: #cf222e;
+  --diff-replace-bg: #2d2206;
+  --diff-replace-border: #9a6700;
+  --diff-unimportant-bg: #0d2137;
+  --diff-unimportant-border: #0969da;
+  --diff-char-insert: #1a4428;
+  --diff-char-delete: #5c1a1a;
+}

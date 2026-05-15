@@ -1,0 +1,56 @@
+/* ==========================================================================
+   session-home.css — Session Home page styles
+   ========================================================================== */
+
+/* Recent Sessions 區塊 */
+.recent-sessions {
+  width: 520px;
+}
+.recent-sessions h2 {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+.recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-primary);
+  border: 1px solid transparent;
+}
+.recent-item:hover {
+  background: var(--bg-secondary);
+  border-color: var(--border-color);
+}
+.recent-item .ri-icon { font-size: 16px; flex-shrink: 0; }
+.recent-item .ri-name { font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-item .ri-path { color: var(--text-secondary); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+.recent-item .ri-time { color: var(--text-secondary); font-size: 11px; flex-shrink: 0; }
+.recent-item .ri-remove {
+  opacity: 0;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 2px;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+.recent-item:hover .ri-remove { opacity: 1; }
+.recent-item .ri-remove:hover { background: var(--diff-delete-bg); color: var(--diff-delete-border); }
+
+/* 空狀態 */
+.recent-empty {
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+  padding: 16px 0;
+}

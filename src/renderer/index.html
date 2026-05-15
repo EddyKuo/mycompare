@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-TW" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <!-- T20: Apply theme before CSS loads to prevent FOUC -->
+  <script>
+    (function() {
+      var stored = localStorage.getItem('mycompare:theme')
+      if (stored) {
+        document.documentElement.dataset.theme = stored
+      } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.dataset.theme = 'dark'
+      }
+    })()
+  </script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MyCompare</title>
+  <link rel="stylesheet" href="/src/styles/main.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Toolbar -->
+    <div class="toolbar" id="toolbar">
+      <!-- Session: New -->
+      <button class="toolbar-btn" id="btn-new-session" title="新增比對 (Ctrl+N)">＋</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- Navigation -->
+      <button class="toolbar-btn" id="btn-first-diff" title="第一個差異 (Alt+Home)" disabled>⇤</button>
+      <button class="toolbar-btn" id="btn-prev-diff" title="上一個差異 (F7)" disabled>↑</button>
+      <button class="toolbar-btn" id="btn-next-diff" title="下一個差異 (F8)" disabled>↓</button>
+      <button class="toolbar-btn" id="btn-last-diff" title="最後一個差異 (Alt+End)" disabled>⇥</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- Copy -->
+      <button class="toolbar-btn" id="btn-copy-left" title="複製到左側 (Alt+←)" disabled>◁</button>
+      <button class="toolbar-btn" id="btn-copy-right" title="複製到右側 (Alt+→)" disabled>▷</button>
+      <button class="toolbar-btn" id="btn-copy-all-left" title="複製全部差異到左側" disabled>◁◁</button>
+      <button class="toolbar-btn" id="btn-copy-all-right" title="複製全部差異到右側" disabled>▷▷</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- Actions -->
+      <button class="toolbar-btn" id="btn-edit-mode" title="切換編輯模式 (Ctrl+E)" disabled>✏</button>
+      <button class="toolbar-btn" id="btn-swap" title="交換左右" disabled>⇄</button>
+      <button class="toolbar-btn" id="btn-refresh" title="重新整理 (F5)" disabled>↺</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- Diff count -->
+      <span class="toolbar-label" id="diff-counter" style="display:none"></span>
+
+      <!-- T46: Show Filter -->
+      <div class="toolbar-separator"></div>
+      <button class="toolbar-btn tc-btn-toggle active" id="btn-show-all"  title="顯示所有行">All</button>
+      <button class="toolbar-btn tc-btn-toggle" id="btn-show-diff" title="只顯示差異行">Diff</button>
+      <button class="toolbar-btn tc-btn-toggle" id="btn-show-same" title="只顯示相同行">Same</button>
+      <button class="toolbar-btn tc-btn-toggle" id="btn-show-none" title="隱藏所有行">None</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- T47: Visible Whitespace -->
+      <button class="toolbar-btn tc-btn-toggle" id="btn-whitespace" title="顯示空白字元">¶</button>
+
+      <!-- T48: Line Numbers -->
+      <button class="toolbar-btn tc-btn-toggle active" id="btn-line-numbers" title="顯示/隱藏行號">#</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- T50: Layout toggle -->
+      <button class="toolbar-btn tc-btn-toggle" id="btn-layout-toggle" title="切換 Side-by-Side / Over-Under">⬛ Side</button>
+      <div class="toolbar-separator"></div>
+
+      <!-- Export & Ignore Rules -->
+      <button class="toolbar-btn" id="btn-export" title="匯出 HTML 報告" disabled>⬇</button>
+      <button class="toolbar-btn" id="btn-ignore-rules" title="忽略規則設定">⚙</button>
+
+      <!-- Theme toggle (right side) -->
+      <div style="margin-left:auto">
+        <button class="toolbar-btn" id="btn-theme" title="切換主題">◑</button>
+      </div>
+    </div>
+
+    <!-- Tab Bar -->
+    <div class="tab-bar" id="tab-bar" style="display:none"></div>
+
+    <!-- Path Bar -->
+    <div class="path-bar" id="path-bar" style="display:none">
+      <div class="path-input-wrap">
+        <button class="open-btn" id="btn-open-left">開啟…</button>
+        <span class="path-display" id="path-left">（未選擇）</span>
+      </div>
+      <div class="path-divider"></div>
+      <div class="path-input-wrap">
+        <button class="open-btn" id="btn-open-right">開啟…</button>
+        <span class="path-display" id="path-right">（未選擇）</span>
+      </div>
+    </div>
+
+    <!-- Main Content -->
+    <div id="main-content" style="flex:1;display:flex;overflow:hidden">
+      <!-- Session Home (default view) -->
+      <div class="session-home" id="session-home">
+        <h1>MyCompare</h1>
+        <div class="session-type-grid">
+          <button class="session-type-btn" data-type="text">
+            <span class="icon">📄</span>
+            <span class="label">文字比對</span>
+            <span class="desc">比對兩個文字檔案</span>
+          </button>
+          <button class="session-type-btn" data-type="folder">
+            <span class="icon">📁</span>
+            <span class="label">資料夾比對</span>
+            <span class="desc">比對兩個目錄結構</span>
+          </button>
+          <button class="session-type-btn" data-type="hex">
+            <span class="icon">🔢</span>
+            <span class="label">Hex 比對</span>
+            <span class="desc">二進位 / Hex 比對</span>
+          </button>
+          <button class="session-type-btn" data-type="image">
+            <span class="icon">🖼️</span>
+            <span class="label">圖片比對</span>
+            <span class="desc">像素級圖片差異</span>
+          </button>
+          <button class="session-type-btn" data-type="table">
+            <span class="icon">📊</span>
+            <span class="label">表格比對</span>
+            <span class="desc">CSV / Excel 比對</span>
+          </button>
+          <button class="session-type-btn" data-type="merge3">
+            <span class="icon">🔀</span>
+            <span class="label">三向合併</span>
+            <span class="desc">3-way merge</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Folder Compare View (hidden initially) -->
+      <div id="view-folder" style="display:none;flex:1;overflow:hidden"></div>
+
+      <!-- Table Compare View -->
+      <div id="view-table" style="display:none;flex:1;overflow:hidden"></div>
+
+      <!-- Image Compare View -->
+      <div id="view-image" style="display:none;flex:1;overflow:hidden"></div>
+
+      <!-- Hex Compare View -->
+      <div id="view-hex" style="display:none;flex:1;overflow:hidden;flex-direction:column"></div>
+
+      <!-- 3-Way Merge View -->
+      <div id="view-merge3" style="display:none;flex:1;overflow:hidden"></div>
+
+      <!-- Text Compare View (hidden initially) -->
+      <div id="view-text" style="display:none;flex:1;overflow:hidden;flex-direction:column">
+        <!-- T08: Compare options bar -->
+        <div class="text-options-bar" id="text-options-bar">
+          <label class="text-option-label">
+            <input type="checkbox" id="chk-ignore-line-endings"> 忽略行尾符號
+          </label>
+          <label class="text-option-label">
+            <input type="checkbox" id="chk-ignore-whitespace"> 忽略空白
+          </label>
+          <label class="text-option-label">
+            <input type="checkbox" id="chk-ignore-case"> 忽略大小寫
+          </label>
+          <!-- T13: Word Wrap -->
+          <label class="text-option-label">
+            <input type="checkbox" id="chk-word-wrap"> 自動換行
+          </label>
+          <!-- T23: Paste buttons -->
+          <button class="text-option-btn" id="btn-paste-left" title="貼上文字到左側">⬇ 貼上左側</button>
+          <button class="text-option-btn" id="btn-paste-right" title="貼上文字到右側">⬇ 貼上右側</button>
+        </div>
+        <!-- T03: Find bar -->
+        <div class="find-bar" id="find-bar" style="display:none">
+          <input type="text" id="find-input" placeholder="搜尋…" autocomplete="off" spellcheck="false">
+          <input type="text" id="replace-input" placeholder="取代…" autocomplete="off" spellcheck="false" style="display:none">
+          <span class="find-count" id="find-count"></span>
+          <button class="find-btn" id="find-prev" title="上一個 (Shift+Enter)">↑</button>
+          <button class="find-btn" id="find-next" title="下一個 (Enter)">↓</button>
+          <label class="find-option"><input type="checkbox" id="find-case"> Aa</label>
+          <label class="find-option"><input type="checkbox" id="find-regex"> .*</label>
+          <button class="find-btn" id="replace-one" title="取代 (Alt+H)" style="display:none">取代</button>
+          <button class="find-btn" id="replace-all" title="全部取代 (Ctrl+Alt+H)" style="display:none">全部取代</button>
+          <button class="find-btn" id="toggle-replace" title="顯示取代欄 (Ctrl+H)">⇄</button>
+          <button class="find-close" id="find-close" title="關閉 (Esc)">✕</button>
+        </div>
+        <!-- T16: Go-to-line bar -->
+        <div class="goto-bar" id="goto-bar" style="display:none">
+          <span>跳轉到行：</span>
+          <input type="number" id="goto-input" min="1" placeholder="行號">
+          <button class="find-btn" id="goto-go">→</button>
+          <button class="find-close" id="goto-close">✕</button>
+        </div>
+        <div class="compare-area" id="compare-area">
+          <!-- Left Pane -->
+          <div class="pane" id="pane-left">
+            <div class="pane-content" id="content-left">
+              <!-- Lines rendered by JS -->
+            </div>
+          </div>
+
+          <!-- Splitter -->
+          <div class="splitter" id="splitter">
+            <canvas id="tc-gutter-canvas"></canvas>
+            <div id="tc-gutter-overlay"></div>
+          </div>
+
+          <!-- Right Pane -->
+          <div class="pane" id="pane-right">
+            <div class="pane-content" id="content-right">
+              <!-- Lines rendered by JS -->
+            </div>
+          </div>
+
+          <!-- Minimap -->
+          <div class="minimap" id="minimap">
+            <div class="minimap-viewport" id="minimap-viewport"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="statusbar" id="statusbar">
+      <span class="statusbar-item" id="status-message">就緒</span>
+      <div class="statusbar-right">
+        <span class="statusbar-item" id="status-encoding">UTF-8</span>
+        <span class="statusbar-separator">|</span>
+        <span class="statusbar-item" id="status-eol">LF</span>
+        <span class="statusbar-separator">|</span>
+        <span class="statusbar-item" id="status-lines">0 行</span>
+      </div>
+    </div>
+  </div>
+  <!-- Ignore Rules Modal -->
+  <div id="ignore-rules-modal" class="modal-overlay" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>忽略規則設定</h3>
+        <button id="btn-modal-close" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <label>忽略模式（符合的行視為相同，每行一個 Regex）：</label>
+        <textarea id="input-ignore-patterns" rows="4" placeholder="例：^\s*//.*$&#10;^\s*$"></textarea>
+        <label>不重要差異模式（符合的行顯示為藍色，每行一個 Regex）：</label>
+        <textarea id="input-unimportant-patterns" rows="4" placeholder="例：^\s*import "></textarea>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-modal-cancel">取消</button>
+        <button id="btn-modal-apply">套用</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
