@@ -18,6 +18,9 @@ electron.vite.config.*.mjs
 .env.*
 !.env.example
 
+# AI framework (private, not pushed to remote)
+.claude/
+
 # Editor
 .vscode/
 .idea/
