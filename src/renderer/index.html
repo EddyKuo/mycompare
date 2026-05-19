@@ -135,38 +135,6 @@
             <span class="label">三向合併</span>
             <span class="desc">3-way merge</span>
           </button>
-          <!-- T66: Paste-text quick compare -->
-          <button class="session-type-btn" data-type="paste-text" id="btn-paste-compare">
-            <span class="icon">📋</span>
-            <span class="label">貼上文字比對</span>
-            <span class="desc">直接貼上兩段文字</span>
-          </button>
-        </div>
-      </div>
-
-      <!-- T66: Paste compare modal -->
-      <div id="paste-compare-modal" class="modal-overlay" style="display:none">
-        <div class="modal-box" style="width:760px;max-width:95vw">
-          <div class="modal-header">
-            <span>貼上文字比對</span>
-            <button id="btn-paste-compare-close" class="modal-close">✕</button>
-          </div>
-          <div class="modal-body">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-              <label style="display:flex;flex-direction:column;gap:4px">
-                <span>左側</span>
-                <textarea id="paste-left" rows="14" style="width:100%;font-family:monospace;resize:vertical"></textarea>
-              </label>
-              <label style="display:flex;flex-direction:column;gap:4px">
-                <span>右側</span>
-                <textarea id="paste-right" rows="14" style="width:100%;font-family:monospace;resize:vertical"></textarea>
-              </label>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button id="btn-paste-compare-go">比對</button>
-            <button id="btn-paste-compare-cancel">取消</button>
-          </div>
         </div>
       </div>
 
