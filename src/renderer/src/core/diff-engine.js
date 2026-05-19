@@ -33,13 +33,17 @@ function splitLines(text) {
  * Apply pre-processing to a line for comparison purposes.
  * The original text is always kept; only the comparison key is normalised.
  * @param {string} line
- * @param {{ ignoreWhitespace?: boolean, ignoreCase?: boolean, ignoreLineEndings?: boolean }} opts
+ * @param {{ ignoreWhitespace?: boolean, ignoreCase?: boolean, ignoreLineEndings?: boolean, ignoreIndent?: boolean, ignoreCrlf?: boolean }} opts
  * @returns {string}
  */
 function normalise(line, opts) {
   let s = line;
-  if (opts.ignoreLineEndings) {
+  if (opts.ignoreLineEndings || opts.ignoreCrlf) {
     s = s.replace(/\r\n|\r/g, '\n');
+  }
+  if (opts.ignoreIndent) {
+    // strip leading whitespace only (preserves internal whitespace)
+    s = s.replace(/^[ \t]+/, '');
   }
   if (opts.ignoreWhitespace) {
     // trim + collapse internal whitespace
@@ -604,7 +608,9 @@ export function diffChars(leftStr, rightStr) {
  *   algorithm?: 'myers'|'patience'|'histogram',
  *   ignoreWhitespace?: boolean,
  *   ignoreCase?: boolean,
- *   ignoreLineEndings?: boolean
+ *   ignoreLineEndings?: boolean,
+ *   ignoreIndent?: boolean,
+ *   ignoreCrlf?: boolean
  * }} options
  * @returns {DiffLine[]}
  *
@@ -622,6 +628,8 @@ export function diffLines(leftText, rightText, options = {}) {
     ignoreWhitespace: false,
     ignoreCase: false,
     ignoreLineEndings: false,
+    ignoreIndent: false,
+    ignoreCrlf: false,
     ...options,
   };
 

@@ -300,6 +300,8 @@ export class TextCompare {
       ignoreWhitespace: options.ignoreWhitespace ?? false,
       ignoreCase: options.ignoreCase ?? false,
       ignoreLineEndings: options.ignoreLineEndings ?? false,
+      ignoreIndent: options.ignoreIndent ?? false,
+      ignoreCrlf: options.ignoreCrlf ?? false,
       contextLines: options.contextLines ?? 6,
       ignorePatterns: options.ignorePatterns ?? [],
       unimportantPatterns: options.unimportantPatterns ?? [],
@@ -445,7 +447,55 @@ export class TextCompare {
     /** @type {'side-by-side' | 'over-under'} */
     this._layoutMode = 'side-by-side';
 
+    // T64: Undo/Redo stack for copy operations
+    /** @type {Array<{ left: string, right: string }>} */
+    this._undoStack = [];
+    /** @type {Array<{ left: string, right: string }>} */
+    this._redoStack = [];
+    this._undoCap = 50;
+
     this._mounted = false;
+  }
+
+  /**
+   * T64: Push current content state to the undo stack before a mutation.
+   * Clears the redo stack (a new mutation invalidates redo history).
+   * Cap stack at this._undoCap (default 50) by dropping oldest entries.
+   */
+  _pushUndoSnapshot() {
+    this._undoStack.push({ left: this._leftContent, right: this._rightContent });
+    if (this._undoStack.length > this._undoCap) {
+      this._undoStack.splice(0, this._undoStack.length - this._undoCap);
+    }
+    this._redoStack.length = 0;
+  }
+
+  /**
+   * T64: Undo the most recent copy/mutation. Returns true if an undo was applied.
+   * @returns {boolean}
+   */
+  undo() {
+    if (this._undoStack.length === 0) return false;
+    const snap = this._undoStack.pop();
+    this._redoStack.push({ left: this._leftContent, right: this._rightContent });
+    this._leftContent = snap.left;
+    this._rightContent = snap.right;
+    this._runDiff();
+    return true;
+  }
+
+  /**
+   * T64: Redo the most recently undone mutation. Returns true if applied.
+   * @returns {boolean}
+   */
+  redo() {
+    if (this._redoStack.length === 0) return false;
+    const snap = this._redoStack.pop();
+    this._undoStack.push({ left: this._leftContent, right: this._rightContent });
+    this._leftContent = snap.left;
+    this._rightContent = snap.right;
+    this._runDiff();
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -515,6 +565,24 @@ export class TextCompare {
       chkIgnoreCase.checked = this._opts.ignoreCase;
       chkIgnoreCase.addEventListener('change', () => {
         this._opts.ignoreCase = chkIgnoreCase.checked;
+        this._runDiff();
+      });
+    }
+
+    // ── T68: ignoreIndent / ignoreCrlf checkboxes ──
+    const chkIgnoreIndent = document.getElementById('chk-ignore-indent');
+    const chkIgnoreCrlf   = document.getElementById('chk-ignore-crlf');
+    if (chkIgnoreIndent) {
+      chkIgnoreIndent.checked = this._opts.ignoreIndent;
+      chkIgnoreIndent.addEventListener('change', () => {
+        this._opts.ignoreIndent = chkIgnoreIndent.checked;
+        this._runDiff();
+      });
+    }
+    if (chkIgnoreCrlf) {
+      chkIgnoreCrlf.checked = this._opts.ignoreCrlf;
+      chkIgnoreCrlf.addEventListener('change', () => {
+        this._opts.ignoreCrlf = chkIgnoreCrlf.checked;
         this._runDiff();
       });
     }
@@ -644,9 +712,17 @@ export class TextCompare {
     const paneLeft  = document.getElementById('pane-left');
     const paneRight = document.getElementById('pane-right');
     if (paneLeft) {
+      paneLeft.addEventListener('dragenter', () => paneLeft.classList.add('tc-pane--drag-over'));
+      paneLeft.addEventListener('dragleave', (e) => {
+        // Only clear when leaving the pane (not bubbling from a child)
+        if (!paneLeft.contains(/** @type {Node|null} */ (e.relatedTarget))) {
+          paneLeft.classList.remove('tc-pane--drag-over');
+        }
+      });
       paneLeft.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
       paneLeft.addEventListener('drop', async (e) => {
         e.preventDefault();
+        paneLeft.classList.remove('tc-pane--drag-over');
         const file = e.dataTransfer.files[0];
         if (!file) return;
         const filePath = file.path; // Electron provides .path
@@ -661,9 +737,16 @@ export class TextCompare {
       });
     }
     if (paneRight) {
+      paneRight.addEventListener('dragenter', () => paneRight.classList.add('tc-pane--drag-over'));
+      paneRight.addEventListener('dragleave', (e) => {
+        if (!paneRight.contains(/** @type {Node|null} */ (e.relatedTarget))) {
+          paneRight.classList.remove('tc-pane--drag-over');
+        }
+      });
       paneRight.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
       paneRight.addEventListener('drop', async (e) => {
         e.preventDefault();
+        paneRight.classList.remove('tc-pane--drag-over');
         const file = e.dataTransfer.files[0];
         if (!file) return;
         const filePath = file.path;
@@ -731,6 +814,63 @@ export class TextCompare {
       btnLayout.addEventListener('click', () => this.toggleLayout());
     }
     this._btnLayout = btnLayout ?? null;
+
+    // ── T69: Draggable splitter ──
+    // Drag the centre splitter to resize left/right panes between 15%–85%.
+    if (this._splitter && this._compareArea) {
+      let dragging = false;
+      let startX = 0;
+      let startWidth = 0;
+      const SPLITTER_PX = 24;
+      const MIN_RATIO = 0.15;
+      const MAX_RATIO = 0.85;
+
+      const onMouseMove = (e) => {
+        if (!dragging) return;
+        const rect = this._compareArea.getBoundingClientRect();
+        const minimapW = parseInt(
+          getComputedStyle(this._compareArea).getPropertyValue('--minimap-width') || '60',
+          10,
+        ) || 60;
+        const totalContent = rect.width - SPLITTER_PX - minimapW;
+        if (totalContent <= 0) return;
+        const newLeftPx = Math.max(
+          totalContent * MIN_RATIO,
+          Math.min(totalContent * MAX_RATIO, e.clientX - rect.left),
+        );
+        const rightPx = totalContent - newLeftPx;
+        this._compareArea.style.gridTemplateColumns =
+          `${newLeftPx}px ${SPLITTER_PX}px ${rightPx}px var(--minimap-width)`;
+        // Avoid text selection while dragging
+        e.preventDefault();
+      };
+      const onMouseUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      };
+      this._onSplitterMouseDown = (e) => {
+        // Only respond to left-button drags on the splitter spine itself, not
+        // its gutter overlay buttons.
+        if (e.button !== 0) return;
+        if (this._layoutMode === 'over-under') return;
+        if (/** @type {HTMLElement} */ (e.target).closest('.tc-gutter-copy')) return;
+        dragging = true;
+        startX = e.clientX;
+        startWidth = this._splitter.getBoundingClientRect().left;
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+        // suppress unused-var lint
+        void startX; void startWidth;
+      };
+      this._splitter.addEventListener('mousedown', this._onSplitterMouseDown);
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+      this._onSplitterMouseMove = onMouseMove;
+      this._onSplitterMouseUp = onMouseUp;
+    }
 
     // ── T33: File Watcher — auto-reload on external change ──
     // S13-C08: capture unsub handle; protect against stale reads with tokens.
@@ -809,6 +949,12 @@ export class TextCompare {
     // T49: cleanup font size shortcuts
     if (this._onKeyDownFontSize) {
       document.removeEventListener('keydown', this._onKeyDownFontSize);
+    }
+
+    // T69: cleanup splitter drag
+    if (this._onSplitterMouseMove) {
+      document.removeEventListener('mousemove', this._onSplitterMouseMove);
+      document.removeEventListener('mouseup', this._onSplitterMouseUp);
     }
 
     // T33: unwatch both files on destroy
@@ -1256,6 +1402,7 @@ export class TextCompare {
   /** Copy ALL diffs to right side: right becomes identical to left (T09) */
   copyAllToRight() {
     if (!this._leftContent) return;
+    this._pushUndoSnapshot();
     this._rightContent = this._leftContent;
     this._runDiff();
   }
@@ -1263,6 +1410,7 @@ export class TextCompare {
   /** Copy ALL diffs to left side: left becomes identical to right (T09) */
   copyAllToLeft() {
     if (!this._rightContent) return;
+    this._pushUndoSnapshot();
     this._leftContent = this._rightContent;
     this._runDiff();
   }
@@ -1582,6 +1730,8 @@ ${rows}
         ignoreWhitespace: this._opts.ignoreWhitespace,
         ignoreCase: this._opts.ignoreCase,
         ignoreLineEndings: this._opts.ignoreLineEndings,
+        ignoreIndent: this._opts.ignoreIndent,
+        ignoreCrlf: this._opts.ignoreCrlf,
       });
     }
 
@@ -2333,6 +2483,8 @@ ${rows}
    */
   _copyBlock(targetSide) {
     if (this._currentDiff < 0 || this._currentDiff >= this._diffBlocks.length) return;
+
+    this._pushUndoSnapshot();
 
     const block = this._diffBlocks[this._currentDiff];
     const sourceSide = targetSide === 'right' ? 'left' : 'right';

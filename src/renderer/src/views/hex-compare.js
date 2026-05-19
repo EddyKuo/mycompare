@@ -41,6 +41,57 @@ function _rafThrottle(fn) {
  * @param {Uint8Array} needle
  * @returns {number[]} 命中起始 offset 陣列
  */
+/**
+ * T78 — Complete-mode byte diff. Runs an LCS-style alignment over two
+ * byte arrays and returns a map from "left offset" → 'same'|'diff' and
+ * "right offset" → 'same'|'diff'. Insert/Delete bytes (i.e. bytes that
+ * have no aligned partner) are classified as 'diff'.
+ *
+ * Capped at 1MB on either side — larger inputs must use Fast mode.
+ *
+ * @param {Uint8Array} left
+ * @param {Uint8Array} right
+ * @returns {{ leftClass: Uint8Array, rightClass: Uint8Array }} 0=same, 1=diff
+ */
+export function hexCompleteByteDiff(left, right) {
+  const n = left.length
+  const m = right.length
+  // Build LCS DP table — Uint16 is enough since we cap at 1MB.
+  const dp = new Uint32Array((n + 1) * (m + 1))
+  const cols = m + 1
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      if (left[i - 1] === right[j - 1]) {
+        dp[i * cols + j] = dp[(i - 1) * cols + (j - 1)] + 1
+      } else {
+        const up   = dp[(i - 1) * cols + j]
+        const left_ = dp[i * cols + (j - 1)]
+        dp[i * cols + j] = up > left_ ? up : left_
+      }
+    }
+  }
+  const leftClass  = new Uint8Array(n)
+  const rightClass = new Uint8Array(m)
+  // Default everything to 'diff'; mark equal pairs as 'same'.
+  leftClass.fill(1)
+  rightClass.fill(1)
+  let i = n
+  let j = m
+  while (i > 0 && j > 0) {
+    if (left[i - 1] === right[j - 1]) {
+      leftClass[i - 1]  = 0
+      rightClass[j - 1] = 0
+      i--
+      j--
+    } else if (dp[(i - 1) * cols + j] >= dp[i * cols + (j - 1)]) {
+      i--
+    } else {
+      j--
+    }
+  }
+  return { leftClass, rightClass }
+}
+
 export function searchHexBytes(haystack, needle) {
   /** @type {number[]} */
   const results = []
@@ -106,6 +157,15 @@ export class HexCompare {
   constructor(options = {}) {
     /** @type {number} */
     this._bytesPerRow = options.bytesPerRow ?? 16
+
+    // T78: diff algorithm mode — 'fast' (linear byte equality) or 'complete' (LCS)
+    /** @type {'fast'|'complete'} */
+    this._diffAlgorithm = options.diffAlgorithm ?? 'fast'
+
+    /** @type {Uint8Array|null} Cached complete-mode classifications (left) */
+    this._completeLeftClass = null
+    /** @type {Uint8Array|null} Cached complete-mode classifications (right) */
+    this._completeRightClass = null
 
     /** @type {string|null} */
     this._leftPath = null
@@ -263,6 +323,7 @@ export class HexCompare {
 
   /** 重新渲染兩側 pane */
   refresh() {
+    this._recomputeCompleteIfNeeded()
     requestAnimationFrame(() => {
       this._renderPaneContent('left')
       this._renderPaneContent('right')
@@ -353,6 +414,17 @@ export class HexCompare {
     const btnRefresh = el('button', { className: 'hx-btn-refresh' }, '↺ 重新整理')
     this._dom.btnRefresh = btnRefresh
     toolbar.appendChild(btnRefresh)
+
+    // T78: Algorithm switch (Fast | Complete)
+    toolbar.appendChild(el('label', { textContent: '演算法：' }))
+    const algoSelect = el('select', { className: 'hx-algo-select' })
+    for (const [val, text] of [['fast', 'Fast'], ['complete', 'Complete']]) {
+      const opt = el('option', { value: val }, text)
+      if (val === this._diffAlgorithm) opt.setAttribute('selected', '')
+      algoSelect.appendChild(opt)
+    }
+    this._dom.algoSelect = algoSelect
+    toolbar.appendChild(algoSelect)
 
     // 大小資訊（動態更新）
     const sizeInfo = el('span', { className: 'hx-size-info' })
@@ -503,6 +575,19 @@ export class HexCompare {
     })
 
     btnRefresh.addEventListener('click', () => this._refreshSync())
+
+    // T78: algorithm switch
+    const algoSelect = this._dom.algoSelect
+    if (algoSelect) {
+      algoSelect.addEventListener('change', () => {
+        const v = /** @type {HTMLSelectElement} */ (algoSelect).value
+        if (v === 'fast' || v === 'complete') {
+          this._diffAlgorithm = v
+          this._recomputeCompleteIfNeeded()
+          this._refreshSync()
+        }
+      })
+    }
 
     // 同步捲動
     scroll_left.addEventListener('scroll',  this._debouncedScrollLeft)
@@ -1013,6 +1098,14 @@ export class HexCompare {
    * @returns {string} '' | 'diff' | 'left-only' | 'right-only'
    */
   _getDiffClass(side, offset, byteVal, otherBytes) {
+    // T78: complete-mode uses pre-computed classification per offset.
+    if (this._diffAlgorithm === 'complete') {
+      const cls = side === 'left' ? this._completeLeftClass : this._completeRightClass
+      if (cls && offset < cls.length) {
+        return cls[offset] === 1 ? 'diff' : ''
+      }
+      // Fall through to fast logic for offsets without classification.
+    }
     if (!otherBytes) {
       // 對側無資料 → 本側為孤兒 byte
       return side === 'left' ? 'left-only' : 'right-only'
@@ -1024,6 +1117,41 @@ export class HexCompare {
     const otherVal = otherBytes[offset]
     if (byteVal !== otherVal) return 'diff'
     return ''
+  }
+
+  /**
+   * T78: (re)compute complete-mode classification if both sides are
+   * available and within the 1MB cap. Falls back silently otherwise.
+   */
+  _recomputeCompleteIfNeeded() {
+    if (this._diffAlgorithm !== 'complete') {
+      this._completeLeftClass = null
+      this._completeRightClass = null
+      return
+    }
+    if (!this._leftBytes || !this._rightBytes) {
+      this._completeLeftClass = null
+      this._completeRightClass = null
+      return
+    }
+    const MAX_COMPLETE = 1_048_576 // 1MB
+    if (this._leftBytes.length > MAX_COMPLETE || this._rightBytes.length > MAX_COMPLETE) {
+      // Too large — warn user and fall back to Fast.
+      this._diffAlgorithm = 'fast'
+      this._completeLeftClass = null
+      this._completeRightClass = null
+      const sel = this._dom.algoSelect
+      if (sel) /** @type {HTMLSelectElement} */ (sel).value = 'fast'
+      const warning = this._dom.warning
+      if (warning) {
+        warning.style.display = ''
+        warning.textContent = '⚠ Complete 演算法只支援 ≤ 1MB；已切回 Fast'
+      }
+      return
+    }
+    const result = hexCompleteByteDiff(this._leftBytes, this._rightBytes)
+    this._completeLeftClass  = result.leftClass
+    this._completeRightClass = result.rightClass
   }
 
   // ── Private: UI helpers ───────────────────────────────────────────────────────

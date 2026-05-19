@@ -157,6 +157,21 @@ body {
   position: relative;
 }
 
+/* T65: Drag-over visual feedback */
+.pane.tc-pane--drag-over {
+  outline: 2px dashed var(--accent-color, #4a90e2);
+  outline-offset: -2px;
+  background: var(--bg-secondary);
+}
+
+/* T69: Splitter cursor hint */
+#splitter {
+  cursor: col-resize;
+}
+.compare-area.over-under #splitter {
+  cursor: default;
+}
+
 /* ── Edit textarea overlay ── */
 .edit-textarea {
   position: absolute;
