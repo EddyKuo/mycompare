@@ -5,9 +5,29 @@
 
 import { showContextMenu } from '../core/context-menu.js'
 import { el, debounce, formatSize } from '../core/utils.js'
+import { isActive } from '../core/active-view.js'
 import '../styles/folder-compare.css'
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * S14-M05: run an async function over an array with bounded concurrency.
+ * @template T
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<void>} worker
+ */
+async function _runWithConcurrency(items, limit, worker) {
+  let i = 0
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (i < items.length) {
+      const idx = i++
+      try { await worker(items[idx]) } catch { /* swallow per-item */ }
+    }
+  })
+  await Promise.all(runners)
+}
+
 
 /** 將 ISO8601 mtime 格式化為 YYYY-MM-DD HH:mm */
 function formatMtime(iso) {
@@ -74,9 +94,17 @@ function compareEntries(leftEntries, rightEntries, mode) {
   const allNames = new Set([...leftMap.keys(), ...rightMap.keys()])
 
   const rows = []
-  for (const name of [...allNames].sort((a, b) =>
-    a.localeCompare(b, undefined, { sensitivity: 'base' })
-  )) {
+  // Sort: directories first, then files; each group alphabetically.
+  // A row counts as a directory if either side is a directory.
+  const sorted = [...allNames].sort((a, b) => {
+    const aLeft = leftMap.get(a), aRight = rightMap.get(a)
+    const bLeft = leftMap.get(b), bRight = rightMap.get(b)
+    const aIsDir = !!(aLeft?.isDirectory || aRight?.isDirectory)
+    const bIsDir = !!(bLeft?.isDirectory || bRight?.isDirectory)
+    if (aIsDir !== bIsDir) return aIsDir ? -1 : 1
+    return a.localeCompare(b, undefined, { sensitivity: 'base' })
+  })
+  for (const name of sorted) {
     const left = leftMap.get(name) ?? null
     const right = rightMap.get(name) ?? null
     const status = computeStatus(left, right, mode)
@@ -535,20 +563,29 @@ ${rows}
       return
     }
 
+    // S13-C07: build with textContent rather than innerHTML so file names
+    // that happen to contain HTML metacharacters cannot inject markup.
     const preview = document.createElement('div')
     preview.className = 'sync-preview'
     const opLabels = { copy: '複製', delete: '刪除' }
-    preview.innerHTML = `
-      <div class="sync-preview-title">待執行操作（共 ${this._syncOps.length} 項）：</div>
-      <div class="sync-preview-list">
-        ${this._syncOps.map(op => `
-          <div class="sync-op sync-op--${op.op}">
-            <span class="sync-op-type">${opLabels[op.op] ?? op.op}</span>
-            <span class="sync-op-path">${op.label ?? op.src ?? op.path}</span>
-          </div>
-        `).join('')}
-      </div>
-    `
+    const title = document.createElement('div')
+    title.className = 'sync-preview-title'
+    title.textContent = `待執行操作（共 ${this._syncOps.length} 項）：`
+    const list = document.createElement('div')
+    list.className = 'sync-preview-list'
+    for (const op of this._syncOps) {
+      const row = document.createElement('div')
+      row.className = `sync-op sync-op--${op.op}`
+      const typeEl = document.createElement('span')
+      typeEl.className = 'sync-op-type'
+      typeEl.textContent = opLabels[op.op] ?? op.op
+      const pathEl = document.createElement('span')
+      pathEl.className = 'sync-op-path'
+      pathEl.textContent = op.label ?? op.src ?? op.path ?? ''
+      row.append(typeEl, pathEl)
+      list.appendChild(row)
+    }
+    preview.append(title, list)
     panel.appendChild(preview)
   }
 
@@ -560,17 +597,26 @@ ${rows}
     const execBtn = panel?.querySelector('#btn-sync-execute')
     if (execBtn) execBtn.disabled = true
 
-    let done = 0, failed = 0
+    // S15-U11: single batch confirm rather than per-file prompt (the old code
+    // popped one native confirm() per delete — a 500-file sync was 500 dialogs).
+    const deletes = this._syncOps.filter(op => op.op === 'delete')
+    let allowDelete = true
+    if (deletes.length > 0) {
+      // eslint-disable-next-line no-alert
+      allowDelete = confirm(`即將刪除 ${deletes.length} 個檔案/資料夾，確定執行？`)
+    }
+
+    let done = 0, failed = 0, skipped = 0
     for (const op of this._syncOps) {
       try {
         if (op.op === 'copy') {
           await window.electronAPI.copyFile(op.src, op.dest)
+          done++
         } else if (op.op === 'delete') {
-          if (confirm(`確定要刪除：${op.path}？`)) {
-            await window.electronAPI.deleteFile(op.path)
-          }
+          if (!allowDelete) { skipped++; continue }
+          await window.electronAPI.deleteFile(op.path)
+          done++
         }
-        done++
       } catch (e) {
         failed++
         console.error('Sync op failed:', op, e)
@@ -578,7 +624,9 @@ ${rows}
     }
 
     this._syncOps = []
-    alert(`同步完成：${done} 項成功${failed ? `，${failed} 項失敗` : ''}`)
+    const suffix = failed ? `，${failed} 項失敗` : ''
+    const skipSuffix = skipped ? `，${skipped} 項已略過` : ''
+    alert(`同步完成：${done} 項成功${suffix}${skipSuffix}`)
     await this.refresh()
   }
 
@@ -862,6 +910,14 @@ ${rows}
 
   /** 卸載並清除 DOM、事件 */
   destroy() {
+    if (this._onDocumentClick) {
+      document.removeEventListener('click', this._onDocumentClick)
+      this._onDocumentClick = null
+    }
+    if (this._onDocumentKeydown) {
+      document.removeEventListener('keydown', this._onDocumentKeydown)
+      this._onDocumentKeydown = null
+    }
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
@@ -901,14 +957,15 @@ ${rows}
 
     const root = el('div', { className: 'folder-compare' })
 
+    // S15-UX: path row first so the "open folder…" buttons sit at the same
+    // visual row across every compare view.
+    root.appendChild(this._buildPathRow())
+
     // Toolbar
     root.appendChild(this._buildToolbar())
 
     // T54: Find bar (hidden by default)
     root.appendChild(this._buildFindBar())
-
-    // Path row
-    root.appendChild(this._buildPathRow())
 
     // Column header
     root.appendChild(this._buildHeader())
@@ -1296,11 +1353,12 @@ ${rows}
       else if (action === 'delete-right') await this._batchDelete('right')
     })
 
-    // Close batch menu and select menu on outside click
-    document.addEventListener('click', () => {
+    // S14-M02: store handler refs so destroy() can remove them.
+    this._onDocumentClick = () => {
       if (batchMenu) batchMenu.style.display = 'none'
       if (selectMenu) selectMenu.style.display = 'none'
-    })
+    }
+    document.addEventListener('click', this._onDocumentClick)
 
     modeSelect.addEventListener('change', () => {
       this._mode = modeSelect.value
@@ -1348,8 +1406,9 @@ ${rows}
     addDropZone(this._dom.rightCell, 'right')
 
     // T54: Ctrl+F → open find bar; F3 / Shift+F3 → navigate; Esc → close
-    document.addEventListener('keydown', (e) => {
-      if (!this._container) return
+    // S14-M02: store handler ref so destroy() can remove it.
+    this._onDocumentKeydown = (e) => {
+      if (!this._container || !isActive('folder')) return
       if (e.ctrlKey && e.key === 'f') {
         e.preventDefault()
         this._openFindBar()
@@ -1359,7 +1418,8 @@ ${rows}
         else if (e.shiftKey) this.findPrev()
         else this.findNext()
       }
-    })
+    }
+    document.addEventListener('keydown', this._onDocumentKeydown)
 
     // Row interaction (delegated)
     list.addEventListener('dblclick', (e) => this._onRowDblClick(e))
@@ -1425,7 +1485,9 @@ ${rows}
       (row.status === 'left-newer' || row.status === 'right-newer' || row.status === 'different')
     )
 
-    await Promise.all(candidates.map(async (row) => {
+    // S14-M05: cap concurrent IPC to avoid flooding main when thousands of
+    // candidates exist (10k files × 2 hashFile calls = 20k parallel IPCs).
+    await _runWithConcurrency(candidates, 8, async (row) => {
       try {
         const [lHash, rHash] = await Promise.all([
           window.electronAPI.hashFile(row.left.path),
@@ -1437,7 +1499,7 @@ ${rows}
       } catch {
         // 無法 hash 則維持原狀態
       }
-    }))
+    })
   }
 
   // ── Private: Filter ─────────────────────────────────────────────────────────

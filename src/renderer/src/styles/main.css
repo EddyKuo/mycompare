@@ -1,4 +1,5 @@
 @import './variables.css';
+@import './toast.css';
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -17,6 +18,27 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+}
+
+/* S15-U12: helpers extracted from inline style="..." in index.html */
+.u-flex-fill           { flex: 1; display: flex; overflow: hidden; }
+.u-flex-col-fill       { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.u-push-right          { margin-left: auto; }
+.u-mt-8                { margin-top: 8px; }
+.u-row-gap-6           { display: flex; gap: 6px; }
+.u-config-input        {
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  font-size: 12px;
+}
+.u-modal-status {
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-height: 14px;
 }
 
 /* ── Toolbar ── */
@@ -49,7 +71,7 @@ body {
 .toolbar-btn:active { background: rgba(0,0,0,0.15); }
 .toolbar-btn:disabled { opacity: 0.4; cursor: default; }
 .toolbar-btn:disabled:hover { background: transparent; }
-.toolbar-btn.active { background: rgba(0,122,204,0.2); color: #007acc; }
+.toolbar-btn.active { background: rgba(0,122,204,0.2); color: var(--accent); }
 
 /* Text-label toolbar buttons need auto width */
 .tc-btn-toggle {
@@ -203,6 +225,19 @@ body {
 .diff-line.replace .line-gutter { background: var(--diff-replace-border); }
 .diff-line.unimportant { background: var(--diff-unimportant-bg); }
 .diff-line.unimportant .line-gutter { background: var(--diff-unimportant-border); }
+
+/* S15-U06: glyph cue on the gutter so colour-blind users can still tell
+ * insert / delete / replace apart. */
+.diff-line .line-gutter {
+  position: relative;
+  text-align: center;
+  font-size: 11px;
+  font-weight: bold;
+}
+.diff-line.insert  .line-gutter::after  { content: '+'; color: rgba(255,255,255,0.9); }
+.diff-line.delete  .line-gutter::after  { content: '−'; color: rgba(255,255,255,0.9); }
+.diff-line.replace .line-gutter::after  { content: '≠'; color: rgba(255,255,255,0.9); }
+.diff-line.unimportant .line-gutter::after { content: '·'; color: rgba(255,255,255,0.9); }
 
 /* Inline char highlights */
 .char-insert { background: var(--diff-char-insert); border-radius: 2px; }
@@ -393,7 +428,7 @@ body {
 }
 
 .session-type-btn:hover {
-  border-color: #007acc;
+  border-color: var(--accent);
   background: var(--bg-toolbar);
 }
 
@@ -450,9 +485,9 @@ body {
   background: var(--bg-secondary); color: var(--text-primary);
 }
 #btn-modal-apply {
-  background: #0066cc; color: #fff; border-color: transparent;
+  background: var(--accent-strong); color: #fff; border-color: transparent;
 }
-#btn-modal-apply:hover { background: #0052a3; }
+#btn-modal-apply:hover { background: var(--accent-active); }
 
 /* T61/T63: Named-config / Workspaces list inside modal */
 .config-list {
@@ -517,7 +552,7 @@ body {
 .tab-item--active {
   background: var(--bg-primary);
   color: var(--text-primary);
-  border-bottom: 2px solid #007acc;
+  border-bottom: 2px solid var(--accent);
 }
 
 .tab-title {
@@ -577,7 +612,7 @@ body {
   cursor: col-resize;
   flex-shrink: 0;
 }
-.mw-pane-divider:hover { background: #007acc; }
+.mw-pane-divider:hover { background: var(--accent); }
 
 .mw-path-bar {
   display: flex;
@@ -628,7 +663,7 @@ body {
   flex-shrink: 0;
 }
 
-.mw-divider:hover, .mw-divider.dragging { background: #007acc; }
+.mw-divider:hover, .mw-divider.dragging { background: var(--accent); }
 
 .mw-output-pane {
   height: 200px;
@@ -774,7 +809,7 @@ body {
 
 /* T43: Bookmark line-number highlight */
 .line-num.bookmarked {
-  color: #007acc;
+  color: var(--accent);
   font-weight: 700;
   background: rgba(0, 122, 204, 0.12);
 }

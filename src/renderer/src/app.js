@@ -8,6 +8,7 @@ import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { getViewTypeForPath } from './core/file-type.js'
 import { NamedConfigStore } from './core/named-config-store.js'
 import { WorkspaceStore } from './core/workspace-store.js'
+import { setActiveView } from './core/active-view.js'
 
 // ---------------------------------------------------------------------------
 // TabManager — session-record-based tab bar
@@ -167,7 +168,7 @@ const tabMgr = new TabManager()
 // 視圖狀態
 // ---------------------------------------------------------------------------
 /** @type {'home' | 'text' | 'folder' | 'table' | 'image' | 'hex' | 'merge3'} */
-let currentView = 'home'
+let currentView = 'home'; setActiveView('home')
 /** @type {TextCompare | null} */
 let textCompare = null
 /** @type {FolderCompare | null} */
@@ -212,6 +213,8 @@ export function initApp() {
   }
 
   // E2E test hook — exposes minimal API for Playwright tests to inject data
+  // S15-U01: extended with image/table/3way entry points so new e2e specs
+  // can drive these views without a file dialog.
   window.__testAPI = {
     hexSetLeft:  (path, b64) => hexCompare?.setLeft(path, b64),
     hexSetRight: (path, b64) => hexCompare?.setRight(path, b64),
@@ -224,6 +227,31 @@ export function initApp() {
       const inner = document.querySelector('.hx-pane .hx-inner')
       return inner ? inner.style.height : ''
     },
+
+    // S15-U01 image
+    imageSetLeft:  (path, b64, ext) => imageCompare?.setLeft(path, b64, ext),
+    imageSetRight: (path, b64, ext) => imageCompare?.setRight(path, b64, ext),
+    imageGetDiffCanvasSize: () => {
+      const c = document.querySelector('.ic-canvas-diff canvas')
+      return c ? { w: c.width, h: c.height } : null
+    },
+    imageGetStats: () => document.querySelector('.ic-stats')?.textContent ?? '',
+
+    // S15-U01 table
+    tableSetLeft:  (path, content) => tableCompare?.setLeft(path, content),
+    tableSetRight: (path, content) => tableCompare?.setRight(path, content),
+    tableGetRowCount: () => document.querySelectorAll('.tc-cell').length > 0
+      ? document.querySelectorAll('.tc-table tr').length
+      : 0,
+    tableGetDiffCellCount: () => document.querySelectorAll('.cell-diff').length,
+
+    // S15-U01 3-way
+    mergeSetAll: (left, base, right) => {
+      mergeCompare?._setContents?.('left',  left)
+      mergeCompare?._setContents?.('base',  base)
+      mergeCompare?._setContents?.('right', right)
+    },
+    mergeGetConflictCount: () => document.querySelectorAll('.mw-conflict-card').length,
   }
 }
 
@@ -232,7 +260,7 @@ export function initApp() {
 // ---------------------------------------------------------------------------
 function showHome() {
   if (currentView === 'home') return
-  currentView = 'home'
+  currentView = 'home'; setActiveView('home')
 
   el('session-home').style.display = ''
   el('view-text').style.display = 'none'
@@ -248,7 +276,7 @@ function showHome() {
 }
 
 function showTextCompare() {
-  currentView = 'text'
+  currentView = 'text'; setActiveView('text')
 
   el('session-home').style.display = 'none'
   el('view-folder').style.display = 'none'
@@ -301,7 +329,7 @@ function showTextCompare() {
 }
 
 function showFolderCompare() {
-  currentView = 'folder'
+  currentView = 'folder'; setActiveView('folder')
 
   el('session-home').style.display = 'none'
   el('view-text').style.display = 'none'
@@ -419,7 +447,7 @@ function showFolderCompare() {
 }
 
 function showTableCompare() {
-  currentView = 'table'
+  currentView = 'table'; setActiveView('table')
   el('session-home').style.display = 'none'
   el('view-text').style.display = 'none'
   el('view-folder').style.display = 'none'
@@ -443,7 +471,7 @@ function showTableCompare() {
 }
 
 function showImageCompare() {
-  currentView = 'image'
+  currentView = 'image'; setActiveView('image')
   el('session-home').style.display = 'none'
   el('view-text').style.display = 'none'
   el('view-folder').style.display = 'none'
@@ -467,7 +495,7 @@ function showImageCompare() {
 }
 
 function showHexCompare() {
-  currentView = 'hex'
+  currentView = 'hex'; setActiveView('hex')
   el('session-home').style.display = 'none'
   el('view-text').style.display = 'none'
   el('view-folder').style.display = 'none'
@@ -491,7 +519,7 @@ function showHexCompare() {
 }
 
 function showMerge3() {
-  currentView = 'merge3'
+  currentView = 'merge3'; setActiveView('merge3')
   el('session-home').style.display = 'none'
   el('view-text').style.display = 'none'
   el('view-folder').style.display = 'none'
@@ -690,11 +718,45 @@ function _handleActivateTab(id, force = false) {
  * @param {string} id
  */
 function _handleCloseTab(id) {
+  // S14-M03: dispose the matching view if it has no more open tabs of its type.
+  const closing = tabMgr.tabs.find(t => t.id === id)
   const nextTab = tabMgr.closeTab(id)
+  _disposeViewIfUnused(closing?.type ?? '')
   if (nextTab) {
     _handleActivateTab(nextTab.id, true)
   } else {
     showHome()
+  }
+}
+
+/**
+ * S14-M03: tear down a view instance when no tabs of its type remain. The
+ * views own `document`-level listeners (keydown, click) that otherwise leak
+ * across tab open/close cycles.
+ * @param {string} type
+ */
+function _disposeViewIfUnused(type) {
+  if (!type) return
+  const stillUsed = tabMgr.tabs.some(t => t.type === type)
+  if (stillUsed) return
+  if (type === 'text' && textCompare) {
+    try { textCompare.destroy() } catch { /* ignore */ }
+    textCompare = null
+  } else if (type === 'folder' && folderCompare) {
+    try { folderCompare.destroy() } catch { /* ignore */ }
+    folderCompare = null
+  } else if (type === 'hex' && hexCompare) {
+    try { hexCompare.destroy() } catch { /* ignore */ }
+    hexCompare = null
+  } else if (type === 'image' && imageCompare) {
+    try { imageCompare.destroy?.() } catch { /* ignore */ }
+    imageCompare = null
+  } else if (type === 'table' && tableCompare) {
+    try { tableCompare.destroy?.() } catch { /* ignore */ }
+    tableCompare = null
+  } else if (type === 'merge3' && mergeCompare) {
+    try { mergeCompare.destroy?.() } catch { /* ignore */ }
+    mergeCompare = null
   }
 }
 

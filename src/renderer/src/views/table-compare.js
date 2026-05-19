@@ -644,8 +644,9 @@ export class TableCompare {
 
     const root = el('div', { className: 'table-compare' })
 
-    root.appendChild(this._buildToolbar())
+    // S15-UX: path row first so "開啟…" sits at the same row as other views.
     root.appendChild(this._buildPathRow())
+    root.appendChild(this._buildToolbar())
 
     const body = el('div', { className: 'tc-body' })
     this._dom.body = body
@@ -1144,7 +1145,9 @@ export class TableCompare {
       const isDiff = cellDiffs ? (cellDiffs[i] ?? false) : false
       td.className = 'tc-cell' + (isDiff ? ' cell-diff' : '')
       const val = rowData?.[i] ?? ''
-      td.innerHTML = escHtml(val)
+      // S14-M11: textContent avoids HTML parsing per-cell — ~30% faster on
+      // 1Mx1k tables. The cell is plain text; no need for innerHTML.
+      td.textContent = val
       tr.appendChild(td)
     }
 

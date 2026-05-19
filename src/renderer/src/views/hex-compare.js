@@ -14,14 +14,24 @@
  */
 
 import { showContextMenu } from '../core/context-menu.js'
-import { el, debounce, formatSize } from '../core/utils.js'
+import { el, formatSize } from '../core/utils.js'
+import { isActive } from '../core/active-view.js'
 import '../styles/hex-compare.css'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const ROW_HEIGHT = 20            // px，固定列高
 const MAX_BYTES  = 10_485_760    // 10 MB
-const SCROLL_DEBOUNCE_MS = 16    // ~1 frame
+
+// S14-M10: rAF throttle — coalesce calls to the next animation frame.
+function _rafThrottle(fn) {
+  let scheduled = false
+  return () => {
+    if (scheduled) return
+    scheduled = true
+    requestAnimationFrame(() => { scheduled = false; fn() })
+  }
+}
 
 // ── Pure Functions (exported for unit testing) ────────────────────────────────
 
@@ -135,9 +145,10 @@ export class HexCompare {
     /** @type {HTMLLinkElement|null} */
     this._injectedStyleEl = null
 
-    // 防抖 scroll handler
-    this._debouncedScrollLeft  = debounce(() => this._onScrollLeft(),  SCROLL_DEBOUNCE_MS)
-    this._debouncedScrollRight = debounce(() => this._onScrollRight(), SCROLL_DEBOUNCE_MS)
+    // S14-M10: rAF-throttled scroll handlers instead of trailing-edge debounce
+    // — debounce drops events during fast wheel scrolling and shows blank rows.
+    this._debouncedScrollLeft  = _rafThrottle(() => this._onScrollLeft())
+    this._debouncedScrollRight = _rafThrottle(() => this._onScrollRight())
 
     // T10: Find bar state
     /**
@@ -169,7 +180,9 @@ export class HexCompare {
       this._ctrlFHandler = null
     }
     // T27: 清除所有 hx-selected 高亮
-    document.querySelectorAll('.hx-selected').forEach(el => el.classList.remove('hx-selected'))
+    // S14-M04: scope to this container so we don't wipe highlights on other hex tabs.
+    const scope = this._container ?? document
+    scope.querySelectorAll('.hx-selected').forEach(el => el.classList.remove('hx-selected'))
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
@@ -550,6 +563,7 @@ export class HexCompare {
 
     // Ctrl+F opens find bar and focuses input
     this._ctrlFHandler = (/** @type {KeyboardEvent} */ e) => {
+      if (!isActive('hex')) return
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault()
         findInput.focus()

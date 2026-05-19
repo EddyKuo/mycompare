@@ -18,6 +18,7 @@
 import { diffLines, diffChars } from '../core/diff-engine.js';
 import { showContextMenu } from '../core/context-menu.js';
 import { detectEol } from '../core/eol-detect.js';
+import { isActive } from '../core/active-view.js';
 
 // ---------------------------------------------------------------------------
 // Virtual scroll constants
@@ -122,6 +123,33 @@ export function applyVisibleWhitespace(str) {
  * @param {string} str
  * @returns {string}
  */
+/**
+ * S13-C02: replace a single line (identified by 0-based index) inside the
+ * source text. Lines are delimited by `\n` and the newline is kept on the
+ * preceding token (matching diff-engine.splitLines semantics).
+ *
+ * @param {string} text
+ * @param {number} lineIdx 0-based line index
+ * @param {string} newLine replacement line, *including* its trailing newline
+ *   if the original had one
+ * @returns {string}
+ */
+function _spliceLine(text, lineIdx, newLine) {
+  if (typeof lineIdx !== 'number' || lineIdx < 0) return text;
+  const lines = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) {
+      lines.push(text.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  if (start < text.length) lines.push(text.slice(start));
+  if (lineIdx >= lines.length) return text;
+  lines[lineIdx] = newLine;
+  return lines.join('');
+}
+
 function escapeHtml(str) {
   return str
     .replace(/&/g, '&amp;')
@@ -394,6 +422,25 @@ export class TextCompare {
     // T49: Font size (px), clamped to [10, 24]
     this._fontSize = 13;
 
+    // S13-C03: row height kept in sync with font-size so virtual scroll math
+    // doesn't desync when the user zooms in.
+    this._rowHeight = VS_ROW_HEIGHT;
+
+    // S13-C08: handle returned by electronAPI.onFileChanged(); must be called
+    // to remove the listener in destroy(). Symbol load tokens guard against
+    // stale-promise races when the user switches files mid-read.
+    /** @type {(() => void) | null} */
+    this._unsubFileChanged = null;
+    this._loadTokenLeft = null;
+    this._loadTokenRight = null;
+
+    // S13-C05: compiled-regex cache for ignore patterns. Cleared whenever
+    // setIgnorePatterns() runs. Keys = pattern source string.
+    /** @type {Map<string, RegExp | null>} */
+    this._ignoreRegexCache = new Map();
+    /** @type {Map<string, RegExp | null>} */
+    this._unimportantRegexCache = new Map();
+
     // T50: Layout mode toggle
     /** @type {'side-by-side' | 'over-under'} */
     this._layoutMode = 'side-by-side';
@@ -500,7 +547,7 @@ export class TextCompare {
 
     // Ctrl+F to open find bar (bound to document; guarded by this._mounted)
     this._onKeyDownFind = (e) => {
-      if (e.key === 'f' && e.ctrlKey && !e.shiftKey && this._mounted) {
+      if (e.key === 'f' && e.ctrlKey && !e.shiftKey && this._mounted && isActive('text')) {
         e.preventDefault();
         this._openFind();
       }
@@ -518,7 +565,7 @@ export class TextCompare {
     btnReplaceAll?.addEventListener('click', () => this._replaceAll());
 
     this._onKeyDownReplace = (e) => {
-      if (e.ctrlKey && e.key === 'h' && this._mounted) {
+      if (e.ctrlKey && e.key === 'h' && this._mounted && isActive('text')) {
         e.preventDefault();
         this._openFind(true);
       }
@@ -527,7 +574,7 @@ export class TextCompare {
 
     // T43: Bookmark shortcuts
     this._onKeyDownBookmark = (e) => {
-      if (!this._mounted) return;
+      if (!this._mounted || !isActive('text')) return;
       if (e.ctrlKey && e.key === 'F2') {
         e.preventDefault();
         this._toggleBookmarkAtCursor();
@@ -556,7 +603,7 @@ export class TextCompare {
 
     // Ctrl+G to open goto-line bar (guarded by this._mounted)
     this._onKeyDownGoto = (e) => {
-      if (e.key === 'g' && e.ctrlKey && !e.shiftKey && this._mounted) {
+      if (e.key === 'g' && e.ctrlKey && !e.shiftKey && this._mounted && isActive('text')) {
         e.preventDefault();
         this._openGoto();
       }
@@ -585,6 +632,8 @@ export class TextCompare {
 
     // ── T36: F5/F7/F8 navigation shortcuts ──
     this._onKeyDownNav = (e) => {
+      // S14-M07: don't fire when another view is active.
+      if (!isActive('text')) return;
       if (e.key === 'F5') { e.preventDefault(); this.refresh(); }
       if (e.key === 'F7') { e.preventDefault(); this.navigatePrev(); }
       if (e.key === 'F8') { e.preventDefault(); this.navigateNext(); }
@@ -661,7 +710,7 @@ export class TextCompare {
 
     // ── T49: Font size keyboard shortcuts ──
     this._onKeyDownFontSize = (e) => {
-      if (!this._mounted) return;
+      if (!this._mounted || !isActive('text')) return;
       if (e.ctrlKey && (e.key === '=' || e.key === '+')) {
         e.preventDefault();
         this.setFontSize(this._fontSize + 1);
@@ -684,19 +733,22 @@ export class TextCompare {
     this._btnLayout = btnLayout ?? null;
 
     // ── T33: File Watcher — auto-reload on external change ──
-    window.electronAPI?.onFileChanged(({ path }) => {
+    // S13-C08: capture unsub handle; protect against stale reads with tokens.
+    const unsub = window.electronAPI?.onFileChanged?.(({ path }) => {
       if (!this._mounted) return;
       if (path === this._leftPath) {
+        const token = (this._loadTokenLeft = Symbol('reload-left'));
         window.electronAPI.readFile(path).then(result => {
-          if (!result) return;
+          if (!result || this._loadTokenLeft !== token) return;
           this._leftContent = result.content;
           this._eolLeft = detectEol(result.content);
           this._runDiff();
           this._showFileChangedToast('left');
         }).catch(() => { /* ignore read errors */ });
       } else if (path === this._rightPath) {
+        const token = (this._loadTokenRight = Symbol('reload-right'));
         window.electronAPI.readFile(path).then(result => {
-          if (!result) return;
+          if (!result || this._loadTokenRight !== token) return;
           this._rightContent = result.content;
           this._eolRight = detectEol(result.content);
           this._runDiff();
@@ -704,6 +756,7 @@ export class TextCompare {
         }).catch(() => { /* ignore read errors */ });
       }
     });
+    this._unsubFileChanged = typeof unsub === 'function' ? unsub : null;
 
     this._mounted = true;
   }
@@ -761,6 +814,15 @@ export class TextCompare {
     // T33: unwatch both files on destroy
     if (this._leftPath) window.electronAPI?.unwatchFile(this._leftPath);
     if (this._rightPath) window.electronAPI?.unwatchFile(this._rightPath);
+
+    // S13-C08: remove the file-changed listener registered in mount().
+    if (this._unsubFileChanged) {
+      try { this._unsubFileChanged(); } catch { /* ignore */ }
+      this._unsubFileChanged = null;
+    }
+    // Invalidate any in-flight reads.
+    this._loadTokenLeft = null;
+    this._loadTokenRight = null;
 
     // T39: cleanup center gutter
     if (this._gutterCanvas)  { this._gutterCanvas.width = 0; this._gutterCanvas = null; }
@@ -898,7 +960,7 @@ export class TextCompare {
 
     if (this._contentLeft) {
       const viewportH = this._contentLeft.clientHeight || 600;
-      const targetTop = rowIdx * VS_ROW_HEIGHT;
+      const targetTop = rowIdx * this._rowHeight;
       const scrollTop = Math.max(0, targetTop - viewportH / 2);
       this._contentLeft.scrollTop  = scrollTop;
       this._contentRight.scrollTop = scrollTop;
@@ -956,7 +1018,7 @@ export class TextCompare {
 
     if (rowIndex < 0) return;
 
-    const scrollTop = rowIndex * VS_ROW_HEIGHT;
+    const scrollTop = rowIndex * this._rowHeight;
     this._contentLeft.scrollTop  = scrollTop;
     this._contentRight.scrollTop = scrollTop;
     this._renderVisibleRows();
@@ -1538,17 +1600,28 @@ ${rows}
     this._emit('ready');
   }
 
-  /** Apply ignorePatterns / unimportantPatterns to _diffResult in-place. */
+  /** Apply ignorePatterns / unimportantPatterns to _diffResult in-place.
+   *  S13-C05: pattern length cap + compile cache. */
   _applyIgnorePatterns() {
-    const compilePatterns = (arr) => arr.flatMap(p => {
-      try { return [new RegExp(p)] } catch { return [] }
-    })
-    const ignoreRe = compilePatterns(this._opts.ignorePatterns)
-    const unimportantRe = compilePatterns(this._opts.unimportantPatterns)
+    const MAX_PATTERN_LEN = 200;
+    const MAX_TEXT_LEN = 100000; // do not test regex against absurdly long lines
+    const compile = (src, cache) => {
+      if (typeof src !== 'string' || src.length === 0) return null;
+      if (cache.has(src)) return cache.get(src);
+      if (src.length > MAX_PATTERN_LEN) { cache.set(src, null); return null; }
+      let re = null;
+      try { re = new RegExp(src) } catch { /* invalid pattern */ }
+      cache.set(src, re);
+      return re;
+    };
+    const ignoreRe = this._opts.ignorePatterns
+      .map(p => compile(p, this._ignoreRegexCache)).filter(Boolean);
+    const unimportantRe = this._opts.unimportantPatterns
+      .map(p => compile(p, this._unimportantRegexCache)).filter(Boolean);
 
     for (const dl of this._diffResult) {
       if (dl.type === 'equal') continue
-      const text = dl.leftText || dl.rightText || ''
+      const text = (dl.leftText || dl.rightText || '').slice(0, MAX_TEXT_LEN)
       if (ignoreRe.some(re => re.test(text))) {
         dl.type = 'equal'
         continue
@@ -1565,6 +1638,9 @@ ${rows}
   setIgnorePatterns(ignorePatterns, unimportantPatterns) {
     this._opts.ignorePatterns = ignorePatterns ?? []
     this._opts.unimportantPatterns = unimportantPatterns ?? []
+    // S13-C05: drop stale compiled regexes — patterns may have been removed.
+    this._ignoreRegexCache.clear()
+    this._unimportantRegexCache.clear()
     this._runDiff()
   }
 
@@ -1745,7 +1821,7 @@ ${rows}
     this._totalRows = this._rows.length;
 
     // Build spacers so scroll range reflects real content height
-    const totalH = this._totalRows * VS_ROW_HEIGHT;
+    const totalH = this._totalRows * this._rowHeight;
 
     const spacerL = document.createElement('div');
     spacerL.className = 'tc-vs-spacer';
@@ -1789,9 +1865,9 @@ ${rows}
     const viewportH  = this._contentLeft.clientHeight || 600;
     const totalRows  = this._totalRows;
 
-    const firstRow = Math.max(0, Math.floor(scrollTop / VS_ROW_HEIGHT) - VS_OVERSCAN);
+    const firstRow = Math.max(0, Math.floor(scrollTop / this._rowHeight) - VS_OVERSCAN);
     const lastRow  = Math.min(totalRows - 1,
-      Math.ceil((scrollTop + viewportH) / VS_ROW_HEIGHT) + VS_OVERSCAN);
+      Math.ceil((scrollTop + viewportH) / this._rowHeight) + VS_OVERSCAN);
 
     const spacerL = this._contentLeft.querySelector('.tc-vs-spacer');
     const spacerR = this._contentRight.querySelector('.tc-vs-spacer');
@@ -1822,8 +1898,8 @@ ${rows}
       const row = this._rows[rowIdx];
       if (!row) continue;
 
-      const topPx = rowIdx * VS_ROW_HEIGHT;
-      const posStyle = `position:absolute;top:${topPx}px;left:0;min-width:100%;height:${VS_ROW_HEIGHT}px;`;
+      const topPx = rowIdx * this._rowHeight;
+      const posStyle = `position:absolute;top:${topPx}px;left:0;min-width:100%;height:${this._rowHeight}px;`;
 
       if (!existingL.has(rowIdx)) {
         let leftEl, rightEl;
@@ -1864,10 +1940,15 @@ ${rows}
   _renderDiffLine(dl) {
     let charDiffs = null;
     if (dl.type === 'replace') {
-      charDiffs = diffChars(
-        dl.leftText.replace(/\r?\n$/, ''),
-        dl.rightText.replace(/\r?\n$/, ''),
-      );
+      // S13-C06: char-diff is O(m·n); memoize per DiffLine. _runDiff rebuilds
+      // _diffResult so a fresh dl object gets a fresh cache slot.
+      if (dl._charDiffs === undefined) {
+        dl._charDiffs = diffChars(
+          dl.leftText.replace(/\r?\n$/, ''),
+          dl.rightText.replace(/\r?\n$/, ''),
+        );
+      }
+      charDiffs = dl._charDiffs;
     }
 
     const uiClass = (base) => dl.unimportant ? `${base} unimportant` : base;
@@ -2094,9 +2175,12 @@ ${rows}
       replace: [240, 190, 40],
     };
 
-    for (const block of this._diffBlocks) {
-      const topPx    = block.startRow * VS_ROW_HEIGHT - scrollTop;
-      const bottomPx = (block.endRow + 1) * VS_ROW_HEIGHT - scrollTop;
+    // S14-M08: capture index alongside block so click handlers do not need
+    // O(n) indexOf on every press.
+    for (let blockIdx = 0; blockIdx < this._diffBlocks.length; blockIdx++) {
+      const block = this._diffBlocks[blockIdx];
+      const topPx    = block.startRow * this._rowHeight - scrollTop;
+      const bottomPx = (block.endRow + 1) * this._rowHeight - scrollTop;
 
       // Clip to visible range
       const visTop    = Math.max(0, topPx);
@@ -2148,10 +2232,10 @@ ${rows}
       btnLeft.className = 'tc-gutter-copy';
       btnLeft.title = '複製到左側';
       btnLeft.textContent = '◀';
+      const capturedIdx = blockIdx;
       btnLeft.addEventListener('click', () => {
-        const blockIdx = this._diffBlocks.indexOf(block);
-        if (blockIdx === -1) return;
-        this._currentDiff = blockIdx;
+        if (capturedIdx < 0 || capturedIdx >= this._diffBlocks.length) return;
+        this._currentDiff = capturedIdx;
         this._copyBlock('left');
       });
 
@@ -2167,9 +2251,8 @@ ${rows}
       btnRight.title = '複製到右側';
       btnRight.textContent = '▶';
       btnRight.addEventListener('click', () => {
-        const blockIdx = this._diffBlocks.indexOf(block);
-        if (blockIdx === -1) return;
-        this._currentDiff = blockIdx;
+        if (capturedIdx < 0 || capturedIdx >= this._diffBlocks.length) return;
+        this._currentDiff = capturedIdx;
         this._copyBlock('right');
       });
 
@@ -2539,12 +2622,18 @@ ${rows}
     const leftReplaced  = replaceFirst(leftText);
     const rightReplaced = replaceFirst(rightText);
 
+    // S13-C02: replace the matched LINE specifically — not the first occurrence
+    // of `leftText` in the whole document (which would mutate the wrong line
+    // when duplicate lines exist). Falls back to indexOf replacement only when
+    // the diff line carries no line number (e.g. synthetic test data).
     if (leftReplaced !== leftText) {
-      // Replace in left content
-      this._leftContent = this._leftContent.replace(leftText, leftReplaced);
+      this._leftContent = dl.leftLine != null
+        ? _spliceLine(this._leftContent, dl.leftLine - 1, leftReplaced)
+        : this._leftContent.replace(leftText, leftReplaced);
     } else if (rightReplaced !== rightText) {
-      // Replace in right content
-      this._rightContent = this._rightContent.replace(rightText, rightReplaced);
+      this._rightContent = dl.rightLine != null
+        ? _spliceLine(this._rightContent, dl.rightLine - 1, rightReplaced)
+        : this._rightContent.replace(rightText, rightReplaced);
     }
 
     this._runDiff();
@@ -2616,15 +2705,15 @@ ${rows}
   _navigateBookmark(dir) {
     if (this._bookmarks.size === 0) return;
     const sorted = [...this._bookmarks].sort((a, b) => a - b);
-    const cur = (this._contentLeft?.scrollTop ?? 0) / VS_ROW_HEIGHT;
+    const cur = (this._contentLeft?.scrollTop ?? 0) / this._rowHeight;
     let target;
     if (dir > 0) {
       target = sorted.find(r => r > cur) ?? sorted[0];
     } else {
       target = [...sorted].reverse().find(r => r < cur) ?? sorted[sorted.length - 1];
     }
-    if (this._contentLeft)  this._contentLeft.scrollTop  = target * VS_ROW_HEIGHT;
-    if (this._contentRight) this._contentRight.scrollTop = target * VS_ROW_HEIGHT;
+    if (this._contentLeft)  this._contentLeft.scrollTop  = target * this._rowHeight;
+    if (this._contentRight) this._contentRight.scrollTop = target * this._rowHeight;
     this._renderVisibleRows();
   }
 
@@ -2762,7 +2851,7 @@ ${rows}
 
   /**
    * Set font size for pane content (clamped to [10, 24] px).
-   * Updates VS_ROW_HEIGHT dynamically so virtual scroll stays accurate.
+   * Updates this._rowHeight dynamically so virtual scroll stays accurate.
    * @param {number} size
    */
   setFontSize(size) {
@@ -2781,13 +2870,14 @@ ${rows}
     const size = this._fontSize;
     const rowH  = size + 7; // e.g. 13+7=20, 16+7=23
 
-    // Update the module-level constant via CSS variable on the element
+    // S13-C03: keep virtual-scroll row height in sync with CSS row height.
+    this._rowHeight = rowH;
+
     if (this._compareArea) {
       this._compareArea.style.setProperty('--tc-font-size', `${size}px`);
       this._compareArea.style.setProperty('--tc-row-height', `${rowH}px`);
     }
 
-    // Also apply to pane content elements directly for immediate effect
     if (this._contentLeft)  this._contentLeft.style.fontSize  = `${size}px`;
     if (this._contentRight) this._contentRight.style.fontSize = `${size}px`;
   }

@@ -1,5 +1,26 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+// S13-C08: keep handler references so callers can unsubscribe.
+/** @type {Map<string, Set<(data: any) => void>>} */
+const _listeners = new Map()
+
+/**
+ * Register a renderer-side listener and return an unsubscribe function.
+ * Also tolerates a `null` callback in the consumer's unsubscribe path.
+ */
+function _onChannel(channel, cb) {
+  if (typeof cb !== 'function') return () => {}
+  const wrapped = (_e, data) => cb(data)
+  ipcRenderer.on(channel, wrapped)
+  let set = _listeners.get(channel)
+  if (!set) { set = new Set(); _listeners.set(channel, set) }
+  set.add(wrapped)
+  return () => {
+    ipcRenderer.removeListener(channel, wrapped)
+    set?.delete(wrapped)
+  }
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   openFile: (options) => ipcRenderer.invoke('open-file', options),
   openFolder: () => ipcRenderer.invoke('open-folder'),
@@ -16,11 +37,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readExcel: (path) => ipcRenderer.invoke('read-excel', path),
   renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
   mkdirFolder: (dirPath) => ipcRenderer.invoke('mkdir-folder', dirPath),
-  // T60: Toggle window full-screen mode
   toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),
-  onOpenFiles: (cb) => ipcRenderer.on('open-files', (_e, data) => cb(data)),
-  // T33: File Watcher
   watchFile: (path) => ipcRenderer.invoke('watch-file', path),
   unwatchFile: (path) => ipcRenderer.invoke('unwatch-file', path),
-  onFileChanged: (cb) => ipcRenderer.on('file-changed', (_e, data) => cb(data)),
+
+  // S13-C08: subscribers now return an unsubscribe handle so views can clean
+  // up in destroy(). The old callback-only signature is preserved.
+  onOpenFiles: (cb) => _onChannel('open-files', cb),
+  onFileChanged: (cb) => _onChannel('file-changed', cb),
 })

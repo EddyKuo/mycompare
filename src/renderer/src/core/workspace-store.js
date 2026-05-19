@@ -12,6 +12,7 @@
  */
 
 const KEY_WORKSPACES = 'mycompare:workspaces'
+const SCHEMA_VERSION = 1   // S15-U10
 
 /**
  * @typedef {object} WorkspaceTabRecord
@@ -34,18 +35,35 @@ function readMap() {
     const raw = localStorage.getItem(KEY_WORKSPACES)
     if (!raw) return {}
     const parsed = JSON.parse(raw)
-    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    if (typeof parsed.__schema === 'number' && parsed.entries && typeof parsed.entries === 'object') {
+      return parsed.entries
+    }
+    return parsed
   } catch {
     return {}
   }
 }
 
-/** @param {Record<string, WorkspaceEntry>} map */
+/**
+ * @param {Record<string, WorkspaceEntry>} map
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
 function writeMap(map) {
   try {
-    localStorage.setItem(KEY_WORKSPACES, JSON.stringify(map))
-  } catch {
-    // quota exceeded — silent
+    localStorage.setItem(KEY_WORKSPACES, JSON.stringify({ __schema: SCHEMA_VERSION, entries: map }))
+    return { ok: true }
+  } catch (err) {
+    const reason = err?.name === 'QuotaExceededError' ? 'quota' : 'unknown'
+    // S14-M12: surface a toast on persistence failures.
+    try {
+      import('./toast.js').then(({ toast }) => {
+        toast(reason === 'quota'
+          ? 'localStorage 空間不足，無法儲存工作區'
+          : '儲存工作區失敗', { type: 'error' })
+      }).catch(() => {})
+    } catch { /* ignore */ }
+    return { ok: false, reason }
   }
 }
 

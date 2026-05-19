@@ -29,6 +29,28 @@
   --gutter-width: 4px;
   --linenum-width: 48px;
   --minimap-width: 80px;
+
+  /* S15-U08: z-index ladder — every overlay-ish element should use one. */
+  --z-toolbar: 10;
+  --z-overlay: 100;
+  --z-modal: 1000;
+  --z-context-menu: 2000;
+  --z-toast: 3000;
+
+  /* S15-U07: accent / brand palette. Tokenise to avoid the ~30 hardcoded
+   * blues scattered through the per-view CSS. */
+  --accent:           #007acc;
+  --accent-strong:    #0066cc;
+  --accent-active:    #0052a3;
+  --accent-fg:        #ffffff;
+  --color-positive:   #2da44e;
+  --color-warning:    #f0b429;
+  --color-warning-strong: #e07800;
+  --color-warning-bg: #fff8e1;
+}
+
+[data-theme="dark"] {
+  --color-warning-bg: #3a2e00;
 }
 
 [data-theme="dark"] {

@@ -19,6 +19,7 @@
  */
 
 import { showContextMenu } from '../core/context-menu.js'
+import { isActive } from '../core/active-view.js'
 import '../styles/image-compare.css'
 
 // ── DOM helper ────────────────────────────────────────────────────────────────
@@ -64,6 +65,19 @@ function el(tag, attrs = {}, ...children) {
  * @param {'exact'|'tolerance'|'grayscale'} [algorithm] - 比對演算法，預設 'exact'
  * @returns {number} 差異像素數
  */
+/**
+ * S14-M01: build a tiny off-screen canvas for downscaled diff input.
+ * @param {number} w
+ * @param {number} h
+ */
+function _makeScratch(w, h) {
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  return { canvas, ctx }
+}
+
 function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, threshold, algorithm = 'exact') {
   // 讀取兩張圖的像素資料（來自各自原始尺寸）
   const leftData  = leftCtx.getImageData(0, 0, lw, lh).data
@@ -507,22 +521,30 @@ export class ImageCompare {
    * 呼叫 electronAPI 開啟左側圖片檔案選擇對話框
    */
   async openLeft() {
-    const result = await window.electronAPI.openFileBinary({
-      filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'] }],
-    })
-    if (!result) return
-    await this.setLeft(result.path, result.base64, result.ext)
+    try {
+      const result = await window.electronAPI.openFileBinary({
+        filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'] }],
+      })
+      if (!result) return
+      await this.setLeft(result.path, result.base64, result.ext)
+    } catch (err) {
+      console.error('[image-compare] openLeft failed:', err)
+    }
   }
 
   /**
    * 呼叫 electronAPI 開啟右側圖片檔案選擇對話框
    */
   async openRight() {
-    const result = await window.electronAPI.openFileBinary({
-      filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'] }],
-    })
-    if (!result) return
-    await this.setRight(result.path, result.base64, result.ext)
+    try {
+      const result = await window.electronAPI.openFileBinary({
+        filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'] }],
+      })
+      if (!result) return
+      await this.setRight(result.path, result.base64, result.ext)
+    } catch (err) {
+      console.error('[image-compare] openRight failed:', err)
+    }
   }
 
   /**
@@ -533,7 +555,9 @@ export class ImageCompare {
    */
   async setLeft(path, base64, ext) {
     const img = await this._loadImage(base64, ext)
-    this._left = { path, base64, ext, img }
+    // S14-M06: drop the base64 string after decode — nothing reads it later
+    // and it can double image memory for large files.
+    this._left = { path, ext, img }
     this._drawImage('left', img)
     this._updatePathDisplay('left', path, img.naturalWidth, img.naturalHeight)
     this._emit('paths-changed', {
@@ -551,7 +575,8 @@ export class ImageCompare {
    */
   async setRight(path, base64, ext) {
     const img = await this._loadImage(base64, ext)
-    this._right = { path, base64, ext, img }
+    // S14-M06: drop base64 after decode.
+    this._right = { path, ext, img }
     this._drawImage('right', img)
     this._updatePathDisplay('right', path, img.naturalWidth, img.naturalHeight)
     this._emit('paths-changed', {
@@ -617,8 +642,9 @@ export class ImageCompare {
 
     const root = el('div', { className: 'image-compare' })
 
-    root.appendChild(this._buildToolbar())
+    // S15-UX: path row first so "開啟圖片…" sits at the same row as other views.
     root.appendChild(this._buildPathRow())
+    root.appendChild(this._buildToolbar())
     root.appendChild(this._buildBody())
     root.appendChild(this._buildStats())
 
@@ -856,63 +882,62 @@ export class ImageCompare {
   // ── Private: Event binding ──────────────────────────────────────────────────
 
   _bindEvents() {
-    const {
-      btnOpenLeft,
-      btnOpenRight,
-      btnRefresh,
-      thresholdSlider,
-      thresholdVal,
-      overlaySelect,
-      btnZoomIn,
-      btnZoomOut,
-      btnActualSize,
-      btnFit,
-      btnRotateCW,
-      btnRotateCCW,
-      btnFlipH,
-      btnFlipV,
-      btnResetTransform,
-    } = this._dom
+    // CLAUDE.md note: the `/** @type {HTMLElement} */ (varName).method()` pattern
+    // here triggers an esbuild TDZ bug on production builds — the leading
+    // comment makes esbuild parse `(varName)` on the NEXT line as a function
+    // call on the destructured binding *before* its initialiser completes,
+    // producing `Cannot access 'btnOpenLeft' before initialization` at run
+    // time. Use destructuring on its own line and reference the bindings
+    // directly without inline casts.
+    const dom = this._dom
+    const btnOpenLeft        = dom.btnOpenLeft
+    const btnOpenRight       = dom.btnOpenRight
+    const btnRefresh         = dom.btnRefresh
+    const thresholdSlider    = dom.thresholdSlider
+    const thresholdVal       = dom.thresholdVal
+    const overlaySelect      = dom.overlaySelect
+    const btnZoomIn          = dom.btnZoomIn
+    const btnZoomOut         = dom.btnZoomOut
+    const btnActualSize      = dom.btnActualSize
+    const btnFit             = dom.btnFit
+    const btnRotateCW        = dom.btnRotateCW
+    const btnRotateCCW       = dom.btnRotateCCW
+    const btnFlipH           = dom.btnFlipH
+    const btnFlipV           = dom.btnFlipV
+    const btnResetTransform  = dom.btnResetTransform
 
-    /** @type {HTMLElement} */ (btnOpenLeft).addEventListener('click', () => this.openLeft())
-    /** @type {HTMLElement} */ (btnOpenRight).addEventListener('click', () => this.openRight())
-    /** @type {HTMLElement} */ (btnRefresh).addEventListener('click', () => this.refresh())
+    btnOpenLeft?.addEventListener('click', () => this.openLeft())
+    btnOpenRight?.addEventListener('click', () => this.openRight())
+    btnRefresh?.addEventListener('click', () => this.refresh())
 
-    /** @type {HTMLInputElement} */ (thresholdSlider).addEventListener('input', () => {
-      const slider = /** @type {HTMLInputElement} */ (thresholdSlider)
-      this._threshold = parseFloat(slider.value)
-      ;/** @type {HTMLElement} */ (thresholdVal).textContent = this._threshold.toFixed(2)
+    thresholdSlider?.addEventListener('input', () => {
+      this._threshold = parseFloat(thresholdSlider.value)
+      if (thresholdVal) thresholdVal.textContent = this._threshold.toFixed(2)
     })
 
-    // 拖放釋放後才觸發 diff 計算（避免拖拉中持續重算）
-    /** @type {HTMLInputElement} */ (thresholdSlider).addEventListener('change', () => {
-      const slider = /** @type {HTMLInputElement} */ (thresholdSlider)
-      this._threshold = parseFloat(slider.value)
-      ;/** @type {HTMLElement} */ (thresholdVal).textContent = this._threshold.toFixed(2)
+    thresholdSlider?.addEventListener('change', () => {
+      this._threshold = parseFloat(thresholdSlider.value)
+      if (thresholdVal) thresholdVal.textContent = this._threshold.toFixed(2)
       this.refresh()
     })
 
-    // T59 Blend Mode select
-    /** @type {HTMLSelectElement} */ (overlaySelect).addEventListener('change', () => {
-      const sel = /** @type {HTMLSelectElement} */ (overlaySelect)
-      const v = sel.value
+    overlaySelect?.addEventListener('change', () => {
+      const v = overlaySelect.value
       if (v === 'normal' || v === 'difference' || v === 'blend') {
         this.setBlendMode(v)
       }
     })
 
-    // T57 Zoom buttons
-    /** @type {HTMLElement} */ (btnZoomIn).addEventListener('click', () => this.zoomIn())
-    /** @type {HTMLElement} */ (btnZoomOut).addEventListener('click', () => this.zoomOut())
-    /** @type {HTMLElement} */ (btnActualSize).addEventListener('click', () => this.resetZoom())
-    /** @type {HTMLElement} */ (btnFit).addEventListener('click', () => this.fitToWindow())
+    btnZoomIn?.addEventListener('click', () => this.zoomIn())
+    btnZoomOut?.addEventListener('click', () => this.zoomOut())
+    btnActualSize?.addEventListener('click', () => this.resetZoom())
+    btnFit?.addEventListener('click', () => this.fitToWindow())
 
-    // T58 Rotate / Flip buttons
-    /** @type {HTMLElement} */ (btnRotateCW).addEventListener('click', () => this.rotateCW())
-    /** @type {HTMLElement} */ (btnRotateCCW).addEventListener('click', () => this.rotateCCW())
-    /** @type {HTMLElement} */ (btnFlipH).addEventListener('click', () => this.flipHorizontal())
-    /** @type {HTMLElement} */ (btnFlipV).addEventListener('click', () => this.flipVertical())
-    /** @type {HTMLElement} */ (btnResetTransform).addEventListener('click', () => this.resetTransform())
+    btnRotateCW?.addEventListener('click', () => this.rotateCW())
+    btnRotateCCW?.addEventListener('click', () => this.rotateCCW())
+    btnFlipH?.addEventListener('click', () => this.flipHorizontal())
+    btnFlipV?.addEventListener('click', () => this.flipVertical())
+    btnResetTransform?.addEventListener('click', () => this.resetTransform())
 
     // Magnifier
     const MAG_ZOOM = 4
@@ -1076,26 +1101,63 @@ export class ImageCompare {
     const rw = rImg.naturalWidth
     const rh = rImg.naturalHeight
 
-    const diffW = Math.max(lw, rw)
-    const diffH = Math.max(lh, rh)
+    const diffWFull = Math.max(lw, rw)
+    const diffHFull = Math.max(lh, rh)
+
+    // S14-M01: cap diff resolution. A pair of 8000x6000 RGBA buffers plus the
+    // diff buffer is ~570MB and crashes the renderer. Downscale via temporary
+    // canvases when either image exceeds MAX_DIFF_DIM. The full-resolution
+    // display canvases (left/right) are untouched.
+    const MAX_DIFF_DIM = 2048
+    const longestEdge = Math.max(diffWFull, diffHFull)
+    const scale = longestEdge > MAX_DIFF_DIM ? MAX_DIFF_DIM / longestEdge : 1
+
+    const diffW = Math.max(1, Math.round(diffWFull * scale))
+    const diffH = Math.max(1, Math.round(diffHFull * scale))
+    const scaledLw = Math.max(1, Math.round(lw * scale))
+    const scaledLh = Math.max(1, Math.round(lh * scale))
+    const scaledRw = Math.max(1, Math.round(rw * scale))
+    const scaledRh = Math.max(1, Math.round(rh * scale))
 
     const diffCanvas = this._dom.canvasDiff
     diffCanvas.width  = diffW
     diffCanvas.height = diffH
 
+    let leftCtx = this._leftCtx
+    let rightCtx = this._rightCtx
+    let useLw = lw, useLh = lh, useRw = rw, useRh = rh
+
+    if (scale < 1) {
+      // Draw scaled copies into temporary canvases for diff math.
+      const scratchL = _makeScratch(scaledLw, scaledLh)
+      const scratchR = _makeScratch(scaledRw, scaledRh)
+      scratchL.ctx.drawImage(lImg, 0, 0, scaledLw, scaledLh)
+      scratchR.ctx.drawImage(rImg, 0, 0, scaledRw, scaledRh)
+      leftCtx = scratchL.ctx
+      rightCtx = scratchR.ctx
+      useLw = scaledLw; useLh = scaledLh
+      useRw = scaledRw; useRh = scaledRh
+    }
+
     const diffCount = pixelDiff(
-      this._leftCtx,
-      this._rightCtx,
+      leftCtx,
+      rightCtx,
       this._diffCtx,
       diffW, diffH,
-      lw, lh,
-      rw, rh,
+      useLw, useLh,
+      useRw, useRh,
       this._threshold,
       this._algorithm,
     )
 
-    const totalPixels = diffW * diffH
-    this._updateStats(diffCount, totalPixels)
+    // Report stats at the FULL resolution so user-facing numbers match the
+    // image dimensions they see. We multiply diffCount up by the inverse
+    // scale^2 if we downscaled; this is an approximation but acceptable.
+    const totalPixels = diffWFull * diffHFull
+    const reportedDiffCount = scale < 1
+      ? Math.round(diffCount * (1 / (scale * scale)))
+      : diffCount
+    this._updateStats(reportedDiffCount, totalPixels)
 
     // 若 overlay 已關閉，隱藏 diff canvas
     this._toggleDiffOverlay()
@@ -1143,7 +1205,7 @@ export class ImageCompare {
   _bindKeyboardShortcuts() {
     /** @param {KeyboardEvent} e */
     this._onKeyDownImage = (e) => {
-      if (!this._mounted) return
+      if (!this._mounted || !isActive('image')) return
       // Ignore when typing into editable input/textarea
       const target = /** @type {HTMLElement | null} */ (e.target)
       if (target && target.matches && target.matches('input, textarea, select')) return

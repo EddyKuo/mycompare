@@ -207,42 +207,34 @@ function uniqueMatchingLines(left, right, lo, hi, ro, ri_end) {
  * @returns {[number, number][]}
  */
 function lisOnRight(pairs) {
-  if (pairs.length === 0) return [];
+  // S14-M09: parallel arrays instead of mutating caller-owned tuples.
+  const n = pairs.length;
+  if (n === 0) return [];
 
-  // piles[i] = last element of pile i (we track full pairs)
-  const piles = [];       // last element of each pile
-  const prev = [];        // predecessor index in `pairs` array
-  const pileIdx = [];     // which pile each pair went into
+  // pileTops[k] = the index (into `pairs`) of the most recent pair placed on pile k.
+  const pileTops = [];
+  const prev = new Int32Array(n).fill(-1);
 
-  for (let i = 0; i < pairs.length; i++) {
+  for (let i = 0; i < n; i++) {
     const ri = pairs[i][1];
-    // Binary search for leftmost pile whose top's ri >= current ri
     let lo = 0;
-    let hi = piles.length;
+    let hi = pileTops.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (piles[mid][1] < ri) lo = mid + 1;
+      if (pairs[pileTops[mid]][1] < ri) lo = mid + 1;
       else hi = mid;
     }
-    piles[lo] = pairs[i];
-    pileIdx[i] = lo;
-    prev[i] = lo > 0 ? piles[lo - 1].__idx : -1;
-    // store index on the pair object temporarily
-    pairs[i].__idx = i;
+    pileTops[lo] = i;
+    prev[i] = lo > 0 ? pileTops[lo - 1] : -1;
   }
 
-  // Reconstruct LIS
   const lis = [];
-  let cur = piles[piles.length - 1].__idx;
+  let cur = pileTops[pileTops.length - 1];
   while (cur !== -1) {
     lis.push(pairs[cur]);
     cur = prev[cur];
   }
   lis.reverse();
-
-  // Cleanup temp property
-  for (const p of pairs) delete p.__idx;
-
   return lis;
 }
 
@@ -446,13 +438,10 @@ function _histogramDiff(left, right) {
 function lcsTable(a, b) {
   const m = a.length;
   const n = b.length;
-  // Use two rows to save memory
-  let prev = new Uint16Array(n + 1);
-  let curr = new Uint16Array(n + 1);
-  // We need the full table for backtracking; fall back to full matrix only when small enough
-  // For char diff the strings are typically short lines, so full matrix is fine.
+  // S13-C04: use Uint32Array (Uint16 silently wraps at 65535 — possible for
+  // pathological inputs like minified JS lines).
   const dp = [];
-  for (let i = 0; i <= m; i++) dp.push(new Uint16Array(n + 1));
+  for (let i = 0; i <= m; i++) dp.push(new Uint32Array(n + 1));
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
       if (a[i - 1] === b[j - 1]) {
@@ -462,10 +451,13 @@ function lcsTable(a, b) {
       }
     }
   }
-  // suppress unused vars
-  void prev; void curr;
   return dp;
 }
+
+// S13-C04: hard cap on char-level LCS. Above this we fall back to a single
+// delete+insert pair (no intra-line highlight). The LCS table grows O(m·n);
+// 5000×5000 already allocates ~100MB of Uint32Array.
+const MAX_CHAR_DIFF_LEN = 5000;
 
 /**
  * Backtrack through LCS table to produce character-level diffs.
@@ -579,6 +571,14 @@ export function diffChars(leftStr, rightStr) {
   if (leftStr === rightStr) return [{ type: 'equal', text: leftStr }];
   if (leftStr === '') return [{ type: 'insert', text: rightStr }];
   if (rightStr === '') return [{ type: 'delete', text: leftStr }];
+
+  // S13-C04: cap inputs to avoid O(m·n) memory + time blowups.
+  if (leftStr.length > MAX_CHAR_DIFF_LEN || rightStr.length > MAX_CHAR_DIFF_LEN) {
+    return [
+      { type: 'delete', text: leftStr },
+      { type: 'insert', text: rightStr },
+    ];
+  }
 
   const a = Array.from(leftStr);  // surrogate-pair safe
   const b = Array.from(rightStr);

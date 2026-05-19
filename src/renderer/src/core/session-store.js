@@ -13,6 +13,7 @@ import { serializeSession, deserializeSession } from './session.js'
 
 const KEY_SESSIONS = 'mycompare:sessions' // { [id]: serialisedSession }
 const KEY_RECENT   = 'mycompare:recent'   // string[] of ids, LRU order
+const SCHEMA_VERSION = 1                  // S15-U10
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -26,7 +27,9 @@ function readSessionsMap() {
   try {
     const raw = localStorage.getItem(KEY_SESSIONS)
     if (!raw) return {}
-    return JSON.parse(raw)
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed.__schema === 'number' && parsed.entries) return parsed.entries
+    return parsed
   } catch {
     return {}
   }
@@ -39,9 +42,19 @@ function readSessionsMap() {
  */
 function writeSessionsMap(map) {
   try {
-    localStorage.setItem(KEY_SESSIONS, JSON.stringify(map))
-  } catch {
-    // localStorage full — silent failure
+    localStorage.setItem(KEY_SESSIONS, JSON.stringify({ __schema: SCHEMA_VERSION, entries: map }))
+    return { ok: true }
+  } catch (err) {
+    const reason = err?.name === 'QuotaExceededError' ? 'quota' : 'unknown'
+    // S14-M12
+    try {
+      import('./toast.js').then(({ toast }) => {
+        toast(reason === 'quota'
+          ? 'localStorage 空間不足，無法儲存 session'
+          : '儲存 session 失敗', { type: 'error' })
+      }).catch(() => {})
+    } catch { /* ignore */ }
+    return { ok: false, reason }
   }
 }
 

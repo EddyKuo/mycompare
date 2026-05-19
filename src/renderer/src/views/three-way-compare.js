@@ -6,6 +6,44 @@
 import { diffLines } from '../core/diff-engine.js'
 
 // ---------------------------------------------------------------------------
+// S13-C01: 3-way merge helpers (module-private)
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a `diffLines(base, side)` result into hunks describing the edits
+ * that `side` made to `base`. Each hunk has a half-open base range
+ * `[baseStart, baseEnd)` and the lines that replace it.
+ *
+ * @param {ReturnType<typeof diffLines>} diff
+ * @returns {Array<{ baseStart: number, baseEnd: number, newLines: string[] }>}
+ */
+export function _buildHunks(diff) {
+  const hunks = []
+  let cur = null
+  let baseIdx = 0
+  const strip = (s) => (s ?? '').replace(/\r?\n$/, '')
+
+  const flush = () => { if (cur) { hunks.push(cur); cur = null } }
+
+  for (const dl of diff) {
+    if (dl.type === 'equal') { flush(); baseIdx++; continue }
+    if (!cur) cur = { baseStart: baseIdx, baseEnd: baseIdx, newLines: [] }
+    if (dl.type === 'delete')      { cur.baseEnd = ++baseIdx }
+    else if (dl.type === 'insert') { cur.newLines.push(strip(dl.rightText)) }
+    else if (dl.type === 'replace'){ cur.baseEnd = ++baseIdx; cur.newLines.push(strip(dl.rightText)) }
+  }
+  flush()
+  return hunks
+}
+
+function _arraysEqual(a, b) {
+  if (a === b) return true
+  if (!a || !b || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // ThreeWayCompare
 // ---------------------------------------------------------------------------
 
@@ -310,10 +348,14 @@ export class ThreeWayCompare {
   _threeWayMerge(left, base, right) {
     const leftDiff = diffLines(base || '', left || '')
     const rightDiff = diffLines(base || '', right || '')
-
-    const leftLines = (left || '').split('\n')
     const baseLines = (base || '').split('\n')
-    const rightLines = (right || '').split('\n')
+
+    // S13-C01: build hunks from each diff, then walk base lines in order,
+    // resolving overlapping hunks as conflicts. Positional alignment of
+    // leftLines[i] vs baseLines[i] would mark every shifted line as a
+    // conflict after a single insertion.
+    const leftHunks  = _buildHunks(leftDiff)
+    const rightHunks = _buildHunks(rightDiff)
 
     /** @type {Array<{ type: 'normal', lines: string[] } | { type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[] }>} */
     const segments = []
@@ -322,42 +364,66 @@ export class ThreeWayCompare {
 
     /** @type {string[]} */
     let pendingNormal = []
-
     const flushNormal = () => {
       if (pendingNormal.length > 0) {
-        segments.push({ type: 'normal', lines: [...pendingNormal] })
+        segments.push({ type: 'normal', lines: pendingNormal })
         pendingNormal = []
       }
     }
 
-    const maxLen = Math.max(leftLines.length, baseLines.length, rightLines.length)
-    for (let i = 0; i < maxLen; i++) {
-      const b = baseLines[i] ?? ''
-      const l = leftLines[i] ?? ''
-      const r = rightLines[i] ?? ''
+    let i = 0, li = 0, ri = 0
+    while (i < baseLines.length || li < leftHunks.length || ri < rightHunks.length) {
+      const lh = leftHunks[li]
+      const rh = rightHunks[ri]
+      const lhAt = lh && lh.baseStart === i
+      const rhAt = rh && rh.baseStart === i
+      // A hunk that starts AT or strictly before `i + 1` and contains another
+      // hunk on the other side that also starts within its base range is an
+      // overlap → conflict.
+      const overlap =
+        (lhAt && rh && rh.baseStart < lh.baseEnd) ||
+        (rhAt && lh && lh.baseStart < rh.baseEnd)
 
-      if (l === b && r === b) {
-        pendingNormal.push(b) // unchanged
-      } else if (l !== b && r === b) {
-        pendingNormal.push(l) // only left changed
-      } else if (r !== b && l === b) {
-        pendingNormal.push(r) // only right changed
-      } else if (l === r) {
-        pendingNormal.push(l) // both changed to same value
-      } else {
-        // Conflict
-        hasConflicts = true
+      if (overlap || (lhAt && rhAt)) {
         flushNormal()
-        segments.push({
-          type: 'conflict',
-          id: conflictId++,
-          leftLines: [l],
-          baseLines: [b],
-          rightLines: [r],
-        })
+        const endBase = Math.max(lh ? lh.baseEnd : i, rh ? rh.baseEnd : i)
+        const baseSlice = baseLines.slice(i, endBase)
+        const leftLines  = lh ? lh.newLines : baseSlice
+        const rightLines = rh ? rh.newLines : baseSlice
+        if (_arraysEqual(leftLines, rightLines)) {
+          // Both sides made the identical edit — not a real conflict.
+          segments.push({ type: 'normal', lines: leftLines })
+        } else {
+          hasConflicts = true
+          segments.push({
+            type: 'conflict',
+            id: conflictId++,
+            leftLines, baseLines: baseSlice, rightLines,
+          })
+        }
+        i = endBase
+        if (lh && lh.baseStart < endBase) li++
+        if (rh && rh.baseStart < endBase) ri++
+      } else if (lhAt) {
+        flushNormal()
+        segments.push({ type: 'normal', lines: lh.newLines })
+        i = lh.baseEnd
+        li++
+      } else if (rhAt) {
+        flushNormal()
+        segments.push({ type: 'normal', lines: rh.newLines })
+        i = rh.baseEnd
+        ri++
+      } else if (i < baseLines.length) {
+        pendingNormal.push(baseLines[i])
+        i++
+      } else {
+        // Out-of-range hunks (defensive): skip
+        if (lh && lh.baseStart < i) li++
+        else if (rh && rh.baseStart < i) ri++
+        else break
       }
     }
-
     flushNormal()
 
     return { leftDiff, rightDiff, segments, hasConflicts }
@@ -502,11 +568,14 @@ export class ThreeWayCompare {
    * @returns {string}
    */
   _escapeHtml(str) {
-    return str
+    // S13-C07: also escape the apostrophe — without it, content rendered into
+    // attribute-like contexts could break out.
+    return String(str)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
   }
 
   // ---------------------------------------------------------------------------

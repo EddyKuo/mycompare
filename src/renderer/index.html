@@ -2,6 +2,8 @@
 <html lang="zh-TW" data-theme="light">
 <head>
   <meta charset="UTF-8" />
+  <!-- S12-S04: Content-Security-Policy (defence in depth) -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'" />
   <!-- T20: Apply theme before CSS loads to prevent FOUC -->
   <script>
     (function() {
@@ -19,8 +21,8 @@
 </head>
 <body>
   <div id="app">
-    <!-- Toolbar -->
-    <div class="toolbar" id="toolbar">
+    <!-- Toolbar (S15-U04: ARIA toolbar role) -->
+    <div class="toolbar" id="toolbar" role="toolbar" aria-label="主工具列">
       <!-- Session: New -->
       <button class="toolbar-btn" id="btn-new-session" title="新增比對 (Ctrl+N)">＋</button>
       <div class="toolbar-separator"></div>
@@ -75,13 +77,13 @@
       <button class="toolbar-btn" id="btn-workspaces" title="工作區（多分頁組合）">📂</button>
 
       <!-- Theme toggle (right side) -->
-      <div style="margin-left:auto">
+      <div class="u-push-right">
         <button class="toolbar-btn" id="btn-theme" title="切換主題">◑</button>
       </div>
     </div>
 
-    <!-- Tab Bar -->
-    <div class="tab-bar" id="tab-bar" style="display:none"></div>
+    <!-- Tab Bar (S15-U04) -->
+    <div class="tab-bar" id="tab-bar" role="tablist" aria-label="分頁列" style="display:none"></div>
 
     <!-- Path Bar -->
     <div class="path-bar" id="path-bar" style="display:none">
@@ -97,7 +99,7 @@
     </div>
 
     <!-- Main Content -->
-    <div id="main-content" style="flex:1;display:flex;overflow:hidden">
+    <div id="main-content" class="u-flex-fill">
       <!-- Session Home (default view) -->
       <div class="session-home" id="session-home">
         <h1>MyCompare</h1>
@@ -136,22 +138,22 @@
       </div>
 
       <!-- Folder Compare View (hidden initially) -->
-      <div id="view-folder" style="display:none;flex:1;overflow:hidden"></div>
+      <div id="view-folder" class="u-flex-fill" style="display:none"></div>
 
       <!-- Table Compare View -->
-      <div id="view-table" style="display:none;flex:1;overflow:hidden"></div>
+      <div id="view-table" class="u-flex-fill" style="display:none"></div>
 
       <!-- Image Compare View -->
-      <div id="view-image" style="display:none;flex:1;overflow:hidden"></div>
+      <div id="view-image" class="u-flex-fill" style="display:none"></div>
 
       <!-- Hex Compare View -->
-      <div id="view-hex" style="display:none;flex:1;overflow:hidden;flex-direction:column"></div>
+      <div id="view-hex" class="u-flex-col-fill" style="display:none"></div>
 
       <!-- 3-Way Merge View -->
-      <div id="view-merge3" style="display:none;flex:1;overflow:hidden"></div>
+      <div id="view-merge3" class="u-flex-fill" style="display:none"></div>
 
       <!-- Text Compare View (hidden initially) -->
-      <div id="view-text" style="display:none;flex:1;overflow:hidden;flex-direction:column">
+      <div id="view-text" class="u-flex-col-fill" style="display:none">
         <!-- T08: Compare options bar -->
         <div class="text-options-bar" id="text-options-bar">
           <label class="text-option-label">
@@ -234,10 +236,10 @@
     </div>
   </div>
   <!-- Ignore Rules Modal -->
-  <div id="ignore-rules-modal" class="modal-overlay" style="display:none">
+  <div id="ignore-rules-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="ignore-rules-title" style="display:none">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>忽略規則設定</h3>
+        <h3 id="ignore-rules-title">忽略規則設定</h3>
         <button id="btn-modal-close" class="modal-close">✕</button>
       </div>
       <div class="modal-body">
@@ -254,24 +256,21 @@
   </div>
 
   <!-- T61: Named Config (Session Settings) Modal -->
-  <div id="config-modal" class="modal-overlay" style="display:none">
+  <div id="config-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="config-modal-title" style="display:none">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>設定管理</h3>
+        <h3 id="config-modal-title">設定管理</h3>
         <button id="btn-config-modal-close" class="modal-close">✕</button>
       </div>
       <div class="modal-body">
         <label>已儲存的設定：</label>
         <div id="config-list" class="config-list"></div>
-        <label style="margin-top:8px">儲存目前設定為：</label>
-        <div style="display:flex;gap:6px">
-          <input id="input-config-name" type="text" placeholder="設定名稱"
-                 style="flex:1;padding:4px 8px;border:1px solid var(--border-color);
-                        background:var(--bg-secondary);color:var(--text-primary);
-                        border-radius:3px;font-size:12px" />
+        <label class="u-mt-8">儲存目前設定為：</label>
+        <div class="u-row-gap-6">
+          <input id="input-config-name" class="u-config-input" type="text" placeholder="設定名稱" />
           <button id="btn-config-save">儲存</button>
         </div>
-        <div id="config-modal-status" style="font-size:11px;color:var(--text-secondary);min-height:14px"></div>
+        <div id="config-modal-status" class="u-modal-status"></div>
       </div>
       <div class="modal-footer">
         <button id="btn-config-modal-cancel">關閉</button>
@@ -280,24 +279,21 @@
   </div>
 
   <!-- T63: Workspaces Modal -->
-  <div id="workspaces-modal" class="modal-overlay" style="display:none">
+  <div id="workspaces-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="workspaces-modal-title" style="display:none">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>工作區</h3>
+        <h3 id="workspaces-modal-title">工作區</h3>
         <button id="btn-workspaces-modal-close" class="modal-close">✕</button>
       </div>
       <div class="modal-body">
         <label>已儲存的工作區：</label>
         <div id="workspaces-list" class="config-list"></div>
-        <label style="margin-top:8px">儲存目前所有分頁為工作區：</label>
-        <div style="display:flex;gap:6px">
-          <input id="input-workspace-name" type="text" placeholder="工作區名稱"
-                 style="flex:1;padding:4px 8px;border:1px solid var(--border-color);
-                        background:var(--bg-secondary);color:var(--text-primary);
-                        border-radius:3px;font-size:12px" />
+        <label class="u-mt-8">儲存目前所有分頁為工作區：</label>
+        <div class="u-row-gap-6">
+          <input id="input-workspace-name" class="u-config-input" type="text" placeholder="工作區名稱" />
           <button id="btn-workspace-save">儲存</button>
         </div>
-        <div id="workspace-modal-status" style="font-size:11px;color:var(--text-secondary);min-height:14px"></div>
+        <div id="workspace-modal-status" class="u-modal-status"></div>
       </div>
       <div class="modal-footer">
         <button id="btn-workspaces-modal-cancel">關閉</button>
