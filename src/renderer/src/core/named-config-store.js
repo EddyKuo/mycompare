@@ -56,7 +56,6 @@ function writeMap(map) {
     // persisted. Lazy-import to avoid a hard dependency in test envs that
     // don't render the toast container.
     try {
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
       import('./toast.js').then(({ toast }) => {
         toast(reason === 'quota'
           ? 'localStorage 空間不足，無法儲存設定'

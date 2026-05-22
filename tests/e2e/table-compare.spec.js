@@ -32,7 +32,7 @@ const RIGHT_CSV = 'id,name,age\n1,Alice,30\n2,Bob,26\n3,Dave,40\n'
 
 test('Table 比對視圖掛載並顯示表格', async () => {
   await goToTableCompare(win)
-  await expect(win.locator('.tc-table, table').first()).toBeAttached({ timeout: 5000 })
+  await expect(win.locator('.tc-wrap, .tc-table-scroll').first()).toBeAttached({ timeout: 5000 })
 })
 
 test('Table 注入 CSV 兩側後渲染列數 > 0 且 cell-diff 出現', async () => {
