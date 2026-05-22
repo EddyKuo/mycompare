@@ -4,6 +4,20 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ---
 
+## 下載
+
+最新版本：[Releases](https://github.com/EddyKuo/mycompare/releases/latest)
+
+| 平台 | 檔案 |
+|------|------|
+| Windows x64 | `MyCompare-Setup-X.Y.Z.exe`（NSIS 安裝程式） |
+| macOS | 尚未提供（可自行 `npm run dist` 建置 DMG） |
+| Linux | 尚未提供（可自行 `npm run dist` 建置 AppImage） |
+
+> **Windows SmartScreen 警告**：目前未做 code-signing，首次執行 Windows 會跳出「已保護您的電腦」。點「其他資訊 → 仍要執行」即可。
+
+---
+
 ## 功能特色
 
 | 比對類型 | 說明 |
@@ -87,10 +101,12 @@ MyCompare/
 ## 安裝
 
 ```bash
-git clone https://github.com/your-org/MyCompare.git
-cd MyCompare
+git clone https://github.com/EddyKuo/mycompare.git
+cd mycompare
 npm install
 ```
+
+> **Windows 打包前置**：`npm run dist` 解壓 `winCodeSign` 套件時會建立 macOS `.dylib` 符號連結，需開啟 Windows「開發人員模式」（設定 → 隱私權與安全性 → 開發人員專用 → 開發人員模式）或以系統管理員身分執行。
 
 ---
 
@@ -157,10 +173,9 @@ npm run test:watch
 npm run test:coverage
 ```
 
-單元測試涵蓋：
+目前覆蓋：**571 / 571 unit tests passing**、**68 / 68 e2e tests passing**。
 
-- `tests/unit/diff-engine.test.js` — Myers / Patience diff 演算法
-- `tests/unit/session.test.js` — Session CRUD 與 localStorage 持久化
+涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測、folder / text / hex / table / image / three-way 各視圖邏輯、安全性與記憶體洩漏檢查等 30+ 測試檔。
 
 ### E2E 測試（Playwright + Electron）
 
@@ -168,12 +183,7 @@ npm run test:coverage
 npm run test:e2e
 ```
 
-E2E 測試會先執行 `npm run build`，再對生產版本執行 Playwright 測試。測試涵蓋：
-
-- Hex 比對視圖掛載與 pane 渲染
-- 虛擬捲動列生成
-- 資料注入（繞過檔案對話框直接注入 base64）
-- Diff 著色
+E2E 測試會先執行 `npm run build`，再對生產版本執行 Playwright 測試（透過 `window.__testAPI` 注入資料，繞過 file dialog）。涵蓋 text / folder / hex / image / table / three-way / smoke / theme 等視圖。
 
 ### Lint
 

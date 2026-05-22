@@ -21,6 +21,10 @@ electron.vite.config.*.mjs
 # AI framework (private, not pushed to remote)
 .claude/
 
+# Internal development docs (not distributed)
+plan.md
+CLAUDE.md
+
 # Editor
 .vscode/
 .idea/
