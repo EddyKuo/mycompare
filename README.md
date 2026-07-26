@@ -40,6 +40,8 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
 - 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz
+- MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對
+- 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
 - 可自訂鍵盤快捷鍵
 - 拖放檔案或資料夾即可開始比對
@@ -48,7 +50,6 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 ### 尚未實作
 
 - **遠端與雲端**：FTP / SFTP / S3 / Dropbox / OneDrive 連線設定檔
-- **Windows Registry 比對**
 - **腳本執行**：腳本語法檢查已實作（`/script=<file>` 會解析並回報錯誤與是否會寫檔），
   但實際執行未實作——會寫檔的指令在未經真實輸入驗證前不適合無人值守執行
 - **壓縮格式**：bzip2 / xz / 7z / RAR 需要外部解碼器，會明確回報不支援而非模糊失敗
@@ -189,10 +190,11 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**1020 / 1020 unit tests passing**、**95 / 95 e2e tests passing**。
+目前覆蓋：**1268 / 1268 unit tests passing**、**106 / 106 e2e tests passing**。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
-各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、記憶體洩漏檢查等 45+ 測試檔。
+各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、
+快照格式、壓縮檔（含 Zip Slip 與比例炸彈）、ID3 與 PE 解析、登錄檔格式等 52 個測試檔。
 
 ### E2E 測試（Playwright + Electron）
 
