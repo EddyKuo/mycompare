@@ -45,6 +45,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   hashFile: (path) => ipcRenderer.invoke('hash-file', path),
   readExcel: (path) => ipcRenderer.invoke('read-excel', path),
   readMetadata: (path) => ipcRenderer.invoke('read-metadata', path),
+  exportRegistryKey: (keyPath) => ipcRenderer.invoke('export-registry-key', { keyPath }),
+  readRegFile: (path) => ipcRenderer.invoke('read-reg-file', path),
   renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
   mkdirFolder: (dirPath) => ipcRenderer.invoke('mkdir-folder', dirPath),
   toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),

@@ -1571,6 +1571,38 @@ async function createSnapshot(crc) {
   }
 }
 
+/**
+ * Export a live registry key and report what came back.
+ *
+ * Windows only: the export goes through reg.exe, which is where the data
+ * actually lives.
+ */
+async function exportRegistry() {
+  const keyPath = prompt('登錄機碼路徑（例如 HKCU\Software\MyApp）：')
+  if (!keyPath) return
+  try {
+    const result = await window.electronAPI?.exportRegistryKey?.(keyPath)
+    if (!result) { showStatus('已取消'); return }
+    showStatus(`已匯出 ${result.rows.length} 個項目到 ${result.path}`)
+  } catch (err) {
+    showStatus(`匯出登錄機碼失敗：${err.message}`)
+  }
+}
+
+/** Open a .reg file and report what it contains. */
+async function openRegFile() {
+  try {
+    const picked = await window.electronAPI?.openFile?.({
+      filters: [{ name: '登錄檔', extensions: ['reg'] }],
+    })
+    if (!picked) return
+    const parsed = await window.electronAPI?.readRegFile?.(picked.path)
+    showStatus(`已載入 ${parsed.rows.length} 個登錄項目（${parsed.format}）`)
+  } catch (err) {
+    showStatus(`讀取登錄檔失敗：${err.message}`)
+  }
+}
+
 /** Load a snapshot file and report what it contains. */
 async function openSnapshot() {
   try {
@@ -1687,6 +1719,8 @@ function setupMenuActions() {
     'session.snapshot.create':    () => void createSnapshot(false),
     'session.snapshot.createCrc': () => void createSnapshot(true),
     'session.snapshot.open':      () => void openSnapshot(),
+    'session.registry.export':    () => void exportRegistry(),
+    'session.registry.open':      () => void openRegFile(),
 
     'session.swap': () => {
       const view = { text: textCompare, folder: folderCompare, hex: hexCompare, table: tableCompare }[currentView]

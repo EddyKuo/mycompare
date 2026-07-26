@@ -515,6 +515,43 @@ ipcMain.handle('read-snapshot-dir', async (_event, { snapshotPath, relDir } = {}
   return snapshotLevel(snapshot, typeof relDir === 'string' ? relDir : '')
 })
 
+/**
+ * IPC: export a live registry key, then read it back.
+ *
+ * Reading the registry directly would need a native binding; reg.exe ships
+ * with Windows and emits the same data in a documented text format, so the
+ * same parser serves both a live key and a .reg file the user already has.
+ */
+ipcMain.handle('export-registry-key', async (event, { keyPath } = {}) => {
+  const { exportRegistryKey, readRegFile, validateRegistryPath } =
+    await import('./registry.js')
+  // Validate before opening the dialog: an unusable key should be reported
+  // straight away rather than after the user has picked a destination.
+  validateRegistryPath(keyPath)
+
+  const win = BrowserWindow.fromWebContents(event.sender)
+  const opts = {
+    defaultPath: 'registry-export.reg',
+    filters: [{ name: '登錄檔', extensions: ['reg'] }],
+  }
+  const { canceled, filePath } = win
+    ? await dialog.showSaveDialog(win, opts)
+    : await dialog.showSaveDialog(opts)
+  if (canceled || !filePath) return null
+  registerRoot(filePath)
+  await exportRegistryKey(keyPath, filePath)
+  const parsed = await readRegFile(filePath)
+  return { path: filePath, format: parsed.format, rows: parsed.rows }
+})
+
+// IPC: 讀取 .reg 檔
+ipcMain.handle('read-reg-file', async (_event, filePath) => {
+  const safe = validatePath(filePath)
+  const { readRegFile } = await import('./registry.js')
+  const parsed = await readRegFile(safe)
+  return { path: safe, format: parsed.format, rows: parsed.rows }
+})
+
 // IPC: 讀取資料夾內容（一層）
 ipcMain.handle('read-dir', async (_event, dirPath) => {
   const safe = validatePath(dirPath)
