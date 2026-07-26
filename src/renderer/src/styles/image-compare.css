@@ -82,6 +82,22 @@
   background-color: var(--bg-toolbar);
 }
 
+/* S16: toolbar checkboxes (auto scale / mismatch range) */
+.ic-toolbar-check {
+  accent-color: var(--bg-statusbar);
+  cursor: pointer;
+  vertical-align: middle;
+  margin: 0;
+}
+
+.ic-toolbar-label[for] {
+  cursor: pointer;
+}
+
+.ic-highlight-select {
+  min-width: 56px;
+}
+
 .ic-btn-refresh {
   padding: 2px 10px;
   background-color: var(--bg-secondary);
@@ -225,8 +241,10 @@
 /* ── Stats bar ───────────────────────────────────────────────────────────────── */
 
 .ic-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   height: var(--statusbar-height);
-  line-height: var(--statusbar-height);
   padding: 0 12px;
   background-color: var(--bg-statusbar);
   color: var(--text-statusbar);
@@ -234,8 +252,41 @@
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ic-stats-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Approximate figures are dimmed so the ≈ prefix isn't the only cue. */
+.ic-stats-text--approx {
+  font-style: italic;
+  opacity: 0.85;
+}
+
+/* S16: mismatch severity legend */
+.ic-mismatch-legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.ic-legend-caption {
+  font-size: 11px;
+  opacity: 0.8;
+  margin: 0 2px;
+}
+
+.ic-legend-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 2px;
 }
 
 /* ── Responsive: narrow viewport ────────────────────────────────────────────── */

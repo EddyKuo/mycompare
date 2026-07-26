@@ -16,6 +16,7 @@
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el, formatSize } from '../core/utils.js'
 import { isActive } from '../core/active-view.js'
+import { renderTextTable, reportHeader } from '../core/report.js'
 import '../styles/hex-compare.css'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -515,6 +516,91 @@ export class HexCompare {
       this._renderPaneContent('left')
       this._renderPaneContent('right')
     })
+  }
+
+  // ── Public: reports ─────────────────────────────────────────────────────────
+
+  /**
+   * Summary statistics for the current comparison.
+   * @returns {{ leftBytes: number, rightBytes: number, regions: number, diffBytes: number }}
+   */
+  getStats() {
+    const regions = this._diffRegions ?? []
+    return {
+      leftBytes: this._leftBytes?.length ?? 0,
+      rightBytes: this._rightBytes?.length ?? 0,
+      regions: regions.length,
+      diffBytes: regions.reduce((sum, r) => sum + r.length, 0),
+    }
+  }
+
+  /**
+   * Plain-text report of the differing regions.
+   *
+   * Regions rather than individual bytes, and capped, because a binary that
+   * differs throughout would otherwise produce a report far larger than the
+   * files themselves.
+   *
+   * @param {{ generatedAt?: Date, maxRegions?: number }} [opts]
+   * @returns {string}
+   */
+  buildTextReport(opts = {}) {
+    const maxRegions = opts.maxRegions ?? 500
+    const stats = this.getStats()
+    const header = reportHeader({
+      title: 'Hex 比對報告',
+      leftPath: this._leftPath,
+      rightPath: this._rightPath,
+      generatedAt: opts.generatedAt,
+    })
+
+    const summary = stats.regions === 0
+      ? '無差異'
+      : `差異區塊 ${stats.regions}，差異位元組 ${stats.diffBytes}` +
+        `（左 ${stats.leftBytes} bytes，右 ${stats.rightBytes} bytes）`
+
+    const shown = (this._diffRegions ?? []).slice(0, maxRegions)
+    const rows = shown.map((r) => [
+      `0x${r.start.toString(16).toUpperCase().padStart(8, '0')}`,
+      String(r.length),
+      this._bytesPreview(this._leftBytes, r),
+      this._bytesPreview(this._rightBytes, r),
+    ])
+
+    const table = rows.length
+      ? renderTextTable(
+          [{ title: 'Offset' }, { title: '長度', align: 'right' },
+           { title: '左' }, { title: '右' }],
+          rows)
+      : '（兩側內容相同）'
+
+    const omitted = (this._diffRegions?.length ?? 0) - shown.length
+    const note = omitted > 0 ? `\n\n（另有 ${omitted} 個差異區塊未列出）` : ''
+    return `${header}${summary}\n\n${table}${note}\n`
+  }
+
+  /**
+   * Hex preview of one region, clipped so a long run stays readable.
+   * @param {Uint8Array|null} bytes
+   * @param {{ start: number, end: number }} region
+   * @returns {string}
+   */
+  _bytesPreview(bytes, region) {
+    if (!bytes) return '（無）'
+    const MAX = 8
+    const end = Math.min(region.end, bytes.length)
+    if (region.start >= end) return '（無）'
+    const slice = bytes.subarray(region.start, Math.min(end, region.start + MAX))
+    const hex = Array.from(slice, toHex).join(' ')
+    return end - region.start > MAX ? `${hex} …` : hex
+  }
+
+  /** Save the plain-text report. */
+  async exportTextReport() {
+    await window.electronAPI.saveFile(
+      'hex-report.txt',
+      this.buildTextReport(),
+      [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }])
   }
 
   // ── Public: difference navigation (S16) ─────────────────────────────────────

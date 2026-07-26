@@ -11,6 +11,9 @@
  *   setLeft(path, base64, ext)
  *   setRight(path, base64, ext)
  *   refresh()
+ *   setAutoScale(on) / getAutoScale()
+ *   setMismatchRange(on) / getMismatchRange()
+ *   setHighlightColor(key) / getHighlightColor()
  *   on(event, handler)
  *   off(event, handler)
  *
@@ -48,44 +51,186 @@ function el(tag, attrs = {}, ...children) {
 // ── Pixel diff algorithm ──────────────────────────────────────────────────────
 
 /**
- * 計算兩張圖片的 pixel-level 差異，並將結果寫入 diffCtx。
- *
- * 若兩張圖片尺寸不同，diff canvas 使用較大尺寸；缺少像素的部分全算差異。
- *
- * @param {CanvasRenderingContext2D} leftCtx
- * @param {CanvasRenderingContext2D} rightCtx
- * @param {CanvasRenderingContext2D} diffCtx
- * @param {number} width   - diff canvas 寬度
- * @param {number} height  - diff canvas 高度
- * @param {number} lw      - 左圖實際寬度
- * @param {number} lh      - 左圖實際高度
- * @param {number} rw      - 右圖實際寬度
- * @param {number} rh      - 右圖實際高度
- * @param {number} threshold - 0~1
- * @param {'exact'|'tolerance'|'grayscale'} [algorithm] - 比對演算法，預設 'exact'
- * @returns {number} 差異像素數
- */
-/**
  * S14-M01: build a tiny off-screen canvas for downscaled diff input.
  * @param {number} w
  * @param {number} h
+ * @returns {{ canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D }}
  */
 function _makeScratch(w, h) {
   const canvas = document.createElement('canvas')
   canvas.width = w
   canvas.height = h
-  const ctx = canvas.getContext('2d')
+  const ctx = /** @type {CanvasRenderingContext2D} */ (canvas.getContext('2d'))
   return { canvas, ctx }
 }
 
-function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, threshold, algorithm = 'exact') {
-  // 讀取兩張圖的像素資料（來自各自原始尺寸）
-  const leftData  = leftCtx.getImageData(0, 0, lw, lh).data
-  const rightData = rightCtx.getImageData(0, 0, rw, rh).data
+/**
+ * 把一張圖以指定尺寸重繪到 off-screen canvas，回傳其 2D context。
+ *
+ * @param {HTMLImageElement} img
+ * @param {number} w
+ * @param {number} h
+ * @returns {CanvasRenderingContext2D}
+ */
+function _makeScratchFor(img, w, h) {
+  const { ctx } = _makeScratch(w, h)
+  ctx.drawImage(img, 0, 0, w, h)
+  return ctx
+}
 
-  // 在 diff canvas 上建立輸出 buffer
-  const diffImgData = diffCtx.createImageData(width, height)
-  const diffData = diffImgData.data
+/**
+ * @typedef {'red'|'green'|'blue'|'magenta'} HighlightColorKey
+ */
+
+/**
+ * Selectable highlight colours for mismatching pixels.
+ * @type {Record<HighlightColorKey, { label: string, rgb: [number, number, number] }>}
+ */
+export const HIGHLIGHT_COLORS = {
+  red:     { label: '紅',   rgb: [255, 0, 0] },
+  green:   { label: '綠',   rgb: [0, 220, 0] },
+  blue:    { label: '藍',   rgb: [0, 110, 255] },
+  magenta: { label: '洋紅', rgb: [255, 0, 255] },
+}
+
+/** @type {HighlightColorKey} */
+export const DEFAULT_HIGHLIGHT_COLOR = 'red'
+
+/** Number of severity buckets used by mismatch-range mode. */
+export const MISMATCH_LEVELS = 4
+
+// Level MISMATCH_LEVELS must reproduce the historical rgba(255,0,0,200) so that
+// turning range mode off changes nothing about the rendered overlay.
+const MAX_HIGHLIGHT_ALPHA = 200
+const MIN_HIGHLIGHT_ALPHA = 80
+const MIN_HIGHLIGHT_INTENSITY = 0.4
+
+/** Alpha applied to unchanged pixels so the diff panel still shows context. */
+const SAME_PIXEL_ALPHA = 128
+
+/**
+ * 兩個像素的「差異強度」（0~255），與是否超過門檻無關。
+ *
+ * @param {number} lR
+ * @param {number} lG
+ * @param {number} lB
+ * @param {number} rR
+ * @param {number} rG
+ * @param {number} rB
+ * @param {'exact'|'tolerance'|'grayscale'} [algorithm]
+ * @returns {number} 0~255
+ */
+export function pixelDiffMagnitude(lR, lG, lB, rR, rG, rB, algorithm = 'exact') {
+  if (algorithm === 'grayscale') {
+    const lumL = 0.299 * lR + 0.587 * lG + 0.114 * lB
+    const lumR = 0.299 * rR + 0.587 * rG + 0.114 * rB
+    return Math.abs(lumL - lumR)
+  }
+  if (algorithm === 'tolerance') {
+    return (Math.abs(lR - rR) + Math.abs(lG - rG) + Math.abs(lB - rB)) / 3
+  }
+  // 'exact' has no notion of "how different"; the max channel delta exists only
+  // so range mode has something to grade — it never affects the diff decision,
+  // because any non-zero delta already means "different" under exact.
+  return Math.max(Math.abs(lR - rR), Math.abs(lG - rG), Math.abs(lB - rB))
+}
+
+/**
+ * 差異判定門檻（0~255）。'exact' 刻意忽略滑桿。
+ *
+ * @param {number} threshold - 0~1
+ * @param {'exact'|'tolerance'|'grayscale'} [algorithm]
+ * @returns {number}
+ */
+export function diffCutoff(threshold, algorithm = 'exact') {
+  return algorithm === 'exact' ? 0 : threshold * 255
+}
+
+/**
+ * @param {number} magnitude
+ * @param {number} threshold - 0~1
+ * @param {'exact'|'tolerance'|'grayscale'} [algorithm]
+ * @returns {boolean}
+ */
+export function isPixelDiff(magnitude, threshold, algorithm = 'exact') {
+  return magnitude > diffCutoff(threshold, algorithm)
+}
+
+/**
+ * 將差異強度分級：0 = 相同，1..MISMATCH_LEVELS = 由輕微到完全不同。
+ *
+ * @param {number} magnitude - 0~255
+ * @param {number} threshold - 0~1
+ * @param {'exact'|'tolerance'|'grayscale'} [algorithm]
+ * @returns {number}
+ */
+export function mismatchLevel(magnitude, threshold, algorithm = 'exact') {
+  const cutoff = diffCutoff(threshold, algorithm)
+  if (!(magnitude > cutoff)) return 0
+  const span = 255 - cutoff
+  if (span <= 0) return MISMATCH_LEVELS
+  const ratio = (magnitude - cutoff) / span
+  return Math.min(MISMATCH_LEVELS, Math.max(1, Math.ceil(ratio * MISMATCH_LEVELS)))
+}
+
+/**
+ * 取得某一分級對應的高亮 RGBA。
+ *
+ * @param {string} colorKey
+ * @param {number} [level] - 1..MISMATCH_LEVELS
+ * @returns {[number, number, number, number]}
+ */
+export function highlightRGBA(colorKey, level = MISMATCH_LEVELS) {
+  const entry = HIGHLIGHT_COLORS[/** @type {HighlightColorKey} */ (colorKey)]
+    ?? HIGHLIGHT_COLORS[DEFAULT_HIGHLIGHT_COLOR]
+  const lv = Math.min(MISMATCH_LEVELS, Math.max(1, Math.round(level)))
+  const t = lv / MISMATCH_LEVELS
+  const k = MIN_HIGHLIGHT_INTENSITY + (1 - MIN_HIGHLIGHT_INTENSITY) * t
+  return [
+    Math.round(entry.rgb[0] * k),
+    Math.round(entry.rgb[1] * k),
+    Math.round(entry.rgb[2] * k),
+    Math.round(MIN_HIGHLIGHT_ALPHA + (MAX_HIGHLIGHT_ALPHA - MIN_HIGHLIGHT_ALPHA) * t),
+  ]
+}
+
+/**
+ * @typedef {object} ComputeDiffOptions
+ * @property {Uint8ClampedArray} leftData   - 左圖 RGBA buffer（lw × lh）
+ * @property {Uint8ClampedArray} rightData  - 右圖 RGBA buffer（rw × rh）
+ * @property {Uint8ClampedArray} out        - 輸出 RGBA buffer（width × height）
+ * @property {number} width
+ * @property {number} height
+ * @property {number} lw
+ * @property {number} lh
+ * @property {number} rw
+ * @property {number} rh
+ * @property {number} threshold - 0~1
+ * @property {'exact'|'tolerance'|'grayscale'} [algorithm]
+ * @property {boolean} [mismatchRange] - true 時依差異強度分級上色
+ * @property {string} [highlightColor]
+ */
+
+/**
+ * 純函式版 pixel diff：吃 RGBA buffer、寫 RGBA buffer，不碰 canvas。
+ *
+ * @param {ComputeDiffOptions} opts
+ * @returns {number} 差異像素數
+ */
+export function computeDiffBuffer(opts) {
+  const {
+    leftData, rightData, out, width, height, lw, lh, rw, rh, threshold,
+    algorithm = 'exact',
+    mismatchRange = false,
+    highlightColor = DEFAULT_HIGHLIGHT_COLOR,
+  } = opts
+
+  // The inner loop runs once per pixel, so the per-level colours are resolved
+  // up-front rather than recomputed millions of times.
+  /** @type {Array<[number, number, number, number]>} */
+  const palette = []
+  for (let i = 1; i <= MISMATCH_LEVELS; i++) palette.push(highlightRGBA(highlightColor, i))
+  const flat = palette[MISMATCH_LEVELS - 1]
 
   let diffCount = 0
 
@@ -93,16 +238,15 @@ function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, th
     for (let x = 0; x < width; x++) {
       const outIdx = (y * width + x) * 4
 
-      // 判斷此座標在兩圖中是否存在
       const inLeft  = x < lw && y < lh
       const inRight = x < rw && y < rh
 
       if (!inLeft || !inRight) {
-        // 超出其中一張圖的範圍 → 全差異，標紅
-        diffData[outIdx]     = 255
-        diffData[outIdx + 1] = 0
-        diffData[outIdx + 2] = 0
-        diffData[outIdx + 3] = 200
+        // 超出其中一張圖的範圍 → 視為最嚴重的差異
+        out[outIdx]     = flat[0]
+        out[outIdx + 1] = flat[1]
+        out[outIdx + 2] = flat[2]
+        out[outIdx + 3] = flat[3]
         diffCount++
         continue
       }
@@ -114,47 +258,120 @@ function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, th
       const lG = leftData[lIdx + 1]
       const lB = leftData[lIdx + 2]
 
-      const rR = rightData[rIdx]
-      const rG = rightData[rIdx + 1]
-      const rB = rightData[rIdx + 2]
+      const magnitude = pixelDiffMagnitude(
+        lR, lG, lB,
+        rightData[rIdx], rightData[rIdx + 1], rightData[rIdx + 2],
+        algorithm,
+      )
 
-      let isDiff
-      if (algorithm === 'exact') {
-        // Exact: all R/G/B channels must be identical (alpha ignored for
-        // comparison). Deliberately ignores the tolerance slider.
-        isDiff = lR !== rR || lG !== rG || lB !== rB
-      } else if (algorithm === 'grayscale') {
-        // Grayscale: compare luminance, cutoff scaled by the tolerance slider.
-        const lumL = 0.299 * lR + 0.587 * lG + 0.114 * lB
-        const lumR = 0.299 * rR + 0.587 * rG + 0.114 * rB
-        isDiff = Math.abs(lumL - lumR) > threshold * 255
-      } else {
-        // Tolerance (default): mean per-channel difference against the slider.
-        const rDiff = Math.abs(lR - rR)
-        const gDiff = Math.abs(lG - rG)
-        const bDiff = Math.abs(lB - rB)
-        isDiff = (rDiff + gDiff + bDiff) / 3 > threshold * 255
-      }
-
-      if (isDiff) {
-        // 差異像素：紅色 rgba(255,0,0,200)
-        diffData[outIdx]     = 255
-        diffData[outIdx + 1] = 0
-        diffData[outIdx + 2] = 0
-        diffData[outIdx + 3] = 200
+      if (isPixelDiff(magnitude, threshold, algorithm)) {
+        const rgba = mismatchRange
+          ? palette[mismatchLevel(magnitude, threshold, algorithm) - 1]
+          : flat
+        out[outIdx]     = rgba[0]
+        out[outIdx + 1] = rgba[1]
+        out[outIdx + 2] = rgba[2]
+        out[outIdx + 3] = rgba[3]
         diffCount++
       } else {
-        // 相同像素：使用左圖原色，alpha=128 (dim 50%)
-        diffData[outIdx]     = lR
-        diffData[outIdx + 1] = lG
-        diffData[outIdx + 2] = lB
-        diffData[outIdx + 3] = 128
+        out[outIdx]     = lR
+        out[outIdx + 1] = lG
+        out[outIdx + 2] = lB
+        out[outIdx + 3] = SAME_PIXEL_ALPHA
       }
     }
   }
 
-  diffCtx.putImageData(diffImgData, 0, 0)
   return diffCount
+}
+
+// ── Diff geometry (auto scale) ────────────────────────────────────────────────
+
+/**
+ * @typedef {object} DiffGeometry
+ * @property {number} width   - diff canvas 寬
+ * @property {number} height  - diff canvas 高
+ * @property {number} leftW   - 左圖進入比對時的寬
+ * @property {number} leftH
+ * @property {number} rightW
+ * @property {number} rightH
+ * @property {boolean} autoScaled - 是否為了對齊尺寸而縮放過
+ */
+
+/**
+ * 決定兩張圖進入 pixel diff 時的尺寸。
+ *
+ * @param {number} lw
+ * @param {number} lh
+ * @param {number} rw
+ * @param {number} rh
+ * @param {boolean} [autoScale]
+ * @returns {DiffGeometry}
+ */
+export function resolveDiffGeometry(lw, lh, rw, rh, autoScale = false) {
+  const mismatched = lw !== rw || lh !== rh
+  const usable = lw > 0 && lh > 0 && rw > 0 && rh > 0
+
+  if (autoScale && usable && mismatched) {
+    // 對齊到「較大」的那張，而不是較小的：縮小會先丟掉細節，
+    // 使得同一張圖的高低解析度版本被判成大量差異。
+    const useLeft = lw * lh >= rw * rh
+    const width  = useLeft ? lw : rw
+    const height = useLeft ? lh : rh
+    return {
+      width, height,
+      leftW: width, leftH: height,
+      rightW: width, rightH: height,
+      autoScaled: true,
+    }
+  }
+
+  return {
+    width: Math.max(lw, rw),
+    height: Math.max(lh, rh),
+    leftW: lw, leftH: lh,
+    rightW: rw, rightH: rh,
+    autoScaled: false,
+  }
+}
+
+/**
+ * 將 geometry 壓在 maxDim 以內（記憶體上限）。scale < 1 代表統計數字是外推的。
+ *
+ * @param {DiffGeometry} geo
+ * @param {number} maxDim
+ * @returns {DiffGeometry & { scale: number }}
+ */
+export function capDiffGeometry(geo, maxDim) {
+  const longest = Math.max(geo.width, geo.height)
+  const scale = longest > maxDim && maxDim > 0 ? maxDim / longest : 1
+  if (scale === 1) return { ...geo, scale }
+  const s = (/** @type {number} */ n) => Math.max(1, Math.round(n * scale))
+  return {
+    width: s(geo.width),
+    height: s(geo.height),
+    leftW: s(geo.leftW),
+    leftH: s(geo.leftH),
+    rightW: s(geo.rightW),
+    rightH: s(geo.rightH),
+    autoScaled: geo.autoScaled,
+    scale,
+  }
+}
+
+/**
+ * 統計列文字。approximate 為 true 時（大圖縮圖後比對再外推）明確標示估計值。
+ *
+ * @param {number} diffCount
+ * @param {number} totalPixels
+ * @param {boolean} [approximate]
+ * @returns {string}
+ */
+export function formatDiffStats(diffCount, totalPixels, approximate = false) {
+  const pct = totalPixels > 0 ? ((diffCount / totalPixels) * 100).toFixed(2) : '0.00'
+  const mark = approximate ? '≈' : ''
+  const suffix = approximate ? '　（估計值：大圖已縮圖後比對）' : ''
+  return `差異像素 ${mark}${diffCount.toLocaleString()} / 總像素 ${totalPixels.toLocaleString()} (${mark}${pct}%)${suffix}`
 }
 
 // ── Zoom/Pan sync ─────────────────────────────────────────────────────────────
@@ -344,6 +561,24 @@ export class ImageCompare {
     this._blendMode = 'difference'
 
     /**
+     * S16: align differently-sized images before the pixel diff.
+     * @type {boolean}
+     */
+    this._autoScale = false
+
+    /**
+     * S16: colour mismatching pixels by severity instead of a flat highlight.
+     * @type {boolean}
+     */
+    this._mismatchRange = false
+
+    /**
+     * S16: user-selectable highlight colour key (see HIGHLIGHT_COLORS).
+     * @type {string}
+     */
+    this._highlightColor = DEFAULT_HIGHLIGHT_COLOR
+
+    /**
      * Mounted flag for keyboard shortcut guard.
      * @type {boolean}
      */
@@ -525,6 +760,63 @@ export class ImageCompare {
   /** @returns {'normal'|'difference'|'blend'} */
   getBlendMode() {
     return this._blendMode
+  }
+
+  // ── Public API: S16 Auto Scale / Mismatch Range / Highlight colour ──────────
+
+  /**
+   * 開啟後，尺寸不同的兩張圖會先對齊到較大的尺寸再做 pixel diff。
+   * @param {boolean} on
+   */
+  setAutoScale(on) {
+    const next = !!on
+    if (next === this._autoScale) return
+    this._autoScale = next
+    const box = /** @type {HTMLInputElement | undefined} */ (this._dom.autoScaleCheck)
+    if (box && box.checked !== next) box.checked = next
+    void this._runDiff()
+  }
+
+  /** @returns {boolean} */
+  getAutoScale() {
+    return this._autoScale
+  }
+
+  /**
+   * 開啟後，差異像素依強度分成 MISMATCH_LEVELS 級顯示深淺。
+   * @param {boolean} on
+   */
+  setMismatchRange(on) {
+    const next = !!on
+    if (next === this._mismatchRange) return
+    this._mismatchRange = next
+    const box = /** @type {HTMLInputElement | undefined} */ (this._dom.mismatchRangeCheck)
+    if (box && box.checked !== next) box.checked = next
+    this._updateLegend()
+    void this._runDiff()
+  }
+
+  /** @returns {boolean} */
+  getMismatchRange() {
+    return this._mismatchRange
+  }
+
+  /**
+   * @param {string} key - HIGHLIGHT_COLORS 的鍵；未知值視為 no-op
+   */
+  setHighlightColor(key) {
+    if (!Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, key)) return
+    if (key === this._highlightColor) return
+    this._highlightColor = key
+    const sel = /** @type {HTMLSelectElement | undefined} */ (this._dom.highlightSelect)
+    if (sel && sel.value !== key) sel.value = key
+    this._updateLegend()
+    void this._runDiff()
+  }
+
+  /** @returns {string} */
+  getHighlightColor() {
+    return this._highlightColor
   }
 
   /**
@@ -754,6 +1046,53 @@ export class ImageCompare {
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
 
+    // S16-1: Auto Scale
+    const autoScaleCheck = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'checkbox',
+      className: 'ic-toolbar-check',
+      id: 'ic-auto-scale',
+      title: '尺寸不同時，先把較小的一張放大到與較大的相同再比對',
+    }))
+    autoScaleCheck.checked = this._autoScale
+    this._dom.autoScaleCheck = autoScaleCheck
+    toolbar.appendChild(autoScaleCheck)
+    toolbar.appendChild(el('label', {
+      className: 'ic-toolbar-label', for: 'ic-auto-scale', textContent: '自動縮放對齊',
+    }))
+
+    // S16-2: Mismatch Range mode
+    const mismatchRangeCheck = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'checkbox',
+      className: 'ic-toolbar-check',
+      id: 'ic-mismatch-range',
+      title: '依差異程度分級上色：越深表示差異越大',
+    }))
+    mismatchRangeCheck.checked = this._mismatchRange
+    this._dom.mismatchRangeCheck = mismatchRangeCheck
+    toolbar.appendChild(mismatchRangeCheck)
+    toolbar.appendChild(el('label', {
+      className: 'ic-toolbar-label', for: 'ic-mismatch-range', textContent: '差異分級',
+    }))
+
+    // S16-3: Highlight colour
+    toolbar.appendChild(el('label', { className: 'ic-toolbar-label', textContent: '標示色：' }))
+    const highlightSelect = /** @type {HTMLSelectElement} */ (el('select', {
+      className: 'ic-overlay-select ic-highlight-select',
+      title: '差異像素的高亮顏色',
+    }))
+    for (const [key, entry] of Object.entries(HIGHLIGHT_COLORS)) {
+      const opt = document.createElement('option')
+      opt.value = key
+      opt.textContent = entry.label
+      highlightSelect.appendChild(opt)
+    }
+    highlightSelect.value = this._highlightColor
+    this._dom.highlightSelect = highlightSelect
+    toolbar.appendChild(highlightSelect)
+
+    // Separator
+    toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
+
     // T57: Zoom controls
     const btnZoomIn = el('button', {
       className: 'ic-btn-refresh', title: '放大 (Ctrl++)', textContent: '🔍+',
@@ -894,9 +1233,38 @@ export class ImageCompare {
   }
 
   _buildStats() {
-    const stats = el('div', { className: 'ic-stats', textContent: '請載入兩張圖片以計算差異' })
-    this._dom.stats = stats
-    return stats
+    const bar = el('div', { className: 'ic-stats' })
+    const text = el('span', {
+      className: 'ic-stats-text', textContent: '請載入兩張圖片以計算差異',
+    })
+    const legend = el('span', { className: 'ic-mismatch-legend' })
+    bar.appendChild(text)
+    bar.appendChild(legend)
+    this._dom.statsBar = bar
+    this._dom.stats = text
+    this._dom.legend = legend
+    this._updateLegend()
+    return bar
+  }
+
+  /** 依目前的分級模式與標示色重建圖例。 */
+  _updateLegend() {
+    const legend = /** @type {HTMLElement | undefined} */ (this._dom.legend)
+    if (!legend) return
+    legend.textContent = ''
+    if (!this._mismatchRange) {
+      legend.style.display = 'none'
+      return
+    }
+    legend.style.display = ''
+    legend.appendChild(el('span', { className: 'ic-legend-caption', textContent: '差異程度：輕' }))
+    for (let lv = 1; lv <= MISMATCH_LEVELS; lv++) {
+      const [r, g, b, a] = highlightRGBA(this._highlightColor, lv)
+      const swatch = el('span', { className: 'ic-legend-swatch' })
+      swatch.style.backgroundColor = `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(3)})`
+      legend.appendChild(swatch)
+    }
+    legend.appendChild(el('span', { className: 'ic-legend-caption', textContent: '重' }))
   }
 
   // ── Private: Event binding ──────────────────────────────────────────────────
@@ -916,6 +1284,9 @@ export class ImageCompare {
     const thresholdSlider    = dom.thresholdSlider
     const thresholdVal       = dom.thresholdVal
     const overlaySelect      = dom.overlaySelect
+    const autoScaleCheck     = dom.autoScaleCheck
+    const mismatchRangeCheck = dom.mismatchRangeCheck
+    const highlightSelect    = dom.highlightSelect
     const btnZoomIn          = dom.btnZoomIn
     const btnZoomOut         = dom.btnZoomOut
     const btnActualSize      = dom.btnActualSize
@@ -946,6 +1317,18 @@ export class ImageCompare {
       if (v === 'normal' || v === 'difference' || v === 'blend') {
         this.setBlendMode(v)
       }
+    })
+
+    autoScaleCheck?.addEventListener('change', () => {
+      this.setAutoScale(autoScaleCheck.checked)
+    })
+
+    mismatchRangeCheck?.addEventListener('change', () => {
+      this.setMismatchRange(mismatchRangeCheck.checked)
+    })
+
+    highlightSelect?.addEventListener('change', () => {
+      this.setHighlightColor(highlightSelect.value)
     })
 
     btnZoomIn?.addEventListener('click', () => this.zoomIn())
@@ -1112,6 +1495,8 @@ export class ImageCompare {
       this._updateStats(null, null)
       return
     }
+    const diffCanvas = /** @type {HTMLCanvasElement | undefined} */ (this._dom.canvasDiff)
+    if (!diffCanvas || !this._diffCtx) return
 
     const { img: lImg } = this._left
     const { img: rImg } = this._right
@@ -1121,63 +1506,53 @@ export class ImageCompare {
     const rw = rImg.naturalWidth
     const rh = rImg.naturalHeight
 
-    const diffWFull = Math.max(lw, rw)
-    const diffHFull = Math.max(lh, rh)
+    const fullGeo = resolveDiffGeometry(lw, lh, rw, rh, this._autoScale)
 
     // S14-M01: cap diff resolution. A pair of 8000x6000 RGBA buffers plus the
-    // diff buffer is ~570MB and crashes the renderer. Downscale via temporary
-    // canvases when either image exceeds MAX_DIFF_DIM. The full-resolution
+    // diff buffer is ~570MB and crashes the renderer. The full-resolution
     // display canvases (left/right) are untouched.
     const MAX_DIFF_DIM = 2048
-    const longestEdge = Math.max(diffWFull, diffHFull)
-    const scale = longestEdge > MAX_DIFF_DIM ? MAX_DIFF_DIM / longestEdge : 1
+    const geo = capDiffGeometry(fullGeo, MAX_DIFF_DIM)
 
-    const diffW = Math.max(1, Math.round(diffWFull * scale))
-    const diffH = Math.max(1, Math.round(diffHFull * scale))
-    const scaledLw = Math.max(1, Math.round(lw * scale))
-    const scaledLh = Math.max(1, Math.round(lh * scale))
-    const scaledRw = Math.max(1, Math.round(rw * scale))
-    const scaledRh = Math.max(1, Math.round(rh * scale))
+    diffCanvas.width  = geo.width
+    diffCanvas.height = geo.height
 
-    const diffCanvas = this._dom.canvasDiff
-    diffCanvas.width  = diffW
-    diffCanvas.height = diffH
+    // Any side whose diff-time size differs from its natural size has to go
+    // through an off-screen canvas — that single path covers both the memory
+    // cap and auto-scale alignment.
+    const leftCtx = (geo.leftW === lw && geo.leftH === lh)
+      ? this._leftCtx
+      : _makeScratchFor(lImg, geo.leftW, geo.leftH)
+    const rightCtx = (geo.rightW === rw && geo.rightH === rh)
+      ? this._rightCtx
+      : _makeScratchFor(rImg, geo.rightW, geo.rightH)
+    if (!leftCtx || !rightCtx) return
 
-    let leftCtx = this._leftCtx
-    let rightCtx = this._rightCtx
-    let useLw = lw, useLh = lh, useRw = rw, useRh = rh
-
-    if (scale < 1) {
-      // Draw scaled copies into temporary canvases for diff math.
-      const scratchL = _makeScratch(scaledLw, scaledLh)
-      const scratchR = _makeScratch(scaledRw, scaledRh)
-      scratchL.ctx.drawImage(lImg, 0, 0, scaledLw, scaledLh)
-      scratchR.ctx.drawImage(rImg, 0, 0, scaledRw, scaledRh)
-      leftCtx = scratchL.ctx
-      rightCtx = scratchR.ctx
-      useLw = scaledLw; useLh = scaledLh
-      useRw = scaledRw; useRh = scaledRh
-    }
-
-    const diffCount = pixelDiff(
-      leftCtx,
-      rightCtx,
-      this._diffCtx,
-      diffW, diffH,
-      useLw, useLh,
-      useRw, useRh,
-      this._threshold,
-      this._algorithm,
-    )
+    const diffImgData = this._diffCtx.createImageData(geo.width, geo.height)
+    const diffCount = computeDiffBuffer({
+      leftData: leftCtx.getImageData(0, 0, geo.leftW, geo.leftH).data,
+      rightData: rightCtx.getImageData(0, 0, geo.rightW, geo.rightH).data,
+      out: diffImgData.data,
+      width: geo.width,
+      height: geo.height,
+      lw: geo.leftW, lh: geo.leftH,
+      rw: geo.rightW, rh: geo.rightH,
+      threshold: this._threshold,
+      algorithm: this._algorithm,
+      mismatchRange: this._mismatchRange,
+      highlightColor: this._highlightColor,
+    })
+    this._diffCtx.putImageData(diffImgData, 0, 0)
 
     // Report stats at the FULL resolution so user-facing numbers match the
-    // image dimensions they see. We multiply diffCount up by the inverse
-    // scale^2 if we downscaled; this is an approximation but acceptable.
-    const totalPixels = diffWFull * diffHFull
-    const reportedDiffCount = scale < 1
-      ? Math.round(diffCount * (1 / (scale * scale)))
+    // image dimensions the user sees. Extrapolating diffCount by 1/scale² is an
+    // estimate, hence the explicit approximate flag below.
+    const approximate = geo.scale < 1
+    const totalPixels = fullGeo.width * fullGeo.height
+    const reportedDiffCount = approximate
+      ? Math.round(diffCount / (geo.scale * geo.scale))
       : diffCount
-    this._updateStats(reportedDiffCount, totalPixels)
+    this._updateStats(reportedDiffCount, totalPixels, approximate)
 
     // 若 overlay 已關閉，隱藏 diff canvas
     this._toggleDiffOverlay()
@@ -1188,18 +1563,20 @@ export class ImageCompare {
   /**
    * @param {number | null} diffCount
    * @param {number | null} totalPixels
+   * @param {boolean} [approximate] - 數字由縮圖比對外推而來
    */
-  _updateStats(diffCount, totalPixels) {
+  _updateStats(diffCount, totalPixels, approximate = false) {
     const stats = this._dom.stats
     if (!stats) return
 
     if (diffCount === null || totalPixels === null) {
       stats.textContent = '請載入兩張圖片以計算差異'
+      stats.classList?.remove('ic-stats-text--approx')
       return
     }
 
-    const pct = totalPixels > 0 ? ((diffCount / totalPixels) * 100).toFixed(2) : '0.00'
-    stats.textContent = `差異像素 ${diffCount.toLocaleString()} / 總像素 ${totalPixels.toLocaleString()} (${pct}%)`
+    stats.textContent = formatDiffStats(diffCount, totalPixels, approximate)
+    stats.classList?.toggle('ic-stats-text--approx', approximate)
   }
 
   // ── Private: Overlay toggle ─────────────────────────────────────────────────
