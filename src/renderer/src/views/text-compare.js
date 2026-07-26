@@ -258,12 +258,15 @@ function createLineEl({ cssClass, lineNum, innerHtml, dataLeft, dataRight }) {
  * @param {number} count  Number of lines collapsed
  * @returns {HTMLDivElement}
  */
-function createCollapsedEl(start, end, count) {
+function createCollapsedEl(start, end, count, expanded = false) {
   const div = document.createElement('div');
-  div.className = 'diff-line collapsed';
+  div.className = expanded ? 'diff-line collapsed collapsed--expanded' : 'diff-line collapsed';
   div.dataset.expandStart = String(start);
   div.dataset.expandEnd = String(end);
-  div.textContent = `── ${count} 行相同（點擊展開）──`;
+  div.dataset.expanded = expanded ? 'true' : 'false';
+  div.textContent = expanded
+    ? `── ${count} 行相同（點擊收合）──`
+    : `── ${count} 行相同（點擊展開）──`;
   return div;
 }
 
@@ -296,6 +299,14 @@ export class TextCompare {
   constructor(options = {}) {
     /** Aborted on destroy() to drop every listener registered via _on(). */
     this._ac = new AbortController();
+
+    /**
+     * Folded runs the user has expanded, keyed "start:end" over _diffResult
+     * indices. Cleared whenever the diff is recomputed, since the indices
+     * would no longer refer to the same lines.
+     * @type {Set<string>}
+     */
+    this._expandedRuns = new Set();
 
     /** @type {Required<TextCompareOptions>} */
     this._opts = {
@@ -1804,6 +1815,10 @@ ${rows}
     // Apply ignore / unimportant patterns
     this._applyIgnorePatterns();
 
+    // Fold state is expressed as _diffResult index ranges, which a fresh diff
+    // invalidates.
+    this._expandedRuns.clear();
+
     this._buildRows();
     this._buildDiffBlocks();
     this._render({ resetScroll });
@@ -2013,12 +2028,24 @@ ${rows}
 
       if (collapseEnd >= collapseStart) {
         const count = collapseEnd - collapseStart + 1;
+        const key = `${collapseStart}:${collapseEnd}`;
+        // A run the user expanded stays expanded, but keeps a header row so it
+        // can be collapsed again. Expansion used to overwrite the placeholder
+        // outright, making the fold one-way.
         this._rows.push({
           kind: 'collapsed',
           expandStart: collapseStart,
           expandEnd: collapseEnd,
           collapsedCount: count,
+          expanded: this._expandedRuns.has(key),
         });
+        if (this._expandedRuns.has(key)) {
+          for (let j = collapseStart; j <= collapseEnd; j++) {
+            this._rows.push({ kind: 'line', diffLine: dl[j] });
+            const c = (dl[j].leftText ?? '').replace(/[\r\n]+$/, '').length;
+            if (c > this._maxLineChars) this._maxLineChars = c;
+          }
+        }
       }
 
       // Emit trailing context
@@ -2137,8 +2164,8 @@ ${rows}
         let leftEl, rightEl;
 
         if (row.kind === 'collapsed') {
-          leftEl  = createCollapsedEl(row.expandStart, row.expandEnd, row.collapsedCount);
-          rightEl = createCollapsedEl(row.expandStart, row.expandEnd, row.collapsedCount);
+          leftEl  = createCollapsedEl(row.expandStart, row.expandEnd, row.collapsedCount, row.expanded);
+          rightEl = createCollapsedEl(row.expandStart, row.expandEnd, row.collapsedCount, row.expanded);
         } else {
           const rendered = this._renderDiffLine(row.diffLine);
           leftEl  = rendered.leftEl;
@@ -2608,24 +2635,29 @@ ${rows}
    * @param {number} expandEnd    _diffResult index (0-based, inclusive)
    */
   _expandCollapsed(expandStart, expandEnd) {
-    // Find the collapsed row in _rows and replace it with expanded line rows
-    const rowIdx = this._rows.findIndex(
-      r => r.kind === 'collapsed' &&
-           r.expandStart === expandStart &&
-           r.expandEnd   === expandEnd
-    );
-    if (rowIdx === -1) return;
+    this._toggleCollapsedRun(expandStart, expandEnd, true);
+  }
 
-    const newRows = [];
-    for (let j = expandStart; j <= expandEnd; j++) {
-      newRows.push({ kind: 'line', diffLine: this._diffResult[j] });
-    }
+  /**
+   * Expand or re-collapse one folded run of equal lines.
+   *
+   * The expanded set is keyed by _diffResult index range and rebuilt through
+   * _buildRows(), so folding is reversible and survives re-renders triggered
+   * by font size, whitespace or show-filter changes.
+   *
+   * @param {number} expandStart inclusive _diffResult index
+   * @param {number} expandEnd   inclusive _diffResult index
+   * @param {boolean} [expand]   omit to toggle
+   */
+  _toggleCollapsedRun(expandStart, expandEnd, expand) {
+    const key = `${expandStart}:${expandEnd}`;
+    const want = expand ?? !this._expandedRuns.has(key);
+    if (want) this._expandedRuns.add(key);
+    else this._expandedRuns.delete(key);
 
-    this._rows.splice(rowIdx, 1, ...newRows);
-
-    // Re-render and rebuild metadata
-    this._render();
+    this._buildRows();
     this._buildDiffBlocks();
+    this._render();
     this._buildMinimap();
   }
 
@@ -2686,7 +2718,7 @@ ${rows}
     const expandStart = parseInt(collapsed.dataset.expandStart, 10);
     const expandEnd   = parseInt(collapsed.dataset.expandEnd, 10);
     if (!isNaN(expandStart) && !isNaN(expandEnd)) {
-      this._expandCollapsed(expandStart, expandEnd);
+      this._toggleCollapsedRun(expandStart, expandEnd);
     }
   }
 

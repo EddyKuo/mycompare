@@ -9,6 +9,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { hexCompleteByteDiff } from '../../src/renderer/src/views/hex-compare.js'
 import { diffLines } from '../../src/renderer/src/core/diff-engine.js'
+import { TextCompare } from '../../src/renderer/src/views/text-compare.js'
 import {
   FolderCompare,
   flattenRows,
@@ -308,6 +309,82 @@ describe('diffLines — pathological inputs', () => {
     const result = diffLines('', 'a\nb\nc')
     expect(result.filter((r) => r.type === 'equal')).toHaveLength(0)
     expect(result.length).toBeGreaterThanOrEqual(3)
+  })
+})
+
+// ── Reversible folding ──────────────────────────────────────────────────────
+
+describe('TextCompare folding', () => {
+  /** 60 identical lines with one change at each end, so the middle folds. */
+  function mounted() {
+    const host = document.createElement('div')
+    host.innerHTML = `
+      <div id="compare-area">
+        <div id="pane-left"><div id="content-left"></div></div>
+        <div id="splitter"><canvas id="tc-gutter-canvas"></canvas><div id="tc-gutter-overlay"></div></div>
+        <div id="pane-right"><div id="content-right"></div></div>
+        <div id="minimap"><div id="minimap-viewport"></div></div>
+      </div>`
+    document.body.replaceChildren(host)
+    window.electronAPI = {
+      watchFile: vi.fn(),
+      unwatchFile: vi.fn(),
+      onFileChanged: vi.fn(() => () => {}),
+    }
+    const tc = new TextCompare()
+    tc.mount()
+
+    const lines = Array.from({ length: 60 }, (_, i) => `line ${i}`)
+    const left = ['HEAD-L', ...lines, 'TAIL-L'].join('\n')
+    const right = ['HEAD-R', ...lines, 'TAIL-R'].join('\n')
+    tc.setLeft('l.txt', left)
+    tc.setRight('r.txt', right)
+    return tc
+  }
+
+  it('folds a long run of identical lines', () => {
+    const tc = mounted()
+    const folds = tc._rows.filter((r) => r.kind === 'collapsed')
+    expect(folds.length).toBeGreaterThan(0)
+    expect(folds[0].expanded).toBe(false)
+  })
+
+  it('expands a fold and can collapse it again', () => {
+    const tc = mounted()
+    const fold = tc._rows.find((r) => r.kind === 'collapsed')
+    const collapsedRowCount = tc._rows.length
+
+    tc._toggleCollapsedRun(fold.expandStart, fold.expandEnd)
+    expect(tc._rows.length).toBeGreaterThan(collapsedRowCount)
+    const afterExpand = tc._rows.find((r) => r.kind === 'collapsed')
+    expect(afterExpand.expanded).toBe(true)
+
+    // The header row survives expansion, which is what makes it reversible.
+    tc._toggleCollapsedRun(fold.expandStart, fold.expandEnd)
+    expect(tc._rows.length).toBe(collapsedRowCount)
+    expect(tc._rows.find((r) => r.kind === 'collapsed').expanded).toBe(false)
+  })
+
+  it('keeps a run expanded across an unrelated re-render', () => {
+    const tc = mounted()
+    const fold = tc._rows.find((r) => r.kind === 'collapsed')
+    tc._toggleCollapsedRun(fold.expandStart, fold.expandEnd)
+    const expandedCount = tc._rows.length
+
+    tc.setFontSize(16)
+    expect(tc._rows.length).toBe(expandedCount)
+    expect(tc._rows.find((r) => r.kind === 'collapsed').expanded).toBe(true)
+  })
+
+  it('drops fold state when the diff is recomputed', () => {
+    const tc = mounted()
+    const fold = tc._rows.find((r) => r.kind === 'collapsed')
+    tc._toggleCollapsedRun(fold.expandStart, fold.expandEnd)
+    expect(tc._expandedRuns.size).toBe(1)
+
+    // Indices refer to _diffResult, so a new diff invalidates them.
+    tc.setRight('r.txt', 'totally\ndifferent\ncontent\n')
+    expect(tc._expandedRuns.size).toBe(0)
   })
 })
 

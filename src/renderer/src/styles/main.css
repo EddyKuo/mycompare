@@ -268,6 +268,13 @@ body {
 }
 .diff-line.collapsed:hover { background: var(--bg-toolbar); }
 
+/* An expanded run keeps its header row so it can be folded back up. */
+.diff-line.collapsed.collapsed--expanded {
+  background: transparent;
+  border-top: 1px dashed var(--border-color, var(--bg-toolbar));
+  opacity: 0.7;
+}
+
 /* ── Center Splitter ── */
 .splitter {
   background: var(--border-color);
