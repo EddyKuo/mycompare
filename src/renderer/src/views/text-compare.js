@@ -1457,6 +1457,37 @@ export class TextCompare {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Public: command surface for the application menu
+  // -------------------------------------------------------------------------
+
+  /** Open the find bar. */
+  openFind() { this._openFind(false); }
+
+  /** Open the find bar in replace mode. */
+  openReplace() { this._openFind(true); }
+
+  /** Open the go-to-line bar. */
+  openGoto() { this._openGoto(); }
+
+  /** Toggle a bookmark on the row the user last clicked. */
+  toggleBookmark() { this._toggleBookmarkAtCursor(); }
+
+  /** Scroll to the next bookmark, wrapping around. */
+  nextBookmark() { this._navigateBookmark(1); }
+
+  /** Scroll to the previous bookmark, wrapping around. */
+  prevBookmark() { this._navigateBookmark(-1); }
+
+  /** Toggle soft wrapping of long lines. */
+  toggleWordWrap() {
+    this._wordWrap = !this._wordWrap;
+    this._applyWordWrap();
+    const chk = document.getElementById('chk-word-wrap');
+    if (chk instanceof HTMLInputElement) chk.checked = this._wordWrap;
+    return this._wordWrap;
+  }
+
   /**
    * Set the diff algorithm and re-run the diff.
    * @param {'myers'|'patience'|'histogram'} algo

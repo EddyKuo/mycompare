@@ -45,4 +45,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // up in destroy(). The old callback-only signature is preserved.
   onOpenFiles: (cb) => _onChannel('open-files', cb),
   onFileChanged: (cb) => _onChannel('file-changed', cb),
+  onMenuAction: (cb) => _onChannel('menu-action', cb),
 })

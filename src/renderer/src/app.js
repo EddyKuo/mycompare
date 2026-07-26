@@ -190,6 +190,7 @@ export function initApp() {
   setupViewSwitching()
   setupToolbarButtons()
   setupPathBarButtons()
+  setupMenuActions()
   setupKeyboardShortcuts()
   renderRecentSessions(openSession, removeSession)
   updateToolbar()
@@ -763,41 +764,49 @@ function _disposeViewIfUnused(type) {
 // ---------------------------------------------------------------------------
 // Session 首頁按鈕（.session-type-btn）
 // ---------------------------------------------------------------------------
+/**
+ * Open a new session of the given type in a fresh tab.
+ * Shared by the home-screen buttons and the Session menu.
+ *
+ * @param {string} type
+ * @param {string} [labelText] fallback label for the unsupported-type message
+ */
+function newSession(type, labelText) {
+  switch (type) {
+    case 'text':
+      tabMgr.addTab('text', '文字比對')
+      showTextCompare()
+      break
+    case 'folder':
+      tabMgr.addTab('folder', '資料夾比對')
+      showFolderCompare()
+      break
+    case 'table':
+      tabMgr.addTab('table', '表格比對')
+      showTableCompare()
+      break
+    case 'image':
+      tabMgr.addTab('image', '圖片比對')
+      showImageCompare()
+      break
+    case 'hex':
+      tabMgr.addTab('hex', 'Hex 比對')
+      showHexCompare()
+      break
+    case 'merge3':
+      tabMgr.addTab('merge3', '三向合併')
+      showMerge3()
+      break
+    default:
+      showStatus(`${labelText ?? type} 功能開發中`)
+      break
+  }
+}
+
 function setupViewSwitching() {
   document.querySelectorAll('.session-type-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      const type = btn.dataset.type
-      const labelText = btn.querySelector('.label')?.textContent ?? type
-
-      switch (type) {
-        case 'text':
-          tabMgr.addTab('text', '文字比對')
-          showTextCompare()
-          break
-        case 'folder':
-          tabMgr.addTab('folder', '資料夾比對')
-          showFolderCompare()
-          break
-        case 'table':
-          tabMgr.addTab('table', '表格比對')
-          showTableCompare()
-          break
-        case 'image':
-          tabMgr.addTab('image', '圖片比對')
-          showImageCompare()
-          break
-        case 'hex':
-          tabMgr.addTab('hex', 'Hex 比對')
-          showHexCompare()
-          break
-        case 'merge3':
-          tabMgr.addTab('merge3', '三向合併')
-          showMerge3()
-          break
-        default:
-          showStatus(`${labelText} 功能開發中`)
-          break
-      }
+      newSession(btn.dataset.type, btn.querySelector('.label')?.textContent)
     })
   })
 
@@ -1406,6 +1415,146 @@ function setupKeyboardShortcuts() {
         if (currentView === 'text') textCompare?.exportHtml({ print: true })
         else if (currentView === 'folder') folderCompare?.exportHtml({ print: true })
         break
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 應用程式選單
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire the native menu to renderer actions.
+ *
+ * The main process only knows command ids; every mapping to a view method
+ * lives here. Commands that do not apply to the active view are no-ops rather
+ * than errors, matching how BC greys out inapplicable items.
+ */
+function setupMenuActions() {
+  if (!window.electronAPI?.onMenuAction) return
+
+  /** @param {number} delta */
+  const zoom = (delta) => {
+    if (currentView === 'text' && textCompare) {
+      textCompare.setFontSize(textCompare._fontSize + delta)
+    } else if (currentView === 'image') {
+      if (delta > 0) imageCompare?.zoomIn?.()
+      else imageCompare?.zoomOut?.()
+    }
+  }
+
+  /** @type {Record<string, () => void>} */
+  const commands = {
+    'session.new.text':   () => newSession('text'),
+    'session.new.folder': () => newSession('folder'),
+    'session.new.table':  () => newSession('table'),
+    'session.new.hex':    () => newSession('hex'),
+    'session.new.image':  () => newSession('image'),
+    'session.new.merge3': () => newSession('merge3'),
+    'session.home':       () => showHome(),
+    'session.settings':   () => openConfigModal(),
+    'session.workspaces': () => openWorkspacesModal(),
+    'session.swap':       () => {
+      if (currentView === 'text') textCompare?.swap()
+      else if (currentView === 'folder') folderCompare?.swap?.()
+    },
+    'session.recompare':  () => {
+      if (currentView === 'text') textCompare?.refresh()
+      else if (currentView === 'folder') folderCompare?.refresh()
+    },
+    'session.close':      () => {
+      const active = tabMgr.activeTab
+      if (active) _handleCloseTab(active.id)
+    },
+
+    'file.openLeft':  () => {
+      if (currentView === 'text') void textCompare?.openLeft()
+      else if (currentView === 'hex') void hexCompare?.openLeft()
+      else if (currentView === 'image') void imageCompare?.openLeft()
+      else if (currentView === 'folder') void folderCompare?.openLeft?.()
+    },
+    'file.openRight': () => {
+      if (currentView === 'text') void textCompare?.openRight()
+      else if (currentView === 'hex') void hexCompare?.openRight()
+      else if (currentView === 'image') void imageCompare?.openRight()
+      else if (currentView === 'folder') void folderCompare?.openRight?.()
+    },
+    'file.saveLeft':  () => { if (currentView === 'text') void textCompare?.saveLeft() },
+    'file.saveRight': () => { if (currentView === 'text') void textCompare?.saveRight() },
+    'file.exportHtml': () => {
+      if (currentView === 'text') void textCompare?.exportHtml()
+      else if (currentView === 'folder') void folderCompare?.exportHtml()
+    },
+    'file.print': () => {
+      if (currentView === 'text') void textCompare?.exportHtml({ print: true })
+      else if (currentView === 'folder') void folderCompare?.exportHtml({ print: true })
+    },
+
+    'edit.undo': () => { if (currentView === 'text') textCompare?.undo() },
+    'edit.redo': () => { if (currentView === 'text') textCompare?.redo() },
+    'edit.toggleEditMode': () => {
+      if (currentView !== 'text' || !textCompare) return
+      const isEdit = textCompare.toggleEditMode()
+      el('btn-edit-mode').classList.toggle('active', isEdit)
+      el('btn-edit-mode').title = isEdit ? '退出編輯模式 (Ctrl+E)' : '切換編輯模式 (Ctrl+E)'
+    },
+    'edit.copyToLeft':     () => { if (currentView === 'text') textCompare?.copyToLeft() },
+    'edit.copyToRight':    () => { if (currentView === 'text') textCompare?.copyToRight() },
+    'edit.copyAllToLeft':  () => { if (currentView === 'text') textCompare?.copyAllToLeft() },
+    'edit.copyAllToRight': () => { if (currentView === 'text') textCompare?.copyAllToRight() },
+
+    'search.find': () => {
+      if (currentView === 'text') textCompare?.openFind()
+      else if (currentView === 'hex') hexCompare?.openFind?.()
+      else if (currentView === 'folder') folderCompare?.openFindBar?.()
+    },
+    'search.replace':  () => { if (currentView === 'text') textCompare?.openReplace() },
+    'search.gotoLine': () => { if (currentView === 'text') textCompare?.openGoto() },
+    'search.nextDiff':  () => { if (currentView === 'text') textCompare?.navigateNext() },
+    'search.prevDiff':  () => { if (currentView === 'text') textCompare?.navigatePrev() },
+    'search.firstDiff': () => { if (currentView === 'text') textCompare?.navigateFirst() },
+    'search.lastDiff':  () => { if (currentView === 'text') textCompare?.navigateLast() },
+    'search.toggleBookmark': () => { if (currentView === 'text') textCompare?.toggleBookmark() },
+    'search.nextBookmark':   () => { if (currentView === 'text') textCompare?.nextBookmark() },
+    'search.prevBookmark':   () => { if (currentView === 'text') textCompare?.prevBookmark() },
+
+    'view.showAll':  () => { if (currentView === 'text') textCompare?.setShowFilter('all') },
+    'view.showDiff': () => { if (currentView === 'text') textCompare?.setShowFilter('diff') },
+    'view.showSame': () => { if (currentView === 'text') textCompare?.setShowFilter('same') },
+    'view.showNone': () => { if (currentView === 'text') textCompare?.setShowFilter('none') },
+    'view.toggleLineNumbers': () => { if (currentView === 'text') textCompare?.toggleLineNumbers() },
+    'view.toggleWhitespace':  () => { if (currentView === 'text') textCompare?.toggleWhitespace() },
+    'view.toggleWordWrap':    () => { if (currentView === 'text') textCompare?.toggleWordWrap() },
+    'view.toggleLayout':      () => { if (currentView === 'text') textCompare?.toggleLayout() },
+    'view.zoomIn':    () => zoom(1),
+    'view.zoomOut':   () => zoom(-1),
+    'view.zoomReset': () => {
+      if (currentView === 'text') textCompare?.setFontSize(13)
+      else if (currentView === 'image') imageCompare?.resetZoom?.()
+    },
+    'view.toggleTheme': () => el('btn-theme').click(),
+    'view.fullScreen':  () => { void window.electronAPI?.toggleFullScreen?.() },
+
+    'tools.ignoreRules':  () => openIgnoreRulesModal(),
+    'tools.namedConfigs': () => openConfigModal(),
+    'tools.shortcuts':    () => el('btn-settings-modal')?.click(),
+    'tools.algorithm.myers':     () => { if (currentView === 'text') textCompare?.setAlgorithm('myers') },
+    'tools.algorithm.patience':  () => { if (currentView === 'text') textCompare?.setAlgorithm('patience') },
+    'tools.algorithm.histogram': () => { if (currentView === 'text') textCompare?.setAlgorithm('histogram') },
+
+    'help.about': () => showStatus('MyCompare — Electron 版 BeyondCompare 複製品'),
+  }
+
+  window.electronAPI.onMenuAction(({ command }) => {
+    const fn = commands[command]
+    if (!fn) {
+      console.warn('[menu] unhandled command:', command)
+      return
+    }
+    try {
+      fn()
+    } catch (err) {
+      console.error(`[menu] ${command} failed:`, err)
     }
   })
 }

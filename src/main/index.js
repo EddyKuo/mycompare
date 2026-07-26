@@ -1,9 +1,10 @@
-import { app, BrowserWindow, Menu, ipcMain, dialog, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { join, extname, dirname } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open } from 'fs/promises'
 import { watch } from 'fs'
 import { decodeBuffer } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
+import { buildAppMenu } from './menu.js'
 
 // ── T33 (S12-W): File Watcher — capped to avoid resource exhaustion ──
 const MAX_WATCHERS = 64
@@ -95,9 +96,8 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  Menu.setApplicationMenu(null)
-
   const win = createWindow()
+  buildAppMenu(win)
   const cliFiles = parseCliArgs(process.argv)
   // S12-S01: CLI args are user-trusted — register them as allowed roots.
   for (const f of cliFiles) registerRoot(f)

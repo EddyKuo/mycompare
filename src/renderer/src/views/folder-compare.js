@@ -313,6 +313,21 @@ export class FolderCompare {
     await this.setRight(result.path)
   }
 
+  /** 開啟檔名搜尋列（Search ▸ Find Filename）。 */
+  openFindBar() {
+    this._openFindBar()
+  }
+
+  /** 對調左右兩側資料夾並重新掃描（Session ▸ Swap Sides）。 */
+  async swap() {
+    ;[this._leftPath, this._rightPath] = [this._rightPath, this._leftPath]
+    ;[this._leftZipEntries, this._rightZipEntries] = [this._rightZipEntries, this._leftZipEntries]
+    this._updatePathDisplay('left', this._leftPath ?? '')
+    this._updatePathDisplay('right', this._rightPath ?? '')
+    this._expanded.clear()
+    await this._scan()
+  }
+
   /** 開啟左側 Zip 檔案 */
   async openZipLeft() {
     const result = await window.electronAPI.openZip()

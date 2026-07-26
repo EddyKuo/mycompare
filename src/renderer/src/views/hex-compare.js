@@ -432,6 +432,15 @@ export class HexCompare {
   }
 
   /** 重新渲染兩側 pane */
+  /** Focus the search box. The find bar is always visible in this view. */
+  openFind() {
+    const input = this._dom.findInput
+    if (input) {
+      input.focus()
+      input.select()
+    }
+  }
+
   refresh() {
     this._recomputeCompleteIfNeeded()
     requestAnimationFrame(() => {
