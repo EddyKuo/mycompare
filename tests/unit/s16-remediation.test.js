@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { hexCompleteByteDiff } from '../../src/renderer/src/views/hex-compare.js'
+import { diffLines } from '../../src/renderer/src/core/diff-engine.js'
 import { FolderCompare, flattenRows, rollupStatus } from '../../src/renderer/src/views/folder-compare.js'
 
 // ── Folder compare tree model ───────────────────────────────────────────────
@@ -173,6 +174,49 @@ describe('FolderCompare.expandAll', () => {
     expect(fc._rows[0].children).toHaveLength(1)
     expect(fc._rows[0].children[0].name).toBe('leaf.txt')
     expect(fc._expanded.size).toBe(1)
+  })
+})
+
+// ── Line-level Myers bounds ─────────────────────────────────────────────────
+
+describe('diffLines — pathological inputs', () => {
+  it('completes on two large, almost entirely different files', () => {
+    const N = 20_000
+    const left  = Array.from({ length: N }, (_, i) => `left line ${i}`).join('\n')
+    const right = Array.from({ length: N }, (_, i) => `right line ${i}`).join('\n')
+
+    const started = Date.now()
+    const result = diffLines(left, right)
+    const elapsed = Date.now() - started
+
+    expect(elapsed).toBeLessThan(20_000)
+    expect(result.length).toBeGreaterThan(0)
+    // Nothing matches, so every left line must be accounted for as removed.
+    const removed = result.filter((r) => r.type === 'delete' || r.type === 'remove').length
+    expect(removed).toBeGreaterThan(0)
+  })
+
+  it('stays exact and fast when a large file has few differences', () => {
+    const N = 20_000
+    const leftLines = Array.from({ length: N }, (_, i) => `line ${i}`)
+    const rightLines = leftLines.slice()
+    rightLines[10] = 'CHANGED'
+    rightLines.splice(500, 0, 'INSERTED')
+
+    const started = Date.now()
+    const result = diffLines(leftLines.join('\n'), rightLines.join('\n'))
+    const elapsed = Date.now() - started
+
+    expect(elapsed).toBeLessThan(5000)
+    const changed = result.filter((r) => r.type !== 'equal').length
+    // One modified line plus one inserted line — a handful of ops, not thousands.
+    expect(changed).toBeLessThan(10)
+  })
+
+  it('handles one side empty', () => {
+    const result = diffLines('', 'a\nb\nc')
+    expect(result.filter((r) => r.type === 'equal')).toHaveLength(0)
+    expect(result.length).toBeGreaterThanOrEqual(3)
   })
 })
 

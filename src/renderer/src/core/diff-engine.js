@@ -70,23 +70,76 @@ function normalise(line, opts) {
  * @returns {{ op: string, li: number, ri: number }[]}
  */
 function _myersDiff(left, right) {
-  const N = left.length;
-  const M = right.length;
-  const MAX = N + M;
+  const N0 = left.length;
+  const M0 = right.length;
+  if (N0 === 0 && M0 === 0) return [];
 
-  if (MAX === 0) return [];
+  // Trim the common prefix and suffix before running Myers. Two large files
+  // that share most of their content collapse to a small differing middle,
+  // which is what keeps the edit distance — and therefore the cost — low.
+  const minLen = Math.min(N0, M0);
+  let pre = 0;
+  while (pre < minLen && left[pre] === right[pre]) pre++;
+  let suf = 0;
+  while (suf < minLen - pre && left[N0 - 1 - suf] === right[M0 - 1 - suf]) suf++;
 
-  // V[k] stores the furthest reaching x-coordinate on diagonal k
-  // We use offset MAX so that negative k values map to positive indices.
-  const size = 2 * MAX + 1;
-  const V = new Int32Array(size);
-  // trace[d] = snapshot of V after d-step exploration
+  const ops = [];
+  for (let i = 0; i < pre; i++) ops.push({ op: 'equal', li: i, ri: i });
+
+  const a = left.slice(pre, N0 - suf);
+  const b = right.slice(pre, M0 - suf);
+  for (const op of _myersCore(a, b, pre)) ops.push(op);
+
+  for (let i = 0; i < suf; i++) {
+    ops.push({ op: 'equal', li: N0 - suf + i, ri: M0 - suf + i });
+  }
+  return ops;
+}
+
+/**
+ * Ceiling on the Myers edit-distance search.
+ *
+ * The back-trace keeps one V snapshot per round, so trace memory grows as
+ * ~4·(D+1)² bytes; without a ceiling, two large mostly-different files drive D
+ * towards N+M and exhaust memory before the algorithm ever finishes.
+ */
+const MAX_LINE_DIFF_D = 3000;
+
+/** Work ceiling for the O((N+M)·D) search, used to scale the budget by size. */
+const LINE_DIFF_OP_BUDGET = 1e8;
+
+/**
+ * Myers O(ND) over an already prefix/suffix-trimmed pair.
+ *
+ * When the edit distance exceeds the budget the search stops and the path is
+ * reconstructed from the furthest-reaching diagonal, with whatever remains
+ * emitted as a delete/insert block. That yields a usable — if not minimal —
+ * diff instead of hanging.
+ *
+ * @param {string[]} a
+ * @param {string[]} b
+ * @param {number} off  index offset to add back to li/ri
+ * @returns {{ op: string, li: number, ri: number }[]}
+ */
+function _myersCore(a, b, off) {
+  const N = a.length;
+  const M = b.length;
+  if (N === 0 && M === 0) return [];
+  if (N === 0) return b.map((_, j) => ({ op: 'insert', li: -1, ri: off + j }));
+  if (M === 0) return a.map((_, i) => ({ op: 'delete', li: off + i, ri: -1 }));
+
+  const budget = Math.max(64, Math.floor(LINE_DIFF_OP_BUDGET / (N + M)));
+  const limit = Math.min(MAX_LINE_DIFF_D, budget, N + M);
+  const vOff = limit + 1;
+  const V = new Int32Array(2 * limit + 3);
+  /** @type {Int32Array[]} trace[d] holds V after d-1 rounds, trimmed to k ∈ [-d, d] */
   const trace = [];
+  let found = -1;
 
-  outer: for (let d = 0; d <= MAX; d++) {
-    trace.push(V.slice());
+  outer: for (let d = 0; d <= limit; d++) {
+    trace.push(V.slice(vOff - d, vOff + d + 1));
     for (let k = -d; k <= d; k += 2) {
-      const ki = k + MAX; // offset index
+      const ki = k + vOff;
       let x;
       if (k === -d || (k !== d && V[ki - 1] < V[ki + 1])) {
         x = V[ki + 1]; // move down (insert)
@@ -94,60 +147,82 @@ function _myersDiff(left, right) {
         x = V[ki - 1] + 1; // move right (delete)
       }
       let y = x - k;
-      // extend snake
-      while (x < N && y < M && left[x] === right[y]) {
+      while (x < N && y < M && a[x] === b[y]) {
         x++;
         y++;
       }
       V[ki] = x;
       if (x >= N && y >= M) {
-        trace.push(V.slice()); // final snapshot is already pushed above; push again to align index
+        found = d;
         break outer;
       }
     }
   }
 
-  // Back-trace to reconstruct the edit path
-  const ops = [];
-  let x = N;
-  let y = M;
+  let startX = N;
+  let startY = M;
+  let startD = found;
+  /** @type {{ op: string, li: number, ri: number }[]} */
+  const tail = [];
 
-  for (let d = trace.length - 2; d >= 0; d--) {
-    const Vprev = trace[d];
-    const k = x - y;
-    const ki = k + MAX;
-
-    // Determine which move was taken to reach current (x, y)
-    let prevK;
-    if (k === -d || (k !== d && Vprev[ki - 1] < Vprev[ki + 1])) {
-      prevK = k + 1; // came from insert (move down)
-    } else {
-      prevK = k - 1; // came from delete (move right)
+  if (found < 0) {
+    // Budget exhausted. Resume from the diagonal that got furthest along and
+    // treat the unexplored remainder as a wholesale replacement.
+    startD = limit;
+    let best = -1;
+    for (let k = -limit; k <= limit; k += 2) {
+      const x = V[k + vOff];
+      const y = x - k;
+      if (x >= 0 && y >= 0 && x <= N && y <= M && x + y > best) {
+        best = x + y;
+        startX = x;
+        startY = y;
+      }
     }
-    const prevX = Vprev[prevK + MAX];
-    const prevY = prevX - prevK;
+    for (let i = startX; i < N; i++) tail.push({ op: 'delete', li: off + i, ri: -1 });
+    for (let j = startY; j < M; j++) tail.push({ op: 'insert', li: -1, ri: off + j });
+  }
 
-    // Rewind snake from current position back to the edit point
+  const ops = [];
+  let x = startX;
+  let y = startY;
+  for (let d = startD; d > 0; d--) {
+    const Vprev = trace[d]; // diagonal k sits at index k + d
+    const k = x - y;
+    const prevK = (k === -d || (k !== d && Vprev[k - 1 + d] < Vprev[k + 1 + d]))
+      ? k + 1
+      : k - 1;
+    const prevX = Vprev[prevK + d];
+    const prevY = prevX - prevK;
     while (x > prevX && y > prevY) {
       x--;
       y--;
-      ops.push({ op: 'equal', li: x, ri: y });
+      ops.push({ op: 'equal', li: off + x, ri: off + y });
     }
-
-    if (d > 0) {
-      if (x === prevX) {
-        // came via insert (moved down in y)
-        y--;
-        ops.push({ op: 'insert', li: -1, ri: y });
-      } else {
-        // came via delete (moved right in x)
-        x--;
-        ops.push({ op: 'delete', li: x, ri: -1 });
-      }
+    if (x === prevX) {
+      y--;
+      ops.push({ op: 'insert', li: -1, ri: off + y });
+    } else {
+      x--;
+      ops.push({ op: 'delete', li: off + x, ri: -1 });
     }
+  }
+  while (x > 0 && y > 0) {
+    x--;
+    y--;
+    ops.push({ op: 'equal', li: off + x, ri: off + y });
+  }
+  while (x > 0) {
+    x--;
+    ops.push({ op: 'delete', li: off + x, ri: -1 });
+  }
+  while (y > 0) {
+    y--;
+    ops.push({ op: 'insert', li: -1, ri: off + y });
   }
 
   ops.reverse();
+  for (const op of tail) ops.push(op);
   return ops;
 }
 

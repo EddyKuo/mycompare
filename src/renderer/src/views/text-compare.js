@@ -294,6 +294,9 @@ export class TextCompare {
    * @param {TextCompareOptions} options
    */
   constructor(options = {}) {
+    /** Aborted on destroy() to drop every listener registered via _on(). */
+    this._ac = new AbortController();
+
     /** @type {Required<TextCompareOptions>} */
     this._opts = {
       algorithm: options.algorithm ?? 'myers',
@@ -503,8 +506,32 @@ export class TextCompare {
   // -------------------------------------------------------------------------
 
   /** Attach to existing DOM elements and wire up event listeners. */
+  /**
+   * Register a listener bound to this view's lifetime.
+   *
+   * The panes, splitter and toolbar controls live in index.html, so they
+   * outlive the view instance. Closing and reopening a text tab used to stack
+   * a fresh set of anonymous listeners on the same nodes with no way to remove
+   * them; destroy() now aborts them all in one go.
+   *
+   * Not for listeners with a shorter lifetime than the view (the splitter's
+   * document-level mousemove/mouseup, for instance, must come off on mouseup).
+   *
+   * @param {EventTarget|null|undefined} target
+   * @param {string} type
+   * @param {EventListener} handler
+   * @param {AddEventListenerOptions} [opts]
+   */
+  _on(target, type, handler, opts) {
+    if (!target) return handler;
+    target.addEventListener(type, handler, { ...(opts ?? {}), signal: this._ac.signal });
+    return handler;
+  }
+
   mount() {
     if (this._mounted) return;
+    // A previous mount()/destroy() cycle leaves an aborted controller behind.
+    if (!this._ac || this._ac.signal.aborted) this._ac = new AbortController();
 
     this._compareArea    = document.getElementById('compare-area');
     this._contentLeft    = document.getElementById('content-left');
@@ -523,21 +550,21 @@ export class TextCompare {
     this._statusEol      = document.getElementById('status-eol');
 
     // Scroll sync
-    this._contentLeft.addEventListener('scroll', this._onScrollLeft);
-    this._contentRight.addEventListener('scroll', this._onScrollRight);
+    this._on(this._contentLeft, 'scroll', this._onScrollLeft);
+    this._on(this._contentRight, 'scroll', this._onScrollRight);
 
     // Minimap click-to-jump
-    this._minimap.addEventListener('click', this._onMinimapClick);
+    this._on(this._minimap, 'click', this._onMinimapClick);
 
     // Collapsed-section expand (event delegation)
-    this._contentLeft.addEventListener('click', this._onContentClick);
-    this._contentRight.addEventListener('click', this._onContentClick);
+    this._on(this._contentLeft, 'click', this._onContentClick);
+    this._on(this._contentRight, 'click', this._onContentClick);
 
     // Context menu
     this._onContextMenuLeft  = (e) => this._handleContextMenu(e, 'left');
     this._onContextMenuRight = (e) => this._handleContextMenu(e, 'right');
-    this._contentLeft.addEventListener('contextmenu',  this._onContextMenuLeft);
-    this._contentRight.addEventListener('contextmenu', this._onContextMenuRight);
+    this._on(this._contentLeft, 'contextmenu',  this._onContextMenuLeft);
+    this._on(this._contentRight, 'contextmenu', this._onContextMenuRight);
 
     // Build edit textarea overlays
     this._textareaLeft  = this._createEditTextarea('left');
@@ -549,21 +576,21 @@ export class TextCompare {
     const chkIgnoreCase        = document.getElementById('chk-ignore-case');
     if (chkIgnoreLineEndings) {
       chkIgnoreLineEndings.checked = this._opts.ignoreLineEndings;
-      chkIgnoreLineEndings.addEventListener('change', () => {
+      this._on(chkIgnoreLineEndings, 'change', () => {
         this._opts.ignoreLineEndings = chkIgnoreLineEndings.checked;
         this._runDiff();
       });
     }
     if (chkIgnoreWhitespace) {
       chkIgnoreWhitespace.checked = this._opts.ignoreWhitespace;
-      chkIgnoreWhitespace.addEventListener('change', () => {
+      this._on(chkIgnoreWhitespace, 'change', () => {
         this._opts.ignoreWhitespace = chkIgnoreWhitespace.checked;
         this._runDiff();
       });
     }
     if (chkIgnoreCase) {
       chkIgnoreCase.checked = this._opts.ignoreCase;
-      chkIgnoreCase.addEventListener('change', () => {
+      this._on(chkIgnoreCase, 'change', () => {
         this._opts.ignoreCase = chkIgnoreCase.checked;
         this._runDiff();
       });
@@ -574,14 +601,14 @@ export class TextCompare {
     const chkIgnoreCrlf   = document.getElementById('chk-ignore-crlf');
     if (chkIgnoreIndent) {
       chkIgnoreIndent.checked = this._opts.ignoreIndent;
-      chkIgnoreIndent.addEventListener('change', () => {
+      this._on(chkIgnoreIndent, 'change', () => {
         this._opts.ignoreIndent = chkIgnoreIndent.checked;
         this._runDiff();
       });
     }
     if (chkIgnoreCrlf) {
       chkIgnoreCrlf.checked = this._opts.ignoreCrlf;
-      chkIgnoreCrlf.addEventListener('change', () => {
+      this._on(chkIgnoreCrlf, 'change', () => {
         this._opts.ignoreCrlf = chkIgnoreCrlf.checked;
         this._runDiff();
       });
@@ -604,11 +631,11 @@ export class TextCompare {
       this._findRegex = /** @type {HTMLInputElement} */ (e.target).checked;
       this._runFind();
     });
-    this._findInput?.addEventListener('input', () => {
+    this._on(this._findInput, 'input', () => {
       this._findQuery = this._findInput.value;
       this._runFind();
     });
-    this._findInput?.addEventListener('keydown', (e) => {
+    this._on(this._findInput, 'keydown', (e) => {
       if (e.key === 'Enter')  { e.preventDefault(); this._navigateFind(e.shiftKey ? -1 : 1); }
       if (e.key === 'Escape') { e.preventDefault(); this._closeFind(); }
     });
@@ -628,9 +655,9 @@ export class TextCompare {
     const btnReplaceAll = document.getElementById('replace-all');
     const btnToggleReplace = document.getElementById('toggle-replace');
 
-    btnToggleReplace?.addEventListener('click', () => this._toggleReplaceMode());
-    btnReplaceOne?.addEventListener('click', () => this._replaceOne());
-    btnReplaceAll?.addEventListener('click', () => this._replaceAll());
+    this._on(btnToggleReplace, 'click', () => this._toggleReplaceMode());
+    this._on(btnReplaceOne, 'click', () => this._replaceOne());
+    this._on(btnReplaceAll, 'click', () => this._replaceAll());
 
     this._onKeyDownReplace = (e) => {
       if (e.ctrlKey && e.key === 'h' && this._mounted && isActive('text')) {
@@ -664,7 +691,7 @@ export class TextCompare {
 
     document.getElementById('goto-close')?.addEventListener('click', () => this._closeGoto());
     document.getElementById('goto-go')?.addEventListener('click', () => this._gotoLine());
-    this._gotoInput?.addEventListener('keydown', (e) => {
+    this._on(this._gotoInput, 'keydown', (e) => {
       if (e.key === 'Enter')  { e.preventDefault(); this._gotoLine(); }
       if (e.key === 'Escape') { e.preventDefault(); this._closeGoto(); }
     });
@@ -682,7 +709,7 @@ export class TextCompare {
     const chkWordWrap = document.getElementById('chk-word-wrap');
     if (chkWordWrap) {
       chkWordWrap.checked = this._wordWrap;
-      chkWordWrap.addEventListener('change', () => {
+      this._on(chkWordWrap, 'change', () => {
         this._wordWrap = chkWordWrap.checked;
         this._applyWordWrap();
       });
@@ -712,15 +739,15 @@ export class TextCompare {
     const paneLeft  = document.getElementById('pane-left');
     const paneRight = document.getElementById('pane-right');
     if (paneLeft) {
-      paneLeft.addEventListener('dragenter', () => paneLeft.classList.add('tc-pane--drag-over'));
-      paneLeft.addEventListener('dragleave', (e) => {
+      this._on(paneLeft, 'dragenter', () => paneLeft.classList.add('tc-pane--drag-over'));
+      this._on(paneLeft, 'dragleave', (e) => {
         // Only clear when leaving the pane (not bubbling from a child)
         if (!paneLeft.contains(/** @type {Node|null} */ (e.relatedTarget))) {
           paneLeft.classList.remove('tc-pane--drag-over');
         }
       });
-      paneLeft.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
-      paneLeft.addEventListener('drop', async (e) => {
+      this._on(paneLeft, 'dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+      this._on(paneLeft, 'drop', async (e) => {
         e.preventDefault();
         paneLeft.classList.remove('tc-pane--drag-over');
         const file = e.dataTransfer.files[0];
@@ -737,14 +764,14 @@ export class TextCompare {
       });
     }
     if (paneRight) {
-      paneRight.addEventListener('dragenter', () => paneRight.classList.add('tc-pane--drag-over'));
-      paneRight.addEventListener('dragleave', (e) => {
+      this._on(paneRight, 'dragenter', () => paneRight.classList.add('tc-pane--drag-over'));
+      this._on(paneRight, 'dragleave', (e) => {
         if (!paneRight.contains(/** @type {Node|null} */ (e.relatedTarget))) {
           paneRight.classList.remove('tc-pane--drag-over');
         }
       });
-      paneRight.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
-      paneRight.addEventListener('drop', async (e) => {
+      this._on(paneRight, 'dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+      this._on(paneRight, 'drop', async (e) => {
         e.preventDefault();
         paneRight.classList.remove('tc-pane--drag-over');
         const file = e.dataTransfer.files[0];
@@ -766,10 +793,10 @@ export class TextCompare {
     const btnShowDiff = document.getElementById('btn-show-diff');
     const btnShowSame = document.getElementById('btn-show-same');
     const btnShowNone = document.getElementById('btn-show-none');
-    if (btnShowAll)  btnShowAll.addEventListener('click',  () => this.setShowFilter('all'));
-    if (btnShowDiff) btnShowDiff.addEventListener('click', () => this.setShowFilter('diff'));
-    if (btnShowSame) btnShowSame.addEventListener('click', () => this.setShowFilter('same'));
-    if (btnShowNone) btnShowNone.addEventListener('click', () => this.setShowFilter('none'));
+    if (btnShowAll)  this._on(btnShowAll, 'click',  () => this.setShowFilter('all'));
+    if (btnShowDiff) this._on(btnShowDiff, 'click', () => this.setShowFilter('diff'));
+    if (btnShowSame) this._on(btnShowSame, 'click', () => this.setShowFilter('same'));
+    if (btnShowNone) this._on(btnShowNone, 'click', () => this.setShowFilter('none'));
     this._btnShowAll  = btnShowAll ?? null;
     this._btnShowDiff = btnShowDiff ?? null;
     this._btnShowSame = btnShowSame ?? null;
@@ -779,14 +806,14 @@ export class TextCompare {
     // ── T47: Visible Whitespace toggle ──
     const btnWhitespace = document.getElementById('btn-whitespace');
     if (btnWhitespace) {
-      btnWhitespace.addEventListener('click', () => this.toggleWhitespace());
+      this._on(btnWhitespace, 'click', () => this.toggleWhitespace());
     }
     this._btnWhitespace = btnWhitespace ?? null;
 
     // ── T48: Line Numbers toggle ──
     const btnLineNums = document.getElementById('btn-line-numbers');
     if (btnLineNums) {
-      btnLineNums.addEventListener('click', () => this.toggleLineNumbers());
+      this._on(btnLineNums, 'click', () => this.toggleLineNumbers());
     }
     this._btnLineNums = btnLineNums ?? null;
     this._applyLineNumbers();
@@ -811,7 +838,7 @@ export class TextCompare {
     // ── T50: Layout toggle button ──
     const btnLayout = document.getElementById('btn-layout-toggle');
     if (btnLayout) {
-      btnLayout.addEventListener('click', () => this.toggleLayout());
+      this._on(btnLayout, 'click', () => this.toggleLayout());
     }
     this._btnLayout = btnLayout ?? null;
 
@@ -865,7 +892,7 @@ export class TextCompare {
         // suppress unused-var lint
         void startX; void startWidth;
       };
-      this._splitter.addEventListener('mousedown', this._onSplitterMouseDown);
+      this._on(this._splitter, 'mousedown', this._onSplitterMouseDown);
       document.addEventListener('mousemove', onMouseMove);
       document.addEventListener('mouseup', onMouseUp);
       this._onSplitterMouseMove = onMouseMove;
@@ -973,6 +1000,11 @@ export class TextCompare {
     // T39: cleanup center gutter
     if (this._gutterCanvas)  { this._gutterCanvas.width = 0; this._gutterCanvas = null; }
     if (this._gutterOverlay) { this._gutterOverlay.innerHTML = ''; this._gutterOverlay = null; }
+
+    // Drop every listener registered through _on(). The panes, splitter and
+    // toolbar buttons are static index.html nodes, so without this each
+    // close/reopen cycle would leave another copy attached.
+    this._ac.abort();
 
     this._mounted = false;
   }
@@ -1222,7 +1254,7 @@ export class TextCompare {
     pane.style.position = 'relative';
     pane.appendChild(ta);
 
-    ta.addEventListener('input', () => {
+    this._on(ta, 'input', () => {
       const timerKey = side === 'left' ? '_editTimerLeft' : '_editTimerRight';
       clearTimeout(this[timerKey]);
       this[timerKey] = setTimeout(() => {
@@ -1331,7 +1363,7 @@ export class TextCompare {
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
     // T33: start watching the new file path (if it's a real file path)
     if (path) window.electronAPI?.watchFile(path);
-    this._runDiff();
+    this._runDiff({ resetScroll: true });
   }
 
   /**
@@ -1350,7 +1382,7 @@ export class TextCompare {
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
     // T33: start watching the new file path (if it's a real file path)
     if (path) window.electronAPI?.watchFile(path);
-    this._runDiff();
+    this._runDiff({ resetScroll: true });
   }
 
   // -------------------------------------------------------------------------
@@ -1710,7 +1742,10 @@ ${rows}
   // -------------------------------------------------------------------------
 
   /** Run diffLines, build rows, render, update minimap + status. */
-  _runDiff() {
+  /**
+   * @param {{ resetScroll?: boolean }} [opts] forwarded to _render
+   */
+  _runDiff({ resetScroll = false } = {}) {
     if (!this._leftContent && !this._rightContent) return;
 
     if (!this._leftContent || !this._rightContent) {
@@ -1740,7 +1775,7 @@ ${rows}
 
     this._buildRows();
     this._buildDiffBlocks();
-    this._render();
+    this._render({ resetScroll });
     this._buildMinimap();
     this._updateStatusBar();
 
@@ -1966,8 +2001,19 @@ ${rows}
   // Private: render
   // -------------------------------------------------------------------------
 
-  /** Re-render both panes using virtual scrolling. */
-  _render() {
+  /**
+   * Re-render both panes using virtual scrolling.
+   *
+   * Scroll position is preserved by default. Expanding a collapsed block or
+   * changing font size / whitespace / show-filter used to snap the user back
+   * to line 0, which made it impossible to read what had just been expanded.
+   * Only a genuinely new document should reset the viewport.
+   *
+   * @param {{ resetScroll?: boolean }} [opts]
+   */
+  _render({ resetScroll = false } = {}) {
+    const prevScrollTop = this._contentLeft?.scrollTop ?? 0;
+    const prevScrollLeft = this._contentLeft?.scrollLeft ?? 0;
     this._totalRows = this._rows.length;
 
     // Build spacers so scroll range reflects real content height
@@ -1988,9 +2034,14 @@ ${rows}
     this._contentLeft.replaceChildren(spacerL);
     this._contentRight.replaceChildren(spacerR);
 
-    // Reset scroll to top
-    this._contentLeft.scrollTop = 0;
-    this._contentRight.scrollTop = 0;
+    const targetTop = resetScroll
+      ? 0
+      : Math.min(prevScrollTop, Math.max(0, totalH - this._contentLeft.clientHeight));
+    const targetLeft = resetScroll ? 0 : prevScrollLeft;
+    this._contentLeft.scrollTop = targetTop;
+    this._contentRight.scrollTop = targetTop;
+    this._contentLeft.scrollLeft = targetLeft;
+    this._contentRight.scrollLeft = targetLeft;
 
     // T13: Reapply word wrap after each render
     this._applyWordWrap();
@@ -2383,7 +2434,7 @@ ${rows}
       btnLeft.title = '複製到左側';
       btnLeft.textContent = '◀';
       const capturedIdx = blockIdx;
-      btnLeft.addEventListener('click', () => {
+      this._on(btnLeft, 'click', () => {
         if (capturedIdx < 0 || capturedIdx >= this._diffBlocks.length) return;
         this._currentDiff = capturedIdx;
         this._copyBlock('left');
@@ -2400,7 +2451,7 @@ ${rows}
       btnRight.className = 'tc-gutter-copy';
       btnRight.title = '複製到右側';
       btnRight.textContent = '▶';
-      btnRight.addEventListener('click', () => {
+      this._on(btnRight, 'click', () => {
         if (capturedIdx < 0 || capturedIdx >= this._diffBlocks.length) return;
         this._currentDiff = capturedIdx;
         this._copyBlock('right');
