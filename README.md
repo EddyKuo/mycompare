@@ -32,10 +32,14 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 其他功能：
 
 - 完整選單列（Session / File / Edit / Search / View / Tools / Help）
+- 命令列開關（`/fv` `/filters` `/qc` `/iu` `/expandall` `/script` 等，`/?` 顯示說明）
+- 資料夾快照（記錄結構與時間戳供日後比對，可選內容雜湊）
+- Session 資料夾分類
 - 多分頁（tab）工作區與工作區儲存
 - 深色 / 淺色主題（跟隨系統或手動切換）
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
+- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
 - 可自訂鍵盤快捷鍵
 - 拖放檔案或資料夾即可開始比對
@@ -43,9 +47,11 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ### 尚未實作
 
-以下屬於原產品的大型子系統，目前不在範圍內：FTP / SFTP / S3 / 雲端硬碟連線、
-Windows Registry 比對、版本資源與 MP3 標籤比對、Snapshots、
-命令列腳本語言、zip 以外的壓縮格式。
+- **遠端與雲端**：FTP / SFTP / S3 / Dropbox / OneDrive 連線設定檔
+- **Windows Registry 比對**
+- **腳本執行**：腳本語法檢查已實作（`/script=<file>` 會解析並回報錯誤與是否會寫檔），
+  但實際執行未實作——會寫檔的指令在未經真實輸入驗證前不適合無人值守執行
+- **壓縮格式**：bzip2 / xz / 7z / RAR 需要外部解碼器，會明確回報不支援而非模糊失敗
 
 ---
 

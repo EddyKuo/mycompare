@@ -603,6 +603,13 @@ ipcMain.handle('toggle-fullscreen', () => {
 })
 
 // IPC: 讀取 Excel (.xlsx/.xls) 並回傳每個工作表的 CSV 字串
+// IPC: MP3 / Version compare 的中繼資料（僅讀取檔頭與檔尾，不載入整個檔案）
+ipcMain.handle('read-metadata', async (_event, filePath) => {
+  const safe = validatePath(filePath)
+  const { readMetadata } = await import('./metadata.js')
+  return readMetadata(safe)
+})
+
 ipcMain.handle('read-excel', async (_event, filePath) => {
   const safe = validatePath(filePath)
   const XLSX = await import('xlsx')
