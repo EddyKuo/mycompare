@@ -16,6 +16,22 @@ import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el } from '../core/utils.js'
 import '../styles/table-compare.css'
 
+/** Fixed row height, mirroring `.tc-row { height: 24px }` in the stylesheet. */
+const TABLE_ROW_HEIGHT = 24
+
+/** Extra rows rendered above and below the viewport to hide scroll seams. */
+const TABLE_OVERSCAN = 10
+
+/** Coalesce scroll-driven re-renders onto the next frame. */
+function _rafThrottle(fn) {
+  let scheduled = false
+  return () => {
+    if (scheduled) return
+    scheduled = true
+    requestAnimationFrame(() => { scheduled = false; fn() })
+  }
+}
+
 // ── HTML Escape ──────────────────────────────────────────────────────────────
 
 /**
@@ -521,7 +537,7 @@ export class TableCompare {
     for (const alignedRow of this._alignedRows) {
       const { status, leftRow, rightRow } = alignedRow
       const diffs = status === 'different'
-        ? computeCellDiffs(leftRow, rightRow, colCount)
+        ? this._cellDiffsFor(alignedRow, colCount)
         : null
 
       leftTbody  += buildTr(leftRow,  status, rowNum, leftColCount,  diffs, 'left')
@@ -602,7 +618,7 @@ export class TableCompare {
       }
 
       if (row.status === 'different') {
-        const diffs = computeCellDiffs(row.leftRow, row.rightRow, colCount)
+        const diffs = this._cellDiffsFor(row, colCount)
         for (let i = 0; i < diffs.length; i++) {
           if (!diffs[i]) continue
           const colName = (headers && headers[i] != null) ? headers[i] : `col${i}`
@@ -849,20 +865,23 @@ export class TableCompare {
       this._parseAndRefresh()
     })
 
-    // Sync scroll between left and right panes
+    // Sync scroll between left and right panes, and repaint the virtual window.
     const { leftScroll, rightScroll } = this._dom
+    const repaint = _rafThrottle(() => this._renderTableWindow())
     let syncingScroll = false
     leftScroll.addEventListener('scroll', () => {
       if (syncingScroll) return
       syncingScroll = true
       rightScroll.scrollTop = leftScroll.scrollTop
       syncingScroll = false
+      repaint()
     })
     rightScroll.addEventListener('scroll', () => {
       if (syncingScroll) return
       syncingScroll = true
       leftScroll.scrollTop = rightScroll.scrollTop
       syncingScroll = false
+      repaint()
     })
 
     // Context menu
@@ -1026,20 +1045,22 @@ export class TableCompare {
     const rightColCount = this._rightParsed
       ? (this._rightParsed[0]?.length ?? 0)
       : 0
-    const colCount = Math.max(leftColCount, rightColCount)
+
+    this._leftColCount = leftColCount
+    this._rightColCount = rightColCount
+    this._colCount = Math.max(leftColCount, rightColCount)
 
     // Filter rows by visibility
-    const visibleRows = this._alignedRows.filter((r) => this._isRowVisible(r))
+    this._visibleRows = this._alignedRows.filter((r) => this._isRowVisible(r))
 
     // Build header rows
     this._renderPaneHeader(this._dom.leftHeader, leftHeaders, leftColCount)
     this._renderPaneHeader(this._dom.rightHeader, rightHeaders, rightColCount)
 
-    // Build left table
     this._dom.leftScroll.innerHTML = ''
     this._dom.rightScroll.innerHTML = ''
 
-    if (visibleRows.length === 0) {
+    if (this._visibleRows.length === 0) {
       const msg = el('div', { className: 'tc-empty-state' },
         el('span', { className: 'tc-empty-icon' }, '✓'),
         el('span', {}, '沒有符合條件的列'),
@@ -1050,32 +1071,89 @@ export class TableCompare {
       return
     }
 
-    const leftTable = el('table', { className: 'tc-table' })
-    const rightTable = el('table', { className: 'tc-table' })
-    const leftTbody = document.createElement('tbody')
-    const rightTbody = document.createElement('tbody')
-
-    let rowNum = 1
-    for (const alignedRow of visibleRows) {
-      const { status, leftRow, rightRow } = alignedRow
-      const cellDiffs = (status === 'different')
-        ? computeCellDiffs(leftRow, rightRow, colCount)
-        : null
-
-      const leftTr = this._buildTableRow(leftRow, status, rowNum, leftColCount, cellDiffs, 'left')
-      const rightTr = this._buildTableRow(rightRow, status, rowNum, rightColCount, cellDiffs, 'right')
-
-      leftTbody.appendChild(leftTr)
-      rightTbody.appendChild(rightTr)
-      rowNum++
+    // Virtual scrolling: a spacer establishes the true scroll height while
+    // only the rows in view are built. Without this a 100k-row CSV produced
+    // 100k <tr> per side on every filter or checkbox change.
+    const totalHeight = this._visibleRows.length * TABLE_ROW_HEIGHT
+    for (const side of ['left', 'right']) {
+      const scroll = this._dom[`${side}Scroll`]
+      const spacer = el('div', { className: 'tc-vs-spacer' })
+      spacer.style.cssText = `position:relative;height:${totalHeight}px;`
+      const table = el('table', { className: 'tc-table' })
+      table.style.cssText = 'position:absolute;left:0;right:0;top:0;'
+      const tbody = document.createElement('tbody')
+      table.appendChild(tbody)
+      spacer.appendChild(table)
+      scroll.appendChild(spacer)
+      this._dom[`${side}Table`] = table
+      this._dom[`${side}Tbody`] = tbody
     }
 
-    leftTable.appendChild(leftTbody)
-    rightTable.appendChild(rightTbody)
-    this._dom.leftScroll.appendChild(leftTable)
-    this._dom.rightScroll.appendChild(rightTable)
-
+    // The tbodies above are brand new, so the previously rendered window no
+    // longer describes what is in the DOM. Without clearing it, an unchanged
+    // range would short-circuit and leave both panes empty.
+    this._windowFirst = null
+    this._windowLast = null
+    this._renderTableWindow()
     this._renderStats()
+  }
+
+  /**
+   * Render only the rows currently in view, plus a small overscan margin.
+   * Both panes share one scroll position, so one window serves both.
+   */
+  _renderTableWindow() {
+    const { leftScroll, leftTbody, rightTbody, leftTable, rightTable } = this._dom
+    if (!leftScroll || !leftTbody || !rightTbody) return
+
+    const rows = this._visibleRows ?? []
+    const viewport = leftScroll.clientHeight || 600
+    const first = Math.max(0, Math.floor(leftScroll.scrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN)
+    const count = Math.ceil(viewport / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN * 2
+    const last = Math.min(rows.length, first + count)
+
+    if (this._windowFirst === first && this._windowLast === last) return
+    this._windowFirst = first
+    this._windowLast = last
+
+    const offset = first * TABLE_ROW_HEIGHT
+    if (leftTable) leftTable.style.top = `${offset}px`
+    if (rightTable) rightTable.style.top = `${offset}px`
+
+    const leftFrag = document.createDocumentFragment()
+    const rightFrag = document.createDocumentFragment()
+
+    for (let i = first; i < last; i++) {
+      const alignedRow = rows[i]
+      const { status, leftRow, rightRow } = alignedRow
+      const cellDiffs = (status === 'different')
+        ? this._cellDiffsFor(alignedRow)
+        : null
+      leftFrag.appendChild(
+        this._buildTableRow(leftRow, status, i + 1, this._leftColCount, cellDiffs, 'left'))
+      rightFrag.appendChild(
+        this._buildTableRow(rightRow, status, i + 1, this._rightColCount, cellDiffs, 'right'))
+    }
+
+    leftTbody.replaceChildren(leftFrag)
+    rightTbody.replaceChildren(rightFrag)
+  }
+
+  /**
+   * Cell diffs for one aligned row, memoised.
+   *
+   * The same row's diffs were previously recomputed by the renderer, by
+   * getStats() and again by exportHtml().
+   *
+   * @param {object} alignedRow
+   */
+  _cellDiffsFor(alignedRow, colCount) {
+    const cols = colCount ?? this._colCount ?? 0
+    if (!alignedRow._cellDiffs || alignedRow._cellDiffs.length !== cols) {
+      alignedRow._cellDiffs = computeCellDiffs(
+        alignedRow.leftRow, alignedRow.rightRow, cols)
+    }
+    return alignedRow._cellDiffs
   }
 
   /**

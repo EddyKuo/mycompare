@@ -54,3 +54,36 @@ test('Table 注入 CSV 兩側後渲染列數 > 0 且 cell-diff 出現', async ()
   const diffCount = await win.evaluate(() => window.__testAPI?.tableGetDiffCellCount())
   expect(diffCount).toBeGreaterThan(0)
 })
+
+test('大表格只渲染可視範圍的列（虛擬捲動）', async () => {
+  await goToTableCompare(win)
+
+  const ROWS = 20000
+  await win.evaluate((n) => {
+    const build = (tweak) => {
+      const lines = ['id,name,value']
+      for (let i = 0; i < n; i++) lines.push(`${i},name${i},${tweak && i === 5 ? 'X' : i}`)
+      return lines.join('\n')
+    }
+    window.__testAPI?.tableSetLeft('big-left.csv', build(false))
+    window.__testAPI?.tableSetRight('big-right.csv', build(true))
+  }, ROWS)
+
+  await win.waitForFunction(
+    () => (window.__testAPI?.tableGetRowCount() ?? 0) > 0,
+    { timeout: 15000 }
+  )
+
+  // Scroll height must reflect all rows even though only a window is built.
+  const spacerHeight = await win.evaluate(
+    () => document.querySelector('.tc-table-scroll .tc-vs-spacer')?.clientHeight ?? 0
+  )
+  expect(spacerHeight).toBeGreaterThan(ROWS * 20)
+
+  const renderedRows = await win.evaluate(
+    () => document.querySelectorAll('.tc-table-scroll .tc-row').length
+  )
+  expect(renderedRows).toBeGreaterThan(0)
+  // Two panes, a viewport's worth each plus overscan — nowhere near 20000.
+  expect(renderedRows).toBeLessThan(500)
+})
