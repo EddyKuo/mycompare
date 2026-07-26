@@ -8,6 +8,7 @@ import { buildAppMenu } from './menu.js'
 import { parseCli, usageText } from './cli.js'
 import { parseScript, describeScript, isMutating } from './script.js'
 import { writeSnapshot, readSnapshot, snapshotLevel } from './snapshot.js'
+import { readArchive, readArchiveEntry } from './archive.js'
 
 // ── T33 (S12-W): File Watcher — capped to avoid resource exhaustion ──
 const MAX_WATCHERS = 64
@@ -407,6 +408,23 @@ ipcMain.handle('open-zip', async (event) => {
   })
 
   return { zipPath, entries }
+})
+
+// IPC: 讀取壓縮檔目錄（tar / gzip / tar.gz / zip 家族），回傳統一形狀
+ipcMain.handle('read-archive', async (_event, archivePath) => {
+  const safe = validatePath(archivePath)
+  return readArchive(safe)
+})
+
+// IPC: 讀取壓縮檔內單一 entry 的內容
+//
+// entryPath 不經過 validatePath()：它是壓縮檔內部的相對路徑，不是檔案系統
+// 路徑，且 validatePath() 會拒絕含 "::" 的字串。穿越防護由 archive.js 的
+// sanitizeEntryPath() 負責。
+ipcMain.handle('read-archive-entry', async (_event, { archivePath, entryPath }) => {
+  const safe = validatePath(archivePath)
+  const buffer = await readArchiveEntry(safe, entryPath)
+  return buffer.toString('base64')
 })
 
 /**

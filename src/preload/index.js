@@ -39,6 +39,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveFile: (defaultPath, content, filters, encoding, backup) =>
     ipcRenderer.invoke('save-file', { defaultPath, content, filters, encoding, backup }),
   openZip: () => ipcRenderer.invoke('open-zip'),
+  readArchive: (archivePath) => ipcRenderer.invoke('read-archive', archivePath),
+  readArchiveEntry: (archivePath, entryPath) =>
+    ipcRenderer.invoke('read-archive-entry', { archivePath, entryPath }),
   hashFile: (path) => ipcRenderer.invoke('hash-file', path),
   readExcel: (path) => ipcRenderer.invoke('read-excel', path),
   renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
