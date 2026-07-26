@@ -648,7 +648,7 @@ export function decodeXz(buf, opts = {}) {
   if (buf.length < 24) throw new LzmaError('xz 檔太短')
 
   // Stream header is 12 bytes: magic(6) + flags(2) + CRC32(4).
-  let pos = 12
+  const pos = 12
   /** @type {Uint8Array[]} */
   const parts = []
   let total = 0
