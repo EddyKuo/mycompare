@@ -323,6 +323,7 @@ export class TextCompare {
       contextLines: options.contextLines ?? 6,
       ignorePatterns: options.ignorePatterns ?? [],
       unimportantPatterns: options.unimportantPatterns ?? [],
+      ignoreUnimportant: options.ignoreUnimportant ?? false,
     };
 
     // Content state
@@ -1875,7 +1876,57 @@ ${rows}
         continue
       }
       dl.unimportant = unimportantRe.length > 0 && unimportantRe.some(re => re.test(text))
+      // BC's "Ignore Unimportant Differences" downgrades these to equal rather
+      // than merely tinting them blue, which is what makes a file with only
+      // cosmetic changes read as identical.
+      if (dl.unimportant && this._opts.ignoreUnimportant) dl.type = 'equal'
     }
+  }
+
+  /**
+   * Toggle whether unimportant differences count as differences at all.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} the resulting state
+   */
+  setIgnoreUnimportant(on) {
+    this._opts.ignoreUnimportant = on ?? !this._opts.ignoreUnimportant
+    this._runDiff()
+    return this._opts.ignoreUnimportant
+  }
+
+  /**
+   * Number of context lines kept around each difference when folding, and
+   * when the Show filter is set to 'diff'.
+   * @param {number} n
+   */
+  setContextLines(n) {
+    const v = Number(n)
+    if (!Number.isFinite(v)) return
+    this._opts.contextLines = Math.max(0, Math.min(100, Math.round(v)))
+    this._runDiff()
+  }
+
+  /** @returns {number} */
+  getContextLines() {
+    return this._opts.contextLines
+  }
+
+  /**
+   * How many rows the active Show filter is hiding.
+   *
+   * Surfaced in the status bar so a filtered view does not read as a file that
+   * simply has fewer lines than it does.
+   *
+   * @returns {{ shown: number, hidden: number, total: number }}
+   */
+  getFilterCounts() {
+    const total = this._diffResult?.length ?? 0
+    let shown = 0
+    for (const row of this._rows) {
+      if (row.kind === 'line') shown++
+      else if (row.kind === 'collapsed' && !row.expanded) shown += row.collapsedCount
+    }
+    return { shown, hidden: Math.max(0, total - shown), total }
   }
 
   /**
@@ -1904,6 +1955,7 @@ ${rows}
       ignoreCase:         this._opts.ignoreCase,
       ignoreLineEndings:  this._opts.ignoreLineEndings,
       contextLines:       this._opts.contextLines,
+      ignoreUnimportant:  this._opts.ignoreUnimportant,
       ignorePatterns:     Array.isArray(this._opts.ignorePatterns) ? [...this._opts.ignorePatterns] : [],
       unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
     }
@@ -1916,7 +1968,7 @@ ${rows}
    */
   applyConfig(settings) {
     if (!settings || typeof settings !== 'object') return
-    const known = ['algorithm','ignoreWhitespace','ignoreCase','ignoreLineEndings','contextLines','ignorePatterns','unimportantPatterns']
+    const known = ['algorithm','ignoreWhitespace','ignoreCase','ignoreLineEndings','contextLines','ignorePatterns','unimportantPatterns','ignoreUnimportant']
     for (const key of known) {
       if (Object.prototype.hasOwnProperty.call(settings, key)) {
         const value = settings[key]
@@ -2566,7 +2618,12 @@ ${rows}
         : '就緒';
     }
     if (this._statusLines) {
-      this._statusLines.textContent = `${totalLines} 行`;
+      // Say so when the Show filter is hiding rows; otherwise a filtered view
+      // reads as a file that simply has fewer lines than it does.
+      const { hidden } = this.getFilterCounts();
+      this._statusLines.textContent = hidden > 0
+        ? `${totalLines} 行（已隱藏 ${hidden}）`
+        : `${totalLines} 行`;
     }
     if (this._statusEncoding) {
       this._statusEncoding.textContent = this._encodingLeft === this._encodingRight

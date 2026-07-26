@@ -123,7 +123,17 @@ export function buildAppMenu(win) {
         item('複製區塊到左側', 'edit.copyToLeft', 'Alt+Left'),
         item('複製區塊到右側', 'edit.copyToRight', 'Alt+Right'),
         item('複製全部差異到左側', 'edit.copyAllToLeft'),
-        item('複製全部差異到右側', 'edit.copyAllToRight')
+        item('複製全部差異到右側', 'edit.copyAllToRight'),
+        { type: 'separator' },
+        {
+          label: '三向合併：全部採用',
+          submenu: [
+            item('左側', 'merge.resolveAll.left'),
+            item('中間（Base）', 'merge.resolveAll.base'),
+            item('右側', 'merge.resolveAll.right'),
+            item('兩者', 'merge.resolveAll.both')
+          ]
+        }
       ]
     },
     {
@@ -163,10 +173,13 @@ export function buildAppMenu(win) {
           ]
         },
         { type: 'separator' },
+        item('忽略不重要差異', 'view.toggleIgnoreUnimportant'),
+        { type: 'separator' },
         item('行號', 'view.toggleLineNumbers'),
         item('顯示空白字元', 'view.toggleWhitespace'),
         item('自動換行', 'view.toggleWordWrap'),
         item('切換並排 / 上下佈局', 'view.toggleLayout'),
+        item('三向合併：只顯示衝突', 'view.merge.conflictsOnly'),
         { type: 'separator' },
         item('放大', 'view.zoomIn', 'CmdOrCtrl+='),
         item('縮小', 'view.zoomOut', 'CmdOrCtrl+-'),

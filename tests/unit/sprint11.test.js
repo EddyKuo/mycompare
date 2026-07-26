@@ -130,6 +130,7 @@ describe('T61 TextCompare config snapshot', () => {
       contextLines: 10,
       ignorePatterns: ['^\\s*//'],
       unimportantPatterns: ['^\\s*import'],
+      ignoreUnimportant: false,
     })
   })
 
@@ -143,6 +144,7 @@ describe('T61 TextCompare config snapshot', () => {
       contextLines: 4,
       ignorePatterns: ['^//'],
       unimportantPatterns: ['^import'],
+      ignoreUnimportant: true,
     }
     tc.applyConfig(snapshot)
     expect(tc.getConfig()).toEqual(snapshot)

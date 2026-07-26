@@ -796,6 +796,10 @@ function setupToolbarButtons() {
   el('btn-modal-close').addEventListener('click', closeIgnoreRulesModal)
   el('btn-modal-cancel').addEventListener('click', closeIgnoreRulesModal)
   el('btn-modal-apply').addEventListener('click', () => {
+    const chkUnimportant = el('chk-ignore-unimportant')
+    if (chkUnimportant) textCompare?.setIgnoreUnimportant(chkUnimportant.checked)
+    const ctxInput = el('input-context-lines')
+    if (ctxInput && ctxInput.value !== '') textCompare?.setContextLines(ctxInput.value)
     const ignorePatterns = el('input-ignore-patterns').value
       .split('\n').map(s => s.trim()).filter(Boolean)
     const unimportantPatterns = el('input-unimportant-patterns').value
@@ -1279,10 +1283,10 @@ function updateToolbar() {
 function setupKeyboardShortcuts() {
   /** @type {Record<string, () => void>} */
   const actions = {
-    nextDiff:  () => { if (currentView === 'text') textCompare?.navigateNext() },
-    prevDiff:  () => { if (currentView === 'text') textCompare?.navigatePrev() },
-    firstDiff: () => { if (currentView === 'text') textCompare?.navigateFirst() },
-    lastDiff:  () => { if (currentView === 'text') textCompare?.navigateLast() },
+    nextDiff:  () => navigateDiff('next'),
+    prevDiff:  () => navigateDiff('prev'),
+    firstDiff: () => navigateDiff('first'),
+    lastDiff:  () => navigateDiff('last'),
     copyLeft:  () => { if (currentView === 'text') textCompare?.copyToLeft() },
     copyRight: () => { if (currentView === 'text') textCompare?.copyToRight() },
     copyAllLeft:  () => { if (currentView === 'text') textCompare?.copyAllToLeft() },
@@ -1455,6 +1459,26 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
   }
 }
 
+/**
+ * Route difference navigation to whichever view is showing.
+ *
+ * Hex, table and 3-way merge all grew their own navigation; without this the
+ * menu items and F7/F8 would still only ever drive the text view.
+ *
+ * @param {'next'|'prev'|'first'|'last'} where
+ */
+function navigateDiff(where) {
+  const cap = where[0].toUpperCase() + where.slice(1)
+  if (currentView === 'text') {
+    textCompare?.[`navigate${cap}`]?.()
+  } else if (currentView === 'merge3') {
+    mergeCompare?.[`${where}Conflict`]?.()
+  } else {
+    const view = { hex: hexCompare, table: tableCompare }[currentView]
+    view?.[`${where}Difference`]?.()
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Session 持久化
 // ---------------------------------------------------------------------------
@@ -1535,9 +1559,9 @@ function setupMenuActions() {
     'session.home':       () => showHome(),
     'session.settings':   () => openConfigModal(),
     'session.workspaces': () => openWorkspacesModal(),
-    'session.swap':       () => {
-      if (currentView === 'text') textCompare?.swap()
-      else if (currentView === 'folder') folderCompare?.swap?.()
+    'session.swap': () => {
+      const view = { text: textCompare, folder: folderCompare, hex: hexCompare, table: tableCompare }[currentView]
+      void view?.swap?.()
     },
     'session.recompare':  () => {
       if (currentView === 'text') textCompare?.refresh()
@@ -1584,17 +1608,29 @@ function setupMenuActions() {
     'edit.copyAllToLeft':  () => { if (currentView === 'text') textCompare?.copyAllToLeft() },
     'edit.copyAllToRight': () => { if (currentView === 'text') textCompare?.copyAllToRight() },
 
+    'merge.resolveAll.left':  () => { mergeCompare?.resolveAll?.('left') },
+    'merge.resolveAll.right': () => { mergeCompare?.resolveAll?.('right') },
+    'merge.resolveAll.base':  () => { mergeCompare?.resolveAll?.('base') },
+    'merge.resolveAll.both':  () => { mergeCompare?.resolveAll?.('both') },
+    'view.merge.conflictsOnly': () => {
+      if (!mergeCompare?.getShowFilter) return
+      const next = mergeCompare.getShowFilter() === 'conflicts' ? 'all' : 'conflicts'
+      mergeCompare.setShowFilter(next)
+      showStatus(next === 'conflicts' ? '只顯示衝突' : '顯示全部')
+    },
+
     'search.find': () => {
       if (currentView === 'text') textCompare?.openFind()
       else if (currentView === 'hex') hexCompare?.openFind?.()
+      else if (currentView === 'table') tableCompare?.openFind?.()
       else if (currentView === 'folder') folderCompare?.openFindBar?.()
     },
     'search.replace':  () => { if (currentView === 'text') textCompare?.openReplace() },
     'search.gotoLine': () => { if (currentView === 'text') textCompare?.openGoto() },
-    'search.nextDiff':  () => { if (currentView === 'text') textCompare?.navigateNext() },
-    'search.prevDiff':  () => { if (currentView === 'text') textCompare?.navigatePrev() },
-    'search.firstDiff': () => { if (currentView === 'text') textCompare?.navigateFirst() },
-    'search.lastDiff':  () => { if (currentView === 'text') textCompare?.navigateLast() },
+    'search.nextDiff':  () => navigateDiff('next'),
+    'search.prevDiff':  () => navigateDiff('prev'),
+    'search.firstDiff': () => navigateDiff('first'),
+    'search.lastDiff':  () => navigateDiff('last'),
     'search.toggleBookmark': () => { if (currentView === 'text') textCompare?.toggleBookmark() },
     'search.nextBookmark':   () => { if (currentView === 'text') textCompare?.nextBookmark() },
     'search.prevBookmark':   () => { if (currentView === 'text') textCompare?.prevBookmark() },
@@ -1622,6 +1658,13 @@ function setupMenuActions() {
     'view.folder.rightNewer':     () => folderCompare?.setViewPreset('right-newer'),
     'view.folder.leftOrphans':    () => folderCompare?.setViewPreset('left-orphans'),
     'view.folder.rightOrphans':   () => folderCompare?.setViewPreset('right-orphans'),
+    'view.toggleIgnoreUnimportant': () => {
+      if (currentView !== 'text' || !textCompare) return
+      const on = textCompare.setIgnoreUnimportant()
+      const chk = el('chk-ignore-unimportant')
+      if (chk) chk.checked = on
+      showStatus(on ? '已忽略不重要差異' : '已顯示不重要差異')
+    },
     'view.toggleLineNumbers': () => { if (currentView === 'text') textCompare?.toggleLineNumbers() },
     'view.toggleWhitespace':  () => { if (currentView === 'text') textCompare?.toggleWhitespace() },
     'view.toggleWordWrap':    () => { if (currentView === 'text') textCompare?.toggleWordWrap() },

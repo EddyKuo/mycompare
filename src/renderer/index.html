@@ -255,6 +255,11 @@
         <textarea id="input-ignore-patterns" rows="4" placeholder="例：^\s*//.*$&#10;^\s*$"></textarea>
         <label>不重要差異模式（符合的行顯示為藍色，每行一個 Regex）：</label>
         <textarea id="input-unimportant-patterns" rows="4" placeholder="例：^\s*import "></textarea>
+        <label class="text-option-label" style="margin-top:8px">
+          <input type="checkbox" id="chk-ignore-unimportant"> 忽略不重要差異（視為相同）
+        </label>
+        <label style="margin-top:8px">前後保留的相同行數（Context）：</label>
+        <input type="number" id="input-context-lines" min="0" max="100" value="6" style="width:80px">
       </div>
       <div class="modal-footer">
         <button id="btn-modal-cancel">取消</button>

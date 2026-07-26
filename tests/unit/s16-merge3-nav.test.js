@@ -24,8 +24,9 @@ const RIGHT = ['a', 'R1', 'c', 'd', 'e', 'R2', 'g'].join('\n')
  * @returns {{ view: ThreeWayCompare, host: HTMLElement }}
  */
 function mountView(contents = {}) {
+  // Kept out of document.body on purpose: several instances coexist across
+  // tests and jsdom's `#id` lookup resolves duplicates document-wide.
   const host = document.createElement('div')
-  document.body.appendChild(host)
   const view = new ThreeWayCompare()
   view.mount(host)
   view.setSide('base', contents.base ?? BASE)
