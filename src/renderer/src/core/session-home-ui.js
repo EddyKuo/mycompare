@@ -5,6 +5,16 @@
  * Import into app.js and call renderRecentSessions() after DOM is ready.
  */
 
+import {
+  ROOT_GROUP,
+  loadGroups,
+  saveGroups,
+  addGroup,
+  removeGroup,
+  assignSession,
+  buildGroupTree,
+  flattenGroups,
+} from './session-groups.js'
 import { SessionStore } from './session-store.js'
 
 /** Shared store instance — also exported for use in app.js */
@@ -83,7 +93,7 @@ function displayPath(session) {
  * @param {(id: string) => void} onRemove
  * @returns {HTMLElement}
  */
-function buildRecentItem(session, onOpen, onRemove) {
+function buildRecentItem(session, onOpen, onRemove, onRegroup) {
   const item = document.createElement('div')
   item.className = 'recent-item'
   item.dataset.id = session.id
@@ -95,8 +105,30 @@ function buildRecentItem(session, onOpen, onRemove) {
     <span class="ri-name">${escapeHtml(session.name)}</span>
     ${path ? `<span class="ri-path" title="${escapeHtml(path)}">${escapeHtml(path)}</span>` : ''}
     <span class="ri-time">${relativeTime(session.updatedAt)}</span>
+    <select class="ri-group" title="移到資料夾"></select>
     <span class="ri-remove" title="移除">✕</span>
   `
+
+  // Filing control. Built as real options rather than markup so a folder name
+  // can never be interpreted as HTML.
+  const picker = item.querySelector('.ri-group')
+  const state = loadGroups()
+  const rootOpt = document.createElement('option')
+  rootOpt.value = ROOT_GROUP
+  rootOpt.textContent = '（未分類）'
+  picker.appendChild(rootOpt)
+  for (const g of flattenGroups(state)) {
+    const opt = document.createElement('option')
+    opt.value = g.id
+    opt.textContent = `${'　'.repeat(g.depth)}${g.name}`
+    picker.appendChild(opt)
+  }
+  picker.value = state.membership[session.id] ?? ROOT_GROUP
+  picker.addEventListener('click', (e) => e.stopPropagation())
+  picker.addEventListener('change', () => {
+    saveGroups(assignSession(loadGroups(), session.id, picker.value))
+    onRegroup?.()
+  })
 
   // Open on row click (but not on the remove button)
   item.addEventListener('click', (e) => {
@@ -219,18 +251,73 @@ export function renderRecentSessions(onOpen, onRemove) {
     return
   }
 
-  // Build list
+  const rerender = () => renderRecentSessions(onOpen, onRemove)
+
+  const btnNewGroup = document.createElement('button')
+  btnNewGroup.className = 'session-action-btn'
+  btnNewGroup.textContent = '＋ 新增資料夾'
+  btnNewGroup.addEventListener('click', () => {
+    const name = prompt('資料夾名稱：')
+    if (!name) return
+    saveGroups(addGroup(loadGroups(), name).state)
+    rerender()
+  })
+  actionBar.appendChild(btnNewGroup)
+
   const list = document.createElement('div')
   list.className = 'recent-list'
 
-  for (const session of sessions) {
-    list.appendChild(
-      buildRecentItem(session, onOpen, (id) => {
-        // Re-render the list, then notify the caller
-        renderRecentSessions(onOpen, onRemove)
-        onRemove(id)
+  const removeAndRerender = (id) => {
+    rerender()
+    onRemove(id)
+  }
+
+  /**
+   * @param {import('./session-groups.js').GroupNode} node
+   * @param {HTMLElement} parentEl
+   * @param {number} depth
+   */
+  const renderNode = (node, parentEl, depth) => {
+    for (const child of node.children) {
+      const header = document.createElement('div')
+      header.className = 'recent-group'
+      header.style.paddingLeft = `${depth * 16}px`
+
+      const label = document.createElement('span')
+      label.className = 'rg-name'
+      label.textContent = `📁 ${child.group.name}`
+      header.appendChild(label)
+
+      const count = document.createElement('span')
+      count.className = 'rg-count'
+      count.textContent = String(child.sessions.length)
+      header.appendChild(count)
+
+      const del = document.createElement('span')
+      del.className = 'rg-remove'
+      del.title = '刪除資料夾（其中的 Session 會移回未分類）'
+      del.textContent = '✕'
+      del.addEventListener('click', () => {
+        saveGroups(removeGroup(loadGroups(), child.group.id))
+        rerender()
       })
-    )
+      header.appendChild(del)
+
+      parentEl.appendChild(header)
+
+      for (const session of child.sessions) {
+        const row = buildRecentItem(session, onOpen, removeAndRerender, rerender)
+        row.style.paddingLeft = `${(depth + 1) * 16}px`
+        parentEl.appendChild(row)
+      }
+      renderNode(child, parentEl, depth + 1)
+    }
+  }
+
+  const tree = buildGroupTree(loadGroups(), sessions)
+  renderNode(tree, list, 0)
+  for (const session of tree.sessions) {
+    list.appendChild(buildRecentItem(session, onOpen, removeAndRerender, rerender))
   }
 
   container.appendChild(list)

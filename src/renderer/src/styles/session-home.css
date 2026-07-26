@@ -60,3 +60,32 @@
   outline: 2px dashed var(--accent, #3b82f6);
   outline-offset: -8px;
 }
+
+/* ── Session folders ── */
+.recent-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--bg-toolbar);
+}
+.recent-group .rg-name { flex: 1; }
+.recent-group .rg-count {
+  font-weight: 400;
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
+.recent-group .rg-remove {
+  cursor: pointer;
+  opacity: 0.5;
+}
+.recent-group .rg-remove:hover { opacity: 1; }
+.recent-item .ri-group {
+  font-size: 11px;
+  max-width: 140px;
+}

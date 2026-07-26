@@ -25,6 +25,7 @@ test.beforeEach(async () => {
   await win.evaluate(() => {
     localStorage.removeItem('mycompare:sessions')
     localStorage.removeItem('mycompare:recent')
+    localStorage.removeItem('mycompare:sessionGroups')
   })
 })
 
@@ -91,4 +92,77 @@ test('updating paths reuses the same session rather than piling up duplicates', 
   })
   // One tab, one session record — not one per path change.
   expect(count).toBe(1)
+})
+
+test('sessions can be filed into folders on the home screen', async () => {
+  // Record a session so there is something to file.
+  await win.evaluate(() => {
+    document.querySelector('.session-type-btn[data-type="hex"]')?.click()
+  })
+  await win.evaluate(() => {
+    window.__testAPI?.hexSetLeft('C:\tmp\g1.bin', btoa('aaa'))
+    window.__testAPI?.hexSetRight('C:\tmp\g2.bin', btoa('bbb'))
+  })
+  await win.evaluate(() => document.getElementById('btn-new-session')?.click())
+  await expect(win.locator('.recent-sessions .recent-item')).toHaveCount(1)
+
+  // Create a folder without going through prompt(), which cannot be driven.
+  await win.evaluate(() => {
+    window.prompt = () => '專案 A'
+    ;[...document.querySelectorAll('.session-action-btn')]
+      .find((b) => b.textContent.includes('新增資料夾'))?.click()
+  })
+  await expect(win.locator('.recent-sessions .recent-group')).toHaveCount(1)
+
+  // File the session into it.
+  const groupId = await win.evaluate(() => {
+    const sel = document.querySelector('.recent-item .ri-group')
+    const opt = [...sel.options].find((o) => o.textContent.includes('專案 A'))
+    sel.value = opt.value
+    sel.dispatchEvent(new Event('change', { bubbles: true }))
+    return opt.value
+  })
+  expect(groupId).toBeTruthy()
+
+  const stored = await win.evaluate(() => {
+    const raw = localStorage.getItem('mycompare:sessionGroups')
+    return raw ? JSON.parse(raw) : null
+  })
+  expect(Object.values(stored.membership)).toContain(groupId)
+
+  // The session now renders under the folder header rather than at the root.
+  const order = await win.evaluate(() =>
+    [...document.querySelectorAll('.recent-sessions .recent-list > *')]
+      .map((el) => el.className))
+  expect(order[0]).toContain('recent-group')
+  expect(order[1]).toContain('recent-item')
+})
+
+test('deleting a folder keeps the sessions filed under it', async () => {
+  // Self-contained: beforeEach clears storage, so this builds its own state.
+  await win.evaluate(() => {
+    document.querySelector('.session-type-btn[data-type="hex"]')?.click()
+  })
+  await win.evaluate(() => {
+    window.__testAPI?.hexSetLeft('C:\tmp\d1.bin', btoa('aaa'))
+    window.__testAPI?.hexSetRight('C:\tmp\d2.bin', btoa('bbb'))
+  })
+  await win.evaluate(() => document.getElementById('btn-new-session')?.click())
+
+  await win.evaluate(() => {
+    window.prompt = () => '待刪除'
+    ;[...document.querySelectorAll('.session-action-btn')]
+      .find((b) => b.textContent.includes('新增資料夾'))?.click()
+    const sel = document.querySelector('.recent-item .ri-group')
+    const opt = [...sel.options].find((o) => o.textContent.includes('待刪除'))
+    sel.value = opt.value
+    sel.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await expect(win.locator('.recent-sessions .recent-group')).toHaveCount(1)
+
+  await win.evaluate(() => document.querySelector('.recent-sessions .rg-remove')?.click())
+
+  // Losing a folder must not lose the work filed under it.
+  await expect(win.locator('.recent-sessions .recent-group')).toHaveCount(0)
+  await expect(win.locator('.recent-sessions .recent-item')).toHaveCount(1)
 })
