@@ -1643,6 +1643,14 @@ function setupMenuActions() {
       if (currentView === 'text') void textCompare?.exportHtml()
       else if (currentView === 'folder') void folderCompare?.exportHtml()
     },
+    'file.exportText': () => {
+      if (currentView === 'text') void textCompare?.exportTextReport()
+      else showStatus('此視圖尚未支援純文字報告')
+    },
+    'file.exportPatch': () => {
+      if (currentView === 'text') void textCompare?.exportUnifiedDiff()
+      else showStatus('Unified Diff 僅適用於文字比對')
+    },
     'file.print': () => {
       if (currentView === 'text') void textCompare?.exportHtml({ print: true })
       else if (currentView === 'folder') void folderCompare?.exportHtml({ print: true })

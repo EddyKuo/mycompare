@@ -18,6 +18,7 @@
 import { diffLines, diffChars } from '../core/diff-engine.js';
 import { showContextMenu } from '../core/context-menu.js';
 import { SettingsStore } from '../core/settings-store.js';
+import { renderTextTable, reportHeader, reportSummary } from '../core/report.js';
 import { detectEol } from '../core/eol-detect.js';
 import { isActive } from '../core/active-view.js';
 
@@ -1652,6 +1653,63 @@ ${rows}
       return
     }
     await window.electronAPI.saveFile('compare-report.html', html)
+  }
+
+  /**
+   * Build the comparison as a plain-text report.
+   *
+   * @param {{ generatedAt?: Date }} [opts]
+   * @returns {string}
+   */
+  buildTextReport(opts = {}) {
+    const stats = this.getDiffStats();
+    const header = reportHeader({
+      title: '文字比對報告',
+      leftPath: this._leftPath,
+      rightPath: this._rightPath,
+      generatedAt: opts.generatedAt,
+    });
+    const summary = reportSummary(stats, {
+      insert: '新增', delete: '刪除', replace: '變更', equal: '相同',
+    });
+
+    const rows = [];
+    for (const dl of this._diffResult ?? []) {
+      if (dl.type === 'equal') continue;
+      const mark = { insert: '+', delete: '-', replace: '~' }[dl.type] ?? '?';
+      rows.push([
+        mark,
+        dl.leftLine == null ? '' : String(dl.leftLine),
+        (dl.leftText ?? '').replace(/[\r\n]+$/, ''),
+        dl.rightLine == null ? '' : String(dl.rightLine),
+        (dl.rightText ?? '').replace(/[\r\n]+$/, ''),
+      ]);
+    }
+
+    const table = rows.length
+      ? renderTextTable(
+          [
+            { title: '' },
+            { title: '左行', align: 'right' },
+            { title: '左內容' },
+            { title: '右行', align: 'right' },
+            { title: '右內容' },
+          ],
+          rows)
+      : '（兩側內容相同）';
+
+    return `${header}${summary}\n\n${table}\n`;
+  }
+
+  /**
+   * Save the plain-text report.
+   * @returns {Promise<void>}
+   */
+  async exportTextReport() {
+    await window.electronAPI.saveFile(
+      'compare-report.txt',
+      this.buildTextReport(),
+      [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }]);
   }
 
   /**

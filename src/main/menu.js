@@ -104,6 +104,8 @@ export function buildAppMenu(win) {
         item('儲存右側', 'file.saveRight', 'CmdOrCtrl+Shift+S'),
         { type: 'separator' },
         item('匯出 HTML 報告…', 'file.exportHtml'),
+        item('匯出純文字報告…', 'file.exportText'),
+        item('匯出 Unified Diff…', 'file.exportPatch'),
         item('列印 / 匯出 PDF…', 'file.print', 'CmdOrCtrl+P')
       ]
     },
