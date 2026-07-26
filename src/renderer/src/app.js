@@ -202,6 +202,7 @@ export function initApp() {
   setupPathBarButtons()
   setupMenuActions()
   setupSettingsModal()
+  setupDragAndDrop()
   setupKeyboardShortcuts()
   renderRecentSessions(openSession, removeSession)
   updateToolbar()
@@ -1457,6 +1458,58 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
     textCompare.setRight(rightPath, rContent ?? '', rEncoding)
     if (algorithm) textCompare.setAlgorithm(algorithm)
   }
+}
+
+/**
+ * Accept files or folders dropped anywhere on the app and start a comparison.
+ *
+ * A drop names paths the renderer is not yet allowed to read, so the paths go
+ * through the main process first to be registered — the same trust step a file
+ * dialog performs.
+ */
+function setupDragAndDrop() {
+  const home = el('session-home')
+  if (!home) return
+
+  const stop = (e) => { e.preventDefault(); e.stopPropagation() }
+  for (const type of ['dragenter', 'dragover']) {
+    home.addEventListener(type, (e) => {
+      stop(e)
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+      home.classList.add('session-home--drag-over')
+    })
+  }
+  home.addEventListener('dragleave', (e) => {
+    if (!home.contains(e.relatedTarget)) home.classList.remove('session-home--drag-over')
+  })
+
+  home.addEventListener('drop', async (e) => {
+    stop(e)
+    home.classList.remove('session-home--drag-over')
+
+    const dropped = [...(e.dataTransfer?.files ?? [])]
+      .map((f) => f.path)
+      .filter(Boolean)
+    if (!dropped.length) return
+
+    let entries
+    try {
+      entries = await window.electronAPI?.acceptDroppedPaths?.(dropped)
+    } catch (err) {
+      console.error('[drop] could not accept paths:', err)
+      return
+    }
+    if (!entries?.length) return
+
+    const [left, right] = entries
+    // A single drop opens that item against nothing, letting the user pick the
+    // other side; two open straight into a comparison.
+    await openComparison({
+      type: left.isDirectory ? 'folder' : undefined,
+      leftPath: left.path,
+      rightPath: right?.path ?? '',
+    })
+  })
 }
 
 /**

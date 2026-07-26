@@ -778,12 +778,16 @@ export class TextCompare {
         const filePath = file.path; // Electron provides .path
         if (!filePath) return;
         try {
+          // A dropped path is not an allowed root yet, so reading it straight
+          // away failed validation in the main process — which is why this
+          // never actually worked.
+          await window.electronAPI.acceptDroppedPaths?.([filePath]);
           const result = await window.electronAPI.readFile(filePath);
           if (result) {
             this._hlLeft = await loadHighlighter(this._extFrom(result.path));
             this.setLeft(result.path, result.content, result.encoding);
           }
-        } catch { /* ignore */ }
+        } catch (err) { console.error('[text-compare] drop failed:', err); }
       });
     }
     if (paneRight) {
@@ -802,12 +806,13 @@ export class TextCompare {
         const filePath = file.path;
         if (!filePath) return;
         try {
+          await window.electronAPI.acceptDroppedPaths?.([filePath]);
           const result = await window.electronAPI.readFile(filePath);
           if (result) {
             this._hlRight = await loadHighlighter(this._extFrom(result.path));
             this.setRight(result.path, result.content, result.encoding);
           }
-        } catch { /* ignore */ }
+        } catch (err) { console.error('[text-compare] drop failed:', err); }
       });
     }
 

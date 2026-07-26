@@ -54,3 +54,9 @@
   text-align: center;
   padding: 16px 0;
 }
+
+/* Drop target feedback on the home screen. */
+.session-home--drag-over {
+  outline: 2px dashed var(--accent, #3b82f6);
+  outline-offset: -8px;
+}

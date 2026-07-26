@@ -151,6 +151,33 @@ ipcMain.handle('open-folder', async (event) => {
   return { path: filePaths[0] }
 })
 
+/**
+ * IPC: accept paths the user dropped onto the window.
+ *
+ * A drop is a user gesture that names specific files, exactly like picking
+ * them in a dialog or passing them on the command line, both of which already
+ * call registerRoot. Without this the renderer could see the dropped path but
+ * every subsequent read failed validation — which is why drag-and-drop onto
+ * the text panes never actually worked.
+ *
+ * Only the dropped entries are registered; nothing else is widened.
+ */
+ipcMain.handle('accept-dropped-paths', async (_event, paths) => {
+  if (!Array.isArray(paths)) return []
+  const out = []
+  for (const p of paths.slice(0, 8)) {
+    if (typeof p !== 'string' || !p) continue
+    try {
+      const info = await stat(p)
+      registerRoot(p)
+      out.push({ path: p, isDirectory: info.isDirectory() })
+    } catch {
+      // Vanished or unreadable between drop and handling — skip it.
+    }
+  }
+  return out
+})
+
 // IPC: 讀取指定路徑的檔案內容（自動偵測編碼）
 ipcMain.handle('read-file', async (_event, filePath) => {
   const safe = validatePath(filePath)
