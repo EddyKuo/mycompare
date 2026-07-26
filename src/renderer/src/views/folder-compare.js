@@ -6,6 +6,7 @@
 import { showContextMenu } from '../core/context-menu.js'
 import { el, debounce, formatSize } from '../core/utils.js'
 import { isActive } from '../core/active-view.js'
+import { parseMasks, matchesMasks } from '../core/file-mask.js'
 import '../styles/folder-compare.css'
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -42,38 +43,18 @@ function formatMtime(iso) {
 }
 
 /**
- * 判斷檔名是否符合 glob-like 篩選規則。
- * 支援：
- *   *.js          → 副檔名過濾（包含）
- *   -node_modules → 名稱過濾（排除）
+ * 判斷單一列是否通過名稱篩選。
+ *
+ * 遮罩語法見 core/file-mask.js，比照 BeyondCompare 的 File Masks：
+ * `;` 分隔多重遮罩、`-` 排除、`[a-z]` 字元集、`name\` 只比對資料夾、
+ * `.\` 與 `...\` 路徑相對語法、尾端 `.` 比對無副檔名的名稱。
+ *
+ * @param {string} name
+ * @param {string} filterStr
+ * @param {{ isDirectory?: boolean, relativePath?: string }} [opts]
  */
-function matchesFilter(name, filterStr) {
-  const parts = filterStr.trim().split(/\s+/).filter(Boolean)
-  if (!parts.length) return true
-
-  let include = true
-  for (const part of parts) {
-    if (part.startsWith('-')) {
-      // 排除規則
-      const pattern = part.slice(1)
-      if (globMatch(name, pattern)) return false
-    } else {
-      // 包含規則：只要有任一包含規則存在，name 必須符合其中一條
-      include = false
-      if (globMatch(name, part)) include = true
-    }
-  }
-  return include
-}
-
-/** 極簡 glob 比對，支援 * 與 ? */
-function globMatch(str, pattern) {
-  // 轉換 glob 為 RegExp
-  const re = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&') // escape regex special chars
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.')
-  return new RegExp(`^${re}$`, 'i').test(str)
+function matchesFilter(name, filterStr, opts = {}) {
+  return matchesMasks(parseMasks(filterStr), name, opts)
 }
 
 /**
@@ -1620,9 +1601,27 @@ ${rows}
 
     // Filter string
     if (this._filterStr.trim()) {
-      return matchesFilter(row.name, this._filterStr)
+      return matchesFilter(row.name, this._filterStr, {
+        isDirectory: !!(row.left?.isDirectory || row.right?.isDirectory),
+        relativePath: this._relativePathOf(row),
+      })
     }
     return true
+  }
+
+  /**
+   * Path of a row relative to its base folder, for path-aware masks
+   * (`.\src\a.js`, `...\a.js`, `p\f`). Falls back to the bare name when no
+   * base path is known.
+   *
+   * @param {CompareRow} row
+   * @returns {string}
+   */
+  _relativePathOf(row) {
+    const full = row.left?.path ?? row.right?.path ?? row.name
+    const base = row.left?.path ? this._leftPath : this._rightPath
+    if (!base || !full.startsWith(base)) return row.name
+    return full.slice(base.length).replace(/^[\\/]+/, '')
   }
 
   // ── Private: Render ─────────────────────────────────────────────────────────
