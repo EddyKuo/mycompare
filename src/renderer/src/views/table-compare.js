@@ -7,11 +7,15 @@
  *   openLeft()  openRight()
  *   setLeft(path, content)  setRight(path, content)
  *   refresh()  on(event, handler)  off(event, handler)
+ *   swap()
+ *   openFind()  closeFind()  findNext()  findPrev()
+ *   nextDifference()  prevDifference()  firstDifference()  lastDifference()
  *
  * 事件：
  *   'paths-changed' → { left: string, right: string }
  */
 
+import { isActive } from '../core/active-view.js'
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el } from '../core/utils.js'
 import '../styles/table-compare.css'
@@ -280,6 +284,84 @@ function computeCellDiffs(leftRow, rightRow, colCount) {
   return diffs
 }
 
+// ── S16: Navigation & search primitives ───────────────────────────────────────
+
+/**
+ * @typedef {{ rowIndex: number, side: 'left'|'right', col: number }} CellMatch
+ */
+
+/**
+ * 掃描對齊列的所有儲存格，回傳符合 query 的位置。
+ *
+ * Matches are ordered row-major, left pane before right pane, so that
+ * "next match" walks the table the way the user reads it.
+ *
+ * @param {AlignedRow[]} rows
+ * @param {string} query
+ * @param {boolean} [caseSensitive]
+ * @returns {CellMatch[]}
+ */
+function findCellMatches(rows, query, caseSensitive = false) {
+  if (!query) return []
+  const needle = caseSensitive ? query : query.toLowerCase()
+  /** @type {CellMatch[]} */
+  const matches = []
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const row = rows[rowIndex]
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const cells = side === 'left' ? row.leftRow : row.rightRow
+      if (!cells) continue
+      for (let col = 0; col < cells.length; col++) {
+        const raw = cells[col] ?? ''
+        const hay = caseSensitive ? raw : raw.toLowerCase()
+        if (hay.includes(needle)) matches.push({ rowIndex, side, col })
+      }
+    }
+  }
+  return matches
+}
+
+/**
+ * 取得所有非 'same' 對齊列的索引（列級差異導航用）。
+ *
+ * @param {AlignedRow[]} rows
+ * @returns {number[]}
+ */
+function diffRowIndices(rows) {
+  const out = []
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].status !== 'same') out.push(i)
+  }
+  return out
+}
+
+/**
+ * 差異導航用的位移：到頭到尾即停，與 text-compare.js 的
+ * navigateNext/navigatePrev 相同（不環繞）。
+ *
+ * @param {number} current
+ * @param {number} total
+ * @param {number} delta
+ * @returns {number} -1 when there is nothing to navigate
+ */
+function stepIndexClamped(current, total, delta) {
+  if (total <= 0) return -1
+  return Math.min(Math.max(current + delta, 0), total - 1)
+}
+
+/**
+ * 搜尋導航用的位移：環繞，與 text-compare.js 的 find 導航相同。
+ *
+ * @param {number} current
+ * @param {number} total
+ * @param {number} delta
+ * @returns {number} -1 when there is nothing to navigate
+ */
+function stepIndexWrapped(current, total, delta) {
+  if (total <= 0) return -1
+  return ((current + delta) % total + total) % total
+}
+
 // ── TableCompare Class ────────────────────────────────────────────────────────
 
 export class TableCompare {
@@ -310,6 +392,25 @@ export class TableCompare {
 
     /** @type {AlignedRow[]} */
     this._alignedRows = []
+
+    /** @type {AlignedRow[]} 通過顯示篩選的列；虛擬捲動與導航都以此為座標系 */
+    this._visibleRows = []
+
+    // S16-T1: find state
+    /** @type {CellMatch[]} */
+    this._findMatches = []
+    /** @type {Map<number, CellMatch[]>} rowIndex → matches，供窗格重繪時 O(1) 查詢 */
+    this._findMatchMap = new Map()
+    this._findCurrentIdx = -1
+    this._findQuery = ''
+    this._findCaseSensitive = false
+    /** @type {((e: KeyboardEvent) => void)|null} */
+    this._keyHandler = null
+
+    // S16-T2: row-level difference navigation
+    /** @type {number[]} */
+    this._diffRows = []
+    this._currentDiffIdx = 0
 
     // Visibility filters
     this._showSame = true
@@ -350,6 +451,10 @@ export class TableCompare {
   /** 清除 DOM、移除事件、移除注入的 style */
   destroy() {
     closeContextMenu()
+    if (this._keyHandler) {
+      document.removeEventListener('keydown', this._keyHandler)
+      this._keyHandler = null
+    }
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
@@ -449,6 +554,69 @@ export class TableCompare {
   refresh() {
     this._parseAndRefresh()
   }
+
+  /**
+   * S16-T3: 交換左右兩側的所有成對狀態，重新比對並重繪。
+   * @returns {this}
+   */
+  swap() {
+    ;[this._leftPath, this._rightPath] = [this._rightPath, this._leftPath]
+    ;[this._leftContent, this._rightContent] = [this._rightContent, this._leftContent]
+    ;[this._leftParsed, this._rightParsed] = [this._rightParsed, this._leftParsed]
+    ;[this._leftHeaders, this._rightHeaders] = [this._rightHeaders, this._leftHeaders]
+
+    this._updatePathDisplay('left', this._leftPath ?? '（未選擇）')
+    this._updatePathDisplay('right', this._rightPath ?? '（未選擇）')
+
+    // Alignment is key-order dependent, so the row set itself changes on a
+    // swap — every navigation index computed from the old order is stale.
+    this._currentDiffIdx = 0
+    this._compare()
+    this._renderTable()
+    this._recomputeFind()
+    this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
+    return this
+  }
+
+  // ── S16-T1: Find ─────────────────────────────────────────────────────────────
+
+  /** 開啟搜尋列並聚焦輸入框 */
+  openFind() {
+    const { findBar, findInput } = this._dom
+    if (!findBar) return
+    findBar.style.display = 'flex'
+    findInput?.focus()
+    findInput?.select()
+  }
+
+  /** 關閉搜尋列並清除所有命中標記 */
+  closeFind() {
+    const { findBar } = this._dom
+    if (findBar) findBar.style.display = 'none'
+    this._findQuery = ''
+    if (this._dom.findInput) this._dom.findInput.value = ''
+    this._recomputeFind()
+  }
+
+  /** 跳到下一個搜尋命中（環繞） */
+  findNext() { this._stepFind(1) }
+
+  /** 跳到上一個搜尋命中（環繞） */
+  findPrev() { this._stepFind(-1) }
+
+  // ── S16-T2: Row-level difference navigation ──────────────────────────────────
+
+  /** 跳到下一個差異列 */
+  nextDifference() { this._gotoDiff(stepIndexClamped(this._currentDiffIdx, this._diffRows.length, 1)) }
+
+  /** 跳到上一個差異列 */
+  prevDifference() { this._gotoDiff(stepIndexClamped(this._currentDiffIdx, this._diffRows.length, -1)) }
+
+  /** 跳到第一個差異列 */
+  firstDifference() { this._gotoDiff(this._diffRows.length ? 0 : -1) }
+
+  /** 跳到最後一個差異列 */
+  lastDifference() { this._gotoDiff(this._diffRows.length - 1) }
 
   /**
    * 訂閱事件
@@ -664,6 +832,7 @@ export class TableCompare {
     // S15-UX: path row first so "開啟…" sits at the same row as other views.
     root.appendChild(this._buildPathRow())
     root.appendChild(this._buildToolbar())
+    root.appendChild(this._buildFindBar())
 
     const body = el('div', { className: 'tc-body' })
     this._dom.body = body
@@ -749,6 +918,24 @@ export class TableCompare {
     // Separator
     toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
 
+    // S16-T2: row-level difference navigation
+    const btnPrevDiff = el('button', { id: 'tc-btn-prev-diff', className: 'tc-btn' }, '▲')
+    btnPrevDiff.title = '上一個差異列'
+    const btnNextDiff = el('button', { id: 'tc-btn-next-diff', className: 'tc-btn' }, '▼')
+    btnNextDiff.title = '下一個差異列'
+    const diffCount = el('span', { id: 'tc-diff-count', className: 'tc-diff-count' }, '')
+    this._dom.btnPrevDiff = btnPrevDiff
+    this._dom.btnNextDiff = btnNextDiff
+    this._dom.diffCount = diffCount
+    toolbar.appendChild(btnPrevDiff)
+    toolbar.appendChild(btnNextDiff)
+    toolbar.appendChild(diffCount)
+
+    // S16-T3: swap sides
+    const btnSwap = el('button', { id: 'tc-btn-swap', className: 'tc-btn' }, '⇄ 交換')
+    this._dom.btnSwap = btnSwap
+    toolbar.appendChild(btnSwap)
+
     // Refresh button
     const btnRefresh = el('button', { className: 'tc-btn tc-btn-refresh' }, '↺ 重新整理')
     this._dom.btnRefresh = btnRefresh
@@ -765,6 +952,47 @@ export class TableCompare {
     toolbar.appendChild(btnExportStats)
 
     return toolbar
+  }
+
+  /**
+   * S16-T1: 搜尋列（預設隱藏，Ctrl+F 開啟）
+   * @returns {HTMLElement}
+   */
+  _buildFindBar() {
+    const bar = el('div', { className: 'tc-find-bar' })
+    bar.style.display = 'none'
+
+    const input = el('input', {
+      type: 'text',
+      id: 'tc-find-input',
+      className: 'tc-find-input',
+      placeholder: '搜尋儲存格內容…',
+    })
+    this._dom.findInput = input
+    bar.appendChild(input)
+
+    const cbCase = this._buildCheckbox('tc-find-case', 'Aa', this._findCaseSensitive)
+    cbCase.title = '大小寫敏感'
+    this._dom.cbFindCase = cbCase.querySelector('input')
+    bar.appendChild(cbCase)
+
+    const btnPrev = el('button', { id: 'tc-find-prev', className: 'tc-find-btn' }, '◀')
+    const btnNext = el('button', { id: 'tc-find-next', className: 'tc-find-btn' }, '▶')
+    this._dom.btnFindPrev = btnPrev
+    this._dom.btnFindNext = btnNext
+    bar.appendChild(btnPrev)
+    bar.appendChild(btnNext)
+
+    const count = el('span', { id: 'tc-find-count', className: 'tc-find-count' }, '')
+    this._dom.findCount = count
+    bar.appendChild(count)
+
+    const btnClose = el('button', { id: 'tc-find-close', className: 'tc-find-btn' }, '✕')
+    this._dom.btnFindClose = btnClose
+    bar.appendChild(btnClose)
+
+    this._dom.findBar = bar
+    return bar
   }
 
   /**
@@ -887,6 +1115,51 @@ export class TableCompare {
     // Context menu
     leftScroll.addEventListener('contextmenu',  (e) => this._onTableContextMenu(e, 'left'))
     rightScroll.addEventListener('contextmenu', (e) => this._onTableContextMenu(e, 'right'))
+
+    this._bindNavEvents()
+  }
+
+  /** S16: find bar, difference navigation and swap wiring */
+  _bindNavEvents() {
+    const { btnPrevDiff, btnNextDiff, btnSwap,
+            findInput, cbFindCase, btnFindPrev, btnFindNext, btnFindClose } = this._dom
+
+    btnPrevDiff.addEventListener('click', () => this.prevDifference())
+    btnNextDiff.addEventListener('click', () => this.nextDifference())
+    btnSwap.addEventListener('click', () => this.swap())
+
+    findInput.addEventListener('input', () => {
+      this._findQuery = findInput.value
+      this._recomputeFind()
+    })
+    findInput.addEventListener('keydown', (/** @type {KeyboardEvent} */ e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        this._stepFind(e.shiftKey ? -1 : 1)
+      } else if (e.key === 'Escape') {
+        e.preventDefault()
+        this.closeFind()
+      }
+    })
+    cbFindCase.addEventListener('change', () => {
+      this._findCaseSensitive = cbFindCase.checked
+      this._recomputeFind()
+    })
+    btnFindPrev.addEventListener('click', () => this.findPrev())
+    btnFindNext.addEventListener('click', () => this.findNext())
+    btnFindClose.addEventListener('click', () => this.closeFind())
+
+    this._keyHandler = (/** @type {KeyboardEvent} */ e) => {
+      if (!this._container || !isActive('table')) return
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault()
+        this.openFind()
+      } else if (e.key === 'F3') {
+        e.preventDefault()
+        this._stepFind(e.shiftKey ? -1 : 1)
+      }
+    }
+    document.addEventListener('keydown', this._keyHandler)
   }
 
   /**
@@ -938,6 +1211,128 @@ export class TableCompare {
     showContextMenu(e, items)
   }
 
+  // ── Private: Find & difference navigation ─────────────────────────────────────
+
+  /**
+   * 依目前的 query 重算命中清單、計數與標記。
+   * 每次資料、篩選或搜尋條件變動後都必須呼叫，因為命中以 _visibleRows 的
+   * 索引表示，而該索引在重新比對或篩選後即失效。
+   */
+  _recomputeFind() {
+    const rows = this._visibleRows ?? []
+    this._findMatches = findCellMatches(rows, this._findQuery, this._findCaseSensitive)
+
+    this._findMatchMap = new Map()
+    for (const m of this._findMatches) {
+      const list = this._findMatchMap.get(m.rowIndex)
+      if (list) list.push(m)
+      else this._findMatchMap.set(m.rowIndex, [m])
+    }
+
+    this._findCurrentIdx = this._findMatches.length ? 0 : -1
+    this._updateFindCount()
+    if (this._findCurrentIdx >= 0) {
+      this._scrollToVisibleRow(this._findMatches[0].rowIndex)
+    } else {
+      this._applyFindHighlights()
+    }
+  }
+
+  /**
+   * @param {number} delta
+   */
+  _stepFind(delta) {
+    const next = stepIndexWrapped(this._findCurrentIdx, this._findMatches.length, delta)
+    if (next < 0) return
+    this._findCurrentIdx = next
+    this._updateFindCount()
+    this._scrollToVisibleRow(this._findMatches[next].rowIndex)
+  }
+
+  _updateFindCount() {
+    const countEl = this._dom.findCount
+    if (!countEl) return
+    if (!this._findQuery) countEl.textContent = ''
+    else if (!this._findMatches.length) countEl.textContent = '無相符'
+    else countEl.textContent = `第 ${this._findCurrentIdx + 1} / ${this._findMatches.length} 筆`
+  }
+
+  /**
+   * 為目前虛擬視窗內的命中儲存格加上標記。
+   *
+   * 標記無法在搜尋當下一次寫入 DOM——視窗外的列根本不存在——所以每次重繪
+   * 視窗後都要依索引重新套用。
+   */
+  _applyFindHighlights() {
+    const first = this._windowFirst
+    const last = this._windowLast
+    if (first == null || last == null) return
+
+    // The window may be reused verbatim between steps (the current match moved
+    // but stayed on screen), so previous marks have to be cleared explicitly.
+    for (const side of ['left', 'right']) {
+      const tbody = this._dom[`${side}Tbody`]
+      if (!tbody) continue
+      for (const td of tbody.querySelectorAll('.tc-cell--match')) {
+        td.classList.remove('tc-cell--match', 'tc-cell--match-current')
+      }
+    }
+
+    const current = this._findCurrentIdx >= 0 ? this._findMatches[this._findCurrentIdx] : null
+
+    for (let i = first; i < last; i++) {
+      const matches = this._findMatchMap.get(i)
+      if (!matches) continue
+      for (const m of matches) {
+        const tbody = this._dom[`${m.side}Tbody`]
+        const tr = tbody?.children[i - first]
+        // +1 skips the row-number cell.
+        const td = tr?.children[m.col + 1]
+        if (!td) continue
+        td.classList.add('tc-cell--match')
+        if (current && current.rowIndex === i && current.side === m.side && current.col === m.col) {
+          td.classList.add('tc-cell--match-current')
+        }
+      }
+    }
+  }
+
+  /**
+   * 捲動到某個可見列（虛擬捲動下必須先移動 scrollTop 再重繪視窗，
+   * 否則目標列不在 DOM 中）。
+   * @param {number} rowIndex  index into this._visibleRows
+   */
+  _scrollToVisibleRow(rowIndex) {
+    const { leftScroll, rightScroll } = this._dom
+    if (!leftScroll) return
+    const viewport = leftScroll.clientHeight || 0
+    const target = Math.max(0, rowIndex * TABLE_ROW_HEIGHT - Math.floor(viewport / 2))
+    leftScroll.scrollTop = target
+    if (rightScroll) rightScroll.scrollTop = target
+    this._renderTableWindow()
+    // _renderTableWindow short-circuits when the window is unchanged; the
+    // current-match mark still needs moving in that case.
+    this._applyFindHighlights()
+  }
+
+  /**
+   * @param {number} idx  index into this._diffRows
+   */
+  _gotoDiff(idx) {
+    if (idx < 0 || idx >= this._diffRows.length) return
+    this._currentDiffIdx = idx
+    this._updateDiffCount()
+    this._scrollToVisibleRow(this._diffRows[idx])
+  }
+
+  _updateDiffCount() {
+    const countEl = this._dom.diffCount
+    if (!countEl) return
+    countEl.textContent = this._diffRows.length
+      ? `第 ${this._currentDiffIdx + 1} / ${this._diffRows.length} 個差異`
+      : '無差異'
+  }
+
   // ── Private: Parse & Compare ──────────────────────────────────────────────────
 
   _parseAndRefresh() {
@@ -957,6 +1352,7 @@ export class TableCompare {
 
     if (!leftParsed && !rightParsed) {
       this._alignedRows = []
+      this._refreshRowIndex()
       return
     }
 
@@ -1001,6 +1397,20 @@ export class TableCompare {
       rightHeaders,
       this._ignoreColumnOrder,
     )
+    this._refreshRowIndex()
+  }
+
+  /**
+   * 重建「可見列」與「差異列索引」。導航座標系與虛擬捲動座標系必須同源，
+   * 否則跳轉會落在錯誤的 scrollTop。
+   */
+  _refreshRowIndex() {
+    this._visibleRows = this._alignedRows.filter((r) => this._isRowVisible(r))
+    this._diffRows = diffRowIndices(this._visibleRows)
+    if (this._currentDiffIdx >= this._diffRows.length) {
+      this._currentDiffIdx = Math.max(0, this._diffRows.length - 1)
+    }
+    this._updateDiffCount()
   }
 
   // ── Private: Render ───────────────────────────────────────────────────────────
@@ -1051,7 +1461,7 @@ export class TableCompare {
     this._colCount = Math.max(leftColCount, rightColCount)
 
     // Filter rows by visibility
-    this._visibleRows = this._alignedRows.filter((r) => this._isRowVisible(r))
+    this._refreshRowIndex()
 
     // Build header rows
     this._renderPaneHeader(this._dom.leftHeader, leftHeaders, leftColCount)
@@ -1068,6 +1478,7 @@ export class TableCompare {
       this._dom.leftScroll.appendChild(msg.cloneNode(true))
       this._dom.rightScroll.appendChild(msg.cloneNode(true))
       this._renderStats()
+      this._recomputeFind()
       return
     }
 
@@ -1096,6 +1507,9 @@ export class TableCompare {
     this._windowLast = null
     this._renderTableWindow()
     this._renderStats()
+    // Match positions are expressed as _visibleRows indices, which the filter
+    // pass above may have just shifted.
+    this._recomputeFind()
   }
 
   /**
@@ -1137,6 +1551,7 @@ export class TableCompare {
 
     leftTbody.replaceChildren(leftFrag)
     rightTbody.replaceChildren(rightFrag)
+    this._applyFindHighlights()
   }
 
   /**
@@ -1328,4 +1743,7 @@ export class TableCompare {
 // ── Exports for unit testing ──────────────────────────────────────────────────
 // These pure functions are ES-module-friendly; tree-shaking removes them in
 // production renderer builds that only import TableCompare.
-export { parseTable, alignRows, computeRowStatus, computeCellDiffs }
+export {
+  parseTable, alignRows, computeRowStatus, computeCellDiffs,
+  findCellMatches, diffRowIndices, stepIndexClamped, stepIndexWrapped,
+}

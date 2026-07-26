@@ -10,6 +10,12 @@ import { getViewTypeForPath } from './core/file-type.js'
 import { NamedConfigStore } from './core/named-config-store.js'
 import { WorkspaceStore } from './core/workspace-store.js'
 import { setActiveView } from './core/active-view.js'
+import {
+  SettingsStore,
+  DEFAULT_SHORTCUTS,
+  eventToCombo,
+  keyComboMatches,
+} from './core/settings-store.js'
 
 // ---------------------------------------------------------------------------
 // TabManager — session-record-based tab bar
@@ -165,6 +171,9 @@ class TabManager {
 /** @type {TabManager} */
 const tabMgr = new TabManager()
 
+/** User settings: keyboard bindings and preferences. */
+const settings = new SettingsStore()
+
 // ---------------------------------------------------------------------------
 // 視圖狀態
 // ---------------------------------------------------------------------------
@@ -192,6 +201,7 @@ export function initApp() {
   setupToolbarButtons()
   setupPathBarButtons()
   setupMenuActions()
+  setupSettingsModal()
   setupKeyboardShortcuts()
   renderRecentSessions(openSession, removeSession)
   updateToolbar()
@@ -1254,96 +1264,71 @@ function updateToolbar() {
 // ---------------------------------------------------------------------------
 // 鍵盤快捷鍵
 // ---------------------------------------------------------------------------
+/**
+ * Global keyboard shortcuts.
+ *
+ * Bindings come from SettingsStore rather than being hard-coded, so the
+ * customisation UI actually has an effect. That store, its default table and
+ * the settings modal all existed but nothing consulted them, leaving the
+ * feature inert.
+ *
+ * Shortcuts owned by a view's own handler (the text find bar, go-to-line,
+ * bookmarks, font size) stay there and are not customisable yet; registering
+ * them here as well would fire both handlers.
+ */
 function setupKeyboardShortcuts() {
+  /** @type {Record<string, () => void>} */
+  const actions = {
+    nextDiff:  () => { if (currentView === 'text') textCompare?.navigateNext() },
+    prevDiff:  () => { if (currentView === 'text') textCompare?.navigatePrev() },
+    firstDiff: () => { if (currentView === 'text') textCompare?.navigateFirst() },
+    lastDiff:  () => { if (currentView === 'text') textCompare?.navigateLast() },
+    copyLeft:  () => { if (currentView === 'text') textCompare?.copyToLeft() },
+    copyRight: () => { if (currentView === 'text') textCompare?.copyToRight() },
+    copyAllLeft:  () => { if (currentView === 'text') textCompare?.copyAllToLeft() },
+    copyAllRight: () => { if (currentView === 'text') textCompare?.copyAllToRight() },
+    undo: () => { if (currentView === 'text') textCompare?.undo() },
+    redo: () => { if (currentView === 'text') textCompare?.redo() },
+    editToggle: () => {
+      if (currentView !== 'text' || !textCompare) return
+      const isEdit = textCompare.toggleEditMode()
+      el('btn-edit-mode').classList.toggle('active', isEdit)
+      el('btn-edit-mode').title = isEdit ? '退出編輯模式 (Ctrl+E)' : '切換編輯模式 (Ctrl+E)'
+    },
+    saveLeft:  () => { if (currentView === 'text') void textCompare?.saveLeft() },
+    saveRight: () => { if (currentView === 'text') void textCompare?.saveRight() },
+    refresh: () => {
+      if (currentView === 'text') textCompare?.refresh()
+      else if (currentView === 'folder') void folderCompare?.refresh()
+    },
+    newSession: () => showHome(),
+    closeTab: () => {
+      const active = tabMgr.activeTab
+      if (active) _handleCloseTab(active.id)
+    },
+    fullscreen: () => { void window.electronAPI?.toggleFullScreen?.() },
+    print: () => {
+      if (currentView === 'text') void textCompare?.exportHtml({ print: true })
+      else if (currentView === 'folder') void folderCompare?.exportHtml({ print: true })
+    },
+  }
+
   document.addEventListener('keydown', (e) => {
     // 在 edit-textarea 中允許 Ctrl+S / Ctrl+Shift+S / Ctrl+E 觸發；其他 input/textarea 則略過
     const isEditTextarea = e.target.classList?.contains('edit-textarea')
-    if (e.target.matches('input, textarea') && !isEditTextarea) return
-    // 在 edit-textarea 中，只處理特定快捷鍵，其餘讓瀏覽器正常處理
+    if (e.target.matches?.('input, textarea') && !isEditTextarea) return
     if (isEditTextarea) {
       if (!((e.key === 's' && e.ctrlKey) || (e.key === 'e' && e.ctrlKey))) return
     }
 
-    switch (true) {
-      case e.key === 'F7' && !e.altKey && !e.ctrlKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.navigatePrev()
-        break
+    const combo = eventToCombo(e)
+    if (!combo) return
 
-      case e.key === 'F8' && !e.altKey && !e.ctrlKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.navigateNext()
-        break
-
-      case e.key === 'Home' && e.altKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.navigateFirst()
-        break
-
-      case e.key === 'End' && e.altKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.navigateLast()
-        break
-
-      case e.key === 'ArrowLeft' && e.altKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.copyToLeft()
-        break
-
-      case e.key === 'ArrowRight' && e.altKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.copyToRight()
-        break
-
-      case e.key === 'F5':
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.refresh()
-        else if (currentView === 'folder') folderCompare?.refresh()
-        break
-
-      case e.key === 'n' && e.ctrlKey:
-        e.preventDefault()
-        showHome()
-        break
-
-      case e.key === 'w' && e.ctrlKey: {
-        e.preventDefault()
-        const active = tabMgr.activeTab
-        if (active) _handleCloseTab(active.id)
-        break
-      }
-
-      case e.key === 'e' && e.ctrlKey:
-        e.preventDefault()
-        if (currentView === 'text' && textCompare) {
-          const isEdit = textCompare.toggleEditMode()
-          el('btn-edit-mode').classList.toggle('active', isEdit)
-          el('btn-edit-mode').title = isEdit ? '退出編輯模式 (Ctrl+E)' : '切換編輯模式 (Ctrl+E)'
-        }
-        break
-
-      case e.key === 's' && e.ctrlKey && !e.shiftKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.saveLeft()
-        break
-
-      case e.key === 's' && e.ctrlKey && e.shiftKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.saveRight()
-        break
-
-      // T60: F11 toggles application full-screen (works in all views)
-      case e.key === 'F11':
-        e.preventDefault()
-        window.electronAPI?.toggleFullScreen?.()
-        break
-
-      // T62: Ctrl+P opens print preview of the current view's HTML report
-      case e.key === 'p' && e.ctrlKey && !e.shiftKey:
-        e.preventDefault()
-        if (currentView === 'text') textCompare?.exportHtml({ print: true })
-        else if (currentView === 'folder') folderCompare?.exportHtml({ print: true })
-        break
+    for (const [action, fn] of Object.entries(actions)) {
+      if (!keyComboMatches(e, settings.getShortcut(action))) continue
+      e.preventDefault()
+      fn()
+      return
     }
   })
 }
@@ -1671,6 +1656,134 @@ function setupMenuActions() {
     } catch (err) {
       console.error(`[menu] ${command} failed:`, err)
     }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 設定 Modal（自訂快捷鍵 + 偏好）
+// ---------------------------------------------------------------------------
+
+/** Human-readable labels for the customisable actions. */
+const SHORTCUT_LABELS = {
+  nextDiff: '下一個差異',
+  prevDiff: '上一個差異',
+  firstDiff: '第一個差異',
+  lastDiff: '最後一個差異',
+  copyLeft: '複製區塊到左側',
+  copyRight: '複製區塊到右側',
+  copyAllLeft: '複製全部差異到左側',
+  copyAllRight: '複製全部差異到右側',
+  undo: '復原',
+  redo: '取消復原',
+  editToggle: '切換編輯模式',
+  saveLeft: '儲存左側',
+  saveRight: '儲存右側',
+  refresh: '重新整理',
+  newSession: '回到首頁 / 新增比對',
+  closeTab: '關閉分頁',
+  fullscreen: '全螢幕',
+}
+
+/**
+ * Populate the settings modal.
+ *
+ * The modal markup, SettingsStore and the default binding table all shipped
+ * previously, but nothing ever rendered the list or read a binding back, so
+ * the feature did nothing at all.
+ */
+function setupSettingsModal() {
+  const modal = el('settings-modal')
+  const list = el('settings-shortcuts-list')
+  if (!modal || !list) return
+
+  const status = el('settings-modal-status')
+  /** @param {string} msg */
+  const setStatus = (msg) => { if (status) status.textContent = msg }
+
+  /** @type {{ action: string, cleanup: () => void } | null} */
+  let recording = null
+
+  const stopRecording = () => {
+    recording?.cleanup()
+    recording = null
+  }
+
+  function render() {
+    list.replaceChildren()
+    for (const action of Object.keys(DEFAULT_SHORTCUTS)) {
+      const label = SHORTCUT_LABELS[action]
+      if (!label) continue
+
+      const row = document.createElement('div')
+      row.className = 'settings-row'
+
+      const nameEl = document.createElement('span')
+      nameEl.className = 'settings-row-name'
+      nameEl.textContent = label
+
+      const comboEl = document.createElement('code')
+      comboEl.className = 'settings-row-combo'
+      comboEl.textContent = settings.getShortcut(action) || '（未設定）'
+
+      const btnRecord = document.createElement('button')
+      btnRecord.textContent = '錄製'
+      btnRecord.addEventListener('click', () => {
+        stopRecording()
+        btnRecord.textContent = '按下按鍵…'
+        setStatus('按下想要的組合鍵，Esc 取消')
+
+        /** @param {KeyboardEvent} e */
+        const onKey = (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          if (e.key === 'Escape') {
+            stopRecording()
+            render()
+            setStatus('已取消')
+            return
+          }
+          const combo = eventToCombo(e)
+          if (!combo) return // modifier-only press; keep waiting
+          const clash = Object.keys(DEFAULT_SHORTCUTS)
+            .find((a) => a !== action && settings.getShortcut(a) === combo)
+          settings.setShortcut(action, combo)
+          stopRecording()
+          render()
+          setStatus(clash
+            ? `已設定 ${combo}，但與「${SHORTCUT_LABELS[clash] ?? clash}」衝突`
+            : `已設定 ${combo}`)
+        }
+
+        document.addEventListener('keydown', onKey, true)
+        recording = {
+          action,
+          cleanup: () => document.removeEventListener('keydown', onKey, true),
+        }
+      })
+
+      const btnClear = document.createElement('button')
+      btnClear.textContent = '清除'
+      btnClear.addEventListener('click', () => {
+        settings.setShortcut(action, '')
+        render()
+        setStatus(`已清除「${label}」`)
+      })
+
+      row.append(nameEl, comboEl, btnRecord, btnClear)
+      list.appendChild(row)
+    }
+  }
+
+  const open = () => { render(); setStatus(''); modal.style.display = 'flex' }
+  const close = () => { stopRecording(); modal.style.display = 'none' }
+
+  el('btn-settings-modal')?.addEventListener('click', open)
+  el('btn-settings-modal-close')?.addEventListener('click', close)
+  el('btn-settings-modal-cancel')?.addEventListener('click', close)
+  el('btn-settings-reset')?.addEventListener('click', () => {
+    settings.reset()
+    render()
+    setStatus('已恢復預設')
   })
 }
 

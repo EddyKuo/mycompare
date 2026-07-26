@@ -248,7 +248,7 @@ ipcMain.handle('delete-file', async (_event, filePath) => {
 })
 
 // IPC: 儲存檔案（顯示 Save 對話框）
-ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encoding }) => {
+ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encoding, backup }) => {
   const win = BrowserWindow.fromWebContents(event.sender)
   const opts = {
     defaultPath,
@@ -259,10 +259,34 @@ ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encod
     : await dialog.showSaveDialog(opts)
   if (canceled || !filePath) return false
   registerRoot(filePath)
+  if (backup !== false) await backupExisting(filePath)
   // Write back in the file's original encoding, not unconditionally UTF-8.
   await writeFile(filePath, encodeContent(content, encoding))
   return true
 })
+
+/**
+ * Keep a copy of a file that is about to be overwritten.
+ *
+ * Saving replaces the user's file in place with no way back; Beyond Compare
+ * keeps a backup for the same reason. A failure here must not block the save
+ * itself — losing the backup is better than refusing to write.
+ *
+ * @param {string} filePath already registered as an allowed root
+ * @returns {Promise<void>}
+ */
+async function backupExisting(filePath) {
+  try {
+    await stat(filePath)
+  } catch {
+    return // nothing there yet, nothing to preserve
+  }
+  try {
+    await copyFile(filePath, `${filePath}.bak`)
+  } catch (err) {
+    console.error('[save-file] backup failed:', err)
+  }
+}
 
 // IPC: 開啟 Zip 檔案並回傳虛擬目錄項目清單
 ipcMain.handle('open-zip', async (event) => {

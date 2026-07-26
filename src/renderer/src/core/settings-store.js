@@ -21,7 +21,25 @@ const KEY_SETTINGS = 'mycompare:settings'
 /**
  * @typedef {object} AppSettings
  * @property {Record<string, string>} shortcuts  action → combo string, e.g. 'Ctrl+Z'
+ * @property {AppPreferences} prefs
  */
+
+/**
+ * @typedef {object} AppPreferences
+ * @property {boolean} backupOnSave  keep a .bak copy before overwriting a file
+ */
+
+/**
+ * Non-shortcut preferences.
+ *
+ * backupOnSave defaults on, as it does in Beyond Compare: saving overwrites
+ * the user's file in place and there is otherwise no way back.
+ *
+ * @type {AppPreferences}
+ */
+export const DEFAULT_PREFS = {
+  backupOnSave: true,
+}
 
 /**
  * Default shortcut bindings. Action names are stable identifiers that the
@@ -122,17 +140,23 @@ export function keyComboMatches(event, combo) {
 function readSettings() {
   try {
     const raw = localStorage.getItem(KEY_SETTINGS)
-    if (!raw) return { shortcuts: { ...DEFAULT_SHORTCUTS } }
+    if (!raw) return { shortcuts: { ...DEFAULT_SHORTCUTS }, prefs: { ...DEFAULT_PREFS } }
     const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object') {
-      return { shortcuts: { ...DEFAULT_SHORTCUTS } }
+      return { shortcuts: { ...DEFAULT_SHORTCUTS }, prefs: { ...DEFAULT_PREFS } }
     }
     const stored = (parsed.shortcuts && typeof parsed.shortcuts === 'object')
       ? parsed.shortcuts
       : {}
-    return { shortcuts: { ...DEFAULT_SHORTCUTS, ...stored } }
+    const storedPrefs = (parsed.prefs && typeof parsed.prefs === 'object')
+      ? parsed.prefs
+      : {}
+    return {
+      shortcuts: { ...DEFAULT_SHORTCUTS, ...stored },
+      prefs: { ...DEFAULT_PREFS, ...storedPrefs },
+    }
   } catch {
-    return { shortcuts: { ...DEFAULT_SHORTCUTS } }
+    return { shortcuts: { ...DEFAULT_SHORTCUTS }, prefs: { ...DEFAULT_PREFS } }
   }
 }
 
@@ -181,10 +205,35 @@ export class SettingsStore {
   }
 
   /**
-   * Reset all shortcuts to defaults.
+   * Read one preference.
+   * @template {keyof AppPreferences} K
+   * @param {K} name
+   * @returns {AppPreferences[K]}
+   */
+  getPref(name) {
+    const s = readSettings()
+    return s.prefs[name] ?? DEFAULT_PREFS[name]
+  }
+
+  /**
+   * Write one preference.
+   * @template {keyof AppPreferences} K
+   * @param {K} name
+   * @param {AppPreferences[K]} value
+   */
+  setPref(name, value) {
+    if (!(name in DEFAULT_PREFS)) return
+    const s = readSettings()
+    s.prefs[name] = value
+    writeSettings(s)
+  }
+
+  /**
+   * Reset all shortcuts to defaults. Preferences are left alone.
    */
   reset() {
-    writeSettings({ shortcuts: { ...DEFAULT_SHORTCUTS } })
+    const s = readSettings()
+    writeSettings({ shortcuts: { ...DEFAULT_SHORTCUTS }, prefs: s.prefs })
   }
 
   /** Remove all stored settings (used by tests). */

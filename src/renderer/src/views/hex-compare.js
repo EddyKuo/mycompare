@@ -201,6 +201,59 @@ function _myersBytes(a, b, maxD) {
   return matches.subarray(0, count)
 }
 
+/**
+ * S16 — Aggregate differing byte offsets into contiguous "difference regions".
+ *
+ * Navigation works on regions rather than raw bytes because a single logical
+ * edit in a binary usually spans many consecutive bytes; stepping byte-by-byte
+ * would make Next Difference useless on real files.
+ *
+ * Offsets past the end of one side count as differing (orphan bytes) in Fast
+ * mode. In Complete mode the caller supplies the pre-computed classifications,
+ * so a byte that Myers matched at a shifted position is *not* a difference even
+ * though the two sides disagree positionally.
+ *
+ * @param {Uint8Array|null} left
+ * @param {Uint8Array|null} right
+ * @param {{ leftClass?: Uint8Array|null, rightClass?: Uint8Array|null }} [opts]
+ * @returns {Array<{ start: number, end: number, length: number }>} end is exclusive
+ */
+export function computeHexDiffRegions(left, right, opts = {}) {
+  const lLen = left ? left.length : 0
+  const rLen = right ? right.length : 0
+  const lc = opts.leftClass ?? null
+  const rc = opts.rightClass ?? null
+  const useClass = lc !== null && rc !== null
+
+  const maxLen = lLen > rLen ? lLen : rLen
+  /** @type {Array<{ start: number, end: number, length: number }>} */
+  const regions = []
+  if (maxLen === 0) return regions
+
+  let start = -1
+  for (let o = 0; o < maxLen; o++) {
+    let isDiff
+    if (useClass) {
+      isDiff = (o < lc.length && lc[o] === 1) || (o < rc.length && rc[o] === 1)
+    } else if (o >= lLen || o >= rLen) {
+      isDiff = true
+    } else {
+      isDiff = left[o] !== right[o]
+    }
+
+    if (isDiff) {
+      if (start < 0) start = o
+    } else if (start >= 0) {
+      regions.push({ start, end: o, length: o - start })
+      start = -1
+    }
+  }
+  if (start >= 0) {
+    regions.push({ start, end: maxLen, length: maxLen - start })
+  }
+  return regions
+}
+
 export function searchHexBytes(haystack, needle) {
   /** @type {number[]} */
   const results = []
@@ -328,6 +381,14 @@ export class HexCompare {
     this._findCurrentIdx = -1
     /** @type {Function|null} Ctrl+F keydown handler reference (for removeEventListener) */
     this._ctrlFHandler = null
+
+    // S16: byte-level difference navigation
+    /** @type {Array<{ start: number, end: number, length: number }>} */
+    this._diffRegions = []
+    /** @type {number} -1 = no region selected yet */
+    this._currentDiffIdx = -1
+    /** @type {Function|null} F7/F8/Alt+Home/Alt+End handler (for removeEventListener) */
+    this._navKeyHandler = null
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -349,6 +410,10 @@ export class HexCompare {
       document.removeEventListener('keydown', this._ctrlFHandler)
       this._ctrlFHandler = null
     }
+    if (this._navKeyHandler) {
+      document.removeEventListener('keydown', this._navKeyHandler)
+      this._navKeyHandler = null
+    }
     // T27: 清除所有 hx-selected 高亮
     // S14-M04: scope to this container so we don't wipe highlights on other hex tabs.
     const scope = this._container ?? document
@@ -367,6 +432,8 @@ export class HexCompare {
     this._rightBytes = null
     this._findMatches = []
     this._findCurrentIdx = -1
+    this._diffRegions = []
+    this._currentDiffIdx = -1
   }
 
   /**
@@ -443,10 +510,72 @@ export class HexCompare {
 
   refresh() {
     this._recomputeCompleteIfNeeded()
+    this._recomputeDiffRegions()
     requestAnimationFrame(() => {
       this._renderPaneContent('left')
       this._renderPaneContent('right')
     })
+  }
+
+  // ── Public: difference navigation (S16) ─────────────────────────────────────
+
+  /**
+   * 目前的差異區塊清單（唯讀快照）
+   * @returns {Array<{ start: number, end: number, length: number }>}
+   */
+  getDiffRegions() {
+    return this._diffRegions
+  }
+
+  /** @returns {number} 目前選取的差異索引；-1 表示尚未選取 */
+  getCurrentDiffIndex() {
+    return this._currentDiffIdx
+  }
+
+  /** 跳至下一個差異區塊（到尾端維持在最後一個，與 TextCompare.navigateNext 一致） */
+  nextDifference() {
+    if (this._diffRegions.length === 0) return
+    this._gotoDiff(Math.min(this._currentDiffIdx + 1, this._diffRegions.length - 1))
+  }
+
+  /** 跳至上一個差異區塊（到頭端維持在第一個） */
+  prevDifference() {
+    if (this._diffRegions.length === 0) return
+    this._gotoDiff(Math.max(this._currentDiffIdx - 1, 0))
+  }
+
+  /** 跳至第一個差異區塊 */
+  firstDifference() {
+    if (this._diffRegions.length === 0) return
+    this._gotoDiff(0)
+  }
+
+  /** 跳至最後一個差異區塊 */
+  lastDifference() {
+    if (this._diffRegions.length === 0) return
+    this._gotoDiff(this._diffRegions.length - 1)
+  }
+
+  /**
+   * 交換兩側所有成對狀態並重算差異。
+   * Complete-mode 分類直接互換而非留待 refresh 重算，避免重算前的短暫錯誤著色。
+   */
+  swap() {
+    ;[this._leftBytes, this._rightBytes] = [this._rightBytes, this._leftBytes]
+    ;[this._leftPath, this._rightPath] = [this._rightPath, this._leftPath]
+    ;[this._leftTruncated, this._rightTruncated] = [this._rightTruncated, this._leftTruncated]
+    ;[this._leftOriginalSize, this._rightOriginalSize] =
+      [this._rightOriginalSize, this._leftOriginalSize]
+    ;[this._completeLeftClass, this._completeRightClass] =
+      [this._completeRightClass, this._completeLeftClass]
+
+    this._updatePathDisplay('left', this._leftPath ?? '（未選擇）')
+    this._updatePathDisplay('right', this._rightPath ?? '（未選擇）')
+    this._updateSizeInfo()
+    // Find hits carry a side tag, so they must be rebuilt rather than relabelled.
+    this._runFind()
+    this.refresh()
+    this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
   }
 
   /** 立即同步渲染（scroll 事件用，不需要 rAF 因為 layout 已穩定） */
@@ -544,6 +673,30 @@ export class HexCompare {
     }
     this._dom.algoSelect = algoSelect
     toolbar.appendChild(algoSelect)
+
+    // ── S16: 差異導航 ──────────────────────────────────────────────────────────
+    const navBar = el('div', { className: 'hx-nav-bar' })
+    const btnDiffFirst = el('button', { className: 'hx-nav-btn', title: '第一個差異（Alt+Home）' }, '⤒')
+    const btnDiffPrev  = el('button', { className: 'hx-nav-btn', title: '上一個差異（F7）' }, '▲')
+    const btnDiffNext  = el('button', { className: 'hx-nav-btn', title: '下一個差異（F8）' }, '▼')
+    const btnDiffLast  = el('button', { className: 'hx-nav-btn', title: '最後一個差異（Alt+End）' }, '⤓')
+    const diffCount    = el('span', { className: 'hx-diff-count' }, '無差異')
+    this._dom.btnDiffFirst = btnDiffFirst
+    this._dom.btnDiffPrev  = btnDiffPrev
+    this._dom.btnDiffNext  = btnDiffNext
+    this._dom.btnDiffLast  = btnDiffLast
+    this._dom.diffCount    = diffCount
+    navBar.appendChild(btnDiffFirst)
+    navBar.appendChild(btnDiffPrev)
+    navBar.appendChild(btnDiffNext)
+    navBar.appendChild(btnDiffLast)
+    navBar.appendChild(diffCount)
+    toolbar.appendChild(navBar)
+
+    // S16: Swap sides
+    const btnSwap = el('button', { className: 'hx-btn-swap', title: '交換左右兩側' }, '⇄ 交換')
+    this._dom.btnSwap = btnSwap
+    toolbar.appendChild(btnSwap)
 
     // 大小資訊（動態更新）
     const sizeInfo = el('span', { className: 'hx-size-info' })
@@ -703,6 +856,7 @@ export class HexCompare {
         if (v === 'fast' || v === 'complete') {
           this._diffAlgorithm = v
           this._recomputeCompleteIfNeeded()
+          this._recomputeDiffRegions()
           this._refreshSync()
         }
       })
@@ -782,6 +936,28 @@ export class HexCompare {
         this._gotoOffset(gotoInput.value.trim())
       }
     })
+
+    // ── S16: difference navigation + swap ──────────────────────────────────────
+    const { btnDiffFirst, btnDiffPrev, btnDiffNext, btnDiffLast, btnSwap } = this._dom
+    btnDiffFirst.addEventListener('click', () => this.firstDifference())
+    btnDiffPrev.addEventListener('click',  () => this.prevDifference())
+    btnDiffNext.addEventListener('click',  () => this.nextDifference())
+    btnDiffLast.addEventListener('click',  () => this.lastDifference())
+    btnSwap.addEventListener('click',      () => this.swap())
+
+    // app.js only routes F7/F8/Alt+Home/Alt+End to the text view, so hex binds
+    // its own listener; isActive() keeps other tabs from reacting.
+    this._navKeyHandler = (/** @type {KeyboardEvent} */ e) => {
+      if (!isActive('hex')) return
+      const target = e.target
+      if (target instanceof Element && target.matches('input, textarea, select')) return
+      if (e.ctrlKey || e.metaKey) return
+      if (e.key === 'F7' && !e.altKey) { e.preventDefault(); this.prevDifference() }
+      else if (e.key === 'F8' && !e.altKey) { e.preventDefault(); this.nextDifference() }
+      else if (e.key === 'Home' && e.altKey) { e.preventDefault(); this.firstDifference() }
+      else if (e.key === 'End' && e.altKey) { e.preventDefault(); this.lastDifference() }
+    }
+    document.addEventListener('keydown', this._navKeyHandler)
   }
 
   // ── Private: Find (T10) ──────────────────────────────────────────────────────
@@ -982,6 +1158,105 @@ export class HexCompare {
     }
   }
 
+  // ── Private: difference navigation (S16) ──────────────────────────────────────
+
+  /** 依當前演算法模式重算差異區塊，並把選取索引夾回合法範圍 */
+  _recomputeDiffRegions() {
+    const useComplete = this._diffAlgorithm === 'complete'
+      && this._completeLeftClass !== null && this._completeRightClass !== null
+    this._diffRegions = computeHexDiffRegions(
+      this._leftBytes,
+      this._rightBytes,
+      useComplete
+        ? { leftClass: this._completeLeftClass, rightClass: this._completeRightClass }
+        : {},
+    )
+    if (this._diffRegions.length === 0) {
+      this._currentDiffIdx = -1
+    } else if (this._currentDiffIdx >= this._diffRegions.length) {
+      this._currentDiffIdx = this._diffRegions.length - 1
+    }
+    this._updateDiffCounter()
+  }
+
+  /**
+   * 選取並捲動至指定差異區塊
+   * @param {number} idx
+   */
+  _gotoDiff(idx) {
+    const region = this._diffRegions[idx]
+    if (!region) return
+    this._currentDiffIdx = idx
+    this._clearCurrentDiffHighlight()
+
+    const rowIndex = Math.floor(region.start / this._bytesPerRow)
+    for (const side of /** @type {('left'|'right')[]} */ (['left', 'right'])) {
+      const scroll = this._dom[`scroll_${side}`]
+      if (!scroll) continue
+      const viewHeight = scroll.clientHeight || 300
+      // 置中；smooth 捲動會讓 scrollTop 還沒更新就渲染，故直接指派
+      const top = Math.max(0, rowIndex * ROW_HEIGHT - Math.floor(viewHeight / 2) + ROW_HEIGHT)
+      scroll.scrollTop = top
+      this._renderVisibleRows(side, scroll)
+    }
+
+    this._applyCurrentDiffHighlight()
+    this._updateDiffCounter()
+  }
+
+  /** 移除目前差異區塊的高亮 */
+  _clearCurrentDiffHighlight() {
+    if (!this._container) return
+    for (const node of this._container.querySelectorAll('.hx-current-diff')) {
+      node.classList.remove('hx-current-diff')
+    }
+  }
+
+  /**
+   * 為目前差異區塊在已渲染的列上加上 hx-current-diff。
+   * 只掃描 DOM 中存在的列，因此成本與可視區大小成正比，而非與區塊大小成正比。
+   */
+  _applyCurrentDiffHighlight() {
+    const region = this._diffRegions[this._currentDiffIdx]
+    if (!region) return
+    const bpr = this._bytesPerRow
+
+    for (const side of /** @type {('left'|'right')[]} */ (['left', 'right'])) {
+      const inner = this._dom[`inner_${side}`]
+      if (!inner) continue
+      for (const rowEl of inner.querySelectorAll('.hx-row[data-row]')) {
+        const rowStart = parseInt(rowEl.dataset.row, 10) * bpr
+        if (rowStart + bpr <= region.start || rowStart >= region.end) continue
+
+        const hexSpans   = rowEl.querySelectorAll('.hx-hex .hx-byte')
+        const asciiSpans = rowEl.querySelectorAll('.hx-ascii .hx-ascii-char')
+        const from = Math.max(region.start - rowStart, 0)
+        const to   = Math.min(region.end - rowStart, bpr)
+        for (let c = from; c < to; c++) {
+          hexSpans[c]?.classList.add('hx-current-diff')
+          asciiSpans[c]?.classList.add('hx-current-diff')
+        }
+      }
+    }
+  }
+
+  /** 更新「第 X / N 個差異」顯示與導航按鈕可用狀態 */
+  _updateDiffCounter() {
+    const total = this._diffRegions.length
+    const label = this._dom.diffCount
+    if (label) {
+      label.textContent = total === 0
+        ? '無差異'
+        : this._currentDiffIdx < 0
+          ? `共 ${total} 個差異`
+          : `第 ${this._currentDiffIdx + 1} / ${total} 個差異`
+    }
+    for (const key of ['btnDiffFirst', 'btnDiffPrev', 'btnDiffNext', 'btnDiffLast']) {
+      const btn = this._dom[key]
+      if (btn instanceof HTMLButtonElement) btn.disabled = total === 0
+    }
+  }
+
   /**
    * @param {MouseEvent} e
    * @param {'left'|'right'} side
@@ -1141,6 +1416,9 @@ export class HexCompare {
     // Re-apply find highlights for newly rendered rows
     if (this._findMatches.length > 0) {
       this._applyFindHighlights()
+    }
+    if (this._currentDiffIdx >= 0) {
+      this._applyCurrentDiffHighlight()
     }
   }
 

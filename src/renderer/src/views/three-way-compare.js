@@ -43,6 +43,117 @@ function _arraysEqual(a, b) {
   return true
 }
 
+/**
+ * @typedef {{ type: 'normal', lines: string[] }} NormalSegment
+ * @typedef {{ type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[] }} ConflictSegment
+ * @typedef {NormalSegment | ConflictSegment} MergeSegment
+ * @typedef {'left'|'right'|'base'|'both'} ConflictChoice
+ */
+
+// ---------------------------------------------------------------------------
+// S16-M01: conflict navigation / filtering / output assembly (pure, testable)
+// ---------------------------------------------------------------------------
+
+/** Lines of surrounding context kept per conflict in 'conflicts' filter mode. */
+const CONFLICT_CONTEXT_LINES = 2
+
+/**
+ * @param {MergeSegment[]} segments
+ * @returns {number[]} conflict ids in document order
+ */
+export function collectConflictIds(segments) {
+  const ids = []
+  for (const seg of segments || []) {
+    if (seg && seg.type === 'conflict') ids.push(seg.id)
+  }
+  return ids
+}
+
+/**
+ * Wrap-around cursor arithmetic for conflict navigation.
+ *
+ * A separate function because the "no conflicts" and "nothing selected yet"
+ * cases are the two that actually break in practice: stepping from -1 must
+ * land on an end of the list rather than on index -2 / 0-by-accident.
+ *
+ * @param {number} current  current index, -1 when nothing is selected
+ * @param {number} delta    +1 next, -1 previous
+ * @param {number} count    total conflicts
+ * @returns {number} next index, or -1 when there is nothing to select
+ */
+export function wrapConflictIndex(current, delta, count) {
+  if (!Number.isFinite(count) || count <= 0) return -1
+  if (current < 0 || current >= count) return delta >= 0 ? 0 : count - 1
+  return ((current + delta) % count + count) % count
+}
+
+/**
+ * Reduce segments to conflicts plus a little surrounding context.
+ *
+ * @param {MergeSegment[]} segments
+ * @param {number} [contextLines]
+ * @returns {MergeSegment[]}
+ */
+export function filterSegmentsForConflicts(segments, contextLines = CONFLICT_CONTEXT_LINES) {
+  const src = segments || []
+  const out = []
+  for (let i = 0; i < src.length; i++) {
+    const seg = src[i]
+    if (seg.type === 'conflict') { out.push(seg); continue }
+
+    const afterConflict = i > 0 && src[i - 1].type === 'conflict'
+    const beforeConflict = i + 1 < src.length && src[i + 1].type === 'conflict'
+    if (!afterConflict && !beforeConflict) continue
+
+    const n = Math.max(0, contextLines)
+    const head = afterConflict ? seg.lines.slice(0, n) : []
+    const tail = beforeConflict ? seg.lines.slice(Math.max(head.length, seg.lines.length - n)) : []
+    const lines = [...head, ...tail]
+    if (lines.length > 0) out.push({ type: 'normal', lines })
+  }
+  return out
+}
+
+/**
+ * Assemble the merged text from segments and the current choices.
+ * Unresolved conflicts keep their `<<<` markers so nothing is silently lost.
+ *
+ * @param {MergeSegment[]} segments
+ * @param {Map<number, ConflictChoice|null>} choices
+ * @returns {string}
+ */
+export function buildMergedText(segments, choices) {
+  return (segments || []).map(seg => {
+    if (seg.type === 'normal') return seg.lines.join('\n')
+    const choice = choices?.get(seg.id)
+    if (choice === 'left')  return seg.leftLines.join('\n')
+    if (choice === 'right') return seg.rightLines.join('\n')
+    if (choice === 'base')  return seg.baseLines.join('\n')
+    if (choice === 'both')  return [...seg.leftLines, ...seg.rightLines].join('\n')
+    return ['<<<<<<< LEFT', ...seg.leftLines, '||||||| BASE', ...seg.baseLines, '=======', ...seg.rightLines, '>>>>>>> RIGHT'].join('\n')
+  }).join('\n')
+}
+
+/**
+ * Flatten segments into the lines one pane should show.
+ *
+ * @param {MergeSegment[]} segments
+ * @param {'left'|'base'|'right'} side
+ * @returns {Array<{ text: string, conflict: boolean }>}
+ */
+export function segmentsToPaneLines(segments, side) {
+  const key = /** @type {'leftLines'|'baseLines'|'rightLines'} */ (`${side}Lines`)
+  const out = []
+  for (const seg of segments || []) {
+    if (seg.type === 'normal') {
+      for (const text of seg.lines) out.push({ text, conflict: false })
+    } else {
+      for (const text of seg[key]) out.push({ text, conflict: true })
+    }
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // ThreeWayCompare
 // ---------------------------------------------------------------------------
@@ -75,16 +186,27 @@ export class ThreeWayCompare {
 
     /**
      * Parsed segments from the last _threeWayMerge call.
-     * @type {Array<{ type: 'normal', lines: string[] } | { type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[] }>}
+     * @type {MergeSegment[]}
      */
     this._segments = []
 
     /**
      * User choices for each conflict segment.
-     * Key: conflict id (number), Value: 'left' | 'right' | 'both' | null
-     * @type {Map<number, 'left'|'right'|'both'|null>}
+     * Key: conflict id (number), Value: choice or null when unresolved.
+     * @type {Map<number, ConflictChoice|null>}
      */
     this._conflictChoices = new Map()
+
+    /** @type {import('../core/diff-engine.js').DiffLine[]|null} */
+    this._leftDiff = null
+    /** @type {import('../core/diff-engine.js').DiffLine[]|null} */
+    this._rightDiff = null
+
+    /** Index (not id) of the conflict the navigation cursor is on; -1 = none. */
+    this._currentConflict = -1
+
+    /** @type {'all'|'conflicts'} */
+    this._showFilter = 'all'
   }
 
   // ---------------------------------------------------------------------------
@@ -114,6 +236,81 @@ export class ThreeWayCompare {
       base: this._basePath,
       right: this._rightPath,
     })
+  }
+
+  /** @returns {number} number of conflicts in the current merge */
+  getConflictCount() {
+    return collectConflictIds(this._segments).length
+  }
+
+  /** @returns {number} index of the focused conflict, -1 when none */
+  getCurrentConflictIndex() {
+    return this._currentConflict
+  }
+
+  /** @returns {number} the index landed on, -1 when there are no conflicts */
+  nextConflict() {
+    return this._gotoConflict(wrapConflictIndex(this._currentConflict, 1, this.getConflictCount()))
+  }
+
+  /** @returns {number} */
+  prevConflict() {
+    return this._gotoConflict(wrapConflictIndex(this._currentConflict, -1, this.getConflictCount()))
+  }
+
+  /** @returns {number} */
+  firstConflict() {
+    return this._gotoConflict(this.getConflictCount() > 0 ? 0 : -1)
+  }
+
+  /** @returns {number} */
+  lastConflict() {
+    const count = this.getConflictCount()
+    return this._gotoConflict(count > 0 ? count - 1 : -1)
+  }
+
+  /**
+   * Restrict the side panes to conflicts (plus context) or show everything.
+   * @param {'all'|'conflicts'} mode
+   */
+  setShowFilter(mode) {
+    if (mode !== 'all' && mode !== 'conflicts') return
+    this._showFilter = mode
+    this._renderSides()
+    this._updateFilterButton()
+  }
+
+  /** @returns {'all'|'conflicts'} */
+  getShowFilter() {
+    return this._showFilter
+  }
+
+  /**
+   * Record a choice for one conflict.
+   * @param {number} id
+   * @param {ConflictChoice} choice
+   */
+  setConflictChoice(id, choice) {
+    if (!this._conflictChoices.has(id)) return
+    this._conflictChoices.set(id, choice)
+    this._renderOutputPane()
+  }
+
+  /**
+   * Apply one choice to every *unresolved* conflict; already-resolved
+   * conflicts are left alone so a batch action cannot undo manual work.
+   *
+   * @param {ConflictChoice} choice
+   * @returns {number} how many conflicts were changed
+   */
+  resolveAll(choice) {
+    if (choice !== 'left' && choice !== 'right' && choice !== 'base' && choice !== 'both') return 0
+    let n = 0
+    for (const [id, cur] of this._conflictChoices) {
+      if (cur == null) { this._conflictChoices.set(id, choice); n++ }
+    }
+    if (n > 0) this._renderOutputPane()
+    return n
   }
 
   /**
@@ -162,6 +359,16 @@ export class ThreeWayCompare {
   _render() {
     this._container.innerHTML = `
       <div class="mw-layout">
+        <div class="mw-toolbar">
+          <button id="mw-btn-prev" title="上一個衝突">▲</button>
+          <button id="mw-btn-next" title="下一個衝突">▼</button>
+          <span class="mw-conflict-counter" id="mw-conflict-counter">無衝突</span>
+          <span class="mw-toolbar-sep"></span>
+          <button id="mw-btn-filter" title="只顯示衝突段落">顯示：全部</button>
+          <span class="mw-toolbar-sep"></span>
+          <button id="mw-btn-all-left">全部採用左側</button>
+          <button id="mw-btn-all-right">全部採用右側</button>
+        </div>
         <div class="mw-top">
           <!-- Left Pane -->
           <div class="mw-pane" id="mw-pane-left">
@@ -200,7 +407,15 @@ export class ThreeWayCompare {
           <textarea class="mw-output-textarea" id="mw-output" spellcheck="false"></textarea>
         </div>
         <style>
+.mw-toolbar { display:flex; align-items:center; gap:4px; padding:4px 8px; font-size:12px; border-bottom:1px solid #d9d9d9; }
+.mw-toolbar button { padding:2px 8px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:12px; background:transparent; color:inherit; }
+.mw-toolbar button.active { border-color:#2563eb; background:#dbeafe; }
+.mw-toolbar-sep { width:1px; height:14px; background:#d9d9d9; margin:0 4px; }
+.mw-conflict-counter { min-width:96px; }
 .mw-conflict-card { border: 1px solid #e0a000; border-radius:4px; margin:4px 0; background:#fffbe6; }
+.mw-conflict-card--current { outline:2px solid #2563eb; outline-offset:1px; }
+.mw-choice-base.active { background:#e0e7ff; border-color:#4f46e5; }
+.mw-line--conflict { background:#fff3cd; }
 .mw-conflict-choices { display:flex; gap:4px; padding:4px 8px; }
 .mw-choice-btn { padding:2px 8px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:12px; }
 .mw-choice-btn.active { border-color: #2563eb; background:#dbeafe; }
@@ -295,8 +510,56 @@ export class ThreeWayCompare {
       }
     })
 
+    // S16-M01: conflict navigation / filter / batch resolve toolbar
+    this._container.querySelector('#mw-btn-prev')?.addEventListener('click', () => this.prevConflict())
+    this._container.querySelector('#mw-btn-next')?.addEventListener('click', () => this.nextConflict())
+    this._container.querySelector('#mw-btn-filter')?.addEventListener('click', () => {
+      this.setShowFilter(this._showFilter === 'all' ? 'conflicts' : 'all')
+    })
+    this._container.querySelector('#mw-btn-all-left')?.addEventListener('click', () => this.resolveAll('left'))
+    this._container.querySelector('#mw-btn-all-right')?.addEventListener('click', () => this.resolveAll('right'))
+
     // T26: Sync scroll across all three content panes
     this._setupSyncScroll()
+  }
+
+  /**
+   * Move the navigation cursor and reveal the matching conflict card.
+   * @param {number} index
+   * @returns {number} the index actually selected
+   */
+  _gotoConflict(index) {
+    this._currentConflict = index
+    const pane = this._outputPaneEl
+    if (pane) {
+      const ids = collectConflictIds(this._segments)
+      const targetId = index >= 0 ? ids[index] : null
+      pane.querySelectorAll('.mw-conflict-card').forEach(card => {
+        const isCurrent = targetId != null && card.dataset.conflictId === String(targetId)
+        card.classList.toggle('mw-conflict-card--current', isCurrent)
+        // jsdom has no scrollIntoView; navigation must still work under test.
+        if (isCurrent) card.scrollIntoView?.({ block: 'center' })
+      })
+    }
+    this._updateConflictCounter()
+    this._emit('conflict-changed', { index, total: this.getConflictCount() })
+    return index
+  }
+
+  _updateConflictCounter() {
+    const el = this._container?.querySelector('#mw-conflict-counter')
+    if (!el) return
+    const total = this.getConflictCount()
+    el.textContent = total === 0
+      ? '無衝突'
+      : `第 ${this._currentConflict >= 0 ? this._currentConflict + 1 : '-'} / ${total} 個衝突`
+  }
+
+  _updateFilterButton() {
+    const btn = this._container?.querySelector('#mw-btn-filter')
+    if (!btn) return
+    btn.textContent = this._showFilter === 'conflicts' ? '顯示：僅衝突' : '顯示：全部'
+    btn.classList.toggle('active', this._showFilter === 'conflicts')
   }
 
   /**
@@ -343,14 +606,48 @@ export class ThreeWayCompare {
     segments.forEach(seg => {
       if (seg.type === 'conflict') this._conflictChoices.set(seg.id, null)
     })
+    this._leftDiff = leftDiff
+    this._rightDiff = rightDiff
+    this._currentConflict = -1
 
-    this._renderSidePane('left', this._leftContent, leftDiff, 'left')
-    this._renderSidePane('base', this._baseContent, null, 'base')
-    this._renderSidePane('right', this._rightContent, rightDiff, 'right')
-
+    this._renderSides()
     this._renderOutputPane()
+    this._updateConflictCounter()
+    this._updateFilterButton()
 
     this._emit('ready', { hasConflicts })
+  }
+
+  /** Render the three side panes honouring the current show filter. */
+  _renderSides() {
+    if (this._showFilter === 'conflicts') {
+      const filtered = filterSegmentsForConflicts(this._segments)
+      this._renderFilteredSidePane('left', filtered)
+      this._renderFilteredSidePane('base', filtered)
+      this._renderFilteredSidePane('right', filtered)
+      return
+    }
+    this._renderSidePane('left', this._leftContent, this._leftDiff, 'left')
+    this._renderSidePane('base', this._baseContent, null, 'base')
+    this._renderSidePane('right', this._rightContent, this._rightDiff, 'right')
+  }
+
+  /**
+   * Render one pane from merge segments rather than from the raw diff.
+   * Line numbers are omitted because filtered output is not contiguous.
+   *
+   * @param {'left'|'base'|'right'} side
+   * @param {MergeSegment[]} segments
+   */
+  _renderFilteredSidePane(side, segments) {
+    const contentEl = this._contentEls[side]
+    if (!contentEl) return
+    contentEl.innerHTML = ''
+    const frag = document.createDocumentFragment()
+    for (const { text, conflict } of segmentsToPaneLines(segments, side)) {
+      frag.appendChild(this._makeLine(conflict ? 'conflict' : 'equal', null, text))
+    }
+    contentEl.appendChild(frag)
   }
 
   /**
@@ -461,15 +758,7 @@ export class ThreeWayCompare {
    * @returns {string}
    */
   _buildOutputText() {
-    return this._segments.map(seg => {
-      if (seg.type === 'normal') return seg.lines.join('\n')
-      const choice = this._conflictChoices.get(seg.id)
-      if (choice === 'left')  return seg.leftLines.join('\n')
-      if (choice === 'right') return seg.rightLines.join('\n')
-      if (choice === 'both')  return [...seg.leftLines, ...seg.rightLines].join('\n')
-      // Unresolved: preserve <<< markers
-      return ['<<<<<<< LEFT', ...seg.leftLines, '||||||| BASE', ...seg.baseLines, '=======', ...seg.rightLines, '>>>>>>> RIGHT'].join('\n')
-    }).join('\n')
+    return buildMergedText(this._segments, this._conflictChoices)
   }
 
   /**
@@ -503,6 +792,11 @@ export class ThreeWayCompare {
         btnLeft.dataset.id = String(seg.id)
         btnLeft.textContent = '接受左側'
 
+        const btnBase = document.createElement('button')
+        btnBase.className = 'mw-choice-btn mw-choice-base'
+        btnBase.dataset.id = String(seg.id)
+        btnBase.textContent = '採用中間'
+
         const btnBoth = document.createElement('button')
         btnBoth.className = 'mw-choice-btn mw-choice-both'
         btnBoth.dataset.id = String(seg.id)
@@ -516,10 +810,12 @@ export class ThreeWayCompare {
         // Restore active state if already chosen
         const existing = this._conflictChoices.get(seg.id)
         if (existing === 'left')  btnLeft.classList.add('active')
+        if (existing === 'base')  btnBase.classList.add('active')
         if (existing === 'both')  btnBoth.classList.add('active')
         if (existing === 'right') btnRight.classList.add('active')
 
         choicesDiv.appendChild(btnLeft)
+        choicesDiv.appendChild(btnBase)
         choicesDiv.appendChild(btnBoth)
         choicesDiv.appendChild(btnRight)
 
@@ -557,10 +853,11 @@ export class ThreeWayCompare {
         const card = pane.querySelector(`.mw-conflict-card[data-conflict-id="${id}"]`)
 
         // Determine which choice
-        /** @type {'left'|'right'|'both'} */
+        /** @type {ConflictChoice} */
         let choice
         if (btn.classList.contains('mw-choice-left'))  choice = 'left'
         else if (btn.classList.contains('mw-choice-right')) choice = 'right'
+        else if (btn.classList.contains('mw-choice-base')) choice = 'base'
         else choice = 'both'
 
         this._conflictChoices.set(id, choice)
@@ -573,6 +870,15 @@ export class ThreeWayCompare {
         this._syncOutputTextarea()
       })
     })
+
+    // Re-rendering rebuilds the cards, so the navigation cursor's highlight
+    // has to be restored or it silently disappears on every choice click.
+    const ids = collectConflictIds(this._segments)
+    const currentId = this._currentConflict >= 0 ? ids[this._currentConflict] : null
+    if (currentId != null) {
+      pane.querySelector(`.mw-conflict-card[data-conflict-id="${currentId}"]`)
+        ?.classList.add('mw-conflict-card--current')
+    }
 
     // Initial textarea sync
     this._syncOutputTextarea()
@@ -704,7 +1010,7 @@ export class ThreeWayCompare {
 
   /**
    * Create a single line element.
-   * @param {string} type  'equal' | 'insert' | 'delete' | 'replace'
+   * @param {string} type  'equal' | 'insert' | 'delete' | 'replace' | 'conflict'
    * @param {number|null} lineNum
    * @param {string} text
    * @returns {HTMLElement}

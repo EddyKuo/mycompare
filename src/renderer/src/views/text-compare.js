@@ -17,6 +17,7 @@
 
 import { diffLines, diffChars } from '../core/diff-engine.js';
 import { showContextMenu } from '../core/context-menu.js';
+import { SettingsStore } from '../core/settings-store.js';
 import { detectEol } from '../core/eol-detect.js';
 import { isActive } from '../core/active-view.js';
 
@@ -269,6 +270,9 @@ function createCollapsedEl(start, end, count, expanded = false) {
     : `── ${count} 行相同（點擊展開）──`;
   return div;
 }
+
+/** Shared settings reader — saves consult it for the backup preference. */
+const _settings = new SettingsStore();
 
 // ---------------------------------------------------------------------------
 // TextCompare class
@@ -1342,7 +1346,8 @@ export class TextCompare {
       { name: '所有檔案', extensions: ['*'] }
     ];
     await window.electronAPI.saveFile(
-      this._leftPath || 'left.txt', this._leftContent, filters, this._encodingLeft);
+      this._leftPath || 'left.txt', this._leftContent, filters,
+      this._encodingLeft, _settings.getPref('backupOnSave'));
     this._modified.left = false;
     this._updateModifiedIndicator();
   }
@@ -1358,7 +1363,8 @@ export class TextCompare {
       { name: '所有檔案', extensions: ['*'] }
     ];
     await window.electronAPI.saveFile(
-      this._rightPath || 'right.txt', this._rightContent, filters, this._encodingRight);
+      this._rightPath || 'right.txt', this._rightContent, filters,
+      this._encodingRight, _settings.getPref('backupOnSave'));
     this._modified.right = false;
     this._updateModifiedIndicator();
   }

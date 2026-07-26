@@ -338,6 +338,40 @@
   background: rgba(230, 81, 0, 0.3);
 }
 
+/* ── Difference navigation (S16) ────────────────────────────────────────────── */
+
+.hx-nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 6px;
+}
+
+.hx-toolbar .hx-nav-btn {
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.hx-toolbar .hx-nav-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hx-diff-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+/* 目前差異區塊：以外框標示，保留底層 diff 配色 */
+.hx-byte.hx-current-diff,
+.hx-ascii-char.hx-current-diff {
+  outline: 1px solid var(--diff-replace-border);
+  font-weight: bold;
+}
+
 /* ── Selected byte highlight (T27) ──────────────────────────────────────────── */
 
 .hx-byte.hx-selected,
