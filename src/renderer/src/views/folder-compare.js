@@ -7,6 +7,8 @@ import { showContextMenu } from '../core/context-menu.js'
 import { el, debounce, formatSize } from '../core/utils.js'
 import { isActive } from '../core/active-view.js'
 import { parseMasks, matchesMasks } from '../core/file-mask.js'
+import { diffLines } from '../core/diff-engine.js'
+import { getViewTypeForPath } from '../core/file-type.js'
 import '../styles/folder-compare.css'
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -130,6 +132,201 @@ export function statusVisibleUnder(status, flags) {
     case 'right-newer': return flags.showRightNewer
     default:            return true
   }
+}
+
+// ── Rules-based content comparison ──────────────────────────────────────────
+
+/**
+ * @typedef {object} RulesOptions
+ * @property {boolean} ignoreWhitespace
+ * @property {boolean} ignoreCase
+ * @property {boolean} ignoreLineEndings
+ * @property {boolean} ignoreIndent
+ * @property {string[]} ignorePatterns    lines matching these take no part in the diff
+ * @property {string[]} unimportantPatterns  changed lines matching these are not real differences
+ * @property {number} maxBytes            per-file ceiling for reading into the renderer
+ * @property {'myers'|'patience'|'histogram'} algorithm
+ */
+
+/**
+ * Whitespace and line endings are unimportant by default because that is what
+ * Beyond Compare's stock text rules do — the whole point of the rules mode is
+ * that a re-indented or CRLF-converted file is not "different".
+ * @type {RulesOptions}
+ */
+export const DEFAULT_RULES_OPTIONS = {
+  ignoreWhitespace: true,
+  ignoreCase: false,
+  ignoreLineEndings: true,
+  ignoreIndent: false,
+  ignorePatterns: [],
+  unimportantPatterns: [],
+  maxBytes: 1_048_576,
+  algorithm: 'myers',
+}
+
+/**
+ * Hard ceiling on the per-file limit. Rules mode pulls whole files across IPC
+ * into the renderer, so no configured value may exceed what a folder of them
+ * can survive.
+ */
+export const MAX_RULES_FILE_BYTES = 4_194_304
+
+/** Statuses worth a content check; anything else is already decided. */
+const RULES_CANDIDATE_STATUSES = new Set(['different', 'left-newer', 'right-newer'])
+
+/** Concurrent file-pair reads, matching the hash path's IPC budget. */
+const RULES_CONCURRENCY = 8
+
+/**
+ * @param {unknown} raw
+ * @returns {RulesOptions}
+ */
+export function normalizeRulesOptions(raw) {
+  const src = (raw && typeof raw === 'object') ? /** @type {Record<string, unknown>} */ (raw) : {}
+  const bool = (key) => typeof src[key] === 'boolean' ? src[key] : DEFAULT_RULES_OPTIONS[key]
+  const list = (key) => Array.isArray(src[key])
+    ? src[key].filter((p) => typeof p === 'string' && p.trim()).map((p) => p.trim())
+    : [...DEFAULT_RULES_OPTIONS[key]]
+  const size = Number(src.maxBytes)
+  return {
+    ignoreWhitespace: bool('ignoreWhitespace'),
+    ignoreCase: bool('ignoreCase'),
+    ignoreLineEndings: bool('ignoreLineEndings'),
+    ignoreIndent: bool('ignoreIndent'),
+    ignorePatterns: list('ignorePatterns'),
+    unimportantPatterns: list('unimportantPatterns'),
+    maxBytes: Number.isFinite(size) && size > 0
+      ? Math.min(size, MAX_RULES_FILE_BYTES)
+      : DEFAULT_RULES_OPTIONS.maxBytes,
+    algorithm: ['myers', 'patience', 'histogram'].includes(/** @type {string} */ (src.algorithm))
+      ? /** @type {'myers'|'patience'|'histogram'} */ (src.algorithm)
+      : DEFAULT_RULES_OPTIONS.algorithm,
+  }
+}
+
+/**
+ * Compile user-supplied patterns, dropping the ones that do not parse.
+ *
+ * A typo in the rules panel must not abort a whole folder comparison, so an
+ * invalid pattern is simply inert.
+ *
+ * @param {string[]} patterns
+ * @returns {RegExp[]}
+ */
+export function compileRulePatterns(patterns) {
+  const out = []
+  for (const p of patterns ?? []) {
+    try { out.push(new RegExp(p)) } catch { /* inert until the user fixes it */ }
+  }
+  return out
+}
+
+/**
+ * Grade a pair of text files the way Beyond Compare's rules-based comparison
+ * does: byte-equal, equal-once-the-rules-are-applied, or genuinely different.
+ *
+ * @param {string} leftText
+ * @param {string} rightText
+ * @param {Partial<RulesOptions>} [options]
+ * @returns {'identical'|'minor'|'major'}
+ */
+export function classifyTextPair(leftText, rightText, options = {}) {
+  const opts = normalizeRulesOptions(options)
+  const left = String(leftText ?? '')
+  const right = String(rightText ?? '')
+  if (left === right) return 'identical'
+
+  const ignoreRe = compileRulePatterns(opts.ignorePatterns)
+  const unimportantRe = compileRulePatterns(opts.unimportantPatterns)
+
+  // Lines the rules delete never reach the diff, so a change confined to them
+  // cannot promote the pair to a real difference.
+  const strip = (text) => ignoreRe.length
+    ? text.split(/\r\n|\r|\n/).filter((line) => !ignoreRe.some((re) => re.test(line))).join('\n')
+    : text
+
+  const diff = diffLines(strip(left), strip(right), {
+    algorithm: opts.algorithm,
+    ignoreWhitespace: opts.ignoreWhitespace,
+    ignoreCase: opts.ignoreCase,
+    ignoreLineEndings: opts.ignoreLineEndings,
+    ignoreIndent: opts.ignoreIndent,
+  })
+  const changed = diff.filter((d) => d.type !== 'equal')
+  if (!changed.length) return 'minor'
+
+  if (unimportantRe.length) {
+    const covered = changed.every((d) =>
+      [d.leftText, d.rightText].every((t) => !t || unimportantRe.some((re) => re.test(t))))
+    if (covered) return 'minor'
+  }
+  return 'major'
+}
+
+/**
+ * Map a grade onto the row fields the view renders.
+ *
+ * `minor` keeps the row on the "same" side of every count and filter — it is a
+ * difference the rules declared uninteresting — and carries the `unimportant`
+ * flag that paints it blue, per the project's colour semantics.
+ *
+ * @param {'identical'|'minor'|'major'} cls
+ * @returns {{ status: 'same'|'different', unimportant: boolean }}
+ */
+export function statusForRulesClass(cls) {
+  if (cls === 'major') return { status: 'different', unimportant: false }
+  return { status: 'same', unimportant: cls === 'minor' }
+}
+
+/**
+ * Whether a name is worth reading as text at all. Anything the app would route
+ * to the image / hex / table views is binary as far as a line diff is
+ * concerned and belongs on the hash path.
+ *
+ * @param {string} nameOrPath
+ * @returns {boolean}
+ */
+export function isRulesTextCandidate(nameOrPath) {
+  return getViewTypeForPath(String(nameOrPath ?? '')) === 'text'
+}
+
+/**
+ * Split rows into the ones a line diff can grade and the ones that fall back to
+ * hashing — binaries, and anything too large to pull into the renderer.
+ *
+ * @param {CompareRow[]} rows
+ * @param {Partial<RulesOptions>} [options]
+ * @returns {{ text: CompareRow[], hash: CompareRow[] }}
+ */
+export function planRulesComparison(rows, options = {}) {
+  const { maxBytes } = normalizeRulesOptions(options)
+  /** @type {{ text: CompareRow[], hash: CompareRow[] }} */
+  const plan = { text: [], hash: [] }
+  for (const row of rows ?? []) {
+    if (!row?.left?.path || !row?.right?.path) continue
+    if (row.left.isDirectory || row.right.isDirectory) continue
+    if (!RULES_CANDIDATE_STATUSES.has(row.status)) continue
+    const biggest = Math.max(Number(row.left.size) || 0, Number(row.right.size) || 0)
+    const readable = isRulesTextCandidate(row.name ?? row.left.path) && biggest <= maxBytes
+    ;(readable ? plan.text : plan.hash).push(row)
+  }
+  return plan
+}
+
+/**
+ * Whether a directory contains nothing worse than unimportant differences.
+ *
+ * Kept separate from `rollupStatus` so the status rollup keeps its existing
+ * contract; the flag is orthogonal to the status.
+ *
+ * @param {CompareRow} row
+ * @returns {boolean}
+ */
+export function rollupUnimportant(row) {
+  if (row?.unimportant) return true
+  if (!row?.children) return false
+  return row.children.some((child) => rollupUnimportant(child))
 }
 
 // ── Columns ─────────────────────────────────────────────────────────────────
@@ -562,6 +759,17 @@ export class FolderCompare {
     // 預設 2 秒與 BeyondCompare 的 FAT 容差一致。
     this._mtimeTolerance = options.mtimeTolerance ?? 2
 
+    /** @type {RulesOptions} settings for the `rules` compare mode */
+    this._rulesOptions = normalizeRulesOptions(options.rulesOptions)
+
+    // A scan owns an AbortController so a cancelled run can be told apart from
+    // the one that replaced it; results from an aborted controller are dropped
+    // rather than written back into the model.
+    /** @type {AbortController|null} */
+    this._scanController = null
+    /** Items finished since the current scan started, for the progress read-out. */
+    this._scanProcessed = 0
+
     // Event handlers map
     this._handlers = {}
 
@@ -633,6 +841,80 @@ export class FolderCompare {
     this._showRightNewer = preset.showRightNewer
     this._syncFilterControls()
     this._applyFilterAndRender()
+  }
+
+  // ── Rules-based comparison ──────────────────────────────────────────────────
+
+  /** @returns {RulesOptions} */
+  getRulesOptions() {
+    return { ...this._rulesOptions, ignorePatterns: [...this._rulesOptions.ignorePatterns], unimportantPatterns: [...this._rulesOptions.unimportantPatterns] }
+  }
+
+  /**
+   * Merge in new rule settings and, in rules mode, re-grade the tree.
+   * @param {Partial<RulesOptions>} partial
+   * @returns {RulesOptions}
+   */
+  setRulesOptions(partial) {
+    this._rulesOptions = normalizeRulesOptions({ ...this._rulesOptions, ...(partial ?? {}) })
+    this._syncRulesControls()
+    if (this._mode === 'rules' && (this._leftPath || this._rightPath)) {
+      void this._compareAndRender()
+    }
+    return this.getRulesOptions()
+  }
+
+  // ── Scan progress & cancellation ────────────────────────────────────────────
+
+  /** @returns {boolean} */
+  isScanning() {
+    return !!this._scanController
+  }
+
+  /**
+   * Abort the running scan. Whatever the in-flight work returns afterwards is
+   * discarded, so the tree keeps the last state the user actually saw.
+   */
+  cancelScan() {
+    if (!this._scanController) return
+    this._scanController.abort()
+    this._setScanStatus('已取消')
+  }
+
+  /**
+   * Start a scan generation, superseding any previous one.
+   * @returns {AbortController}
+   */
+  _beginScan() {
+    this._scanController?.abort()
+    const ctrl = new AbortController()
+    this._scanController = ctrl
+    this._scanProcessed = 0
+    if (this._dom.btnCancel) this._dom.btnCancel.style.display = ''
+    this._setScanStatus('掃描中… 0 項')
+    return ctrl
+  }
+
+  /**
+   * @param {AbortController} ctrl
+   */
+  _endScan(ctrl) {
+    // A newer scan may already own the UI; only its owner may clear it.
+    if (this._scanController !== ctrl) return
+    this._scanController = null
+    if (this._dom.btnCancel) this._dom.btnCancel.style.display = 'none'
+    if (!ctrl.signal.aborted) this._setScanStatus('')
+  }
+
+  /** @param {number} [n] */
+  _tickProgress(n = 1) {
+    this._scanProcessed += n
+    if (this._scanController) this._setScanStatus(`掃描中… ${this._scanProcessed} 項`)
+  }
+
+  /** @param {string} text */
+  _setScanStatus(text) {
+    if (this._dom.scanStatus) this._dom.scanStatus.textContent = text
   }
 
   // ── Columns & sorting ───────────────────────────────────────────────────────
@@ -736,6 +1018,7 @@ export class FolderCompare {
       mtimeTolerance: this._mtimeTolerance,
       filterStr: this._filterStr,
       columns: [...this._columns],
+      rulesOptions: this.getRulesOptions(),
     }
   }
 
@@ -744,7 +1027,11 @@ export class FolderCompare {
    */
   applyConfig(cfg) {
     if (!cfg || typeof cfg !== 'object') return
-    if (['name', 'size', 'mtime', 'both', 'content'].includes(cfg.mode)) this._mode = cfg.mode
+    if (['name', 'size', 'mtime', 'both', 'content', 'rules'].includes(cfg.mode)) this._mode = cfg.mode
+    if (cfg.rulesOptions) {
+      this._rulesOptions = normalizeRulesOptions({ ...this._rulesOptions, ...cfg.rulesOptions })
+      this._syncRulesControls()
+    }
     if (typeof cfg.mtimeTolerance === 'number' && cfg.mtimeTolerance >= 0) {
       this._mtimeTolerance = cfg.mtimeTolerance
     }
@@ -889,15 +1176,18 @@ export class FolderCompare {
 
     const rows = flattenRows(this._rows ?? []).map(row => {
       const key = String(row.status ?? '').replace(/-/g, '_')
-      const bg = statusColor[key] ?? '#fff'
+      // Rules-graded rows keep the blue "unimportant difference" semantics of
+      // the live view instead of reading as plain "相同".
+      const bg = row.unimportant ? '#e8f0fe' : (statusColor[key] ?? '#fff')
       const indent = '  '.repeat((row.depth ?? 0))
       const name = indent + esc(row.name ?? '')
       const lSize = fmtSize(row.left?.size)
       const rSize = fmtSize(row.right?.size)
       const lDate = fmtDate(row.left?.mtime)
       const rDate = fmtDate(row.right?.mtime)
+      const label = row.unimportant ? '不重要差異' : (statusLabel[key] ?? row.status)
       return `<tr style="background:${bg}">
-  <td>${name}</td><td>${statusLabel[key] ?? row.status}</td>
+  <td>${name}</td><td>${label}</td>
   <td>${lSize}</td><td>${lDate}</td>
   <td>${rSize}</td><td>${rDate}</td>
 </tr>`
@@ -1411,7 +1701,16 @@ ${rows}
    */
   async expandAll() {
     const budget = { loaded: 0 }
-    await this._expandSubtree(this._rows, 0, budget)
+    const ctrl = this._beginScan()
+    // Cancelling has to leave the tree exactly as the user last saw it, so the
+    // expansion set is restored wholesale rather than unwound row by row.
+    const before = new Set(this._expanded)
+    try {
+      await this._expandSubtree(this._rows, 0, budget, ctrl.signal)
+    } finally {
+      if (ctrl.signal.aborted) this._expanded = before
+      this._endScan(ctrl)
+    }
     if (budget.loaded >= MAX_EXPAND_ALL_DIRS) {
       console.warn(`FolderCompare.expandAll: stopped after ${MAX_EXPAND_ALL_DIRS} directories`)
     }
@@ -1581,6 +1880,9 @@ ${rows}
 
   /** 卸載並清除 DOM、事件 */
   destroy() {
+    // Late IPC results must not land on a torn-down view.
+    this._scanController?.abort()
+    this._scanController = null
     if (this._onDocumentClick) {
       document.removeEventListener('click', this._onDocumentClick)
       this._onDocumentClick = null
@@ -1641,6 +1943,9 @@ ${rows}
     // Toolbar
     root.appendChild(this._buildToolbar())
 
+    // Rules panel (hidden by default)
+    root.appendChild(this._buildRulesPanel())
+
     // T54: Find bar (hidden by default)
     root.appendChild(this._buildFindBar())
 
@@ -1684,6 +1989,7 @@ ${rows}
       { value: 'mtime',   label: '名稱+修改時間' },
       { value: 'both',    label: '名稱+大小+時間' },
       { value: 'content', label: '內容 (MD5)' },
+      { value: 'rules',   label: '內容 (規則)' },
     ].forEach(({ value, label }) => {
       const opt = el('option', { value }, label)
       if (value === this._mode) opt.setAttribute('selected', '')
@@ -1764,6 +2070,23 @@ ${rows}
     this._dom.btnColumns = btnColumns
     toolbar.appendChild(btnColumns)
 
+    const btnRules = el('button', { className: 'fc-btn-rules', title: '比對規則（忽略選項）' }, '⚖ 規則')
+    this._dom.btnRules = btnRules
+    toolbar.appendChild(btnRules)
+
+    // Scan progress + cancel, hidden until a scan is actually running.
+    const scanStatus = el('span', { className: 'fc-scan-status' }, '')
+    this._dom.scanStatus = scanStatus
+    toolbar.appendChild(scanStatus)
+
+    const btnCancel = el('button', {
+      className: 'fc-btn-cancel',
+      title: '取消掃描',
+      style: 'display:none',
+    }, '✕ 取消')
+    this._dom.btnCancel = btnCancel
+    toolbar.appendChild(btnCancel)
+
     // T51: Advanced selection dropdown
     const selectWrap = el('div', { className: 'fc-select-wrap' })
     const btnSelect = el('button', {
@@ -1829,6 +2152,104 @@ ${rows}
     toolbar.appendChild(batchWrap)
 
     return toolbar
+  }
+
+  /**
+   * Ignore-rule settings for the `rules` compare mode. Built once and toggled,
+   * so the fields keep whatever the user typed between openings.
+   * @returns {HTMLElement}
+   */
+  _buildRulesPanel() {
+    const panel = el('div', { className: 'fc-rules-panel', style: 'display:none' })
+
+    /** @type {Array<[string, string]>} */
+    const toggles = [
+      ['ignoreWhitespace', '忽略空白'],
+      ['ignoreCase', '忽略大小寫'],
+      ['ignoreLineEndings', '忽略行尾符號'],
+      ['ignoreIndent', '忽略縮排'],
+    ]
+    this._dom.rulesToggles = {}
+    for (const [key, label] of toggles) {
+      const cb = el('input', { type: 'checkbox', className: 'fc-rules-cb', 'data-rule': key })
+      cb.checked = !!this._rulesOptions[key]
+      const wrap = el('label', { className: 'fc-rules-toggle' })
+      wrap.appendChild(cb)
+      wrap.appendChild(document.createTextNode(' ' + label))
+      this._dom.rulesToggles[key] = cb
+      panel.appendChild(wrap)
+    }
+
+    const ignoreInput = el('input', {
+      type: 'text',
+      className: 'fc-rules-ignore',
+      placeholder: '忽略正規表達式（; 分隔）',
+      title: '符合的行完全不參與比對',
+    })
+    ignoreInput.value = this._rulesOptions.ignorePatterns.join(';')
+    this._dom.rulesIgnore = ignoreInput
+    panel.appendChild(ignoreInput)
+
+    const unimportantInput = el('input', {
+      type: 'text',
+      className: 'fc-rules-unimportant',
+      placeholder: '不重要正規表達式（; 分隔）',
+      title: '差異若全落在符合的行上，視為不重要差異',
+    })
+    unimportantInput.value = this._rulesOptions.unimportantPatterns.join(';')
+    this._dom.rulesUnimportant = unimportantInput
+    panel.appendChild(unimportantInput)
+
+    const sizeInput = el('input', {
+      type: 'number',
+      className: 'fc-rules-size',
+      min: '1',
+      title: `單檔大小上限（KB），上限 ${Math.floor(MAX_RULES_FILE_BYTES / 1024)}`,
+    })
+    sizeInput.value = String(Math.floor(this._rulesOptions.maxBytes / 1024))
+    this._dom.rulesSize = sizeInput
+    panel.appendChild(el('label', { className: 'fc-rules-size-label' }, '上限 KB'))
+    panel.appendChild(sizeInput)
+
+    const btnApply = el('button', { className: 'fc-rules-apply' }, '套用')
+    this._dom.rulesApply = btnApply
+    panel.appendChild(btnApply)
+
+    this._dom.rulesPanel = panel
+    return panel
+  }
+
+  /** Push the rule settings back onto the panel controls. */
+  _syncRulesControls() {
+    const { rulesToggles, rulesIgnore, rulesUnimportant, rulesSize } = this._dom
+    for (const [key, cb] of Object.entries(rulesToggles ?? {})) {
+      cb.checked = !!this._rulesOptions[key]
+    }
+    if (rulesIgnore) rulesIgnore.value = this._rulesOptions.ignorePatterns.join(';')
+    if (rulesUnimportant) rulesUnimportant.value = this._rulesOptions.unimportantPatterns.join(';')
+    if (rulesSize) rulesSize.value = String(Math.floor(this._rulesOptions.maxBytes / 1024))
+  }
+
+  /** Read the panel controls into the rule settings. */
+  _readRulesPanel() {
+    const { rulesToggles, rulesIgnore, rulesUnimportant, rulesSize } = this._dom
+    const split = (value) => String(value ?? '').split(';').map((s) => s.trim()).filter(Boolean)
+    /** @type {Partial<RulesOptions>} */
+    const next = {
+      ignorePatterns: split(rulesIgnore?.value),
+      unimportantPatterns: split(rulesUnimportant?.value),
+    }
+    for (const [key, cb] of Object.entries(rulesToggles ?? {})) next[key] = !!cb.checked
+    const kb = Number(rulesSize?.value)
+    if (Number.isFinite(kb) && kb > 0) next.maxBytes = Math.round(kb * 1024)
+    this.setRulesOptions(next)
+  }
+
+  /** 顯示 / 隱藏比對規則面板 */
+  toggleRulesPanel() {
+    const panel = this._dom.rulesPanel
+    if (!panel) return
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none'
   }
 
   /** 建立 find bar（T54），由 _render() 呼叫，預設隱藏 */
@@ -2031,6 +2452,13 @@ ${rows}
       this._openColumnMenu(e)
     })
 
+    this._dom.btnRules?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this.toggleRulesPanel()
+    })
+    this._dom.rulesApply?.addEventListener('click', () => this._readRulesPanel())
+    this._dom.btnCancel?.addEventListener('click', () => this.cancelScan())
+
     // T56: Expand All / Collapse All
     btnExpandAll?.addEventListener('click', () => void this.expandAll())
     btnCollapseAll?.addEventListener('click', () => this.collapseAll())
@@ -2207,46 +2635,113 @@ ${rows}
     }
 
     this._renderLoading()
+    const ctrl = this._beginScan()
 
     try {
       const [leftEntries, rightEntries] = await Promise.all([
         this._leftPath  ? window.electronAPI.readDir(this._leftPath)  : Promise.resolve([]),
         this._rightPath ? window.electronAPI.readDir(this._rightPath) : Promise.resolve([]),
       ])
+      // Entries that arrive after a cancel belong to a comparison the user no
+      // longer wants; keeping the previous tree is the consistent outcome.
+      if (ctrl.signal.aborted) { this._renderList(); return }
       this._leftEntries = leftEntries
       this._rightEntries = rightEntries
+      this._tickProgress(leftEntries.length + rightEntries.length)
       this._expanded.clear()
-      this._compareAndRender()
+      await this._compareAndRender(ctrl.signal)
       this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
     } catch (err) {
       console.error('FolderCompare._scan error:', err)
       this._renderError(err.message)
+    } finally {
+      this._endScan(ctrl)
     }
   }
 
-  /** 執行比對並更新 this._rows，然後重新渲染 */
-  async _compareAndRender() {
+  /**
+   * 執行比對並更新 this._rows，然後重新渲染
+   * @param {AbortSignal} [signal]
+   */
+  async _compareAndRender(signal) {
     // 清空批次選取狀態
     this._selectedNames.clear()
     this._updateBatchButton()
     if (this._dom.cbSelectAll) this._dom.cbSelectAll.checked = false
 
-    // 先以 'both'（名稱+大小+時間）做初步比對；content 模式再進一步以 MD5 確認
-    const baseMode = this._mode === 'content' ? 'both' : this._mode
-    this._rows = compareEntries(this._leftEntries, this._rightEntries, baseMode, this._mtimeTolerance)
+    // Re-comparing after a mode or rule change is just as slow as a scan, so it
+    // gets its own cancellable generation when the caller has not opened one.
+    const owned = signal ? null : this._beginScan()
+    const sig = signal ?? owned.signal
 
-    if (this._mode === 'content' && window.electronAPI?.hashFile) {
-      await this._applyContentHash()
+    // 先以 'both'（名稱+大小+時間）做初步比對；content / rules 模式再進一步確認
+    this._rows = compareEntries(this._leftEntries, this._rightEntries, this._baseMode(), this._mtimeTolerance)
+
+    try {
+      await this._applyDeepCompare(this._rows, sig)
+    } finally {
+      if (owned) this._endScan(owned)
     }
 
     this._applyFilterAndRender()
   }
 
+  /** @returns {'name'|'size'|'mtime'|'both'} 內容類模式先以 metadata 粗篩 */
+  _baseMode() {
+    return (this._mode === 'content' || this._mode === 'rules') ? 'both' : this._mode
+  }
+
+  /**
+   * 依 mode 執行需要讀檔的第二階段比對。
+   * @param {CompareRow[]} rows
+   * @param {AbortSignal} [signal]
+   */
+  async _applyDeepCompare(rows, signal) {
+    if (this._mode === 'content' && window.electronAPI?.hashFile) {
+      await this._applyContentHash(rows, signal)
+    } else if (this._mode === 'rules') {
+      await this._applyRulesCompare(rows, signal)
+    }
+  }
+
+  /**
+   * Rules-based grading: text files go through the line diff, everything else
+   * (binaries, and anything over the size ceiling) falls back to hashing so a
+   * huge file is never pulled into the renderer.
+   *
+   * @param {CompareRow[]} rows
+   * @param {AbortSignal} [signal]
+   */
+  async _applyRulesCompare(rows = this._rows, signal) {
+    const plan = planRulesComparison(rows, this._rulesOptions)
+    if (plan.hash.length) await this._applyContentHash(plan.hash, signal)
+    if (!plan.text.length || !window.electronAPI?.readFile) return
+
+    await _runWithConcurrency(plan.text, RULES_CONCURRENCY, async (row) => {
+      if (signal?.aborted) return
+      const [left, right] = await Promise.all([
+        window.electronAPI.readFile(row.left.path),
+        window.electronAPI.readFile(row.right.path),
+      ])
+      // The reads outlive a cancel; writing their verdict would resurrect a
+      // comparison the user already abandoned.
+      if (signal?.aborted) return
+      const { status, unimportant } = statusForRulesClass(
+        classifyTextPair(left?.content ?? left ?? '', right?.content ?? right ?? '', this._rulesOptions),
+      )
+      row.status = status
+      row.unimportant = unimportant
+      this._tickProgress()
+    })
+  }
+
   /**
    * 對需要進一步確認的列（size 相同但 mtime 不同，或 'different'）
    * 計算雙側 MD5；若 hash 相同則改為 'same'。
+   * @param {CompareRow[]} rows
+   * @param {AbortSignal} [signal]
    */
-  async _applyContentHash(rows = this._rows) {
+  async _applyContentHash(rows = this._rows, signal) {
     const candidates = rows.filter(row =>
       !row.left?.isDirectory &&
       !row.right?.isDirectory &&
@@ -2257,15 +2752,20 @@ ${rows}
 
     // S14-M05: cap concurrent IPC to avoid flooding main when thousands of
     // candidates exist (10k files × 2 hashFile calls = 20k parallel IPCs).
-    await _runWithConcurrency(candidates, 8, async (row) => {
+    if (!window.electronAPI?.hashFile) return
+    await _runWithConcurrency(candidates, RULES_CONCURRENCY, async (row) => {
+      if (signal?.aborted) return
       try {
         const [lHash, rHash] = await Promise.all([
           window.electronAPI.hashFile(row.left.path),
           window.electronAPI.hashFile(row.right.path),
         ])
+        if (signal?.aborted) return
         if (lHash && rHash && lHash === rHash) {
           row.status = 'same'
+          row.unimportant = false
         }
+        this._tickProgress()
       } catch {
         // 無法 hash 則維持原狀態
       }
@@ -2291,7 +2791,14 @@ ${rows}
   }
 
   _isRowVisible(row) {
-    if (!statusVisibleUnder(row.status, this._viewFlags)) return false
+    // A rules-graded row with only unimportant differences sits between the two
+    // buckets: it is "same" for counting, but hiding it while the user is
+    // hunting for differences would lose the one hint that it changed at all.
+    if (row.unimportant) {
+      if (!this._showSame && !this._showDiff) return false
+    } else if (!statusVisibleUnder(row.status, this._viewFlags)) {
+      return false
+    }
 
     // The "顯示差異" master toggle also suppresses the newer-on-one-side
     // statuses, which are differences too.
@@ -2437,9 +2944,10 @@ ${rows}
    * 之前子項只存在於 DOM，所以報表、統計、目錄狀態全都看不到展開後的內容。
    *
    * @param {CompareRow} row
+   * @param {AbortSignal} [signal]
    * @returns {Promise<void>}
    */
-  async _loadChildren(row) {
+  async _loadChildren(row, signal) {
     if (row.children) return
     const leftPath = row.left?.isDirectory ? row.left.path : null
     const rightPath = row.right?.isDirectory ? row.right.path : null
@@ -2447,22 +2955,25 @@ ${rows}
       row.children = []
       return
     }
-    const baseMode = this._mode === 'content' ? 'both' : this._mode
     const [leftChildren, rightChildren] = await Promise.all([
       leftPath  ? window.electronAPI.readDir(leftPath)  : Promise.resolve([]),
       rightPath ? window.electronAPI.readDir(rightPath) : Promise.resolve([]),
     ])
-    row.children = compareEntries(leftChildren, rightChildren, baseMode, this._mtimeTolerance)
-    if (this._mode === 'content' && window.electronAPI?.hashFile) {
-      await this._applyContentHash(row.children)
-    }
+    // Leaving `children` null on cancel keeps the row collapsible and reloadable
+    // rather than half-populated.
+    if (signal?.aborted) return
+    row.children = compareEntries(leftChildren, rightChildren, this._baseMode(), this._mtimeTolerance)
+    this._tickProgress(row.children.length)
+    await this._applyDeepCompare(row.children, signal)
+    if (signal?.aborted) { row.children = null; return }
     this._refreshRollups()
   }
 
-  /** 由葉往根重算所有已載入目錄的狀態。 */
+  /** 由葉往根重算所有已載入目錄的狀態與「不重要差異」標記。 */
   _refreshRollups() {
     for (const row of this._rows ?? []) {
       row.status = rollupStatus(row)
+      if (row.children) row.unimportant = row.status === 'same' && rollupUnimportant(row)
     }
   }
 
@@ -2471,24 +2982,28 @@ ${rows}
    * @param {CompareRow[]} rows
    * @param {number} depth
    * @param {{ loaded: number }} budget
+   * @param {AbortSignal} [signal]
    */
-  async _expandSubtree(rows, depth, budget) {
+  async _expandSubtree(rows, depth, budget, signal) {
     for (const row of rows) {
       if (budget.loaded >= MAX_EXPAND_ALL_DIRS) return
+      if (signal?.aborted) return
       const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
       if (!isDir) continue
       this._expanded.add(this._expandKey(depth, row))
       if (!row.children) {
         budget.loaded++
         try {
-          await this._loadChildren(row)
+          await this._loadChildren(row, signal)
         } catch (err) {
           console.error('FolderCompare._expandSubtree error:', err)
           row.children = []
           continue
         }
       }
-      await this._expandSubtree(row.children, depth + 1, budget)
+      // A cancelled load leaves children null; there is nothing to walk into.
+      if (!row.children) return
+      await this._expandSubtree(row.children, depth + 1, budget, signal)
     }
   }
 
@@ -2507,11 +3022,12 @@ ${rows}
     const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
 
     const rowEl = el('div', {
-      className: `fc-row ${row.status}${isDir ? ' is-dir' : ''}`,
+      className: `fc-row ${row.status}${isDir ? ' is-dir' : ''}${row.unimportant ? ' fc-row--unimportant' : ''}`,
       'data-name': row.name,
       'data-left-path': row.left?.path ?? '',
       'data-right-path': row.right?.path ?? '',
       'data-status': row.status,
+      'data-unimportant': row.unimportant ? 'true' : 'false',
       'data-is-dir': isDir ? 'true' : 'false',
       'data-depth': String(depth),
     })
@@ -2618,8 +3134,10 @@ ${rows}
     if (!rows.length) return
 
     const counts = {}
+    let unimportant = 0
     for (const row of rows) {
       counts[row.status] = (counts[row.status] ?? 0) + 1
+      if (row.unimportant) unimportant++
     }
 
     const defs = [
@@ -2637,6 +3155,13 @@ ${rows}
       const item = el('span', { className: 'fc-stat-item' })
       item.appendChild(el('span', { className: `fc-stat-dot ${key}` }))
       item.appendChild(document.createTextNode(`${label}: ${count}`))
+      stats.appendChild(item)
+    }
+
+    if (unimportant) {
+      const item = el('span', { className: 'fc-stat-item' })
+      item.appendChild(el('span', { className: 'fc-stat-dot unimportant' }))
+      item.appendChild(document.createTextNode(`不重要差異: ${unimportant}`))
       stats.appendChild(item)
     }
 
@@ -2900,11 +3425,17 @@ ${rows}
 
     // 先畫出佔位（_renderRows 會處理 children === null 的情況）
     this._rerenderPreservingScroll()
+    const ctrl = this._beginScan()
     try {
-      await this._loadChildren(row)
+      await this._loadChildren(row, ctrl.signal)
     } catch (err) {
       console.error('FolderCompare._expandDir error:', err)
       row.children = []
+    } finally {
+      // Cancelling mid-load must not leave a directory marked open with a
+      // permanent "載入中…" placeholder under it.
+      if (ctrl.signal.aborted && !row.children) this._expanded.delete(expandKey)
+      this._endScan(ctrl)
     }
     this._rerenderPreservingScroll()
   }
