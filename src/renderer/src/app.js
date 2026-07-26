@@ -1547,6 +1547,44 @@ async function reloadEncoding(side, encoding) {
 }
 
 /**
+ * Take a snapshot of the folder currently open on the left.
+ *
+ * @param {boolean} crc  also hash file contents, so later content drift is
+ *   detectable — a snapshot stores no file data, which is the whole point of
+ *   it, so without a hash only size and timestamp can be compared.
+ */
+async function createSnapshot(crc) {
+  const folder = folderCompare?._leftPath || folderCompare?._rightPath
+  if (currentView !== 'folder' || !folder) {
+    showStatus('請先開啟資料夾比對並選擇資料夾')
+    return
+  }
+  showStatus(crc ? '建立快照中（計算雜湊，可能較久）…' : '建立快照中…')
+  try {
+    const result = await window.electronAPI?.createSnapshot?.(folder, crc)
+    if (!result) { showStatus('已取消'); return }
+    showStatus(result.truncated
+      ? `快照已建立（${result.count} 項，已達上限而截斷）`
+      : `快照已建立：${result.count} 項`)
+  } catch (err) {
+    showStatus(`建立快照失敗：${err.message}`)
+  }
+}
+
+/** Load a snapshot file and report what it contains. */
+async function openSnapshot() {
+  try {
+    const info = await window.electronAPI?.loadSnapshot?.()
+    if (!info) return
+    const when = new Date(info.createdAt).toLocaleString('zh-TW')
+    showStatus(`已載入快照「${info.name}」：${info.count} 項，建立於 ${when}` +
+      (info.hasCrc ? '（含內容雜湊）' : '（僅結構與時間戳）'))
+  } catch (err) {
+    showStatus(`開啟快照失敗：${err.message}`)
+  }
+}
+
+/**
  * Route difference navigation to whichever view is showing.
  *
  * Hex, table and 3-way merge all grew their own navigation; without this the
@@ -1646,6 +1684,10 @@ function setupMenuActions() {
     'session.home':       () => showHome(),
     'session.settings':   () => openConfigModal(),
     'session.workspaces': () => openWorkspacesModal(),
+    'session.snapshot.create':    () => void createSnapshot(false),
+    'session.snapshot.createCrc': () => void createSnapshot(true),
+    'session.snapshot.open':      () => void openSnapshot(),
+
     'session.swap': () => {
       const view = { text: textCompare, folder: folderCompare, hex: hexCompare, table: tableCompare }[currentView]
       void view?.swap?.()

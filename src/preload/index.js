@@ -25,6 +25,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openFile: (options) => ipcRenderer.invoke('open-file', options),
   openFolder: () => ipcRenderer.invoke('open-folder'),
   readDir: (path) => ipcRenderer.invoke('read-dir', path),
+  createSnapshot: (folderPath, crc) => ipcRenderer.invoke('create-snapshot', { folderPath, crc }),
+  loadSnapshot: () => ipcRenderer.invoke('load-snapshot'),
+  readSnapshotDir: (snapshotPath, relDir) =>
+    ipcRenderer.invoke('read-snapshot-dir', { snapshotPath, relDir }),
   readFile: (path, encoding) => ipcRenderer.invoke('read-file', path, encoding),
   acceptDroppedPaths: (paths) => ipcRenderer.invoke('accept-dropped-paths', paths),
   openFileBinary: (options) => ipcRenderer.invoke('open-file-binary', options),

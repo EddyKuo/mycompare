@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
-import { join, extname, dirname } from 'path'
+import { join, extname, dirname, basename } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open } from 'fs/promises'
 import { watch } from 'fs'
 import { decodeBuffer, encodeContent } from './encoding.js'
@@ -7,6 +7,7 @@ import { registerRoot, validatePath, validatePathPair } from './path-validator.j
 import { buildAppMenu } from './menu.js'
 import { parseCli, usageText } from './cli.js'
 import { parseScript, describeScript, isMutating } from './script.js'
+import { writeSnapshot, readSnapshot, snapshotLevel } from './snapshot.js'
 
 // ── T33 (S12-W): File Watcher — capped to avoid resource exhaustion ──
 const MAX_WATCHERS = 64
@@ -432,6 +433,69 @@ function fileAttributes(name, s) {
     hidden: process.platform === 'win32' ? null : name.startsWith('.'),
   }
 }
+
+/**
+ * Snapshots loaded this session, keyed by the file they came from.
+ *
+ * Held in memory because the folder view asks for one directory level at a
+ * time and re-reading a multi-megabyte snapshot per level would be absurd.
+ * @type {Map<string, import('./snapshot.js').Snapshot>}
+ */
+const _snapshots = new Map()
+
+// IPC: 建立資料夾快照
+ipcMain.handle('create-snapshot', async (event, { folderPath, crc } = {}) => {
+  const safe = validatePath(folderPath)
+  const win = BrowserWindow.fromWebContents(event.sender)
+  const opts = {
+    defaultPath: `${basename(safe) || 'snapshot'}.mcss`,
+    filters: [{ name: 'MyCompare 快照', extensions: ['mcss'] }],
+  }
+  const { canceled, filePath } = win
+    ? await dialog.showSaveDialog(win, opts)
+    : await dialog.showSaveDialog(opts)
+  if (canceled || !filePath) return null
+  registerRoot(filePath)
+  return writeSnapshot(safe, filePath, { crc: !!crc })
+})
+
+// IPC: 載入快照檔
+ipcMain.handle('load-snapshot', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  const opts = {
+    properties: ['openFile'],
+    filters: [{ name: 'MyCompare 快照', extensions: ['mcss'] }],
+  }
+  const { canceled, filePaths } = win
+    ? await dialog.showOpenDialog(win, opts)
+    : await dialog.showOpenDialog(opts)
+  if (canceled || !filePaths.length) return null
+  registerRoot(filePaths[0])
+  const snapshot = await readSnapshot(filePaths[0])
+  _snapshots.set(filePaths[0], snapshot)
+  return {
+    path: filePaths[0],
+    name: snapshot.name,
+    root: snapshot.root,
+    createdAt: snapshot.createdAt,
+    hasCrc: snapshot.hasCrc,
+    count: snapshot.entries.length,
+  }
+})
+
+// IPC: 讀取快照中的某一層
+ipcMain.handle('read-snapshot-dir', async (_event, { snapshotPath, relDir } = {}) => {
+  // Load on demand rather than requiring load-snapshot to have run first:
+  // ordering is not the caller's problem, and a restored session or workspace
+  // has a snapshot path without ever having gone through the open dialog.
+  let snapshot = _snapshots.get(snapshotPath)
+  if (!snapshot) {
+    const safe = validatePath(snapshotPath)
+    snapshot = await readSnapshot(safe)
+    _snapshots.set(snapshotPath, snapshot)
+  }
+  return snapshotLevel(snapshot, typeof relDir === 'string' ? relDir : '')
+})
 
 // IPC: 讀取資料夾內容（一層）
 ipcMain.handle('read-dir', async (_event, dirPath) => {
