@@ -5,19 +5,53 @@ import { watch } from 'fs'
 import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
 import { buildAppMenu } from './menu.js'
+import { parseCli, usageText } from './cli.js'
+import { parseScript, describeScript, isMutating } from './script.js'
 
 // ── T33 (S12-W): File Watcher — capped to avoid resource exhaustion ──
 const MAX_WATCHERS = 64
 /** @type {Map<string, import('fs').FSWatcher>} */
 const _fileWatchers = new Map()
 
+// Re-exported so existing callers and tests keep the same import site.
+export { parseCliArgs } from './cli.js'
+
 /**
- * 解析 CLI 參數，回傳非 flag 的檔案路徑（最多兩個）。
- * @param {string[]} argv - process.argv
- * @returns {string[]}
+ * Parse and report on a script file, without executing it.
+ *
+ * Execution is deliberately not implemented yet: the commands that make
+ * scripting worth having also delete and overwrite files, and running those
+ * unattended off a grammar that has never been exercised against real inputs
+ * is not something to switch on quietly. Validating and describing the script
+ * is useful on its own — it catches typos in a build hook before they reach a
+ * machine that would act on them — and it is the half that can be trusted now.
+ *
+ * @param {string} scriptPath
+ * @returns {Promise<number>} process exit code
  */
-export function parseCliArgs(argv) {
-  return argv.slice(2).filter(a => !a.startsWith('--')).slice(0, 2)
+async function runScriptFile(scriptPath) {
+  let source
+  try {
+    source = await readFile(scriptPath, 'utf-8')
+  } catch (err) {
+    process.stderr.write(`無法讀取腳本 ${scriptPath}：${err.message}\n`)
+    return 2
+  }
+
+  const { commands, errors } = parseScript(source)
+  if (errors.length) {
+    for (const e of errors) {
+      process.stderr.write(`${scriptPath}:${e.line}: ${e.message}\n`)
+    }
+    return 1
+  }
+
+  process.stdout.write(`${scriptPath} — ${commands.length} 個指令，語法正確\n`)
+  process.stdout.write(`${describeScript(commands)}\n`)
+  if (isMutating(commands)) {
+    process.stdout.write('\n注意：腳本執行尚未實作，目前僅做語法檢查。\n')
+  }
+  return 0
 }
 
 function createWindow() {
@@ -95,17 +129,37 @@ function createWindow() {
   return win
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const cli = parseCli(process.argv)
+
+  // Help must not open a window: the point of asking for it is usually that
+  // the invocation was wrong.
+  if (cli.switches.help) {
+    process.stdout.write(`${usageText()}\n`)
+    app.quit()
+    return
+  }
+
+  if (typeof cli.switches.script === 'string') {
+    const code = await runScriptFile(cli.switches.script)
+    app.exit(code)
+    return
+  }
+
   const win = createWindow()
   buildAppMenu(win)
-  const cliFiles = parseCliArgs(process.argv)
+
+  const cliFiles = cli.paths
   // S12-S01: CLI args are user-trusted — register them as allowed roots.
   for (const f of cliFiles) registerRoot(f)
   if (cliFiles.length >= 1) {
     win.webContents.once('did-finish-load', () => {
       win.webContents.send('open-files', {
         left: cliFiles[0] ?? '',
-        right: cliFiles[1] ?? ''
+        right: cliFiles[1] ?? '',
+        base: cliFiles[2] ?? '',
+        output: cliFiles[3] ?? '',
+        options: cli.switches
       })
     })
   }
