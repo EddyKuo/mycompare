@@ -1845,6 +1845,7 @@ const SHORTCUT_LABELS = {
   newSession: '回到首頁 / 新增比對',
   closeTab: '關閉分頁',
   fullscreen: '全螢幕',
+  print: '列印 / 匯出 PDF',
 }
 
 /**

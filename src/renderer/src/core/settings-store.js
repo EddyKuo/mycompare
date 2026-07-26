@@ -67,6 +67,7 @@ export const DEFAULT_SHORTCUTS = {
   newSession:    'Ctrl+N',
   closeTab:      'Ctrl+W',
   fullscreen:    'F11',
+  print:         'Ctrl+P',
 }
 
 /**

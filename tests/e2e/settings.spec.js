@@ -83,3 +83,43 @@ test('a rebound key drives the action', async () => {
   await win.locator('body').press('F4')
   await expect(win.locator('.tab-item')).toHaveCount(0)
 })
+
+test('every shortcut action shown in the modal has a default binding', async () => {
+  await win.locator('#btn-settings-modal').click()
+
+  const rows = await win.evaluate(() =>
+    [...document.querySelectorAll('#settings-shortcuts-list .settings-row')]
+      .map((r) => ({
+        name: r.querySelector('.settings-row-name')?.textContent ?? '',
+        combo: r.querySelector('.settings-row-combo')?.textContent ?? '',
+      })))
+
+  expect(rows.length).toBeGreaterThan(10)
+
+  // An action with no default is unreachable from the keyboard, which is how
+  // Ctrl+P was briefly lost when the handler moved to the binding table.
+  // Copy-all is deliberately unbound — it is reachable from the toolbar and
+  // menu, and BC ships no default for it either. Listing the exceptions
+  // explicitly means a newly added action that forgets a default still fails.
+  const INTENTIONALLY_UNBOUND = ['複製全部差異到左側', '複製全部差異到右側']
+  const unbound = rows
+    .filter((r) => r.combo === '（未設定）')
+    .map((r) => r.name)
+  expect(unbound.sort()).toEqual([...INTENTIONALLY_UNBOUND].sort())
+})
+
+test('Ctrl+P still reaches the print action', async () => {
+  const bound = await win.evaluate(() => {
+    const raw = localStorage.getItem('mycompare:settings')
+    const s = raw ? JSON.parse(raw) : null
+    return s?.shortcuts?.print ?? null
+  })
+  // Defaults are only materialised once something is written; read through the
+  // rendered modal instead, which merges defaults in.
+  await win.locator('#btn-settings-modal').click()
+  const shown = await win.evaluate(() =>
+    [...document.querySelectorAll('#settings-shortcuts-list .settings-row')]
+      .some((r) => r.querySelector('.settings-row-combo')?.textContent === 'Ctrl+P'))
+  expect(bound === null || bound === 'Ctrl+P').toBe(true)
+  expect(shown).toBe(true)
+})
