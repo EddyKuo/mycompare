@@ -150,6 +150,18 @@ export function buildAppMenu(win) {
         item('只顯示差異', 'view.showDiff'),
         item('只顯示相同', 'view.showSame'),
         item('全部隱藏', 'view.showNone'),
+        {
+          label: '資料夾顯示模式',
+          submenu: [
+            item('顯示孤兒', 'view.folder.orphans'),
+            item('不顯示孤兒', 'view.folder.noOrphans'),
+            item('差異但不含孤兒', 'view.folder.diffNoOrphans'),
+            item('左側較新', 'view.folder.leftNewer'),
+            item('右側較新', 'view.folder.rightNewer'),
+            item('僅左側孤兒', 'view.folder.leftOrphans'),
+            item('僅右側孤兒', 'view.folder.rightOrphans')
+          ]
+        },
         { type: 'separator' },
         item('行號', 'view.toggleLineNumbers'),
         item('顯示空白字元', 'view.toggleWhitespace'),

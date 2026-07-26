@@ -9,7 +9,14 @@
 import { describe, it, expect, vi } from 'vitest'
 import { hexCompleteByteDiff } from '../../src/renderer/src/views/hex-compare.js'
 import { diffLines } from '../../src/renderer/src/core/diff-engine.js'
-import { FolderCompare, flattenRows, rollupStatus } from '../../src/renderer/src/views/folder-compare.js'
+import {
+  FolderCompare,
+  flattenRows,
+  rollupStatus,
+  statusVisibleUnder,
+  VIEW_PRESETS,
+  VIEW_PRESET_LABELS,
+} from '../../src/renderer/src/views/folder-compare.js'
 
 // ── Folder compare tree model ───────────────────────────────────────────────
 
@@ -174,6 +181,90 @@ describe('FolderCompare.expandAll', () => {
     expect(fc._rows[0].children).toHaveLength(1)
     expect(fc._rows[0].children[0].name).toBe('leaf.txt')
     expect(fc._expanded.size).toBe(1)
+  })
+})
+
+// ── Folder view presets ─────────────────────────────────────────────────────
+
+describe('folder view presets', () => {
+  const ALL_STATUSES = ['same', 'different', 'left-only', 'right-only', 'left-newer', 'right-newer']
+
+  /** @param {string} preset */
+  const visibleUnder = (preset) =>
+    ALL_STATUSES.filter((s) => statusVisibleUnder(s, VIEW_PRESETS[preset]))
+
+  it('covers every display filter Beyond Compare offers', () => {
+    for (const [name] of VIEW_PRESET_LABELS) {
+      expect(VIEW_PRESETS[name], `missing preset ${name}`).toBeDefined()
+    }
+    expect(VIEW_PRESET_LABELS).toHaveLength(Object.keys(VIEW_PRESETS).length)
+  })
+
+  it('shows everything under "all"', () => {
+    expect(visibleUnder('all')).toEqual(ALL_STATUSES)
+  })
+
+  it('hides everything under "none"', () => {
+    expect(visibleUnder('none')).toEqual([])
+  })
+
+  it('keeps orphans visible under "differences", as BC does', () => {
+    const v = visibleUnder('differences')
+    expect(v).toContain('left-only')
+    expect(v).toContain('right-only')
+    expect(v).not.toContain('same')
+  })
+
+  it('drops orphans under "no-orphans" but keeps content differences', () => {
+    const v = visibleUnder('no-orphans')
+    expect(v).toContain('same')
+    expect(v).toContain('different')
+    expect(v).not.toContain('left-only')
+    expect(v).not.toContain('right-only')
+  })
+
+  it('shows only same rows under "same"', () => {
+    expect(visibleUnder('same')).toEqual(['same'])
+  })
+
+  it('separates the two orphan sides', () => {
+    expect(visibleUnder('left-orphans')).toEqual(['left-only'])
+    expect(visibleUnder('right-orphans')).toEqual(['right-only'])
+  })
+
+  it('separates the two newer sides', () => {
+    expect(visibleUnder('left-newer')).toEqual(['left-newer'])
+    expect(visibleUnder('right-newer')).toEqual(['right-newer'])
+  })
+
+  it('applies a preset to a live instance and syncs the combined orphan flag', () => {
+    const fc = buildFC([])
+    fc._applyFilterAndRender = vi.fn()
+    fc.setViewPreset('left-orphans')
+    expect(fc._showLeftOnly).toBe(true)
+    expect(fc._showRightOnly).toBe(false)
+    // Combined accessor reports true while either side is on.
+    expect(fc._showOrphan).toBe(true)
+
+    fc.setViewPreset('same')
+    expect(fc._showOrphan).toBe(false)
+  })
+
+  it('ignores an unknown preset name', () => {
+    const fc = buildFC([])
+    fc._applyFilterAndRender = vi.fn()
+    fc.setViewPreset('nope')
+    expect(fc._viewPreset).toBe('all')
+  })
+
+  it('setting the combined orphan flag drives both sides', () => {
+    const fc = buildFC([])
+    fc._showOrphan = false
+    expect(fc._showLeftOnly).toBe(false)
+    expect(fc._showRightOnly).toBe(false)
+    fc._showOrphan = true
+    expect(fc._showLeftOnly).toBe(true)
+    expect(fc._showRightOnly).toBe(true)
   })
 })
 

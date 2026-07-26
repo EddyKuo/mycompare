@@ -63,6 +63,75 @@ function matchesFilter(name, filterStr, opts = {}) {
  */
 const MAX_EXPAND_ALL_DIRS = 2000
 
+/**
+ * @typedef {object} ViewFlags
+ * @property {boolean} showSame
+ * @property {boolean} showDiff        content differences
+ * @property {boolean} showLeftOnly
+ * @property {boolean} showRightOnly
+ * @property {boolean} showLeftNewer
+ * @property {boolean} showRightNewer
+ */
+
+/**
+ * Beyond Compare's View menu display filters.
+ *
+ * BC presents these as a preset list rather than independent toggles, and the
+ * groupings are not always what the names suggest — "Show Differences", for
+ * one, includes orphans.
+ *
+ * @type {Record<string, ViewFlags>}
+ */
+export const VIEW_PRESETS = {
+  all:              { showSame: true,  showDiff: true,  showLeftOnly: true,  showRightOnly: true,  showLeftNewer: true,  showRightNewer: true },
+  differences:      { showSame: false, showDiff: true,  showLeftOnly: true,  showRightOnly: true,  showLeftNewer: true,  showRightNewer: true },
+  same:             { showSame: true,  showDiff: false, showLeftOnly: false, showRightOnly: false, showLeftNewer: false, showRightNewer: false },
+  orphans:          { showSame: false, showDiff: false, showLeftOnly: true,  showRightOnly: true,  showLeftNewer: false, showRightNewer: false },
+  'no-orphans':     { showSame: true,  showDiff: true,  showLeftOnly: false, showRightOnly: false, showLeftNewer: true,  showRightNewer: true },
+  'diff-no-orphans':{ showSame: false, showDiff: true,  showLeftOnly: false, showRightOnly: false, showLeftNewer: true,  showRightNewer: true },
+  'left-newer':     { showSame: false, showDiff: false, showLeftOnly: false, showRightOnly: false, showLeftNewer: true,  showRightNewer: false },
+  'right-newer':    { showSame: false, showDiff: false, showLeftOnly: false, showRightOnly: false, showLeftNewer: false, showRightNewer: true },
+  'left-orphans':   { showSame: false, showDiff: false, showLeftOnly: true,  showRightOnly: false, showLeftNewer: false, showRightNewer: false },
+  'right-orphans':  { showSame: false, showDiff: false, showLeftOnly: false, showRightOnly: true,  showLeftNewer: false, showRightNewer: false },
+  none:             { showSame: false, showDiff: false, showLeftOnly: false, showRightOnly: false, showLeftNewer: false, showRightNewer: false },
+}
+
+/** Display order and labels for the preset dropdown. */
+export const VIEW_PRESET_LABELS = [
+  ['all', '顯示全部'],
+  ['differences', '顯示差異'],
+  ['same', '顯示相同'],
+  ['orphans', '顯示孤兒'],
+  ['no-orphans', '不顯示孤兒'],
+  ['diff-no-orphans', '差異但不含孤兒'],
+  ['left-newer', '左側較新'],
+  ['right-newer', '右側較新'],
+  ['left-orphans', '僅左側孤兒'],
+  ['right-orphans', '僅右側孤兒'],
+  ['none', '全部隱藏'],
+]
+
+/**
+ * Decide whether a row passes a set of view flags.
+ *
+ * Pure so the preset table can be verified without a DOM.
+ *
+ * @param {string} status
+ * @param {ViewFlags} flags
+ * @returns {boolean}
+ */
+export function statusVisibleUnder(status, flags) {
+  switch (status) {
+    case 'same':        return flags.showSame
+    case 'different':   return flags.showDiff
+    case 'left-only':   return flags.showLeftOnly
+    case 'right-only':  return flags.showRightOnly
+    case 'left-newer':  return flags.showLeftNewer
+    case 'right-newer': return flags.showRightNewer
+    default:            return true
+  }
+}
+
 // ── compareEntries ────────────────────────────────────────────────────────────
 
 /**
@@ -209,12 +278,16 @@ export class FolderCompare {
     this._leftEntries = []   // FileEntry[] for current left dir
     this._rightEntries = []  // FileEntry[] for current right dir
 
-    // Visibility filters
+    // Visibility filters. Orphans are tracked per side so BC's
+    // "Show Left Orphans" / "Show Right Orphans" presets are expressible;
+    // the _showOrphan accessor below keeps the combined toggle working.
     this._showSame = true
     this._showDiff = true
-    this._showOrphan = true
+    this._showLeftOnly = true
+    this._showRightOnly = true
     this._showLeftNewer = true   // T55
     this._showRightNewer = true  // T55
+    this._viewPreset = 'all'
     this._filterStr = ''
 
     // Expanded directories: Set of "side:path"
@@ -267,7 +340,67 @@ export class FolderCompare {
     this._findBarVisible = false
   }
 
+  /**
+   * Combined orphan toggle, kept as an accessor over the per-side flags so the
+   * single "顯示孤兒" checkbox still behaves as one control.
+   */
+  get _showOrphan() { return this._showLeftOnly || this._showRightOnly }
+  set _showOrphan(v) { this._showLeftOnly = !!v; this._showRightOnly = !!v }
+
+  /** Current view flags as a plain object. */
+  get _viewFlags() {
+    return {
+      showSame: this._showSame,
+      showDiff: this._showDiff,
+      showLeftOnly: this._showLeftOnly,
+      showRightOnly: this._showRightOnly,
+      showLeftNewer: this._showLeftNewer,
+      showRightNewer: this._showRightNewer,
+    }
+  }
+
   // ── Public API ──────────────────────────────────────────────────────────────
+
+  /**
+   * Apply one of Beyond Compare's View-menu display filters.
+   * @param {keyof typeof VIEW_PRESETS} name
+   */
+  setViewPreset(name) {
+    const preset = VIEW_PRESETS[name]
+    if (!preset) return
+    this._viewPreset = name
+    this._showSame = preset.showSame
+    this._showDiff = preset.showDiff
+    this._showLeftOnly = preset.showLeftOnly
+    this._showRightOnly = preset.showRightOnly
+    this._showLeftNewer = preset.showLeftNewer
+    this._showRightNewer = preset.showRightNewer
+    this._syncFilterControls()
+    this._applyFilterAndRender()
+  }
+
+  /**
+   * Re-point the preset dropdown at whichever preset the current flags match,
+   * so hand-tweaking the checkboxes does not leave a stale label showing.
+   */
+  _markPresetCustom() {
+    const flags = this._viewFlags
+    const hit = Object.entries(VIEW_PRESETS).find(([, p]) =>
+      Object.keys(p).every((k) => p[k] === flags[k]))
+    this._viewPreset = hit ? hit[0] : 'all'
+    if (this._dom.viewPreset && hit) this._dom.viewPreset.value = hit[0]
+  }
+
+  /** Push the current flags back onto the toolbar controls. */
+  _syncFilterControls() {
+    const { cbSame, cbDiff, cbOrphan, btnLeftNewer, btnRightNewer, viewPreset } = this._dom
+    if (cbSame) cbSame.checked = this._showSame
+    if (cbDiff) cbDiff.checked = this._showDiff
+    if (cbOrphan) cbOrphan.checked = this._showOrphan
+    btnLeftNewer?.classList.toggle('fc-btn-filter-toggle--active', this._showLeftNewer)
+    btnRightNewer?.classList.toggle('fc-btn-filter-toggle--active', this._showRightNewer)
+    if (viewPreset) viewPreset.value = this._viewPreset
+  }
 
   /** 把 UI 渲染到 containerEl */
   mount(containerEl) {
@@ -1085,6 +1218,16 @@ ${rows}
     this._dom.modeSelect = modeSelect
     toolbar.appendChild(modeSelect)
 
+    // View preset select — Beyond Compare's View-menu display filters.
+    const viewPreset = el('select', { className: 'fc-view-preset', title: '顯示模式' })
+    for (const [value, label] of VIEW_PRESET_LABELS) {
+      const opt = el('option', { value }, label)
+      if (value === this._viewPreset) opt.setAttribute('selected', '')
+      viewPreset.appendChild(opt)
+    }
+    this._dom.viewPreset = viewPreset
+    toolbar.appendChild(viewPreset)
+
     // Checkboxes
     const cbSame = this._buildCheckbox('fc-show-same', '顯示相同', this._showSame)
     this._dom.cbSame = cbSame.querySelector('input')
@@ -1329,7 +1472,7 @@ ${rows}
   // ── Private: Event binding ──────────────────────────────────────────────────
 
   _bindEvents() {
-    const { modeSelect, cbSame, cbDiff, cbOrphan, filter,
+    const { modeSelect, cbSame, cbDiff, cbOrphan, filter, viewPreset,
             btnRefresh, btnSync, btnOpenLeft, btnOpenRight, btnZipLeft, btnZipRight, list,
             cbSelectAll, btnBatch, batchMenu,
             btnLeftNewer, btnRightNewer,
@@ -1444,16 +1587,25 @@ ${rows}
       this._compareAndRender()
     })
 
+    viewPreset?.addEventListener('change', () => {
+      this.setViewPreset(viewPreset.value)
+    })
+
+    // The individual toggles below stay usable; flipping one means the shown
+    // set no longer matches a named preset.
     cbSame.addEventListener('change', () => {
       this._showSame = cbSame.checked
+      this._markPresetCustom()
       this._applyFilterAndRender()
     })
     cbDiff.addEventListener('change', () => {
       this._showDiff = cbDiff.checked
+      this._markPresetCustom()
       this._applyFilterAndRender()
     })
     cbOrphan.addEventListener('change', () => {
       this._showOrphan = cbOrphan.checked
+      this._markPresetCustom()
       this._applyFilterAndRender()
     })
 
@@ -1590,14 +1742,13 @@ ${rows}
   }
 
   _isRowVisible(row) {
-    // Visibility checkboxes
-    if (row.status === 'same' && !this._showSame) return false
-    if (['different', 'left-newer', 'right-newer'].includes(row.status) && !this._showDiff) return false
-    if (['left-only', 'right-only'].includes(row.status) && !this._showOrphan) return false
+    if (!statusVisibleUnder(row.status, this._viewFlags)) return false
 
-    // T55: Left Newer / Right Newer individual toggles
-    if (row.status === 'left-newer' && !this._showLeftNewer) return false
-    if (row.status === 'right-newer' && !this._showRightNewer) return false
+    // The "顯示差異" master toggle also suppresses the newer-on-one-side
+    // statuses, which are differences too.
+    if (!this._showDiff && (row.status === 'left-newer' || row.status === 'right-newer')) {
+      return false
+    }
 
     // Filter string
     if (this._filterStr.trim()) {

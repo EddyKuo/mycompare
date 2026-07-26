@@ -1518,10 +1518,29 @@ function setupMenuActions() {
     'search.nextBookmark':   () => { if (currentView === 'text') textCompare?.nextBookmark() },
     'search.prevBookmark':   () => { if (currentView === 'text') textCompare?.prevBookmark() },
 
-    'view.showAll':  () => { if (currentView === 'text') textCompare?.setShowFilter('all') },
-    'view.showDiff': () => { if (currentView === 'text') textCompare?.setShowFilter('diff') },
-    'view.showSame': () => { if (currentView === 'text') textCompare?.setShowFilter('same') },
-    'view.showNone': () => { if (currentView === 'text') textCompare?.setShowFilter('none') },
+    'view.showAll':  () => {
+      if (currentView === 'text') textCompare?.setShowFilter('all')
+      else if (currentView === 'folder') folderCompare?.setViewPreset('all')
+    },
+    'view.showDiff': () => {
+      if (currentView === 'text') textCompare?.setShowFilter('diff')
+      else if (currentView === 'folder') folderCompare?.setViewPreset('differences')
+    },
+    'view.showSame': () => {
+      if (currentView === 'text') textCompare?.setShowFilter('same')
+      else if (currentView === 'folder') folderCompare?.setViewPreset('same')
+    },
+    'view.showNone': () => {
+      if (currentView === 'text') textCompare?.setShowFilter('none')
+      else if (currentView === 'folder') folderCompare?.setViewPreset('none')
+    },
+    'view.folder.orphans':        () => folderCompare?.setViewPreset('orphans'),
+    'view.folder.noOrphans':      () => folderCompare?.setViewPreset('no-orphans'),
+    'view.folder.diffNoOrphans':  () => folderCompare?.setViewPreset('diff-no-orphans'),
+    'view.folder.leftNewer':      () => folderCompare?.setViewPreset('left-newer'),
+    'view.folder.rightNewer':     () => folderCompare?.setViewPreset('right-newer'),
+    'view.folder.leftOrphans':    () => folderCompare?.setViewPreset('left-orphans'),
+    'view.folder.rightOrphans':   () => folderCompare?.setViewPreset('right-orphans'),
     'view.toggleLineNumbers': () => { if (currentView === 'text') textCompare?.toggleLineNumbers() },
     'view.toggleWhitespace':  () => { if (currentView === 'text') textCompare?.toggleWhitespace() },
     'view.toggleWordWrap':    () => { if (currentView === 'text') textCompare?.toggleWordWrap() },
