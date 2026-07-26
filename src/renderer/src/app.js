@@ -1,7 +1,7 @@
 import { TextCompare } from './views/text-compare.js'
 import { FolderCompare } from './views/folder-compare.js'
 import { TableCompare } from './views/table-compare.js'
-import { ImageCompare } from './views/image-compare.js'
+import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
 import { HexCompare } from './views/hex-compare.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
@@ -365,13 +365,13 @@ function showFolderCompare() {
         // image 需要 base64；透過 readFileBinary IPC 讀取
         if (leftPath) {
           try {
-            const r = await window.electronAPI.readFileBinary(leftPath)
+            const r = await window.electronAPI.readFileBinary(leftPath, MAX_IMAGE_BYTES)
             if (r) await imageCompare?.setLeft(r.path, r.base64, r.ext)
           } catch { /* 讓使用者手動開啟 */ }
         }
         if (rightPath) {
           try {
-            const r = await window.electronAPI.readFileBinary(rightPath)
+            const r = await window.electronAPI.readFileBinary(rightPath, MAX_IMAGE_BYTES)
             if (r) await imageCompare?.setRight(r.path, r.base64, r.ext)
           } catch { /* 讓使用者手動開啟 */ }
         }
@@ -1193,13 +1193,13 @@ async function _restoreOneWorkspaceTab(saved) {
       if (imageCompare) {
         if (saved.leftPath) {
           try {
-            const r = await window.electronAPI.readFileBinary(saved.leftPath)
+            const r = await window.electronAPI.readFileBinary(saved.leftPath, MAX_IMAGE_BYTES)
             if (r) await imageCompare.setLeft(r.path, r.base64, r.ext)
           } catch { /* skip */ }
         }
         if (saved.rightPath) {
           try {
-            const r = await window.electronAPI.readFileBinary(saved.rightPath)
+            const r = await window.electronAPI.readFileBinary(saved.rightPath, MAX_IMAGE_BYTES)
             if (r) await imageCompare.setRight(r.path, r.base64, r.ext)
           } catch { /* skip */ }
         }

@@ -12,7 +12,7 @@
  *   'paths-changed' → { left: string, right: string }
  */
 
-import { showContextMenu } from '../core/context-menu.js'
+import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el } from '../core/utils.js'
 import '../styles/table-compare.css'
 
@@ -333,6 +333,7 @@ export class TableCompare {
 
   /** 清除 DOM、移除事件、移除注入的 style */
   destroy() {
+    closeContextMenu()
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null

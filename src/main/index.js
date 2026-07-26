@@ -1,6 +1,6 @@
 import { app, BrowserWindow, Menu, ipcMain, dialog, shell } from 'electron'
 import { join, extname, dirname } from 'path'
-import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename } from 'fs/promises'
+import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open } from 'fs/promises'
 import { watch } from 'fs'
 import { decodeBuffer } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
@@ -159,6 +159,41 @@ ipcMain.handle('read-file', async (_event, filePath) => {
   return { path: safe, content, encoding }
 })
 
+/**
+ * Hard ceiling for a single binary IPC payload. Renderer views truncate too,
+ * but doing it here keeps the main process from reading — and base64-encoding,
+ * which costs another 1.33x — a multi-hundred-MB file it is about to discard.
+ */
+const MAX_BINARY_BYTES = 10_485_760 // 10 MB
+
+/**
+ * Read at most `maxBytes` from a file, reporting the true on-disk size so the
+ * renderer can still show an accurate "truncated" warning.
+ *
+ * @param {string} safePath  already validated by validatePath()
+ * @param {number} maxBytes
+ * @returns {Promise<{ base64: string, size: number, truncated: boolean }>}
+ */
+async function readBinaryBounded(safePath, maxBytes = MAX_BINARY_BYTES) {
+  const info = await stat(safePath)
+  if (info.size <= maxBytes) {
+    const buffer = await readFile(safePath)
+    return { base64: buffer.toString('base64'), size: buffer.length, truncated: false }
+  }
+  const handle = await open(safePath, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes)
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
+    return {
+      base64: buffer.subarray(0, bytesRead).toString('base64'),
+      size: info.size,
+      truncated: true
+    }
+  } finally {
+    await handle.close()
+  }
+}
+
 // IPC: 開啟檔案對話框並讀取二進位（base64）
 ipcMain.handle('open-file-binary', async (event, options = {}) => {
   const { filters } = options
@@ -170,23 +205,25 @@ ipcMain.handle('open-file-binary', async (event, options = {}) => {
     : await dialog.showOpenDialog(dialogOptions)
   if (canceled || !filePaths.length) return null
   registerRoot(filePaths[0])
-  const buffer = await readFile(filePaths[0])
+  const { base64, size, truncated } = await readBinaryBounded(filePaths[0], options.maxBytes)
   return {
     path: filePaths[0],
-    base64: buffer.toString('base64'),
-    size: buffer.length,
+    base64,
+    size,
+    truncated,
     ext: extname(filePaths[0]).slice(1).toLowerCase()
   }
 })
 
 // IPC: 讀取指定路徑的二進位檔案（base64）
-ipcMain.handle('read-file-binary', async (_event, filePath) => {
+ipcMain.handle('read-file-binary', async (_event, filePath, maxBytes) => {
   const safe = validatePath(filePath)
-  const buffer = await readFile(safe)
+  const { base64, size, truncated } = await readBinaryBounded(safe, maxBytes)
   return {
     path: safe,
-    base64: buffer.toString('base64'),
-    size: buffer.length,
+    base64,
+    size,
+    truncated,
     ext: extname(safe).slice(1).toLowerCase()
   }
 })

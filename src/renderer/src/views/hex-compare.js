@@ -13,7 +13,7 @@
  *  - T11: Offset 跳轉（goto-offset input）
  */
 
-import { showContextMenu } from '../core/context-menu.js'
+import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el, formatSize } from '../core/utils.js'
 import { isActive } from '../core/active-view.js'
 import '../styles/hex-compare.css'
@@ -22,6 +22,14 @@ import '../styles/hex-compare.css'
 
 const ROW_HEIGHT = 20            // px，固定列高
 const MAX_BYTES  = 10_485_760    // 10 MB
+
+/**
+ * Edit-distance budget for Complete-mode byte diff. Myers back-trace keeps
+ * one trimmed V snapshot per round, so trace memory is ~4·(D+1)² bytes —
+ * 4096 ⇒ ~67 MB worst case, reached only when the two files genuinely differ
+ * by that many bytes after prefix/suffix trimming.
+ */
+const HEX_COMPLETE_MAX_D = 4096
 
 // S14-M10: rAF throttle — coalesce calls to the next animation frame.
 function _rafThrottle(fn) {
@@ -47,49 +55,150 @@ function _rafThrottle(fn) {
  * "right offset" → 'same'|'diff'. Insert/Delete bytes (i.e. bytes that
  * have no aligned partner) are classified as 'diff'.
  *
- * Capped at 1MB on either side — larger inputs must use Fast mode.
+ * Implemented as: common prefix/suffix trim, then Myers O(ND) over the
+ * differing middle region with a bounded edit-distance budget. Memory is
+ * O(D²) rather than O(n·m), so multi-MB inputs are safe.
+ *
+ * If the edit distance exceeds `maxEditDistance`, the middle region degrades
+ * to a positional byte compare and `truncated: true` is returned.
  *
  * @param {Uint8Array} left
  * @param {Uint8Array} right
- * @returns {{ leftClass: Uint8Array, rightClass: Uint8Array }} 0=same, 1=diff
+ * @param {{ maxEditDistance?: number }} [opts]
+ * @returns {{ leftClass: Uint8Array, rightClass: Uint8Array, truncated: boolean }} 0=same, 1=diff
  */
-export function hexCompleteByteDiff(left, right) {
+export function hexCompleteByteDiff(left, right, opts = {}) {
   const n = left.length
   const m = right.length
-  // Build LCS DP table — Uint16 is enough since we cap at 1MB.
-  const dp = new Uint32Array((n + 1) * (m + 1))
-  const cols = m + 1
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      if (left[i - 1] === right[j - 1]) {
-        dp[i * cols + j] = dp[(i - 1) * cols + (j - 1)] + 1
+  const leftClass  = new Uint8Array(n)
+  const rightClass = new Uint8Array(m)
+  // Default everything to 'diff'; matched pairs get flipped to 'same' below.
+  leftClass.fill(1)
+  rightClass.fill(1)
+
+  // ── Trim common prefix / suffix. For binaries this usually removes the
+  //    overwhelming majority of the input, keeping Myers cheap. ──
+  const minLen = n < m ? n : m
+  let pre = 0
+  while (pre < minLen && left[pre] === right[pre]) {
+    leftClass[pre] = 0
+    rightClass[pre] = 0
+    pre++
+  }
+  let suf = 0
+  while (suf < minLen - pre && left[n - 1 - suf] === right[m - 1 - suf]) {
+    leftClass[n - 1 - suf] = 0
+    rightClass[m - 1 - suf] = 0
+    suf++
+  }
+
+  const aLen = n - suf - pre
+  const bLen = m - suf - pre
+  if (aLen === 0 || bLen === 0) {
+    return { leftClass, rightClass, truncated: false }
+  }
+
+  const a = left.subarray(pre, pre + aLen)
+  const b = right.subarray(pre, pre + bLen)
+  const maxD = opts.maxEditDistance ?? HEX_COMPLETE_MAX_D
+  const matches = _myersBytes(a, b, maxD)
+
+  if (matches === null) {
+    // Budget exhausted — fall back to a positional compare over the middle.
+    const lim = aLen < bLen ? aLen : bLen
+    for (let i = 0; i < lim; i++) {
+      if (a[i] === b[i]) {
+        leftClass[pre + i] = 0
+        rightClass[pre + i] = 0
+      }
+    }
+    return { leftClass, rightClass, truncated: true }
+  }
+
+  for (let i = 0; i < matches.length; i += 2) {
+    leftClass[pre + matches[i]] = 0
+    rightClass[pre + matches[i + 1]] = 0
+  }
+  return { leftClass, rightClass, truncated: false }
+}
+
+/**
+ * Myers O(ND) diff over two byte arrays.
+ *
+ * Per-round V snapshots are stored trimmed to the reachable diagonal band
+ * (2d+1 entries), so total trace memory is ~4·(D+1)² bytes instead of the
+ * O(D·(N+M)) a full-width snapshot would cost.
+ *
+ * @param {Uint8Array} a
+ * @param {Uint8Array} b
+ * @param {number} maxD  edit-distance budget; returns null when exceeded
+ * @returns {Int32Array|null} flat [aIdx, bIdx, aIdx, bIdx, …] matched pairs
+ */
+function _myersBytes(a, b, maxD) {
+  const N = a.length
+  const M = b.length
+  const limit = Math.min(maxD, N + M)
+  const off = limit + 1
+  const V = new Int32Array(2 * limit + 3)
+  /** @type {Int32Array[]} */
+  const trace = []
+  let found = -1
+
+  outer: for (let d = 0; d <= limit; d++) {
+    // Snapshot of V as it stands after d-1 rounds, trimmed to k ∈ [-d, d].
+    trace.push(V.slice(off - d, off + d + 1))
+    for (let k = -d; k <= d; k += 2) {
+      const ki = k + off
+      let x
+      if (k === -d || (k !== d && V[ki - 1] < V[ki + 1])) {
+        x = V[ki + 1] // move down (insert)
       } else {
-        const up   = dp[(i - 1) * cols + j]
-        const left_ = dp[i * cols + (j - 1)]
-        dp[i * cols + j] = up > left_ ? up : left_
+        x = V[ki - 1] + 1 // move right (delete)
+      }
+      let y = x - k
+      while (x < N && y < M && a[x] === b[y]) {
+        x++
+        y++
+      }
+      V[ki] = x
+      if (x >= N && y >= M) {
+        found = d
+        break outer
       }
     }
   }
-  const leftClass  = new Uint8Array(n)
-  const rightClass = new Uint8Array(m)
-  // Default everything to 'diff'; mark equal pairs as 'same'.
-  leftClass.fill(1)
-  rightClass.fill(1)
-  let i = n
-  let j = m
-  while (i > 0 && j > 0) {
-    if (left[i - 1] === right[j - 1]) {
-      leftClass[i - 1]  = 0
-      rightClass[j - 1] = 0
-      i--
-      j--
-    } else if (dp[(i - 1) * cols + j] >= dp[i * cols + (j - 1)]) {
-      i--
-    } else {
-      j--
+  if (found < 0) return null
+
+  // Back-trace. Matches are collected in reverse; order is irrelevant to the
+  // caller, which only uses them to flip classification bits.
+  const matches = new Int32Array(2 * Math.min(N, M))
+  let count = 0
+  let x = N
+  let y = M
+  for (let d = found; d > 0; d--) {
+    const Vprev = trace[d] // index of diagonal k is (k + d)
+    const k = x - y
+    const prevK = (k === -d || (k !== d && Vprev[k - 1 + d] < Vprev[k + 1 + d]))
+      ? k + 1
+      : k - 1
+    const prevX = Vprev[prevK + d]
+    const prevY = prevX - prevK
+    while (x > prevX && y > prevY) {
+      x--
+      y--
+      matches[count++] = x
+      matches[count++] = y
     }
+    if (x === prevX) y--
+    else x--
   }
-  return { leftClass, rightClass }
+  while (x > 0 && y > 0) {
+    x--
+    y--
+    matches[count++] = x
+    matches[count++] = y
+  }
+  return matches.subarray(0, count)
 }
 
 export function searchHexBytes(haystack, needle) {
@@ -235,6 +344,7 @@ export class HexCompare {
 
   /** 卸載並清除 DOM 及事件 */
   destroy() {
+    closeContextMenu()
     if (this._ctrlFHandler) {
       document.removeEventListener('keydown', this._ctrlFHandler)
       this._ctrlFHandler = null
@@ -1134,24 +1244,20 @@ export class HexCompare {
       this._completeRightClass = null
       return
     }
-    const MAX_COMPLETE = 1_048_576 // 1MB
-    if (this._leftBytes.length > MAX_COMPLETE || this._rightBytes.length > MAX_COMPLETE) {
-      // Too large — warn user and fall back to Fast.
-      this._diffAlgorithm = 'fast'
-      this._completeLeftClass = null
-      this._completeRightClass = null
-      const sel = this._dom.algoSelect
-      if (sel) /** @type {HTMLSelectElement} */ (sel).value = 'fast'
-      const warning = this._dom.warning
-      if (warning) {
-        warning.style.display = ''
-        warning.textContent = '⚠ Complete 演算法只支援 ≤ 1MB；已切回 Fast'
-      }
-      return
-    }
-    const result = hexCompleteByteDiff(this._leftBytes, this._rightBytes)
+    // Myers cost is O((N+M)·D). Scale the edit-distance budget by input size so
+    // worst-case work stays within ~2·10^8 byte comparisons regardless of file
+    // size; oversized diffs degrade to a positional compare rather than hanging.
+    const total = this._leftBytes.length + this._rightBytes.length + 1
+    const maxEditDistance = Math.max(64, Math.min(HEX_COMPLETE_MAX_D, Math.floor(2e8 / total)))
+    const result = hexCompleteByteDiff(this._leftBytes, this._rightBytes, { maxEditDistance })
     this._completeLeftClass  = result.leftClass
     this._completeRightClass = result.rightClass
+    const warning = this._dom.warning
+    if (result.truncated && warning) {
+      warning.style.display = ''
+      warning.textContent =
+        `⚠ 差異量超過 Complete 演算法上限（編輯距離 > ${maxEditDistance}），此區段以位置對齊近似`
+    }
   }
 
   // ── Private: UI helpers ───────────────────────────────────────────────────────

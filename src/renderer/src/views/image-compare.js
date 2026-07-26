@@ -18,7 +18,7 @@
  *   'paths-changed' → { left: string, right: string }
  */
 
-import { showContextMenu } from '../core/context-menu.js'
+import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { isActive } from '../core/active-view.js'
 import '../styles/image-compare.css'
 
@@ -120,22 +120,20 @@ function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, th
 
       let isDiff
       if (algorithm === 'exact') {
-        // Exact: all R/G/B channels must be identical (alpha ignored for comparison)
+        // Exact: all R/G/B channels must be identical (alpha ignored for
+        // comparison). Deliberately ignores the tolerance slider.
         isDiff = lR !== rR || lG !== rG || lB !== rB
-      } else if (algorithm === 'tolerance') {
-        // Tolerance: sum of absolute channel differences ≤ 30
-        isDiff = Math.abs(lR - rR) + Math.abs(lG - rG) + Math.abs(lB - rB) > 30
       } else if (algorithm === 'grayscale') {
-        // Grayscale: compare luminance values, threshold |lum1 - lum2| > 15
+        // Grayscale: compare luminance, cutoff scaled by the tolerance slider.
         const lumL = 0.299 * lR + 0.587 * lG + 0.114 * lB
         const lumR = 0.299 * rR + 0.587 * rG + 0.114 * rB
-        isDiff = Math.abs(lumL - lumR) > 15
+        isDiff = Math.abs(lumL - lumR) > threshold * 255
       } else {
-        // Fallback: threshold-based (original logic)
-        const rDiff = Math.abs(lR - rR) / 255
-        const gDiff = Math.abs(lG - rG) / 255
-        const bDiff = Math.abs(lB - rB) / 255
-        isDiff = (rDiff + gDiff + bDiff) / 3 > threshold
+        // Tolerance (default): mean per-channel difference against the slider.
+        const rDiff = Math.abs(lR - rR)
+        const gDiff = Math.abs(lG - rG)
+        const bDiff = Math.abs(lB - rB)
+        isDiff = (rDiff + gDiff + bDiff) / 3 > threshold * 255
       }
 
       if (isDiff) {
@@ -163,6 +161,13 @@ function pixelDiff(leftCtx, rightCtx, diffCtx, width, height, lw, lh, rw, rh, th
 
 const MIN_ZOOM = 0.1
 const MAX_ZOOM = 10
+
+/**
+ * Upper bound for an image payload over IPC. Unlike hex, a truncated image is
+ * useless (the decoder would choke), so anything larger is rejected outright
+ * rather than silently clipped.
+ */
+export const MAX_IMAGE_BYTES = 134_217_728 // 128 MB
 
 /**
  * @typedef {object} SyncTransformController
@@ -422,6 +427,11 @@ export class ImageCompare {
     this._leftCtx = null
     this._rightCtx = null
     this._diffCtx = null
+    // Decoded bitmaps are the largest thing this view holds; drop them so a
+    // retained instance can't pin megabytes of image data.
+    this._left = null
+    this._right = null
+    closeContextMenu()
   }
 
   // ── Public API: T57 Zoom ────────────────────────────────────────────────────
@@ -524,8 +534,13 @@ export class ImageCompare {
     try {
       const result = await window.electronAPI.openFileBinary({
         filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'] }],
+        maxBytes: MAX_IMAGE_BYTES,
       })
       if (!result) return
+      if (result.truncated) {
+        console.error('[image-compare] file exceeds the image size limit:', result.path)
+        return
+      }
       await this.setLeft(result.path, result.base64, result.ext)
     } catch (err) {
       console.error('[image-compare] openLeft failed:', err)
@@ -539,8 +554,13 @@ export class ImageCompare {
     try {
       const result = await window.electronAPI.openFileBinary({
         filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'] }],
+        maxBytes: MAX_IMAGE_BYTES,
       })
       if (!result) return
+      if (result.truncated) {
+        console.error('[image-compare] file exceeds the image size limit:', result.path)
+        return
+      }
       await this.setRight(result.path, result.base64, result.ext)
     } catch (err) {
       console.error('[image-compare] openRight failed:', err)
