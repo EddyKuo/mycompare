@@ -7,6 +7,7 @@ import { registerRoot, validatePath, validatePathPair } from './path-validator.j
 import { buildAppMenu } from './menu.js'
 import { parseCli, usageText } from './cli.js'
 import { parseScript, describeScript, isMutating } from './script.js'
+import { runScript } from './script-runner.js'
 import { writeSnapshot, readSnapshot, snapshotLevel } from './snapshot.js'
 import { readArchive, readArchiveEntry } from './archive.js'
 
@@ -19,19 +20,19 @@ const _fileWatchers = new Map()
 export { parseCliArgs } from './cli.js'
 
 /**
- * Parse and report on a script file, without executing it.
+ * Parse and run a script file.
  *
- * Execution is deliberately not implemented yet: the commands that make
- * scripting worth having also delete and overwrite files, and running those
- * unattended off a grammar that has never been exercised against real inputs
- * is not something to switch on quietly. Validating and describing the script
- * is useful on its own — it catches typos in a build hook before they reach a
- * machine that would act on them — and it is the half that can be trusted now.
+ * Running is opt-in. A script reaches this function from a build hook or a
+ * VCS trigger, where nobody is watching and the working directory is whatever
+ * the caller happened to be in; defaulting to a dry run means the first
+ * mistake costs a wasted invocation instead of a tree of files. `/execute`
+ * is the point at which the operator states they have read the plan.
  *
  * @param {string} scriptPath
+ * @param {boolean} [execute]
  * @returns {Promise<number>} process exit code
  */
-async function runScriptFile(scriptPath) {
+async function runScriptFile(scriptPath, execute = false) {
   let source
   try {
     source = await readFile(scriptPath, 'utf-8')
@@ -49,9 +50,23 @@ async function runScriptFile(scriptPath) {
   }
 
   process.stdout.write(`${scriptPath} — ${commands.length} 個指令，語法正確\n`)
-  process.stdout.write(`${describeScript(commands)}\n`)
-  if (isMutating(commands)) {
-    process.stdout.write('\n注意：腳本執行尚未實作，目前僅做語法檢查。\n')
+  process.stdout.write(`${describeScript(commands)}\n\n`)
+
+  const result = await runScript(commands, {
+    execute,
+    validatePath,
+    registerRoot,
+    out: (line) => process.stdout.write(`${line}\n`),
+  })
+
+  if (!result.ok) {
+    for (const e of result.errors) {
+      process.stderr.write(`${scriptPath}:${e.line}: ${e.message}\n`)
+    }
+    return 1
+  }
+  if (!execute && isMutating(commands)) {
+    process.stdout.write('\n提示：這是預演。確認上述操作無誤後，加上 /execute 重新執行。\n')
   }
   return 0
 }
@@ -143,7 +158,7 @@ app.whenReady().then(async () => {
   }
 
   if (typeof cli.switches.script === 'string') {
-    const code = await runScriptFile(cli.switches.script)
+    const code = await runScriptFile(cli.switches.script, cli.switches.execute === true)
     app.exit(code)
     return
   }
