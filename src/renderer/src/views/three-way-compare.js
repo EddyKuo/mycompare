@@ -155,13 +155,138 @@ export function segmentsToPaneLines(segments, side) {
 }
 
 // ---------------------------------------------------------------------------
+// S16-M02: virtual scrolling (pure, testable)
+// ---------------------------------------------------------------------------
+
+/** Fixed row height, in px. Virtualisation cannot work with wrapping rows. */
+const ROW_HEIGHT = 18
+
+/** Rows rendered beyond each edge of the viewport, to hide scroll latency. */
+const OVERSCAN_ROWS = 8
+
+/**
+ * Viewport height assumed when the pane reports 0 — it is hidden, detached or
+ * not laid out yet. Rendering *something* beats rendering a blank pane that
+ * only fills in after the user happens to scroll.
+ */
+const VIEWPORT_HEIGHT_FALLBACK = 600
+
+/** A normal segment longer than this is elided in the output *preview* only. */
+const OUTPUT_PREVIEW_MAX_LINES = 200
+
+/**
+ * @typedef {{ type: 'equal'|'insert'|'delete'|'replace'|'conflict', lineNum: number|null, text: string }} PaneRow
+ */
+
+/**
+ * Half-open row range `[start, end)` that has to exist in the DOM.
+ *
+ * @param {number} scrollTop
+ * @param {number} viewportHeight  pane clientHeight; 0 falls back (see above)
+ * @param {number} totalRows
+ * @param {number} [rowHeight]
+ * @param {number} [overscan]
+ * @returns {{ start: number, end: number }}
+ */
+export function computeVisibleRange(scrollTop, viewportHeight, totalRows, rowHeight = ROW_HEIGHT, overscan = OVERSCAN_ROWS) {
+  const total = Number.isFinite(totalRows) && totalRows > 0 ? Math.floor(totalRows) : 0
+  if (total === 0) return { start: 0, end: 0 }
+
+  const rh = Number.isFinite(rowHeight) && rowHeight > 0 ? rowHeight : ROW_HEIGHT
+  const over = Number.isFinite(overscan) && overscan > 0 ? Math.floor(overscan) : 0
+  const height = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : VIEWPORT_HEIGHT_FALLBACK
+  const top = Number.isFinite(scrollTop) && scrollTop > 0 ? Math.min(scrollTop, total * rh) : 0
+
+  const start = Math.max(0, Math.floor(top / rh) - over)
+  const end = Math.min(total, Math.ceil((top + height) / rh) + over)
+  return { start, end: Math.max(start, end) }
+}
+
+/** @param {string|null|undefined} s */
+const _stripEol = (s) => (s ?? '').replace(/\r?\n$/, '')
+
+/**
+ * Flatten a base→side diff into displayable rows.
+ *
+ * Left and right panes map identically: both show the "right" side of their
+ * own diff, with base line numbers on unchanged rows.
+ *
+ * @param {import('../core/diff-engine.js').DiffLine[]|null} diff
+ * @returns {PaneRow[]}
+ */
+export function diffToPaneRows(diff) {
+  /** @type {PaneRow[]} */
+  const rows = []
+  for (const dl of diff || []) {
+    switch (dl.type) {
+      case 'insert':
+        rows.push({ type: 'insert', lineNum: dl.rightLine ?? null, text: _stripEol(dl.rightText) })
+        break
+      case 'replace':
+        rows.push({ type: 'replace', lineNum: dl.rightLine ?? null, text: _stripEol(dl.rightText) })
+        break
+      case 'delete':
+        rows.push({ type: 'delete', lineNum: null, text: _stripEol(dl.leftText) })
+        break
+      default:
+        rows.push({ type: 'equal', lineNum: dl.leftLine ?? null, text: _stripEol(dl.leftText) })
+    }
+  }
+  return rows
+}
+
+/**
+ * The full row list one pane would show — the unit of virtualisation.
+ *
+ * Both display modes end up as a flat array here, which is what lets one
+ * windowing implementation serve them: 'conflicts' only changes *which* rows
+ * exist, never how they are positioned.
+ *
+ * @param {'left'|'base'|'right'} side
+ * @param {{
+ *   showFilter?: 'all'|'conflicts',
+ *   segments?: MergeSegment[],
+ *   content?: string,
+ *   diff?: import('../core/diff-engine.js').DiffLine[]|null,
+ * }} [opts]
+ * @returns {PaneRow[]}
+ */
+export function buildPaneRows(side, opts = {}) {
+  const { showFilter = 'all', segments = [], content = '', diff = null } = opts
+
+  if (showFilter === 'conflicts') {
+    // Line numbers are omitted: filtered output is not contiguous.
+    return segmentsToPaneLines(segments ? filterSegmentsForConflicts(segments) : [], side)
+      .map(({ text, conflict }) => ({
+        type: /** @type {PaneRow['type']} */ (conflict ? 'conflict' : 'equal'),
+        lineNum: null,
+        text,
+      }))
+  }
+
+  if (!diff) {
+    return (content || '').split('\n').map((text, i) => ({
+      type: /** @type {PaneRow['type']} */ ('equal'),
+      lineNum: i + 1,
+      text,
+    }))
+  }
+  return diffToPaneRows(diff)
+}
+
+// ---------------------------------------------------------------------------
 // ThreeWayCompare
 // ---------------------------------------------------------------------------
+
+/** Distinguishes instances so two mounted merge tabs cannot share element ids. */
+let _instanceSeq = 0
 
 export class ThreeWayCompare {
   constructor() {
     /** @type {HTMLElement|null} */
     this._container = null
+
+    this._uid = ++_instanceSeq
 
     this._leftPath = ''
     this._basePath = ''
@@ -207,6 +332,18 @@ export class ThreeWayCompare {
 
     /** @type {'all'|'conflicts'} */
     this._showFilter = 'all'
+
+    /** Full row lists per pane; only a window of these reaches the DOM. */
+    /** @type {{ left: PaneRow[], base: PaneRow[], right: PaneRow[] }} */
+    this._paneRows = { left: [], base: [], right: [] }
+
+    /** Last rendered window, kept so redundant scroll events cost nothing. */
+    this._renderedRange = { start: -1, end: -1 }
+
+    /** @type {'myers'|'patience'|'histogram'} */
+    this._algorithm = 'myers'
+    this._ignoreWhitespace = false
+    this._ignoreCase = false
   }
 
   // ---------------------------------------------------------------------------
@@ -228,7 +365,7 @@ export class ThreeWayCompare {
     if (side !== 'left' && side !== 'base' && side !== 'right') return
     this[`_${side}Content`] = content ?? ''
     if (path != null) this[`_${side}Path`] = path
-    const pathEl = this._container?.querySelector(`#mw-path-${side}`)
+    const pathEl = this._pathEl(side)
     if (pathEl && path != null) pathEl.textContent = path
     this._runMerge()
     this._emit('paths-changed', {
@@ -314,12 +451,60 @@ export class ThreeWayCompare {
   }
 
   /**
+   * Comparison settings only — never paths or file contents, because a named
+   * config is meant to be reusable across sessions.
+   *
+   * @returns {{ showFilter: 'all'|'conflicts', algorithm: 'myers'|'patience'|'histogram', ignoreWhitespace: boolean, ignoreCase: boolean }}
+   */
+  getConfig() {
+    return {
+      showFilter: this._showFilter,
+      algorithm: this._algorithm,
+      ignoreWhitespace: this._ignoreWhitespace,
+      ignoreCase: this._ignoreCase,
+    }
+  }
+
+  /**
+   * @param {object} cfg  untrusted: comes from localStorage / an imported file
+   */
+  applyConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return
+    const c = /** @type {Record<string, unknown>} */ (cfg)
+
+    if (c.showFilter === 'all' || c.showFilter === 'conflicts') this._showFilter = c.showFilter
+    if (c.algorithm === 'myers' || c.algorithm === 'patience' || c.algorithm === 'histogram') {
+      this._algorithm = c.algorithm
+    }
+    if (typeof c.ignoreWhitespace === 'boolean') this._ignoreWhitespace = c.ignoreWhitespace
+    if (typeof c.ignoreCase === 'boolean') this._ignoreCase = c.ignoreCase
+
+    this._runMerge()
+  }
+
+  /**
+   * Scroll the side panes so `rowIndex` is the first visible row.
+   *
+   * Takes the target position as the source of truth rather than reading
+   * `scrollTop` back: a pane with no layout would report 0 and silently
+   * cancel the jump.
+   *
+   * @param {number} rowIndex
+   */
+  scrollToRow(rowIndex) {
+    const top = Math.max(0, Math.floor(Number(rowIndex) || 0)) * ROW_HEIGHT
+    for (const pane of this._panes()) pane.scrollTop = top
+    this._renderPaneWindows(top)
+  }
+
+  /**
    * Mount the view into a container element.
    * @param {HTMLElement} containerEl
    */
   mount(containerEl) {
     this._container = containerEl
     this._render()
+    this._disambiguateIds()
     this._bindEvents()
   }
 
@@ -333,6 +518,11 @@ export class ThreeWayCompare {
     }
     if (this._container) this._container.innerHTML = ''
     this._listeners.clear()
+    this._paneRows = { left: [], base: [], right: [] }
+    this._renderedRange = { start: -1, end: -1 }
+    this._contentEls = { left: null, base: null, right: null }
+    this._outputEl = null
+    this._outputPaneEl = null
   }
 
   /**
@@ -360,48 +550,48 @@ export class ThreeWayCompare {
     this._container.innerHTML = `
       <div class="mw-layout">
         <div class="mw-toolbar">
-          <button id="mw-btn-prev" title="上一個衝突">▲</button>
-          <button id="mw-btn-next" title="下一個衝突">▼</button>
+          <button class="mw-btn-prev" id="mw-btn-prev" title="上一個衝突">▲</button>
+          <button class="mw-btn-next" id="mw-btn-next" title="下一個衝突">▼</button>
           <span class="mw-conflict-counter" id="mw-conflict-counter">無衝突</span>
           <span class="mw-toolbar-sep"></span>
-          <button id="mw-btn-filter" title="只顯示衝突段落">顯示：全部</button>
+          <button class="mw-btn-filter" id="mw-btn-filter" title="只顯示衝突段落">顯示：全部</button>
           <span class="mw-toolbar-sep"></span>
-          <button id="mw-btn-all-left">全部採用左側</button>
-          <button id="mw-btn-all-right">全部採用右側</button>
+          <button class="mw-btn-all-left" id="mw-btn-all-left">全部採用左側</button>
+          <button class="mw-btn-all-right" id="mw-btn-all-right">全部採用右側</button>
         </div>
         <div class="mw-top">
           <!-- Left Pane -->
           <div class="mw-pane" id="mw-pane-left">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="left">開啟左側…</button>
-              <span class="mw-path" id="mw-path-left">（未選擇）</span>
+              <span class="mw-path" data-side="left" id="mw-path-left">（未選擇）</span>
             </div>
-            <div class="mw-content" id="mw-content-left"></div>
+            <div class="mw-content mw-content-left" data-side="left" id="mw-content-left"></div>
           </div>
           <div class="mw-pane-divider"></div>
           <!-- Base Pane -->
           <div class="mw-pane" id="mw-pane-base">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="base">開啟基底…</button>
-              <span class="mw-path" id="mw-path-base">（未選擇）</span>
+              <span class="mw-path" data-side="base" id="mw-path-base">（未選擇）</span>
             </div>
-            <div class="mw-content" id="mw-content-base"></div>
+            <div class="mw-content mw-content-base" data-side="base" id="mw-content-base"></div>
           </div>
           <div class="mw-pane-divider"></div>
           <!-- Right Pane -->
           <div class="mw-pane" id="mw-pane-right">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="right">開啟右側…</button>
-              <span class="mw-path" id="mw-path-right">（未選擇）</span>
+              <span class="mw-path" data-side="right" id="mw-path-right">（未選擇）</span>
             </div>
-            <div class="mw-content" id="mw-content-right"></div>
+            <div class="mw-content mw-content-right" data-side="right" id="mw-content-right"></div>
           </div>
         </div>
         <div class="mw-divider" id="mw-divider"></div>
         <div class="mw-output-pane">
           <div class="mw-output-header">
             <span>合併輸出</span>
-            <button id="mw-btn-save">儲存輸出…</button>
+            <button class="mw-btn-save" id="mw-btn-save">儲存輸出…</button>
           </div>
           <div class="mw-output-content" id="mw-output-pane"></div>
           <textarea class="mw-output-textarea" id="mw-output" spellcheck="false"></textarea>
@@ -430,26 +620,71 @@ export class ThreeWayCompare {
 .mw-normal-seg { margin:0; padding:2px 8px; font-size:12px; white-space:pre-wrap; }
 .mw-output-pane-inner { padding:4px 0; overflow:auto; }
 .mw-output-textarea { display:none; }
+/* Virtual scrolling only holds together while every row is exactly
+   ROW_HEIGHT tall, so wrapping is disabled here on purpose. */
+.mw-content .mw-vspacer { position:relative; width:100%; }
+.mw-content .mw-vwindow { position:absolute; top:0; left:0; right:0; }
+.mw-content .mw-line { height:18px; min-height:18px; box-sizing:border-box; overflow:hidden; }
+.mw-content .mw-linetext { white-space:pre; word-break:normal; overflow:hidden; text-overflow:ellipsis; }
         </style>
       </div>
     `
 
     // Cache element refs
     this._contentEls = {
-      left: this._container.querySelector('#mw-content-left'),
-      base: this._container.querySelector('#mw-content-base'),
-      right: this._container.querySelector('#mw-content-right'),
+      left: this._q('.mw-content-left'),
+      base: this._q('.mw-content-base'),
+      right: this._q('.mw-content-right'),
     }
-    this._outputEl = this._container.querySelector('#mw-output')
-    this._outputPaneEl = this._container.querySelector('#mw-output-pane')
+    this._outputEl = /** @type {HTMLTextAreaElement|null} */ (this._q('.mw-output-textarea'))
+    this._outputPaneEl = this._q('.mw-output-content')
 
     // Setup resizable output pane
     this._setupDividerDrag()
   }
 
+  /**
+   * Container-scoped lookup. Every internal query goes through here so that a
+   * second mounted instance can never reach into the first one's DOM.
+   *
+   * @param {string} selector
+   * @returns {HTMLElement|null}
+   */
+  _q(selector) {
+    return /** @type {HTMLElement|null} */ (this._container?.querySelector(selector) ?? null)
+  }
+
+  /**
+   * @param {'left'|'base'|'right'} side
+   * @returns {HTMLElement|null}
+   */
+  _pathEl(side) {
+    return this._q(`.mw-path[data-side="${side}"]`)
+  }
+
+  /** @returns {HTMLElement[]} the three scrollable side panes that exist */
+  _panes() {
+    return [this._contentEls.left, this._contentEls.base, this._contentEls.right].filter(Boolean)
+  }
+
+  /**
+   * Suffix any element id that another instance already owns.
+   *
+   * The markup keeps its historical ids for readability and for outside
+   * callers, but duplicated ids across two merge tabs would make a
+   * document-wide `#mw-output` lookup resolve to the wrong tab.
+   */
+  _disambiguateIds() {
+    if (!this._container) return
+    for (const el of this._container.querySelectorAll('[id]')) {
+      const owner = document.getElementById(el.id)
+      if (owner && owner !== el) el.id = `${el.id}--${this._uid}`
+    }
+  }
+
   _setupDividerDrag() {
-    const divider = this._container.querySelector('#mw-divider')
-    const outputPane = this._container.querySelector('.mw-output-pane')
+    const divider = this._q('.mw-divider')
+    const outputPane = this._q('.mw-output-pane')
     if (!divider || !outputPane) return
 
     let startY = 0
@@ -486,7 +721,7 @@ export class ThreeWayCompare {
           if (!result) return
           this[`_${side}Path`] = result.path
           this[`_${side}Content`] = result.content
-          const pathEl = this._container.querySelector(`#mw-path-${side}`)
+          const pathEl = this._pathEl(side)
           if (pathEl) pathEl.textContent = result.path
           this._runMerge()
           this._emit('paths-changed', {
@@ -501,7 +736,7 @@ export class ThreeWayCompare {
     })
 
     // Save output button
-    this._container.querySelector('#mw-btn-save')?.addEventListener('click', async () => {
+    this._q('.mw-btn-save')?.addEventListener('click', async () => {
       const content = this._buildOutputText()
       try {
         await window.electronAPI.saveFile('merged-output.txt', content)
@@ -511,13 +746,13 @@ export class ThreeWayCompare {
     })
 
     // S16-M01: conflict navigation / filter / batch resolve toolbar
-    this._container.querySelector('#mw-btn-prev')?.addEventListener('click', () => this.prevConflict())
-    this._container.querySelector('#mw-btn-next')?.addEventListener('click', () => this.nextConflict())
-    this._container.querySelector('#mw-btn-filter')?.addEventListener('click', () => {
+    this._q('.mw-btn-prev')?.addEventListener('click', () => this.prevConflict())
+    this._q('.mw-btn-next')?.addEventListener('click', () => this.nextConflict())
+    this._q('.mw-btn-filter')?.addEventListener('click', () => {
       this.setShowFilter(this._showFilter === 'all' ? 'conflicts' : 'all')
     })
-    this._container.querySelector('#mw-btn-all-left')?.addEventListener('click', () => this.resolveAll('left'))
-    this._container.querySelector('#mw-btn-all-right')?.addEventListener('click', () => this.resolveAll('right'))
+    this._q('.mw-btn-all-left')?.addEventListener('click', () => this.resolveAll('left'))
+    this._q('.mw-btn-all-right')?.addEventListener('click', () => this.resolveAll('right'))
 
     // T26: Sync scroll across all three content panes
     this._setupSyncScroll()
@@ -547,7 +782,7 @@ export class ThreeWayCompare {
   }
 
   _updateConflictCounter() {
-    const el = this._container?.querySelector('#mw-conflict-counter')
+    const el = this._q('.mw-conflict-counter')
     if (!el) return
     const total = this.getConflictCount()
     el.textContent = total === 0
@@ -556,7 +791,7 @@ export class ThreeWayCompare {
   }
 
   _updateFilterButton() {
-    const btn = this._container?.querySelector('#mw-btn-filter')
+    const btn = this._q('.mw-btn-filter')
     if (!btn) return
     btn.textContent = this._showFilter === 'conflicts' ? '顯示：僅衝突' : '顯示：全部'
     btn.classList.toggle('active', this._showFilter === 'conflicts')
@@ -567,7 +802,7 @@ export class ThreeWayCompare {
    * When any pane is scrolled, the other two are updated to match scrollTop.
    */
   _setupSyncScroll() {
-    const panes = Object.values(this._contentEls).filter(Boolean)
+    const panes = this._panes()
     if (panes.length < 2) return
 
     let syncing = false
@@ -580,6 +815,8 @@ export class ThreeWayCompare {
           if (other !== pane) other.scrollTop = scrollTop
         }
         syncing = false
+        // Panes scroll as one, so one window range serves all three.
+        this._renderPaneWindows(scrollTop)
       }
       pane.addEventListener('scroll', handler)
       return { pane, handler }
@@ -618,36 +855,82 @@ export class ThreeWayCompare {
     this._emit('ready', { hasConflicts })
   }
 
-  /** Render the three side panes honouring the current show filter. */
+  /** Recompute the row lists for all three panes and repaint the window. */
   _renderSides() {
-    if (this._showFilter === 'conflicts') {
-      const filtered = filterSegmentsForConflicts(this._segments)
-      this._renderFilteredSidePane('left', filtered)
-      this._renderFilteredSidePane('base', filtered)
-      this._renderFilteredSidePane('right', filtered)
-      return
+    const common = { showFilter: this._showFilter, segments: this._segments }
+    this._paneRows = {
+      left: buildPaneRows('left', { ...common, content: this._leftContent, diff: this._leftDiff }),
+      base: buildPaneRows('base', { ...common, content: this._baseContent, diff: null }),
+      right: buildPaneRows('right', { ...common, content: this._rightContent, diff: this._rightDiff }),
     }
-    this._renderSidePane('left', this._leftContent, this._leftDiff, 'left')
-    this._renderSidePane('base', this._baseContent, null, 'base')
-    this._renderSidePane('right', this._rightContent, this._rightDiff, 'right')
+    // Row lists changed, so the previously painted window says nothing about
+    // what is on screen now.
+    this._renderedRange = { start: -1, end: -1 }
+    this._renderPaneWindows(this._panes()[0]?.scrollTop ?? 0)
   }
 
   /**
-   * Render one pane from merge segments rather than from the raw diff.
-   * Line numbers are omitted because filtered output is not contiguous.
+   * Paint the rows visible at `scrollTop` into all three panes.
    *
-   * @param {'left'|'base'|'right'} side
-   * @param {MergeSegment[]} segments
+   * @param {number} [scrollTop]
    */
-  _renderFilteredSidePane(side, segments) {
+  _renderPaneWindows(scrollTop = 0) {
+    const total = Math.max(
+      this._paneRows.left.length,
+      this._paneRows.base.length,
+      this._paneRows.right.length,
+    )
+    const viewport = this._panes()[0]?.clientHeight ?? 0
+    const range = computeVisibleRange(scrollTop, viewport, total, ROW_HEIGHT, OVERSCAN_ROWS)
+    if (range.start === this._renderedRange.start && range.end === this._renderedRange.end) return
+    this._renderedRange = range
+
+    for (const side of /** @type {const} */ (['left', 'base', 'right'])) {
+      this._renderPaneWindow(side, range)
+    }
+  }
+
+  /**
+   * @param {'left'|'base'|'right'} side
+   * @param {{ start: number, end: number }} range
+   */
+  _renderPaneWindow(side, range) {
     const contentEl = this._contentEls[side]
     if (!contentEl) return
-    contentEl.innerHTML = ''
-    const frag = document.createDocumentFragment()
-    for (const { text, conflict } of segmentsToPaneLines(segments, side)) {
-      frag.appendChild(this._makeLine(conflict ? 'conflict' : 'equal', null, text))
+
+    let spacer = contentEl.querySelector('.mw-vspacer')
+    let win = spacer?.querySelector('.mw-vwindow')
+    if (!spacer || !win) {
+      contentEl.innerHTML = ''
+      spacer = document.createElement('div')
+      spacer.className = 'mw-vspacer'
+      win = document.createElement('div')
+      win.className = 'mw-vwindow'
+      spacer.appendChild(win)
+      contentEl.appendChild(spacer)
     }
-    contentEl.appendChild(frag)
+
+    const rows = this._paneRows[side]
+    spacer.style.height = `${rows.length * ROW_HEIGHT}px`
+    win.style.transform = `translateY(${range.start * ROW_HEIGHT}px)`
+
+    const frag = document.createDocumentFragment()
+    for (let i = range.start; i < Math.min(range.end, rows.length); i++) {
+      const row = rows[i]
+      frag.appendChild(this._makeLine(row.type, row.lineNum, row.text))
+    }
+    win.replaceChildren(frag)
+  }
+
+  /**
+   * The rows one pane would show in full — exposed for tests and for callers
+   * that need line counts without touching the DOM.
+   *
+   * @param {'left'|'base'|'right'} side
+   * @returns {PaneRow[]}
+   */
+  getPaneRows(side) {
+    return this._paneRows[side] ?? []
   }
 
   /**
@@ -668,8 +951,13 @@ export class ThreeWayCompare {
    * }}
    */
   _threeWayMerge(left, base, right) {
-    const leftDiff = diffLines(base || '', left || '')
-    const rightDiff = diffLines(base || '', right || '')
+    const diffOpts = {
+      algorithm: this._algorithm,
+      ignoreWhitespace: this._ignoreWhitespace,
+      ignoreCase: this._ignoreCase,
+    }
+    const leftDiff = diffLines(base || '', left || '', diffOpts)
+    const rightDiff = diffLines(base || '', right || '', diffOpts)
     const baseLines = (base || '').split('\n')
 
     // S13-C01: build hunks from each diff, then walk base lines in order,
@@ -776,7 +1064,12 @@ export class ThreeWayCompare {
       if (seg.type === 'normal') {
         const pre = document.createElement('pre')
         pre.className = 'mw-normal-seg'
-        pre.textContent = seg.lines.join('\n')
+        // The textarea below still carries every line; only this preview is
+        // elided, so a 100k-line unchanged run cannot stall layout.
+        const extra = seg.lines.length - OUTPUT_PREVIEW_MAX_LINES
+        pre.textContent = extra > 0
+          ? [...seg.lines.slice(0, OUTPUT_PREVIEW_MAX_LINES), `… 省略 ${extra} 行（輸出內容不受影響）`].join('\n')
+          : seg.lines.join('\n')
         frag.appendChild(pre)
       } else {
         // Conflict card
@@ -912,101 +1205,6 @@ export class ThreeWayCompare {
   // ---------------------------------------------------------------------------
   // Internal – pane rendering
   // ---------------------------------------------------------------------------
-
-  /**
-   * Render a side pane (left / base / right).
-   * For the base pane we show the raw content with equal styling.
-   * For left/right panes we show the diff against base.
-   *
-   * @param {'left'|'base'|'right'} side
-   * @param {string} content  raw content of this side
-   * @param {import('../core/diff-engine.js').DiffLine[]|null} diff  diff from base; null = show plain base
-   * @param {'left'|'base'|'right'} _role  (unused, kept for clarity)
-   */
-  _renderSidePane(side, content, diff, _role) {
-    const contentEl = this._contentEls[side]
-    if (!contentEl) return
-
-    contentEl.innerHTML = ''
-    const frag = document.createDocumentFragment()
-
-    if (diff === null) {
-      // Base pane: render raw lines with equal style
-      const lines = (content || '').split('\n')
-      lines.forEach((text, idx) => {
-        frag.appendChild(this._makeLine('equal', idx + 1, text))
-      })
-    } else {
-      // Left / Right pane: render diff lines
-      for (const dl of diff) {
-        let lineNum, text, cssType
-
-        if (side === 'left') {
-          // diff is base→left; left pane shows left content
-          switch (dl.type) {
-            case 'equal':
-              lineNum = dl.leftLine
-              text = dl.leftText
-              cssType = 'equal'
-              break
-            case 'insert':
-              // Line exists only in left (i.e., new in left vs base)
-              lineNum = dl.rightLine
-              text = dl.rightText
-              cssType = 'insert'
-              break
-            case 'delete':
-              // Line removed from left (exists only in base)
-              lineNum = null
-              text = dl.leftText
-              cssType = 'delete'
-              break
-            case 'replace':
-              lineNum = dl.rightLine
-              text = dl.rightText
-              cssType = 'replace'
-              break
-            default:
-              lineNum = dl.leftLine
-              text = dl.leftText
-              cssType = 'equal'
-          }
-        } else {
-          // Right pane
-          switch (dl.type) {
-            case 'equal':
-              lineNum = dl.leftLine
-              text = dl.leftText
-              cssType = 'equal'
-              break
-            case 'insert':
-              lineNum = dl.rightLine
-              text = dl.rightText
-              cssType = 'insert'
-              break
-            case 'delete':
-              lineNum = null
-              text = dl.leftText
-              cssType = 'delete'
-              break
-            case 'replace':
-              lineNum = dl.rightLine
-              text = dl.rightText
-              cssType = 'replace'
-              break
-            default:
-              lineNum = dl.leftLine
-              text = dl.leftText
-              cssType = 'equal'
-          }
-        }
-
-        frag.appendChild(this._makeLine(cssType, lineNum, (text || '').replace(/\r?\n$/, '')))
-      }
-    }
-
-    contentEl.appendChild(frag)
-  }
 
   /**
    * Create a single line element.
