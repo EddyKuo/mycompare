@@ -22,20 +22,30 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 | 比對類型 | 說明 |
 |----------|------|
-| **文字比對** | Myers / Patience 雙演算法、字元級差異、忽略規則、編輯模式、三向合併 |
-| **資料夾比對** | 遞迴目錄樹、同步模式、ZIP 壓縮包瀏覽、批次操作 |
-| **Hex 比對** | Binary 虛擬捲動、Byte-by-byte diff 著色、Ctrl+F 搜尋、Offset 跳轉 |
-| **圖片比對** | 像素級差異疊層、縮放對齊 |
-| **表格比對** | CSV / Excel 欄位對齊比對 |
-| **三向合併** | 3-way merge、衝突標記 |
+| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則、編輯模式、可逆摺疊、書籤、Find & Replace |
+| **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、ZIP 瀏覽、批次操作 |
+| **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、差異區塊導航、搜尋、Offset 跳轉 |
+| **圖片比對** | 像素級差異、Auto Scale 尺寸對齊、差異強度分級、旋轉翻轉、同步縮放 |
+| **表格比對** | CSV / Excel、虛擬捲動、數值與日期容差比對、多欄複合 key、忽略欄位 |
+| **三向合併** | 3-way merge、衝突導航、只顯示衝突、Take Left/Center/Right/Both、批次解決 |
 
 其他功能：
 
-- 多分頁（tab）工作區，可同時開啟多個比對
+- 完整選單列（Session / File / Edit / Search / View / Tools / Help）
+- 多分頁（tab）工作區與工作區儲存
 - 深色 / 淺色主題（跟隨系統或手動切換）
-- HTML 報告匯出
+- HTML / 純文字報告匯出、Unified Diff、列印與 PDF
+- 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
+- 手動指定檔案編碼；存檔時保留原始編碼並自動備份
+- 可自訂鍵盤快捷鍵
+- 拖放檔案或資料夾即可開始比對
 - 右鍵快捷選單
-- 完整鍵盤快捷鍵
+
+### 尚未實作
+
+以下屬於原產品的大型子系統，目前不在範圍內：FTP / SFTP / S3 / 雲端硬碟連線、
+Windows Registry 比對、版本資源與 MP3 標籤比對、Snapshots、
+命令列腳本語言、zip 以外的壓縮格式。
 
 ---
 
@@ -173,9 +183,10 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**571 / 571 unit tests passing**、**68 / 68 e2e tests passing**。
+目前覆蓋：**1020 / 1020 unit tests passing**、**95 / 95 e2e tests passing**。
 
-涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測、folder / text / hex / table / image / three-way 各視圖邏輯、安全性與記憶體洩漏檢查等 30+ 測試檔。
+涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
+各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、記憶體洩漏檢查等 45+ 測試檔。
 
 ### E2E 測試（Playwright + Electron）
 
