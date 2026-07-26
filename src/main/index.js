@@ -179,11 +179,11 @@ ipcMain.handle('accept-dropped-paths', async (_event, paths) => {
 })
 
 // IPC: 讀取指定路徑的檔案內容（自動偵測編碼）
-ipcMain.handle('read-file', async (_event, filePath) => {
+ipcMain.handle('read-file', async (_event, filePath, forcedEncoding) => {
   const safe = validatePath(filePath)
   const buffer = await readFile(safe)
-  const { content, encoding } = decodeBuffer(buffer)
-  return { path: safe, content, encoding }
+  const { content, encoding, detected } = decodeBuffer(buffer, forcedEncoding)
+  return { path: safe, content, encoding, detected }
 })
 
 /**

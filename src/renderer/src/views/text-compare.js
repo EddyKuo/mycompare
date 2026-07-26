@@ -1496,6 +1496,36 @@ export class TextCompare {
   // Public: command surface for the application menu
   // -------------------------------------------------------------------------
 
+  /**
+   * Re-read one side using an explicitly chosen encoding.
+   *
+   * Detection guesses, and guesses badly on short non-UTF-8 files. Without a
+   * manual override a mis-detected file was unreadable and — worse — would be
+   * written back through the wrong codec on save.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} encoding
+   * @returns {Promise<boolean>} false when there is no file on that side
+   */
+  async reloadWithEncoding(side, encoding) {
+    const path = side === 'left' ? this._leftPath : this._rightPath;
+    if (!path) return false;
+    const result = await window.electronAPI.readFile(path, encoding);
+    if (!result) return false;
+    if (side === 'left') this.setLeft(result.path, result.content, result.encoding);
+    else this.setRight(result.path, result.content, result.encoding);
+    return true;
+  }
+
+  /**
+   * Encoding currently in effect for one side.
+   * @param {'left'|'right'} side
+   * @returns {string}
+   */
+  getEncoding(side) {
+    return side === 'left' ? this._encodingLeft : this._encodingRight;
+  }
+
   /** Open the find bar. */
   openFind() { this._openFind(false); }
 

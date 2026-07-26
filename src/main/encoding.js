@@ -9,13 +9,31 @@ const iconv = require('iconv-lite')
  * @param {Buffer} buffer
  * @returns {{ content: string, encoding: string }}
  */
-export function decodeBuffer(buffer) {
-  if (!buffer || buffer.length === 0) return { content: '', encoding: 'UTF-8' }
+export function decodeBuffer(buffer, forced) {
+  if (!buffer || buffer.length === 0) {
+    return { content: '', encoding: forced || 'UTF-8', detected: false }
+  }
+  // An explicit choice wins: chardet is unreliable on short non-UTF-8 samples,
+  // so the user needs a way to say what the file actually is.
+  if (forced && iconv.encodingExists(forced)) {
+    return { content: iconv.decode(buffer, forced), encoding: forced, detected: false }
+  }
   const detected = chardet.detect(buffer) || 'UTF-8'
   const encoding = iconv.encodingExists(detected) ? detected : 'UTF-8'
   const content = iconv.decode(buffer, encoding)
-  return { content, encoding }
+  return { content, encoding, detected: true }
 }
+
+/**
+ * 常用編碼清單，供 UI 的手動選擇使用。
+ * @type {string[]}
+ */
+export const COMMON_ENCODINGS = [
+  'UTF-8', 'UTF-16LE', 'UTF-16BE',
+  'Big5', 'GBK', 'GB18030',
+  'Shift_JIS', 'EUC-JP', 'EUC-KR',
+  'windows-1252', 'ISO-8859-1',
+]
 
 /**
  * 以指定編碼把字串編成 Buffer，供寫檔使用。

@@ -1528,6 +1528,25 @@ function setupDragAndDrop() {
 }
 
 /**
+ * Re-read one side of a text comparison with an explicit encoding.
+ *
+ * @param {'left'|'right'} side
+ * @param {string} encoding
+ */
+async function reloadEncoding(side, encoding) {
+  if (currentView !== 'text' || !textCompare) {
+    showStatus('請先開啟文字比對')
+    return
+  }
+  try {
+    const ok = await textCompare.reloadWithEncoding(side, encoding)
+    showStatus(ok ? `${side === 'left' ? '左' : '右'}側已以 ${encoding} 重新載入` : '該側尚未開啟檔案')
+  } catch (err) {
+    showStatus(`以 ${encoding} 讀取失敗：${err.message}`)
+  }
+}
+
+/**
  * Route difference navigation to whichever view is showing.
  *
  * Hex, table and 3-way merge all grew their own navigation; without this the
@@ -1658,6 +1677,29 @@ function setupMenuActions() {
       if (currentView === 'text') void textCompare?.exportHtml()
       else if (currentView === 'folder') void folderCompare?.exportHtml()
     },
+    'file.encoding.left.UTF-8': () => reloadEncoding('left', 'UTF-8'),
+    'file.encoding.left.UTF-16LE': () => reloadEncoding('left', 'UTF-16LE'),
+    'file.encoding.left.UTF-16BE': () => reloadEncoding('left', 'UTF-16BE'),
+    'file.encoding.left.Big5': () => reloadEncoding('left', 'Big5'),
+    'file.encoding.left.GBK': () => reloadEncoding('left', 'GBK'),
+    'file.encoding.left.GB18030': () => reloadEncoding('left', 'GB18030'),
+    'file.encoding.left.Shift_JIS': () => reloadEncoding('left', 'Shift_JIS'),
+    'file.encoding.left.EUC-JP': () => reloadEncoding('left', 'EUC-JP'),
+    'file.encoding.left.EUC-KR': () => reloadEncoding('left', 'EUC-KR'),
+    'file.encoding.left.windows-1252': () => reloadEncoding('left', 'windows-1252'),
+    'file.encoding.left.ISO-8859-1': () => reloadEncoding('left', 'ISO-8859-1'),
+    'file.encoding.right.UTF-8': () => reloadEncoding('right', 'UTF-8'),
+    'file.encoding.right.UTF-16LE': () => reloadEncoding('right', 'UTF-16LE'),
+    'file.encoding.right.UTF-16BE': () => reloadEncoding('right', 'UTF-16BE'),
+    'file.encoding.right.Big5': () => reloadEncoding('right', 'Big5'),
+    'file.encoding.right.GBK': () => reloadEncoding('right', 'GBK'),
+    'file.encoding.right.GB18030': () => reloadEncoding('right', 'GB18030'),
+    'file.encoding.right.Shift_JIS': () => reloadEncoding('right', 'Shift_JIS'),
+    'file.encoding.right.EUC-JP': () => reloadEncoding('right', 'EUC-JP'),
+    'file.encoding.right.EUC-KR': () => reloadEncoding('right', 'EUC-KR'),
+    'file.encoding.right.windows-1252': () => reloadEncoding('right', 'windows-1252'),
+    'file.encoding.right.ISO-8859-1': () => reloadEncoding('right', 'ISO-8859-1'),
+
     'file.exportText': () => {
       if (currentView === 'text') void textCompare?.exportTextReport()
       else if (currentView === 'hex') void hexCompare?.exportTextReport()

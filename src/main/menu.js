@@ -103,6 +103,44 @@ export function buildAppMenu(win) {
         item('儲存左側', 'file.saveLeft', 'CmdOrCtrl+S'),
         item('儲存右側', 'file.saveRight', 'CmdOrCtrl+Shift+S'),
         { type: 'separator' },
+        {
+          label: '以指定編碼重新載入',
+          submenu: [
+        {
+          label: '左側',
+          submenu: [
+            item('UTF-8', 'file.encoding.left.UTF-8'),
+            item('UTF-16LE', 'file.encoding.left.UTF-16LE'),
+            item('UTF-16BE', 'file.encoding.left.UTF-16BE'),
+            item('Big5', 'file.encoding.left.Big5'),
+            item('GBK', 'file.encoding.left.GBK'),
+            item('GB18030', 'file.encoding.left.GB18030'),
+            item('Shift_JIS', 'file.encoding.left.Shift_JIS'),
+            item('EUC-JP', 'file.encoding.left.EUC-JP'),
+            item('EUC-KR', 'file.encoding.left.EUC-KR'),
+            item('windows-1252', 'file.encoding.left.windows-1252'),
+            item('ISO-8859-1', 'file.encoding.left.ISO-8859-1')
+          ]
+        },
+        {
+          label: '右側',
+          submenu: [
+            item('UTF-8', 'file.encoding.right.UTF-8'),
+            item('UTF-16LE', 'file.encoding.right.UTF-16LE'),
+            item('UTF-16BE', 'file.encoding.right.UTF-16BE'),
+            item('Big5', 'file.encoding.right.Big5'),
+            item('GBK', 'file.encoding.right.GBK'),
+            item('GB18030', 'file.encoding.right.GB18030'),
+            item('Shift_JIS', 'file.encoding.right.Shift_JIS'),
+            item('EUC-JP', 'file.encoding.right.EUC-JP'),
+            item('EUC-KR', 'file.encoding.right.EUC-KR'),
+            item('windows-1252', 'file.encoding.right.windows-1252'),
+            item('ISO-8859-1', 'file.encoding.right.ISO-8859-1')
+          ]
+        }
+          ]
+        },
+        { type: 'separator' },
         item('匯出 HTML 報告…', 'file.exportHtml'),
         item('匯出純文字報告…', 'file.exportText'),
         item('匯出 Unified Diff…', 'file.exportPatch'),

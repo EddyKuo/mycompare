@@ -101,3 +101,44 @@ test('View > 切換主題 flips the document theme', async () => {
     .poll(() => win.evaluate(() => document.documentElement.dataset.theme))
     .not.toBe(before)
 })
+
+test('the encoding submenu offers both sides and the common encodings', async () => {
+  const found = await app.evaluate(({ Menu }) => {
+    const walk = (items, path, out) => {
+      for (const it of items) {
+        const here = path ? `${path} > ${it.label}` : it.label
+        if (it.submenu) walk(it.submenu.items, here, out)
+        else out.push(here)
+      }
+      return out
+    }
+    return walk(Menu.getApplicationMenu().items, '', [])
+  })
+
+  const enc = found.filter((l) => l.includes('以指定編碼重新載入'))
+  expect(enc.some((l) => l.includes('左側') && l.endsWith('Big5'))).toBe(true)
+  expect(enc.some((l) => l.includes('右側') && l.endsWith('Shift_JIS'))).toBe(true)
+  expect(enc.some((l) => l.endsWith('UTF-8'))).toBe(true)
+})
+
+test('choosing an encoding outside a text compare reports rather than throwing', async () => {
+  // Start from the home screen so no text view is active.
+  await win.evaluate(() => document.getElementById('btn-new-session')?.click())
+
+  await app.evaluate(({ Menu }) => {
+    const find = (items, pred) => {
+      for (const it of items) {
+        if (it.submenu) {
+          const hit = find(it.submenu.items, pred)
+          if (hit) return hit
+        } else if (pred(it)) return it
+      }
+      return null
+    }
+    find(Menu.getApplicationMenu().items, (it) => it.label === 'Big5').click()
+  })
+
+  await expect
+    .poll(() => win.evaluate(() => document.getElementById('status-message')?.textContent))
+    .toContain('請先開啟文字比對')
+})

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { createRequire } from 'module'
-import { decodeBuffer, encodeContent } from '../../src/main/encoding.js'
+import { decodeBuffer, encodeContent, COMMON_ENCODINGS } from '../../src/main/encoding.js'
 
 const iconv = createRequire(import.meta.url)('iconv-lite')
 
@@ -74,5 +74,38 @@ describe('encodeContent', () => {
 
   it('treats null content as empty', () => {
     expect(encodeContent(null, 'UTF-8').length).toBe(0)
+  })
+})
+
+describe('forced encoding', () => {
+  it('overrides detection when asked', () => {
+    const buf = iconv.encode('繁體中文測試', 'Big5')
+    // Detection gets this wrong on a short sample; the explicit choice must win.
+    const auto = decodeBuffer(buf)
+    const forced = decodeBuffer(buf, 'Big5')
+    expect(forced.content).toBe('繁體中文測試')
+    expect(forced.encoding).toBe('Big5')
+    expect(forced.detected).toBe(false)
+    expect(auto.detected).toBe(true)
+  })
+
+  it('falls back to detection for an unsupported name', () => {
+    const buf = Buffer.from('hello', 'utf-8')
+    const out = decodeBuffer(buf, 'not-a-real-encoding')
+    expect(out.content).toBe('hello')
+    expect(out.detected).toBe(true)
+  })
+
+  it('reports the forced encoding for an empty file', () => {
+    expect(decodeBuffer(Buffer.alloc(0), 'Big5').encoding).toBe('Big5')
+  })
+
+  it('offers UTF-8 and the common legacy encodings for the picker', () => {
+    expect(COMMON_ENCODINGS).toContain('UTF-8')
+    expect(COMMON_ENCODINGS).toContain('Big5')
+    expect(COMMON_ENCODINGS).toContain('Shift_JIS')
+    for (const enc of COMMON_ENCODINGS) {
+      expect(iconv.encodingExists(enc), enc).toBe(true)
+    }
   })
 })
