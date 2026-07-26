@@ -367,6 +367,13 @@ export class TextCompare {
     this._statusLines = null;
     this._statusEncoding = null;
 
+    /**
+     * Detected encoding per side, carried from the read so a save can write
+     * the file back the way it was found.
+     */
+    this._encodingLeft = 'UTF-8';
+    this._encodingRight = 'UTF-8';
+
     // Virtual scroll state
     this._totalRows = 0;
     this._maxLineChars = 0;
@@ -769,7 +776,7 @@ export class TextCompare {
           const result = await window.electronAPI.readFile(filePath);
           if (result) {
             this._hlLeft = await loadHighlighter(this._extFrom(result.path));
-            this.setLeft(result.path, result.content);
+            this.setLeft(result.path, result.content, result.encoding);
           }
         } catch { /* ignore */ }
       });
@@ -793,7 +800,7 @@ export class TextCompare {
           const result = await window.electronAPI.readFile(filePath);
           if (result) {
             this._hlRight = await loadHighlighter(this._extFrom(result.path));
-            this.setRight(result.path, result.content);
+            this.setRight(result.path, result.content, result.encoding);
           }
         } catch { /* ignore */ }
       });
@@ -1234,14 +1241,14 @@ export class TextCompare {
     const result = await window.electronAPI.openFile();
     if (!result) return;
     this._hlLeft = await loadHighlighter(this._extFrom(result.path));
-    this.setLeft(result.path, result.content);
+    this.setLeft(result.path, result.content, result.encoding);
   }
 
   async openRight() {
     const result = await window.electronAPI.openFile();
     if (!result) return;
     this._hlRight = await loadHighlighter(this._extFrom(result.path));
-    this.setRight(result.path, result.content);
+    this.setRight(result.path, result.content, result.encoding);
   }
 
   // -------------------------------------------------------------------------
@@ -1334,7 +1341,8 @@ export class TextCompare {
       { name: '文字檔', extensions: ['txt','js','ts','py','java','c','cpp','cs','go','rs','html','css','json','yaml','yml','xml','sql','md','sh'] },
       { name: '所有檔案', extensions: ['*'] }
     ];
-    await window.electronAPI.saveFile(this._leftPath || 'left.txt', this._leftContent, filters);
+    await window.electronAPI.saveFile(
+      this._leftPath || 'left.txt', this._leftContent, filters, this._encodingLeft);
     this._modified.left = false;
     this._updateModifiedIndicator();
   }
@@ -1349,7 +1357,8 @@ export class TextCompare {
       { name: '文字檔', extensions: ['txt','js','ts','py','java','c','cpp','cs','go','rs','html','css','json','yaml','yml','xml','sql','md','sh'] },
       { name: '所有檔案', extensions: ['*'] }
     ];
-    await window.electronAPI.saveFile(this._rightPath || 'right.txt', this._rightContent, filters);
+    await window.electronAPI.saveFile(
+      this._rightPath || 'right.txt', this._rightContent, filters, this._encodingRight);
     this._modified.right = false;
     this._updateModifiedIndicator();
   }
@@ -1362,13 +1371,14 @@ export class TextCompare {
    * @param {string} path
    * @param {string} content
    */
-  setLeft(path, content) {
+  setLeft(path, content, encoding) {
     // T33: unwatch old path before switching
     if (this._leftPath && this._leftPath !== path) {
       window.electronAPI?.unwatchFile(this._leftPath);
     }
     this._leftPath = path;
     this._leftContent = content;
+    if (encoding) this._encodingLeft = encoding;
     this._eolLeft = detectEol(content); // T01
     if (this._pathLeft) this._pathLeft.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
@@ -1381,13 +1391,14 @@ export class TextCompare {
    * @param {string} path
    * @param {string} content
    */
-  setRight(path, content) {
+  setRight(path, content, encoding) {
     // T33: unwatch old path before switching
     if (this._rightPath && this._rightPath !== path) {
       window.electronAPI?.unwatchFile(this._rightPath);
     }
     this._rightPath = path;
     this._rightContent = content;
+    if (encoding) this._encodingRight = encoding;
     this._eolRight = detectEol(content); // T01
     if (this._pathRight) this._pathRight.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
@@ -2552,7 +2563,9 @@ ${rows}
       this._statusLines.textContent = `${totalLines} 行`;
     }
     if (this._statusEncoding) {
-      this._statusEncoding.textContent = 'UTF-8';
+      this._statusEncoding.textContent = this._encodingLeft === this._encodingRight
+        ? this._encodingLeft
+        : `${this._encodingLeft} / ${this._encodingRight}`;
     }
     if (this._statusEol) {
       this._statusEol.textContent = this._eolLeft || 'LF';

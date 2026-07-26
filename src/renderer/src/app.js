@@ -5,6 +5,7 @@ import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
 import { HexCompare } from './views/hex-compare.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
+import { createSession, updateSession } from './core/session.js'
 import { getViewTypeForPath } from './core/file-type.js'
 import { NamedConfigStore } from './core/named-config-store.js'
 import { WorkspaceStore } from './core/workspace-store.js'
@@ -202,12 +203,12 @@ export function initApp() {
       showTextCompare()
       if (textCompare && left) {
         window.electronAPI.readFile(left)
-          .then(r => { if (r) textCompare.setLeft(r.path, r.content) })
+          .then(r => { if (r) textCompare.setLeft(r.path, r.content, r.encoding) })
           .catch(() => {})
       }
       if (textCompare && right) {
         window.electronAPI.readFile(right)
-          .then(r => { if (r) textCompare.setRight(r.path, r.content) })
+          .then(r => { if (r) textCompare.setRight(r.path, r.content, r.encoding) })
           .catch(() => {})
       }
     })
@@ -248,9 +249,9 @@ export function initApp() {
 
     // S15-U01 3-way
     mergeSetAll: (left, base, right) => {
-      mergeCompare?._setContents?.('left',  left)
-      mergeCompare?._setContents?.('base',  base)
-      mergeCompare?._setContents?.('right', right)
+      mergeCompare?.setSide('left',  left)
+      mergeCompare?.setSide('base',  base)
+      mergeCompare?.setSide('right', right)
     },
     mergeGetConflictCount: () => document.querySelectorAll('.mw-conflict-card').length,
   }
@@ -272,6 +273,10 @@ function showHome() {
   el('view-merge3').style.display = 'none'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
+
+  // Refresh the recent list — sessions recorded since the last render would
+  // otherwise not appear until the app restarts.
+  renderRecentSessions(openSession, removeSession)
 
   updateToolbar()
 }
@@ -305,6 +310,7 @@ function showTextCompare() {
     })
 
     textCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('text', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
       tabMgr.updateActivePaths({ leftPath: left ?? '', rightPath: right ?? '' })
@@ -347,6 +353,7 @@ function showFolderCompare() {
     folderCompare.mount(el('view-folder'))
 
     folderCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('folder', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
       tabMgr.updateActivePaths({ leftPath: left ?? '', rightPath: right ?? '' })
@@ -357,90 +364,8 @@ function showFolderCompare() {
       updateToolbar()
     })
 
-    folderCompare.on('open-file-compare', async ({ leftPath, leftContent, rightPath, rightContent, algorithm }) => {
-      const viewType = getViewTypeForPath(leftPath || rightPath)
-
-      if (viewType === 'image') {
-        tabMgr.addTab('image', '圖片比對')
-        showImageCompare()
-        // image 需要 base64；透過 readFileBinary IPC 讀取
-        if (leftPath) {
-          try {
-            const r = await window.electronAPI.readFileBinary(leftPath, MAX_IMAGE_BYTES)
-            if (r) await imageCompare?.setLeft(r.path, r.base64, r.ext)
-          } catch { /* 讓使用者手動開啟 */ }
-        }
-        if (rightPath) {
-          try {
-            const r = await window.electronAPI.readFileBinary(rightPath, MAX_IMAGE_BYTES)
-            if (r) await imageCompare?.setRight(r.path, r.base64, r.ext)
-          } catch { /* 讓使用者手動開啟 */ }
-        }
-        return
-      }
-
-      if (viewType === 'table') {
-        tabMgr.addTab('table', '表格比對')
-        showTableCompare()
-        // TableCompare.setLeft(path, content)
-        let lContent = leftContent
-        let rContent = rightContent
-        if (lContent === undefined && leftPath) {
-          try { lContent = (await window.electronAPI.readFile(leftPath))?.content ?? '' } catch { lContent = '' }
-        }
-        if (rContent === undefined && rightPath) {
-          try { rContent = (await window.electronAPI.readFile(rightPath))?.content ?? '' } catch { rContent = '' }
-        }
-        if (leftPath)  tableCompare?.setLeft(leftPath, lContent ?? '')
-        if (rightPath) tableCompare?.setRight(rightPath, rContent ?? '')
-        return
-      }
-
-      if (viewType === 'hex') {
-        tabMgr.addTab('hex', 'Hex 比對')
-        showHexCompare()
-        // hex 需要 base64；透過 readFileBinary IPC 讀取
-        if (leftPath) {
-          try {
-            const r = await window.electronAPI.readFileBinary(leftPath)
-            if (r) hexCompare?.setLeft(r.path, r.base64)
-          } catch { /* 讓使用者手動開啟 */ }
-        }
-        if (rightPath) {
-          try {
-            const r = await window.electronAPI.readFileBinary(rightPath)
-            if (r) hexCompare?.setRight(r.path, r.base64)
-          } catch { /* 讓使用者手動開啟 */ }
-        }
-        return
-      }
-
-      // Default: text
-      let lContent = leftContent
-      let rContent = rightContent
-      if (lContent === undefined && leftPath) {
-        try {
-          const result = await window.electronAPI.readFile(leftPath)
-          lContent = result?.content ?? ''
-        } catch {
-          lContent = ''
-        }
-      }
-      if (rContent === undefined && rightPath) {
-        try {
-          const result = await window.electronAPI.readFile(rightPath)
-          rContent = result?.content ?? ''
-        } catch {
-          rContent = ''
-        }
-      }
-      tabMgr.addTab('text', '文字比對')
-      showTextCompare()
-      if (textCompare) {
-        textCompare.setLeft(leftPath, lContent ?? '')
-        textCompare.setRight(rightPath, rContent ?? '')
-        if (algorithm) textCompare.setAlgorithm(algorithm)
-      }
+    folderCompare.on('open-file-compare', async (payload) => {
+      await openComparison(payload)
     })
   }
 
@@ -463,6 +388,7 @@ function showTableCompare() {
     tableCompare = new TableCompare({})
     tableCompare.mount(el('view-table'))
     tableCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('table', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
       updateToolbar()
@@ -487,6 +413,7 @@ function showImageCompare() {
     imageCompare = new ImageCompare({})
     imageCompare.mount(el('view-image'))
     imageCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('image', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
       updateToolbar()
@@ -511,6 +438,7 @@ function showHexCompare() {
     hexCompare = new HexCompare({})
     hexCompare.mount(el('view-hex'))
     hexCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('hex', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
       updateToolbar()
@@ -536,6 +464,7 @@ function showMerge3() {
     mergeCompare.mount(el('view-merge3'))
 
     mergeCompare.on('paths-changed', ({ left, base, right }) => {
+      recordSession('merge3', { leftPath: left ?? '', rightPath: right ?? '', basePath: base ?? '' })
       tabMgr.updateActivePaths({ leftPath: left, rightPath: right, basePath: base })
       // derive a short title from file names
       if (left || right) {
@@ -660,12 +589,12 @@ function _handleActivateTab(id, force = false) {
         // First activation with paths but no state yet (e.g., opened from session)
         if (tab.leftPath && textCompare) {
           window.electronAPI.readFile(tab.leftPath).then(r => {
-            if (r) textCompare?.setLeft(r.path, r.content)
+            if (r) textCompare?.setLeft(r.path, r.content, r.encoding)
           }).catch(() => {})
         }
         if (tab.rightPath && textCompare) {
           window.electronAPI.readFile(tab.rightPath).then(r => {
-            if (r) textCompare?.setRight(r.path, r.content)
+            if (r) textCompare?.setRight(r.path, r.content, r.encoding)
           }).catch(() => {})
         }
       } else {
@@ -1153,13 +1082,13 @@ async function _restoreOneWorkspaceTab(saved) {
         if (saved.leftPath) {
           try {
             const r = await window.electronAPI.readFile(saved.leftPath)
-            if (r) textCompare.setLeft(r.path, r.content)
+            if (r) textCompare.setLeft(r.path, r.content, r.encoding)
           } catch { /* skip */ }
         }
         if (saved.rightPath) {
           try {
             const r = await window.electronAPI.readFile(saved.rightPath)
-            if (r) textCompare.setRight(r.path, r.content)
+            if (r) textCompare.setRight(r.path, r.content, r.encoding)
           } catch { /* skip */ }
         }
       }
@@ -1419,6 +1348,173 @@ function setupKeyboardShortcuts() {
   })
 }
 
+/**
+ * Open a comparison of the given paths in a new tab.
+ *
+ * Shared by folder-compare double-click and by opening a stored session, so
+ * every session type loads through one path instead of only text and folder.
+ *
+ * @param {{ type?: string, leftPath?: string, rightPath?: string, basePath?: string,
+ *           leftContent?: string, rightContent?: string, algorithm?: string }} opts
+ */
+async function openComparison({ type, leftPath, rightPath, basePath, leftContent, rightContent, algorithm } = {}) {
+  // An explicit type (from a stored session) wins; otherwise route on the
+  // file extension as a folder-compare double-click does.
+  const viewType = type && type !== 'auto' ? type : getViewTypeForPath(leftPath || rightPath)
+
+  if (viewType === 'folder') {
+    tabMgr.addTab('folder', '資料夾比對')
+    showFolderCompare()
+    if (leftPath) await folderCompare?.setLeft(leftPath)
+    if (rightPath) await folderCompare?.setRight(rightPath)
+    return
+  }
+
+  if (viewType === 'merge3') {
+    tabMgr.addTab('merge3', '三向合併')
+    showMerge3()
+    for (const [side, path] of [['left', leftPath], ['base', basePath], ['right', rightPath]]) {
+      if (!path) continue
+      try {
+        const r = await window.electronAPI.readFile(path)
+        if (r) mergeCompare?.setSide(side, r.content, r.path)
+      } catch { /* leave the pane empty for manual selection */ }
+    }
+    return
+  }
+
+  if (viewType === 'image') {
+    tabMgr.addTab('image', '圖片比對')
+    showImageCompare()
+    // image 需要 base64；透過 readFileBinary IPC 讀取
+    if (leftPath) {
+      try {
+        const r = await window.electronAPI.readFileBinary(leftPath, MAX_IMAGE_BYTES)
+        if (r) await imageCompare?.setLeft(r.path, r.base64, r.ext)
+      } catch { /* 讓使用者手動開啟 */ }
+    }
+    if (rightPath) {
+      try {
+        const r = await window.electronAPI.readFileBinary(rightPath, MAX_IMAGE_BYTES)
+        if (r) await imageCompare?.setRight(r.path, r.base64, r.ext)
+      } catch { /* 讓使用者手動開啟 */ }
+    }
+    return
+  }
+
+  if (viewType === 'table') {
+    tabMgr.addTab('table', '表格比對')
+    showTableCompare()
+    // TableCompare.setLeft(path, content)
+    let lContent = leftContent
+    let rContent = rightContent
+    if (lContent === undefined && leftPath) {
+      try { lContent = (await window.electronAPI.readFile(leftPath))?.content ?? '' } catch { lContent = '' }
+    }
+    if (rContent === undefined && rightPath) {
+      try { rContent = (await window.electronAPI.readFile(rightPath))?.content ?? '' } catch { rContent = '' }
+    }
+    if (leftPath)  tableCompare?.setLeft(leftPath, lContent ?? '')
+    if (rightPath) tableCompare?.setRight(rightPath, rContent ?? '')
+    return
+  }
+
+  if (viewType === 'hex') {
+    tabMgr.addTab('hex', 'Hex 比對')
+    showHexCompare()
+    // hex 需要 base64；透過 readFileBinary IPC 讀取
+    if (leftPath) {
+      try {
+        const r = await window.electronAPI.readFileBinary(leftPath)
+        if (r) hexCompare?.setLeft(r.path, r.base64)
+      } catch { /* 讓使用者手動開啟 */ }
+    }
+    if (rightPath) {
+      try {
+        const r = await window.electronAPI.readFileBinary(rightPath)
+        if (r) hexCompare?.setRight(r.path, r.base64)
+      } catch { /* 讓使用者手動開啟 */ }
+    }
+    return
+  }
+
+  // Default: text
+  let lContent = leftContent
+  let rContent = rightContent
+  let lEncoding
+  let rEncoding
+  if (lContent === undefined && leftPath) {
+    try {
+      const result = await window.electronAPI.readFile(leftPath)
+      lContent = result?.content ?? ''
+      lEncoding = result?.encoding
+    } catch {
+      lContent = ''
+    }
+  }
+  if (rContent === undefined && rightPath) {
+    try {
+      const result = await window.electronAPI.readFile(rightPath)
+      rContent = result?.content ?? ''
+      rEncoding = result?.encoding
+    } catch {
+      rContent = ''
+    }
+  }
+  tabMgr.addTab('text', '文字比對')
+  showTextCompare()
+  if (textCompare) {
+    textCompare.setLeft(leftPath, lContent ?? '', lEncoding)
+    textCompare.setRight(rightPath, rContent ?? '', rEncoding)
+    if (algorithm) textCompare.setAlgorithm(algorithm)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session 持久化
+// ---------------------------------------------------------------------------
+
+/**
+ * Create or update the stored session behind the active tab.
+ *
+ * The session store, its schema and the Recent Sessions UI were all in place,
+ * but nothing ever called store.save(), so the list could only ever be empty.
+ * Recording on every path change keeps the entry current without asking the
+ * user to save explicitly, which is how BC's automatic recent list behaves.
+ *
+ * @param {string} type   session type ('text' | 'folder' | …)
+ * @param {{ leftPath?: string, rightPath?: string, basePath?: string }} paths
+ */
+function recordSession(type, paths) {
+  const tab = tabMgr.activeTab
+  if (!tab) return
+  const { leftPath = '', rightPath = '', basePath = '' } = paths
+  // Nothing worth remembering until at least one side points somewhere.
+  if (!leftPath && !rightPath) return
+
+  const name = (p) => (p ? p.replace(/\\/g, '/').split('/').pop() : '')
+  const label = [name(leftPath), name(rightPath)].filter(Boolean).join(' ↔ ') || type
+
+  try {
+    if (tab.sessionId) {
+      const existing = store.getById(tab.sessionId)
+      if (existing) {
+        store.save(updateSession(existing, {
+          name: label,
+          options: { ...existing.options, leftPath, rightPath, basePath },
+        }))
+        return
+      }
+    }
+    const created = store.save(
+      createSession(type, label, { leftPath, rightPath, basePath }))
+    tab.sessionId = created.id
+  } catch (err) {
+    // Persistence must never break the comparison itself.
+    console.error('[session] could not record session:', err)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 應用程式選單
 // ---------------------------------------------------------------------------
@@ -1628,34 +1724,27 @@ function setupTheme() {
 async function openSession(session) {
   if (!session) return
 
-  switch (session.type) {
-    case 'text': {
-      tabMgr.addTab('text', '文字比對')
-      showTextCompare()
-      if (session.leftPath && session.rightPath && textCompare) {
-        try {
-          const [left, right] = await Promise.all([
-            window.electronAPI.readFile(session.leftPath),
-            window.electronAPI.readFile(session.rightPath)
-          ])
-          if (left) textCompare.setLeft(left.path, left.content)
-          if (right) textCompare.setRight(right.path, right.content)
-        } catch (err) {
-          showStatus(`無法開啟 session：${err.message}`)
-        }
-      }
-      break
-    }
-    case 'folder': {
-      tabMgr.addTab('folder', '資料夾比對')
-      showFolderCompare()
-      if (session.leftPath && folderCompare) folderCompare.setLeft(session.leftPath)
-      if (session.rightPath && folderCompare) folderCompare.setRight(session.rightPath)
-      break
-    }
-    default:
-      showStatus(`${session.type} session 功能開發中`)
+  // createSession() nests paths under `options`, while some callers hand over
+  // an already-flattened record. Reading only the top level meant a stored
+  // session opened an empty tab.
+  const leftPath = session.options?.leftPath ?? session.leftPath ?? ''
+  const rightPath = session.options?.rightPath ?? session.rightPath ?? ''
+  const basePath = session.options?.basePath ?? session.basePath ?? ''
+
+  if (!leftPath && !rightPath) {
+    showStatus('此 session 沒有記錄任何路徑')
+    return
   }
+
+  // Every type routes through the same loader, so opening a stored hex, image,
+  // table or merge session works rather than reporting "功能開發中".
+  await openComparison({
+    type: session.type,
+    leftPath,
+    rightPath,
+    basePath,
+    algorithm: session.options?.algorithm,
+  })
 }
 
 function removeSession(id) {

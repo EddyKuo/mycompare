@@ -92,6 +92,31 @@ export class ThreeWayCompare {
   // ---------------------------------------------------------------------------
 
   /**
+   * Load one pane's content programmatically.
+   *
+   * Callers previously reached for a `_setContents` method that never existed;
+   * the optional-call syntax meant the failure was silent, so restoring a
+   * merge session and the e2e test hook both quietly did nothing.
+   *
+   * @param {'left'|'base'|'right'} side
+   * @param {string} content
+   * @param {string} [path]
+   */
+  setSide(side, content, path) {
+    if (side !== 'left' && side !== 'base' && side !== 'right') return
+    this[`_${side}Content`] = content ?? ''
+    if (path != null) this[`_${side}Path`] = path
+    const pathEl = this._container?.querySelector(`#mw-path-${side}`)
+    if (pathEl && path != null) pathEl.textContent = path
+    this._runMerge()
+    this._emit('paths-changed', {
+      left: this._leftPath,
+      base: this._basePath,
+      right: this._rightPath,
+    })
+  }
+
+  /**
    * Mount the view into a container element.
    * @param {HTMLElement} containerEl
    */

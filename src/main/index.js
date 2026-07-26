@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { join, extname, dirname } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open } from 'fs/promises'
 import { watch } from 'fs'
-import { decodeBuffer } from './encoding.js'
+import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
 import { buildAppMenu } from './menu.js'
 
@@ -248,7 +248,7 @@ ipcMain.handle('delete-file', async (_event, filePath) => {
 })
 
 // IPC: 儲存檔案（顯示 Save 對話框）
-ipcMain.handle('save-file', async (event, { defaultPath, content, filters }) => {
+ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encoding }) => {
   const win = BrowserWindow.fromWebContents(event.sender)
   const opts = {
     defaultPath,
@@ -259,7 +259,8 @@ ipcMain.handle('save-file', async (event, { defaultPath, content, filters }) => 
     : await dialog.showSaveDialog(opts)
   if (canceled || !filePath) return false
   registerRoot(filePath)
-  await writeFile(filePath, content, 'utf-8')
+  // Write back in the file's original encoding, not unconditionally UTF-8.
+  await writeFile(filePath, encodeContent(content, encoding))
   return true
 })
 
