@@ -141,9 +141,10 @@
 }
 
 /* ── Column Header ── */
+/* Mirrors the .fc-row track layout so header labels sit over their columns. */
 .fc-header {
   display: grid;
-  grid-template-columns: 1fr 80px 140px 1px 1fr 80px 140px;
+  grid-template-columns: 22px 1fr 1px 1fr;
   height: 26px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
@@ -154,12 +155,34 @@
   user-select: none;
 }
 
+/* grid-template-columns is set inline from the visible column set. */
+.fc-header-side {
+  display: grid;
+  align-items: center;
+  min-width: 0;
+  padding-left: 4px;
+}
+
 .fc-col {
   display: flex;
   align-items: center;
   padding: 0 6px;
   overflow: hidden;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.fc-col:hover {
+  color: var(--text-primary);
+}
+
+.fc-col--sorted {
+  color: var(--text-primary);
+}
+
+.fc-col-size,
+.fc-col-ext {
+  justify-content: flex-end;
 }
 
 .fc-col-sep {
@@ -172,6 +195,20 @@
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+  position: relative;
+}
+
+/* Virtual scroll surface: sized to the whole flattened tree while only the
+   rows inside the viewport exist in the DOM. */
+.fc-vlist {
+  position: relative;
+  width: 100%;
+}
+
+.fc-vlist > .fc-row {
+  position: absolute;
+  left: 0;
+  right: 0;
 }
 
 .fc-list::-webkit-scrollbar {
@@ -192,13 +229,27 @@
 }
 
 /* ── Row ── */
+/* Height is fixed: the virtual scroller maps scrollTop to a row index. */
 .fc-row {
   display: grid;
   grid-template-columns: 22px 1fr 1px 1fr;
-  min-height: 22px;
-  border-bottom: 1px solid transparent;
+  height: var(--fc-row-height, 22px);
+  box-sizing: border-box;
   cursor: default;
   transition: filter 0.05s;
+}
+
+.fc-row--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.fc-row--focused {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .fc-row-cb {
@@ -268,20 +319,21 @@
 }
 
 /* ── Cell ── */
+/* grid-template-columns is set inline from the visible column set. */
 .fc-cell {
   display: grid;
-  grid-template-columns: auto 1fr 80px 140px;
   align-items: center;
-  padding: 1px 0;
   min-width: 0;
   overflow: hidden;
 }
 
-.fc-prefix {
+/* Indent, toggle and icon live inside the name column so the header's single
+   grid template stays aligned at every tree depth. */
+.fc-name-cell {
   display: flex;
   align-items: center;
-  flex-shrink: 0;
-  gap: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .fc-cell-left {
@@ -328,23 +380,37 @@
   min-width: 0;
 }
 
-.fc-size {
-  width: 80px;
+.fc-size,
+.fc-mtime,
+.fc-ext,
+.fc-relpath,
+.fc-attrs {
   font-size: 11px;
   color: var(--text-secondary);
-  text-align: right;
-  padding-right: 8px;
   white-space: nowrap;
-  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
-.fc-mtime {
-  width: 140px;
-  font-size: 11px;
-  color: var(--text-secondary);
-  white-space: nowrap;
+.fc-size,
+.fc-ext {
+  text-align: right;
+  padding-right: 8px;
+}
+
+.fc-mtime,
+.fc-attrs {
   padding-right: 4px;
-  flex-shrink: 0;
+}
+
+.fc-relpath {
+  padding-right: 6px;
+}
+
+.fc-attrs {
+  font-family: monospace;
+  letter-spacing: 1px;
 }
 
 /* Empty cell placeholder (for orphan rows) */
@@ -607,6 +673,24 @@
 
 .fc-btn-expand-all:hover,
 .fc-btn-collapse-all:hover {
+  background: var(--bg-toolbar);
+  border-color: var(--accent);
+}
+
+/* ── Column chooser ── */
+.fc-btn-columns {
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+  height: 24px;
+  white-space: nowrap;
+}
+
+.fc-btn-columns:hover {
   background: var(--bg-toolbar);
   border-color: var(--accent);
 }

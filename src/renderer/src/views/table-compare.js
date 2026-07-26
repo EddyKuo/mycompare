@@ -18,6 +18,7 @@
  */
 
 import { isActive } from '../core/active-view.js'
+import { renderTextTable, reportHeader, reportSummary } from '../core/report.js'
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el } from '../core/utils.js'
 import '../styles/table-compare.css'
@@ -1178,6 +1179,62 @@ export class TableCompare {
       rightOnly:       counts.rightOnly,
       columnDiffCounts,
     }
+  }
+
+  /**
+   * Plain-text report of the differing rows.
+   *
+   * Lists differences only, and caps the listing: a table that differs
+   * throughout would otherwise produce a report larger than the source data.
+   *
+   * @param {{ generatedAt?: Date, maxRows?: number }} [opts]
+   * @returns {string}
+   */
+  buildTextReport(opts = {}) {
+    const maxRows = opts.maxRows ?? 1000
+    const stats = this.getStats()
+    const header = reportHeader({
+      title: '表格比對報告',
+      leftPath: this._leftPath,
+      rightPath: this._rightPath,
+      generatedAt: opts.generatedAt,
+    })
+    const summary = reportSummary(stats, {
+      same: '相同', different: '不同', leftOnly: '僅左側', rightOnly: '僅右側',
+    })
+
+    const label = {
+      different: '不同', 'left-only': '僅左側', 'right-only': '僅右側',
+    }
+    const differing = (this._alignedRows ?? []).filter((r) => r.status !== 'same')
+    const shown = differing.slice(0, maxRows)
+    const join = (row) => (row ?? []).join(' | ')
+
+    const rows = shown.map((r, i) => [
+      String(i + 1),
+      label[r.status] ?? r.status,
+      join(r.leftRow),
+      join(r.rightRow),
+    ])
+
+    const table = rows.length
+      ? renderTextTable(
+          [{ title: '#', align: 'right' }, { title: '狀態' },
+           { title: '左' }, { title: '右' }],
+          rows)
+      : '（兩側內容相同）'
+
+    const omitted = differing.length - shown.length
+    const note = omitted > 0 ? `\n\n（另有 ${omitted} 列未列出）` : ''
+    return `${header}${summary}\n\n${table}${note}\n`
+  }
+
+  /** Save the plain-text report. */
+  async exportTextReport() {
+    await window.electronAPI.saveFile(
+      'table-report.txt',
+      this.buildTextReport(),
+      [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }])
   }
 
   // ── Private: emit ────────────────────────────────────────────────────────────

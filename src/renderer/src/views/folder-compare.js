@@ -132,6 +132,249 @@ export function statusVisibleUnder(status, flags) {
   }
 }
 
+// ── Columns ─────────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {object} FolderColumnDef
+ * @property {string} id
+ * @property {string} label
+ * @property {string} width CSS grid track
+ * @property {boolean} [locked] cannot be hidden
+ */
+
+/**
+ * Columns the folder view is able to show, in canonical display order.
+ *
+ * Beyond Compare also offers read-only / hidden / archive attribute columns.
+ * The `read-dir` IPC reports only name / path / size / mtime / isDirectory /
+ * isSymbolicLink, so `attrs` is limited to the flags the main process actually
+ * returns rather than inventing values the renderer cannot know.
+ *
+ * @type {FolderColumnDef[]}
+ */
+export const FOLDER_COLUMN_DEFS = [
+  { id: 'name',    label: '名稱',     width: 'minmax(0, 1fr)', locked: true },
+  { id: 'size',    label: '大小',     width: '80px' },
+  { id: 'mtime',   label: '修改時間', width: '140px' },
+  { id: 'ext',     label: '副檔名',   width: '72px' },
+  { id: 'relpath', label: '相對路徑', width: '160px' },
+  { id: 'attrs',   label: '屬性',     width: '56px' },
+]
+
+/** @type {string[]} */
+export const DEFAULT_FOLDER_COLUMNS = ['name', 'size', 'mtime']
+
+const FOLDER_COLUMNS_KEY = 'mycompare:folderColumns'
+const FOLDER_COLUMNS_SCHEMA = 1
+
+/**
+ * Coerce an arbitrary stored value into a usable column set.
+ *
+ * A set with no recognisable column falls back to the default rather than to
+ * "name only" — a corrupt entry should not leave the user staring at a view
+ * with no size or timestamp and no obvious way back.
+ *
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+export function normalizeColumns(raw) {
+  if (!Array.isArray(raw)) return [...DEFAULT_FOLDER_COLUMNS]
+  const known = new Set(FOLDER_COLUMN_DEFS.map((c) => c.id))
+  const picked = new Set(raw.filter((id) => typeof id === 'string' && known.has(id)))
+  if (!picked.size) return [...DEFAULT_FOLDER_COLUMNS]
+  // The name column carries the expand toggle and the icon, so it is not
+  // something the user is allowed to switch off.
+  picked.add('name')
+  return FOLDER_COLUMN_DEFS.filter((c) => picked.has(c.id)).map((c) => c.id)
+}
+
+/**
+ * @returns {string[]}
+ */
+export function loadFolderColumns() {
+  try {
+    const raw = localStorage.getItem(FOLDER_COLUMNS_KEY)
+    if (!raw) return [...DEFAULT_FOLDER_COLUMNS]
+    const parsed = JSON.parse(raw)
+    // Tolerate a bare array from any earlier/hand-edited value.
+    return normalizeColumns(Array.isArray(parsed) ? parsed : parsed?.columns)
+  } catch {
+    return [...DEFAULT_FOLDER_COLUMNS]
+  }
+}
+
+/**
+ * @param {unknown} ids
+ * @returns {string[]} the normalised set that was actually stored
+ */
+export function saveFolderColumns(ids) {
+  const columns = normalizeColumns(ids)
+  try {
+    localStorage.setItem(
+      FOLDER_COLUMNS_KEY,
+      JSON.stringify({ __schema: FOLDER_COLUMNS_SCHEMA, columns }),
+    )
+  } catch {
+    // Quota or private-mode failure; the choice still applies to this session.
+  }
+  return columns
+}
+
+// ── Sorting ─────────────────────────────────────────────────────────────────
+
+/**
+ * @param {CompareRow} row
+ * @returns {boolean}
+ */
+function isDirRow(row) {
+  return !!(row?.left?.isDirectory || row?.right?.isDirectory)
+}
+
+/**
+ * Lower-cased extension without the dot. A leading dot (`.gitignore`) is a
+ * name, not an extension.
+ * @param {string} name
+ * @returns {string}
+ */
+export function extensionOf(name) {
+  const base = String(name ?? '')
+  const dot = base.lastIndexOf('.')
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : ''
+}
+
+/**
+ * Attribute flags for one side, from what `read-dir` reports.
+ * @param {FileEntry|null|undefined} entry
+ * @returns {string}
+ */
+export function entryAttrText(entry) {
+  if (!entry) return ''
+  return (entry.isDirectory ? 'D' : '') + (entry.isSymbolicLink ? 'L' : '')
+}
+
+/**
+ * Sort key for a row under a given column.
+ *
+ * `relpath` sorts on the absolute path: within one comparison every row on a
+ * side shares the same base prefix, so it orders identically to the relative
+ * path while keeping this function free of view state.
+ *
+ * @param {CompareRow} row
+ * @param {string} key
+ * @returns {string|number}
+ */
+export function columnSortValue(row, key) {
+  const entry = row?.left ?? row?.right ?? null
+  switch (key) {
+    case 'size':
+      return isDirRow(row) ? -1 : (entry?.size ?? -1)
+    case 'mtime': {
+      const t = Date.parse(entry?.mtime ?? '')
+      return Number.isNaN(t) ? -1 : t
+    }
+    case 'ext':     return extensionOf(row?.name)
+    case 'relpath': return entry?.path ?? row?.name ?? ''
+    case 'attrs':   return entryAttrText(entry)
+    case 'status':  return String(row?.status ?? '')
+    default:        return String(row?.name ?? '')
+  }
+}
+
+/**
+ * @param {CompareRow} a
+ * @param {CompareRow} b
+ * @param {string} key
+ * @param {number} [dir] 1 ascending, -1 descending
+ * @returns {number}
+ */
+export function compareRowsBy(a, b, key, dir = 1) {
+  // Directories stay above files whichever way the column sorts, as in BC.
+  const aDir = isDirRow(a)
+  const bDir = isDirRow(b)
+  if (aDir !== bDir) return aDir ? -1 : 1
+
+  const av = columnSortValue(a, key)
+  const bv = columnSortValue(b, key)
+  let cmp = (typeof av === 'number' && typeof bv === 'number')
+    ? av - bv
+    : String(av).localeCompare(String(bv), undefined, { sensitivity: 'base' })
+  // Name breaks ties so equal sizes/timestamps do not shuffle between renders.
+  if (cmp === 0 && key !== 'name') {
+    cmp = String(a?.name ?? '').localeCompare(String(b?.name ?? ''), undefined, { sensitivity: 'base' })
+  }
+  return cmp * (dir < 0 ? -1 : 1)
+}
+
+/**
+ * Sort one level of the tree. Returns a new array of the *same* row objects so
+ * callers keep the identity the expand/collapse bookkeeping relies on.
+ *
+ * @param {CompareRow[]} rows
+ * @param {string} [key]
+ * @param {number} [dir]
+ * @returns {CompareRow[]}
+ */
+export function sortRows(rows, key = 'name', dir = 1) {
+  return [...(rows ?? [])].sort((a, b) => compareRowsBy(a, b, key, dir))
+}
+
+// ── Visible-tree flattening ─────────────────────────────────────────────────
+
+/**
+ * @typedef {object} FlatRow
+ * @property {CompareRow} row
+ * @property {number} depth
+ * @property {boolean} isDir
+ * @property {boolean} expanded
+ * @property {boolean} loading expanded but children have not arrived yet
+ */
+
+/**
+ * Flatten the part of the tree the user can currently see into the
+ * one-dimensional array the virtual scroller indexes into.
+ *
+ * Only expanded directories contribute children, so the array length equals the
+ * number of rows on screen — which is what makes a fixed row height enough to
+ * map scrollTop to a row index.
+ *
+ * @param {CompareRow[]} rows
+ * @param {object} [opts]
+ * @param {(row: CompareRow, depth: number) => boolean} [opts.isExpanded]
+ * @param {(row: CompareRow, depth: number) => boolean} [opts.isVisible]
+ * @param {(rows: CompareRow[]) => CompareRow[]} [opts.sort]
+ * @param {number} [depth]
+ * @returns {FlatRow[]}
+ */
+export function flattenVisibleRows(rows, opts = {}, depth = 0) {
+  const isExpanded = opts.isExpanded ?? (() => false)
+  const isVisible = opts.isVisible ?? (() => true)
+  const sort = opts.sort ?? ((r) => r)
+
+  const level = sort((rows ?? []).filter((row) => isVisible(row, depth)))
+  const out = []
+  for (const row of level) {
+    const isDir = isDirRow(row)
+    const expanded = isDir && !!isExpanded(row, depth)
+    out.push({ row, depth, isDir, expanded, loading: expanded && !row.children })
+    if (expanded && row.children) {
+      out.push(...flattenVisibleRows(row.children, opts, depth + 1))
+    }
+  }
+  return out
+}
+
+// ── Virtual scroll geometry ─────────────────────────────────────────────────
+
+/** Fixed row height; must match `--fc-row-height` in folder-compare.css. */
+const ROW_HEIGHT = 22
+/** Rows rendered beyond each edge of the viewport, to hide scroll latency. */
+const OVERSCAN = 4
+/** Used when clientHeight is 0 (detached container / jsdom). */
+const FALLBACK_VIEWPORT_HEIGHT = 600
+
+const _raf = globalThis.requestAnimationFrame ?? ((cb) => setTimeout(cb, 16))
+const _caf = globalThis.cancelAnimationFrame ?? clearTimeout
+
 // ── compareEntries ────────────────────────────────────────────────────────────
 
 /**
@@ -290,8 +533,21 @@ export class FolderCompare {
     this._viewPreset = 'all'
     this._filterStr = ''
 
+    // Column set and sort order are a global preference rather than per-tab
+    // state, so a newly opened comparison looks like the last one.
+    this._columns = loadFolderColumns()
+    this._sortKey = 'name'
+    this._sortDir = 1
+
     // Expanded directories: Set of "side:path"
     this._expanded = new Set()
+
+    /** @type {FlatRow[]} the flattened visible tree the virtual list indexes */
+    this._visibleRows = []
+    /** rAF handle coalescing scroll-driven window re-renders */
+    this._scrollFrame = 0
+    /** @type {string|null} path key of the row the keyboard acts on */
+    this._focusedKey = null
 
     // Root of the compare tree. Each row may carry `children` once loaded.
     this._rows = []
@@ -377,6 +633,47 @@ export class FolderCompare {
     this._showRightNewer = preset.showRightNewer
     this._syncFilterControls()
     this._applyFilterAndRender()
+  }
+
+  // ── Columns & sorting ───────────────────────────────────────────────────────
+
+  /** @returns {string[]} currently visible column ids, in display order */
+  getColumns() {
+    return [...this._columns]
+  }
+
+  /**
+   * Replace the visible column set and persist it.
+   * @param {unknown} ids
+   */
+  setColumns(ids) {
+    this._columns = saveFolderColumns(ids)
+    this._rebuildHeader()
+    this._applyFilterAndRender()
+  }
+
+  /** @param {string} id */
+  toggleColumn(id) {
+    this.setColumns(this._columns.includes(id)
+      ? this._columns.filter((c) => c !== id)
+      : [...this._columns, id])
+  }
+
+  /**
+   * Sort by a column; asking again for the active column reverses it.
+   * @param {string} key
+   */
+  sortBy(key) {
+    if (!key) return
+    if (this._sortKey === key) this._sortDir = -this._sortDir
+    else { this._sortKey = key; this._sortDir = 1 }
+    this._rebuildHeader()
+    this._applyFilterAndRender()
+  }
+
+  /** @returns {{ key: string, dir: number }} */
+  getSort() {
+    return { key: this._sortKey, dir: this._sortDir }
   }
 
   /**
@@ -929,6 +1226,79 @@ ${rows}
     await this.refresh()
   }
 
+  // ── Copy across (Ctrl+R / Ctrl+L) ───────────────────────────────────────────
+
+  /**
+   * Copy the checked rows — or, with nothing checked, the focused row — to the
+   * other side. Unlike the batch menu this is not limited to orphans, matching
+   * BC's Ctrl+R / Ctrl+L which overwrite differing files too.
+   *
+   * @param {'left'|'right'} target
+   * @returns {Promise<void>}
+   */
+  async copySelectedTo(target) {
+    const targetBase = target === 'right' ? this._rightPath : this._leftPath
+    if (!targetBase) {
+      alert(target === 'right' ? '請先選擇右側資料夾' : '請先選擇左側資料夾')
+      return
+    }
+
+    const keys = this._selectedNames.size
+      ? this._selectedNames
+      : new Set(this._focusedKey ? [this._focusedKey] : [])
+    if (!keys.size) return
+
+    const jobs = []
+    for (const row of flattenRows(this._rows ?? [])) {
+      const key = row.left?.path || row.right?.path
+      if (!key || !keys.has(key)) continue
+      const src = target === 'right' ? row.left : row.right
+      if (!src?.path || src.isDirectory) continue
+      jobs.push({ src: src.path, dest: this._destPathFor(row, target) })
+    }
+    if (!jobs.length) { alert('沒有可複製的項目'); return }
+    if (!confirm(`確定要複製 ${jobs.length} 個檔案到${target === 'right' ? '右' : '左'}側？`)) return
+
+    let done = 0, failed = 0
+    for (const job of jobs) {
+      try {
+        await window.electronAPI.copyFile(job.src, job.dest)
+        done++
+      } catch (e) {
+        failed++
+        console.error('copySelectedTo failed:', job, e)
+      }
+    }
+    alert(`複製完成：${done} 項成功${failed ? `，${failed} 項失敗` : ''}`)
+    await this.refresh()
+  }
+
+  /**
+   * @param {CompareRow} row
+   * @param {'left'|'right'} target
+   * @returns {string}
+   */
+  _destPathFor(row, target) {
+    const base = target === 'right' ? this._rightPath : this._leftPath
+    const rel = this._relativePathOf(row, target === 'right' ? 'left' : 'right')
+    const sep = base.includes('\\') ? '\\' : '/'
+    return base.replace(/[\\/]+$/, '') + sep + rel.replace(/^[\\/]+/, '')
+  }
+
+  /**
+   * Remember which row the keyboard shortcuts act on when nothing is checked.
+   * @param {string|null} key
+   */
+  _setFocusedKey(key) {
+    this._focusedKey = key ?? null
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    for (const rowEl of vlist.querySelectorAll('.fc-row')) {
+      const rowKey = rowEl.dataset.leftPath || rowEl.dataset.rightPath
+      rowEl.classList.toggle('fc-row--focused', !!key && rowKey === key)
+    }
+  }
+
   // ── T51: Advanced selection ─────────────────────────────────────────────────
 
   /** 勾選所有 left-newer rows */
@@ -1061,62 +1431,119 @@ ${rows}
     }
     if (this._dom.findInput) this._dom.findInput.value = ''
     // 移除 highlight
-    this._dom.list?.querySelectorAll('.fc-row--match').forEach(el => el.classList.remove('fc-row--match'))
-    this._dom.list?.querySelectorAll('.fc-row--match-current').forEach(el => el.classList.remove('fc-row--match-current'))
+    this._dom.list?.querySelectorAll('.fc-row--match').forEach(r => r.classList.remove('fc-row--match'))
+    this._dom.list?.querySelectorAll('.fc-row--match-current').forEach(r => r.classList.remove('fc-row--match-current'))
   }
 
-  /** 更新 find highlight */
+  /**
+   * Matches are indices into the flattened model, not into the rendered rows:
+   * virtualisation means a match can be thousands of rows away from anything
+   * currently in the DOM.
+   */
   _updateFindHighlight() {
     if (!this._dom.list) return
-    // 清除舊 highlight
-    this._dom.list.querySelectorAll('.fc-row--match').forEach(el => el.classList.remove('fc-row--match'))
-    this._dom.list.querySelectorAll('.fc-row--match-current').forEach(el => el.classList.remove('fc-row--match-current'))
+    const q = this._findQuery.trim().toLowerCase()
 
-    if (!this._findQuery.trim()) return
+    if (!this._visibleRows.length) {
+      // No model to index — a harness put rows straight into the list element.
+      this._findMatches = []
+      this._highlightRenderedByName(q)
+      return
+    }
 
-    const q = this._findQuery.toLowerCase()
-    const allRowEls = Array.from(this._dom.list.querySelectorAll('.fc-row'))
+    this._findMatches = q
+      ? computeFindMatches(this._visibleRows.map((f) => f.row), q)
+      : []
+
+    if (this._findMatches.length) {
+      this._findCursor = Math.min(this._findCursor, this._findMatches.length - 1)
+      this._scrollFlatIndexIntoView(this._findMatches[this._findCursor])
+    }
+    this._applyFindClasses()
+    this._setFindStatus(this._findMatches.length)
+  }
+
+  /** Paint match classes onto whichever rows are currently rendered. */
+  _applyFindClasses() {
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    const matched = new Set(this._findMatches)
+    const current = this._findMatches[this._findCursor]
+    for (const rowEl of vlist.querySelectorAll('.fc-row')) {
+      const idx = Number(rowEl.dataset.flatIndex)
+      rowEl.classList.toggle('fc-row--match', matched.has(idx))
+      rowEl.classList.toggle('fc-row--match-current', idx === current)
+    }
+  }
+
+  /**
+   * @param {string} q lower-cased query
+   */
+  _highlightRenderedByName(q) {
+    const list = this._dom.list
+    if (!list) return
+    list.querySelectorAll('.fc-row--match').forEach((r) => r.classList.remove('fc-row--match'))
+    list.querySelectorAll('.fc-row--match-current').forEach((r) => r.classList.remove('fc-row--match-current'))
+    if (!q) return
+
     const matchEls = []
-    for (const rowEl of allRowEls) {
-      const name = (rowEl.dataset.name ?? '').toLowerCase()
-      if (name.includes(q)) {
+    for (const rowEl of list.querySelectorAll('.fc-row')) {
+      if ((rowEl.dataset.name ?? '').toLowerCase().includes(q)) {
         rowEl.classList.add('fc-row--match')
         matchEls.push(rowEl)
       }
     }
-
     if (matchEls.length) {
-      const idx = Math.min(this._findCursor, matchEls.length - 1)
-      this._findCursor = idx
-      matchEls[idx]?.classList.add('fc-row--match-current')
-      matchEls[idx]?.scrollIntoView?.({ block: 'nearest' })
+      this._findCursor = Math.min(this._findCursor, matchEls.length - 1)
+      matchEls[this._findCursor]?.classList.add('fc-row--match-current')
+      matchEls[this._findCursor]?.scrollIntoView?.({ block: 'nearest' })
     }
+    this._setFindStatus(matchEls.length)
+  }
 
-    // 更新 status label
-    if (this._dom.findStatus) {
-      this._dom.findStatus.textContent = matchEls.length
-        ? `${this._findCursor + 1} / ${matchEls.length}`
-        : '無結果'
+  /** @param {number} total */
+  _setFindStatus(total) {
+    if (!this._dom.findStatus) return
+    this._dom.findStatus.textContent = total ? `${this._findCursor + 1} / ${total}` : '無結果'
+  }
+
+  /**
+   * Bring a flattened-tree index into the viewport, then repaint the window.
+   * @param {number} index
+   */
+  _scrollFlatIndexIntoView(index) {
+    const list = this._dom.list
+    if (!list) return
+    const top = index * ROW_HEIGHT
+    const viewHeight = list.clientHeight || FALLBACK_VIEWPORT_HEIGHT
+    if (top < list.scrollTop) list.scrollTop = top
+    else if (top + ROW_HEIGHT > list.scrollTop + viewHeight) {
+      list.scrollTop = top - viewHeight + ROW_HEIGHT
     }
+    this._renderWindow()
+  }
+
+  /** @returns {number} */
+  _findMatchCount() {
+    if (this._visibleRows.length) return this._findMatches.length
+    return this._dom.list?.querySelectorAll('.fc-row--match').length ?? 0
   }
 
   /** 跳到下一個 match */
   findNext() {
-    const q = this._findQuery.toLowerCase()
-    if (!q) return
-    const matchEls = Array.from(this._dom.list?.querySelectorAll('.fc-row--match') ?? [])
-    if (!matchEls.length) return
-    this._findCursor = (this._findCursor + 1) % matchEls.length
+    if (!this._findQuery.trim()) return
+    const count = this._findMatchCount()
+    if (!count) return
+    this._findCursor = (this._findCursor + 1) % count
     this._updateFindHighlight()
   }
 
   /** 跳到上一個 match */
   findPrev() {
-    const q = this._findQuery.toLowerCase()
-    if (!q) return
-    const matchEls = Array.from(this._dom.list?.querySelectorAll('.fc-row--match') ?? [])
-    if (!matchEls.length) return
-    this._findCursor = (this._findCursor - 1 + matchEls.length) % matchEls.length
+    if (!this._findQuery.trim()) return
+    const count = this._findMatchCount()
+    if (!count) return
+    this._findCursor = (this._findCursor - 1 + count) % count
     this._updateFindHighlight()
   }
 
@@ -1130,10 +1557,16 @@ ${rows}
       document.removeEventListener('keydown', this._onDocumentKeydown)
       this._onDocumentKeydown = null
     }
+    if (this._scrollFrame) {
+      _caf(this._scrollFrame)
+      this._scrollFrame = 0
+    }
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
     }
+    this._dom.vlist = null
+    this._visibleRows = []
     this._handlers = {}
     if (this._injectedStyleEl) {
       this._injectedStyleEl.remove()
@@ -1185,6 +1618,15 @@ ${rows}
     // List
     const list = el('div', { className: 'fc-list' })
     this._dom.list = list
+    this._dom.vlist = null
+    // Coalesce to one window re-render per frame; scroll fires far more often.
+    list.addEventListener('scroll', () => {
+      if (this._scrollFrame) return
+      this._scrollFrame = _raf(() => {
+        this._scrollFrame = 0
+        this._renderWindow()
+      })
+    })
     root.appendChild(list)
 
     // Stats bar
@@ -1285,6 +1727,10 @@ ${rows}
     const btnCollapseAll = el('button', { className: 'fc-btn-collapse-all', title: '收合全部目錄' }, '⊟')
     this._dom.btnCollapseAll = btnCollapseAll
     toolbar.appendChild(btnCollapseAll)
+
+    const btnColumns = el('button', { className: 'fc-btn-columns', title: '選擇顯示欄位' }, '▦ 欄位')
+    this._dom.btnColumns = btnColumns
+    toolbar.appendChild(btnColumns)
 
     // T51: Advanced selection dropdown
     const selectWrap = el('div', { className: 'fc-select-wrap' })
@@ -1452,21 +1898,68 @@ ${rows}
     return row
   }
 
+  /** @returns {FolderColumnDef[]} */
+  _columnDefs() {
+    return FOLDER_COLUMN_DEFS.filter((c) => this._columns.includes(c.id))
+  }
+
+  /**
+   * Grid tracks for one side. Header cells and row cells share this string so
+   * the two stay aligned whatever the column set is.
+   * @returns {string}
+   */
+  _sideTemplate() {
+    return this._columnDefs().map((c) => c.width).join(' ')
+  }
+
   _buildHeader() {
     const header = el('div', { className: 'fc-header' })
-    const cols = [
-      { className: 'fc-col fc-col-name', text: '名稱' },
-      { className: 'fc-col fc-col-size', text: '大小' },
-      { className: 'fc-col fc-col-mtime', text: '修改時間' },
-      { className: 'fc-col-sep', text: '' },
-      { className: 'fc-col fc-col-name', text: '名稱' },
-      { className: 'fc-col fc-col-size', text: '大小' },
-      { className: 'fc-col fc-col-mtime', text: '修改時間' },
-    ]
-    for (const col of cols) {
-      header.appendChild(el('div', { className: col.className }, col.text))
+    const template = this._sideTemplate()
+
+    header.appendChild(el('div', { className: 'fc-col-cb-spacer' }))
+    for (const side of ['left', 'right']) {
+      if (side === 'right') header.appendChild(el('div', { className: 'fc-col-sep' }))
+      const sideEl = el('div', { className: `fc-header-side fc-header-side--${side}` })
+      sideEl.style.gridTemplateColumns = template
+      for (const def of this._columnDefs()) {
+        const sorted = this._sortKey === def.id
+        const arrow = sorted ? (this._sortDir > 0 ? ' ▲' : ' ▼') : ''
+        sideEl.appendChild(el('div', {
+          className: `fc-col fc-col-${def.id}${sorted ? ' fc-col--sorted' : ''}`,
+          'data-column': def.id,
+          title: `依「${def.label}」排序`,
+        }, def.label + arrow))
+      }
+      header.appendChild(sideEl)
     }
+
+    header.addEventListener('click', (e) => {
+      const col = (e.target instanceof Element ? e.target : null)?.closest('[data-column]')
+      if (col) this.sortBy(col.dataset.column)
+    })
+    header.addEventListener('contextmenu', (e) => this._openColumnMenu(e))
+
+    this._dom.header = header
     return header
+  }
+
+  /** Swap in a freshly built header after a column or sort change. */
+  _rebuildHeader() {
+    const old = this._dom.header
+    if (!old?.parentElement) return
+    old.replaceWith(this._buildHeader())
+  }
+
+  /**
+   * Column show/hide menu, opened from the header context menu or the toolbar.
+   * @param {MouseEvent} e
+   */
+  _openColumnMenu(e) {
+    showContextMenu(e, FOLDER_COLUMN_DEFS.map((def) => ({
+      label: `${this._columns.includes(def.id) ? '✓ ' : '　 '}${def.label}`,
+      disabled: !!def.locked,
+      action: () => this.toggleColumn(def.id),
+    })))
   }
 
   // ── Private: Event binding ──────────────────────────────────────────────────
@@ -1497,6 +1990,13 @@ ${rows}
       this._showRightNewer = !this._showRightNewer
       btnRightNewer.classList.toggle('fc-btn-filter-toggle--active', this._showRightNewer)
       this._applyFilterAndRender()
+    })
+
+    // Column chooser — stopPropagation so the document click handler that
+    // closes the other toolbar menus does not immediately close this one.
+    this._dom.btnColumns?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this._openColumnMenu(e)
     })
 
     // T56: Expand All / Collapse All
@@ -1648,6 +2148,13 @@ ${rows}
         if (!this._findBarVisible) this._openFindBar()
         else if (e.shiftKey) this.findPrev()
         else this.findNext()
+      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'r' || e.key === 'R')) {
+        // Ctrl+R would otherwise reload the renderer.
+        e.preventDefault()
+        void this.copySelectedTo('right')
+      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault()
+        void this.copySelectedTo('left')
       }
     }
     document.addEventListener('keydown', this._onDocumentKeydown)
@@ -1736,8 +2243,18 @@ ${rows}
   // ── Private: Filter ─────────────────────────────────────────────────────────
 
   _applyFilterAndRender() {
-    const visible = this._rows.filter((row) => this._isRowVisible(row))
-    this._renderRows(visible)
+    this._visibleRows = flattenVisibleRows(this._rows, {
+      isExpanded: (row, depth) => this._expanded.has(this._expandKey(depth, row)),
+      isVisible: (row) => this._isRowVisible(row),
+      sort: (rows) => sortRows(rows, this._sortKey, this._sortDir),
+    })
+    // Click handlers reach the real model object through this index rather than
+    // rebuilding a stub from dataset attributes.
+    this._rowByKey = new Map()
+    for (const flat of this._visibleRows) {
+      this._rowByKey.set(this._expandKey(flat.depth, flat.row), flat.row)
+    }
+    this._renderVirtualList()
     this._renderStats(this._rows)
   }
 
@@ -1766,11 +2283,15 @@ ${rows}
    * base path is known.
    *
    * @param {CompareRow} row
+   * @param {'left'|'right'} [prefer] which side to measure from, when present
    * @returns {string}
    */
-  _relativePathOf(row) {
-    const full = row.left?.path ?? row.right?.path ?? row.name
-    const base = row.left?.path ? this._leftPath : this._rightPath
+  _relativePathOf(row, prefer = 'left') {
+    const first = prefer === 'right' ? row.right : row.left
+    const second = prefer === 'right' ? row.left : row.right
+    const entry = first ?? second
+    const full = entry?.path ?? row.name
+    const base = entry === row.left ? this._leftPath : this._rightPath
     if (!base || !full.startsWith(base)) return row.name
     return full.slice(base.length).replace(/^[\\/]+/, '')
   }
@@ -1812,59 +2333,70 @@ ${rows}
   }
 
   /**
-   * 渲染一組 CompareRow 到 list
-   * @param {CompareRow[]} rows
-   * @param {HTMLElement} [parentEl] - 預設為 this._dom.list（頂層）
-   * @param {number} [depth]
+   * Size the scroll surface to the whole flattened tree, then draw only the
+   * rows the viewport can reach.
    */
-  _renderRows(rows, parentEl = null, depth = 0) {
-    const target = parentEl ?? this._dom.list
-    if (!target) return
+  _renderVirtualList() {
+    const list = this._dom.list
+    if (!list) return
 
-    if (!parentEl) {
-      // 頂層：清空後重繪，並重建 expandKey → row 的索引供點擊事件查詢。
-      target.innerHTML = ''
-      this._rowByKey = new Map()
-    }
-
-    if (!rows.length) {
-      if (!parentEl) {
-        target.appendChild(
-          el('div', { className: 'fc-empty-state' },
-            el('span', { className: 'fc-empty-icon' }, '✓'),
-            el('span', {}, '沒有符合條件的項目')
-          )
+    if (!this._visibleRows.length) {
+      list.innerHTML = ''
+      this._dom.vlist = null
+      list.appendChild(
+        el('div', { className: 'fc-empty-state' },
+          el('span', { className: 'fc-empty-icon' }, '✓'),
+          el('span', {}, '沒有符合條件的項目')
         )
-      }
+      )
       return
     }
 
-    const fragment = document.createDocumentFragment()
-    for (const row of rows) {
-      const expandKey = this._expandKey(depth, row)
-      this._rowByKey.set(expandKey, row)
-
-      const rowEl = this._buildRow(row, depth)
-      fragment.appendChild(rowEl)
-
-      const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
-      if (!isDir || !this._expanded.has(expandKey)) continue
-
-      const subContainer = el('div', {
-        className: 'fc-sublist',
-        'data-expand-key': expandKey,
-      })
-      fragment.appendChild(subContainer)
-
-      if (row.children) {
-        const visibleChildren = row.children.filter((r) => this._isRowVisible(r))
-        this._renderRows(visibleChildren, subContainer, depth + 1)
-      } else {
-        // 尚未載入：顯示佔位，由 _expandRow 補上後重繪。
-        subContainer.appendChild(el('div', { className: 'fc-loading' }, '⌛ 載入中…'))
-      }
+    let vlist = this._dom.vlist
+    if (!vlist || vlist.parentElement !== list) {
+      list.innerHTML = ''
+      vlist = el('div', { className: 'fc-vlist' })
+      this._dom.vlist = vlist
+      list.appendChild(vlist)
     }
-    target.appendChild(fragment)
+    vlist.style.height = `${this._visibleRows.length * ROW_HEIGHT}px`
+    this._renderWindow()
+  }
+
+  /** Draw the rows inside the current scroll window (plus overscan). */
+  _renderWindow() {
+    const list = this._dom.list
+    const vlist = this._dom.vlist
+    if (!list || !vlist) return
+
+    const flat = this._visibleRows
+    const viewHeight = list.clientHeight || FALLBACK_VIEWPORT_HEIGHT
+    const start = Math.max(0, Math.floor((list.scrollTop || 0) / ROW_HEIGHT) - OVERSCAN)
+    const end = Math.min(flat.length - 1, start + Math.ceil(viewHeight / ROW_HEIGHT) + OVERSCAN * 2)
+
+    vlist.innerHTML = ''
+    const fragment = document.createDocumentFragment()
+    for (let i = start; i <= end; i++) {
+      const entry = flat[i]
+      if (!entry) continue
+      const rowEl = entry.loading
+        ? el('div', { className: 'fc-row fc-row--loading' }, '⌛ 載入中…')
+        : this._buildRow(entry.row, entry.depth, entry.expanded)
+      rowEl.style.top = `${i * ROW_HEIGHT}px`
+      rowEl.dataset.flatIndex = String(i)
+      fragment.appendChild(rowEl)
+    }
+    vlist.appendChild(fragment)
+    this._applyFindClasses()
+  }
+
+  /**
+   * @param {HTMLElement} rowEl
+   * @returns {FlatRow|null}
+   */
+  _flatEntryOf(rowEl) {
+    const idx = Number(rowEl?.dataset?.flatIndex)
+    return Number.isInteger(idx) ? (this._visibleRows[idx] ?? null) : null
   }
 
   /**
@@ -1934,7 +2466,12 @@ ${rows}
     return `${depth}:${lp}|${rp}`
   }
 
-  _buildRow(row, depth = 0) {
+  /**
+   * @param {CompareRow} row
+   * @param {number} [depth]
+   * @param {boolean} [expanded]
+   */
+  _buildRow(row, depth = 0, expanded = undefined) {
     const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
 
     const rowEl = el('div', {
@@ -1957,17 +2494,18 @@ ${rows}
     })
     const key = row.left?.path || row.right?.path
     if (key && this._selectedNames.has(key)) cb.checked = true
+    if (key && key === this._focusedKey) rowEl.classList.add('fc-row--focused')
     rowEl.appendChild(cb)
 
     // Left cell
-    const expanded = isDir && this._expanded.has(this._expandKey(depth, row))
-    const leftCell = this._buildCell(row.left, isDir, depth,
-      row.status === 'right-only', row.status, 'left', expanded)
+    const isExpanded = expanded ?? (isDir && this._expanded.has(this._expandKey(depth, row)))
+    const leftCell = this._buildCell(row.left, row, isDir, depth,
+      row.status === 'right-only', 'left', isExpanded)
     // Separator
     const sep = el('div', { className: 'fc-row-sep' })
     // Right cell
-    const rightCell = this._buildCell(row.right, isDir, depth,
-      row.status === 'left-only', row.status, 'right', expanded)
+    const rightCell = this._buildCell(row.right, row, isDir, depth,
+      row.status === 'left-only', 'right', isExpanded)
 
     rowEl.appendChild(leftCell)
     rowEl.appendChild(sep)
@@ -1978,49 +2516,66 @@ ${rows}
 
   /**
    * @param {FileEntry|null} entry
+   * @param {CompareRow} row
    * @param {boolean} isDir
    * @param {number} depth
    * @param {boolean} isEmpty - 孤兒側（對側沒有此檔案）
-   * @param {string} status
    * @param {'left'|'right'} side
    * @param {boolean} [expanded] - 目錄是否已展開（決定 ▶ / ▼）
    */
-  _buildCell(entry, isDir, depth, isEmpty, status, side, expanded = false) {
+  _buildCell(entry, row, isDir, depth, isEmpty, side, expanded = false) {
     if (isEmpty || !entry) {
       return el('div', { className: 'fc-cell fc-cell-empty fc-cell-' + side })
     }
 
     const cell = el('div', { className: `fc-cell fc-cell-${side}` })
-
-    // Prefix: indent + toggle + icon (all in one flex container = single grid column)
-    const prefix = el('div', { className: 'fc-prefix' })
-    if (depth > 0) {
-      const indent = el('span', { className: 'fc-indent' })
-      indent.style.width = `${depth * 16}px`
-      prefix.appendChild(indent)
+    cell.style.gridTemplateColumns = this._sideTemplate()
+    for (const def of this._columnDefs()) {
+      cell.appendChild(this._buildColumnCell(def, entry, row, isDir, depth, expanded))
     }
-    if (isDir) {
-      prefix.appendChild(el('span', { className: 'fc-toggle' }, expanded ? '▼' : '▶'))
-    } else {
-      prefix.appendChild(el('span', { className: 'fc-toggle' }, ''))
-    }
-    prefix.appendChild(el('span', { className: 'fc-icon' }, isDir ? '📁' : '📄'))
-    cell.appendChild(prefix)
-
-    // Name
-    const name = el('span', { className: 'fc-name' }, entry.name)
-    cell.appendChild(name)
-
-    // Size (files only)
-    const sizeEl = el('span', { className: 'fc-size' },
-      isDir ? '' : formatSize(entry.size))
-    cell.appendChild(sizeEl)
-
-    // Mtime
-    const mtimeEl = el('span', { className: 'fc-mtime' }, formatMtime(entry.mtime))
-    cell.appendChild(mtimeEl)
-
     return cell
+  }
+
+  /**
+   * Tree affordances live inside the name column rather than in a track of
+   * their own, so the header keeps a single grid template that lines up
+   * whatever the indentation depth is.
+   *
+   * @param {FolderColumnDef} def
+   * @param {FileEntry} entry
+   * @param {CompareRow} row
+   * @param {boolean} isDir
+   * @param {number} depth
+   * @param {boolean} expanded
+   * @returns {HTMLElement}
+   */
+  _buildColumnCell(def, entry, row, isDir, depth, expanded) {
+    switch (def.id) {
+      case 'size':
+        return el('span', { className: 'fc-size' }, isDir ? '' : formatSize(entry.size))
+      case 'mtime':
+        return el('span', { className: 'fc-mtime' }, formatMtime(entry.mtime))
+      case 'ext':
+        return el('span', { className: 'fc-ext' }, isDir ? '' : extensionOf(entry.name))
+      case 'relpath': {
+        const rel = this._relativePathOf(row)
+        return el('span', { className: 'fc-relpath', title: entry.path ?? rel }, rel)
+      }
+      case 'attrs':
+        return el('span', { className: 'fc-attrs' }, entryAttrText(entry))
+      default: {
+        const nameCell = el('div', { className: 'fc-name-cell' })
+        if (depth > 0) {
+          const indent = el('span', { className: 'fc-indent' })
+          indent.style.width = `${depth * 16}px`
+          nameCell.appendChild(indent)
+        }
+        nameCell.appendChild(el('span', { className: 'fc-toggle' }, isDir ? (expanded ? '▼' : '▶') : ''))
+        nameCell.appendChild(el('span', { className: 'fc-icon' }, isDir ? '📁' : '📄'))
+        nameCell.appendChild(el('span', { className: 'fc-name' }, entry.name))
+        return nameCell
+      }
+    }
   }
 
   _renderStats(rows) {
@@ -2064,6 +2619,8 @@ ${rows}
   _onRowClick(e) {
     const rowEl = e.target.closest('.fc-row')
     if (!rowEl) return
+    this._setFocusedKey(rowEl.dataset.leftPath || rowEl.dataset.rightPath || null)
+
     const isDir = rowEl.dataset.isDir === 'true'
     if (!isDir) return
 

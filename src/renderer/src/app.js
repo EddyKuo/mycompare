@@ -1646,6 +1646,7 @@ function setupMenuActions() {
     'file.exportText': () => {
       if (currentView === 'text') void textCompare?.exportTextReport()
       else if (currentView === 'hex') void hexCompare?.exportTextReport()
+      else if (currentView === 'table') void tableCompare?.exportTextReport()
       else showStatus('此視圖尚未支援純文字報告')
     },
     'file.exportPatch': () => {
