@@ -12,7 +12,37 @@
  */
 
 import { resolve, sep, dirname, isAbsolute } from 'path'
-import { existsSync, statSync } from 'fs'
+import { existsSync, statSync, realpathSync } from 'fs'
+
+/**
+ * Resolve symlinks and junctions in a path.
+ *
+ * Comparing lexically resolved paths is not enough: a symlink placed inside an
+ * allowed root can point anywhere, so `<root>/link/id_rsa` passes a string
+ * comparison while actually reading somewhere else entirely. Resolving both
+ * sides through the filesystem closes that.
+ *
+ * Falls back to the given path when it does not exist yet — a save-dialog
+ * target, for instance — since there is no link to follow in that case.
+ *
+ * @param {string} p an already lexically resolved absolute path
+ * @returns {string}
+ */
+function _realpath(p) {
+  try {
+    return realpathSync.native(p)
+  } catch {
+    // Missing leaf: resolve the deepest existing ancestor instead, so a link
+    // higher up the chain still cannot smuggle the target out of the root.
+    const parent = dirname(p)
+    if (parent === p) return p
+    try {
+      return resolve(realpathSync.native(parent), p.slice(parent.length + 1))
+    } catch {
+      return p
+    }
+  }
+}
 
 /** @type {Set<string>} */
 const allowedRoots = new Set()
@@ -49,7 +79,9 @@ export function registerRoot(p) {
     /* fall through and register resolved as-is */
   }
   if (dir) {
-    allowedRoots.add(_normalize(dir))
+    // Store the real location so a root reached through a link still matches
+    // the real paths validatePath() resolves.
+    allowedRoots.add(_normalize(_realpath(dir)))
   }
 }
 
@@ -93,7 +125,7 @@ export function validatePath(p) {
     throw new Error('Invalid path: cannot resolve')
   }
 
-  const normalized = _normalize(resolved)
+  const normalized = _normalize(_realpath(resolved))
   for (const root of allowedRoots) {
     if (_containsPath(root, normalized)) {
       return resolved

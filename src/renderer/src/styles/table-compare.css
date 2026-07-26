@@ -59,6 +59,24 @@
   box-shadow: 0 0 0 1px #007acc33;
 }
 
+.tc-key-input {
+  font-size: 12px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  height: 24px;
+  width: 64px;
+  outline: none;
+  text-align: center;
+}
+
+.tc-key-input:focus {
+  border-color: #007acc;
+  box-shadow: 0 0 0 1px #007acc33;
+}
+
 .tc-toolbar-sep {
   width: 1px;
   height: 20px;
@@ -366,6 +384,121 @@
   border-right: 1px solid var(--border-color);
   user-select: none;
   flex-shrink: 0;
+}
+
+/* ── S16: Resize columns to fit ──
+   Explicit widths only stick under fixed layout; auto layout re-derives them
+   from cell content and ignores the <colgroup>. */
+.tc-table--fitted {
+  table-layout: fixed;
+  width: auto;
+}
+
+.tc-table--fitted .tc-cell {
+  max-width: none;
+}
+
+/* ── S16: Column settings panel ── */
+.tc-col-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.table-compare {
+  position: relative;
+}
+
+.tc-col-panel-box {
+  display: flex;
+  flex-direction: column;
+  min-width: 420px;
+  max-width: 90%;
+  max-height: 80%;
+  padding: 12px 14px;
+  gap: 10px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
+}
+
+.tc-col-panel-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.tc-col-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.tc-col-panel-empty {
+  padding: 12px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tc-col-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto 76px 24px;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.tc-col-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tc-col-key-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tc-col-mode,
+.tc-col-tol {
+  font-size: 12px;
+  height: 24px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.tc-col-tol:disabled {
+  opacity: 0.4;
+}
+
+.tc-col-tol-unit {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.tc-col-panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* ── Empty / Loading / Error States ── */

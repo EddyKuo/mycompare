@@ -10,6 +10,8 @@
  *   swap()
  *   openFind()  closeFind()  findNext()  findPrev()
  *   nextDifference()  prevDifference()  firstDifference()  lastDifference()
+ *   getKeyColumns()  setKeyColumns()  getColumnRules()  setColumnRule()  setColumnRules()
+ *   openColumnSettings()  closeColumnSettings()  resizeColumnsToFit()
  *
  * 事件：
  *   'paths-changed' → { left: string, right: string }
@@ -147,6 +149,238 @@ function parseTable(content, delimiter) {
   return rows
 }
 
+// ── S16: Column handling (numeric / date tolerance, ignored columns) ──────────
+
+/**
+ * @typedef {'text'|'numeric'|'date'|'ignore'} ColumnMode
+ * @typedef {{ mode: ColumnMode, tolerance: number }} ColumnRule
+ * @typedef {Record<number, ColumnRule>|Array<ColumnRule|null|undefined>|null|undefined} ColumnRuleSet
+ */
+
+/** @type {ColumnRule} */
+const DEFAULT_COLUMN_RULE = Object.freeze({ mode: 'text', tolerance: 0 })
+
+/** @type {ReadonlySet<string>} */
+const COLUMN_MODES = new Set(['text', 'numeric', 'date', 'ignore'])
+
+/**
+ * 取得某欄的比對規則；未設定或設定無效時回傳預設的字串比對。
+ *
+ * @param {ColumnRuleSet} rules
+ * @param {number} index
+ * @returns {ColumnRule}
+ */
+function columnRuleAt(rules, index) {
+  const raw = rules ? rules[index] : null
+  if (!raw || !COLUMN_MODES.has(raw.mode)) return DEFAULT_COLUMN_RULE
+  const tolerance = Number(raw.tolerance)
+  return { mode: raw.mode, tolerance: Number.isFinite(tolerance) ? Math.abs(tolerance) : 0 }
+}
+
+/** Reject anything that `Number()` would coerce loosely (''、'0x10'、'  12abc'). */
+const NUMERIC_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/
+
+/**
+ * 將儲存格文字解析為數字；無法解析時回傳 null（呼叫端須退回字串比對）。
+ *
+ * @param {string|null|undefined} raw
+ * @returns {number|null}
+ */
+function parseNumericValue(raw) {
+  if (raw == null) return null
+  // Thousands separators are presentation, not value.
+  const s = String(raw).trim().replace(/,/g, '')
+  if (!NUMERIC_RE.test(s)) return null
+  const n = Number(s)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * 將儲存格文字解析為 epoch 毫秒；無法解析時回傳 null。
+ *
+ * 支援 `YYYY-MM-DD`、`YYYY/MM/DD`、`MM/DD/YYYY`、`MM-DD-YYYY`，
+ * 後面可再接 `HH:MM` 或 `HH:MM:SS`（以 `T` 或空白分隔）。
+ *
+ * @param {string|null|undefined} raw
+ * @returns {number|null}
+ */
+function parseDateValue(raw) {
+  if (raw == null) return null
+  const s = String(raw).trim().replace(/Z$/i, '').trim()
+  if (s === '') return null
+
+  const parts = s.split(/[T\s]+/)
+  if (parts.length > 2) return null
+  const [datePart, timePart] = parts
+
+  let year, month, day
+  let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/.exec(datePart)
+  if (m) {
+    year = Number(m[1]); month = Number(m[2]); day = Number(m[3])
+  } else {
+    m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/.exec(datePart)
+    if (!m) return null
+    month = Number(m[1]); day = Number(m[2]); year = Number(m[3])
+  }
+
+  let hh = 0, mm = 0, ss = 0
+  if (timePart) {
+    const tm = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(timePart)
+    if (!tm) return null
+    hh = Number(tm[1]); mm = Number(tm[2]); ss = tm[3] ? Number(tm[3]) : 0
+    if (hh > 23 || mm > 59 || ss > 59) return null
+  }
+
+  // UTC keeps results independent of the machine's timezone and of DST.
+  const ms = Date.UTC(year, month - 1, day, hh, mm, ss)
+  const dt = new Date(ms)
+  // Date.UTC silently rolls overflow over (2024-02-31 → 2024-03-02); a bogus
+  // date must fail parsing rather than compare equal to a real one.
+  if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) {
+    return null
+  }
+  return ms
+}
+
+/**
+ * 依欄位規則判定兩個儲存格是否視為相同。
+ *
+ * @param {string|null|undefined} left
+ * @param {string|null|undefined} right
+ * @param {ColumnRule} [rule]
+ * @returns {boolean}
+ */
+function cellsEqual(left, right, rule = DEFAULT_COLUMN_RULE) {
+  const a = left ?? ''
+  const b = right ?? ''
+  if (rule.mode === 'ignore') return true
+
+  if (rule.mode === 'numeric') {
+    const na = parseNumericValue(a)
+    const nb = parseNumericValue(b)
+    // A wide tolerance must never mask unparseable text as "equal"; anything
+    // the parser rejects is compared literally instead.
+    if (na != null && nb != null) {
+      // `100.01 - 100.00` lands at 1.0000000000005e-2 in binary floating point,
+      // so an exactly-at-tolerance pair needs a magnitude-scaled slack or the
+      // user's "tolerance 0.01" would not actually cover a 0.01 difference.
+      const slack = Number.EPSILON * 8 * Math.max(1, Math.abs(na), Math.abs(nb))
+      return Math.abs(na - nb) <= rule.tolerance + slack
+    }
+    return a === b
+  }
+
+  if (rule.mode === 'date') {
+    const da = parseDateValue(a)
+    const db = parseDateValue(b)
+    // Tolerance is expressed in seconds; epochs are milliseconds.
+    if (da != null && db != null) return Math.abs(da - db) <= rule.tolerance * 1000
+    return a === b
+  }
+
+  return a === b
+}
+
+/**
+ * 將 key 欄設定正規化為索引陣列。空陣列代表「按位置對齊」。
+ *
+ * 接受單一數字（向後相容既有的 `keyColumn: 0` / `-1`）或數字陣列。
+ *
+ * @param {number|number[]|null|undefined} keyColumn
+ * @returns {number[]}
+ */
+function normaliseKeyColumns(keyColumn) {
+  const raw = Array.isArray(keyColumn) ? keyColumn : [keyColumn]
+  /** @type {number[]} */
+  const out = []
+  for (const v of raw) {
+    const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10)
+    if (!Number.isInteger(n) || n < 0) continue
+    if (!out.includes(n)) out.push(n)
+  }
+  return out
+}
+
+/** Unit separator — cannot appear in parsed CSV cells, so keys stay unambiguous. */
+const KEY_SEPARATOR = '\u001F'
+
+/**
+ * @param {string} value
+ * @param {ColumnRule} rule
+ * @returns {string}
+ */
+function canonicalKeyPart(value, rule) {
+  if (rule.mode === 'numeric') {
+    const n = parseNumericValue(value)
+    // `100` / `100.0` / `100.00` must land in the same bucket, otherwise the
+    // two rows never meet and both look like orphans.
+    if (n != null) return `n:${n}`
+  } else if (rule.mode === 'date') {
+    const d = parseDateValue(value)
+    if (d != null) return `d:${d}`
+  }
+  return value
+}
+
+/**
+ * 由一或多個 key 欄組出對齊用的複合鍵。
+ *
+ * @param {string[]|null|undefined} row
+ * @param {number[]} keyCols
+ * @param {ColumnRuleSet} [rules]
+ * @returns {string}
+ */
+function buildRowKey(row, keyCols, rules) {
+  return keyCols
+    .map((c) => canonicalKeyPart(row?.[c] ?? '', columnRuleAt(rules, c)))
+    .join(KEY_SEPARATOR)
+}
+
+/** Wide (CJK/fullwidth) glyphs occupy roughly two Latin cells. */
+const WIDE_CHAR_RE =
+  /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/
+
+/**
+ * @param {string|null|undefined} text
+ * @returns {number}
+ */
+function displayWidth(text) {
+  let n = 0
+  for (const ch of String(text ?? '')) n += WIDE_CHAR_RE.test(ch) ? 2 : 1
+  return n
+}
+
+/**
+ * 依取樣內容估算每欄合適的像素寬度（Resize Columns to Fit）。
+ *
+ * 只吃傳入的取樣列，呼叫端負責限制取樣範圍，避免掃描整張表。
+ *
+ * @param {Array<string[]|null|undefined>} sampleRows
+ * @param {number} colCount
+ * @param {string[]|null} [headers]
+ * @param {{ charWidth?: number, padding?: number, min?: number, max?: number }} [opts]
+ * @returns {number[]} 像素寬度
+ */
+function measureColumnWidths(sampleRows, colCount, headers = null, opts = {}) {
+  const charWidth = opts.charWidth ?? 7
+  const padding = opts.padding ?? 18
+  const min = opts.min ?? 40
+  const max = opts.max ?? 480
+
+  /** @type {number[]} */
+  const widths = []
+  for (let c = 0; c < colCount; c++) {
+    let widest = headers ? displayWidth(headers[c]) : 0
+    for (const row of sampleRows) {
+      if (!row) continue
+      const w = displayWidth(row[c])
+      if (w > widest) widest = w
+    }
+    widths.push(Math.min(max, Math.max(min, Math.round(widest * charWidth + padding))))
+  }
+  return widths
+}
+
 // ── Comparison Logic ──────────────────────────────────────────────────────────
 
 /**
@@ -175,13 +409,14 @@ function reorderRow(row, sourceHeaders, targetHeaders) {
  *
  * @param {string[][]} leftData   左側資料（不含標題行，若 hasHeader=true）
  * @param {string[][]} rightData  右側資料
- * @param {number} keyCol         key 欄位索引，-1 代表按位置對齊
+ * @param {number|number[]} keyCol  key 欄索引；單一數字（-1 代表按位置對齊）或多欄組合鍵
  * @param {string[]|null} leftHeaders   左側標題行（ignoreColumnOrder 用）
  * @param {string[]|null} rightHeaders  右側標題行
  * @param {boolean} ignoreColumnOrder
+ * @param {ColumnRuleSet} [columnRules]  每欄比對規則（numeric/date/ignore）
  * @returns {AlignedRow[]}
  */
-function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignoreColumnOrder) {
+function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignoreColumnOrder, columnRules) {
   // 若需要忽略欄位排序，先將右側資料欄位重排成左側順序
   let normalizedRight = rightData
   let normalizedRightHeaders = rightHeaders
@@ -190,7 +425,9 @@ function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignor
     normalizedRightHeaders = leftHeaders
   }
 
-  if (keyCol === -1) {
+  const keyCols = normaliseKeyColumns(keyCol)
+
+  if (keyCols.length === 0) {
     // 按位置對齊
     const len = Math.max(leftData.length, normalizedRight.length)
     const result = []
@@ -198,7 +435,7 @@ function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignor
       const lRow = leftData[i] ?? null
       const rRow = normalizedRight[i] ?? null
       result.push({
-        status: computeRowStatus(lRow, rRow),
+        status: computeRowStatus(lRow, rRow, columnRules),
         leftRow: lRow,
         rightRow: rRow,
         leftIdx: i,
@@ -211,14 +448,14 @@ function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignor
   // 按 key 欄位對齊
   const leftMap = new Map()
   for (let i = 0; i < leftData.length; i++) {
-    const key = leftData[i][keyCol] ?? ''
+    const key = buildRowKey(leftData[i], keyCols, columnRules)
     if (!leftMap.has(key)) leftMap.set(key, [])
     leftMap.get(key).push({ row: leftData[i], idx: i })
   }
 
   const rightMap = new Map()
   for (let i = 0; i < normalizedRight.length; i++) {
-    const key = normalizedRight[i][keyCol] ?? ''
+    const key = buildRowKey(normalizedRight[i], keyCols, columnRules)
     if (!rightMap.has(key)) rightMap.set(key, [])
     rightMap.get(key).push({ row: normalizedRight[i], idx: i })
   }
@@ -242,7 +479,7 @@ function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignor
       const lEntry = leftGroup[i] ?? null
       const rEntry = rightGroup[i] ?? null
       result.push({
-        status: computeRowStatus(lEntry?.row ?? null, rEntry?.row ?? null),
+        status: computeRowStatus(lEntry?.row ?? null, rEntry?.row ?? null, columnRules),
         leftRow: lEntry?.row ?? null,
         rightRow: rEntry?.row ?? null,
         leftIdx: lEntry?.idx ?? -1,
@@ -257,14 +494,15 @@ function alignRows(leftData, rightData, keyCol, leftHeaders, rightHeaders, ignor
  * 計算單列的比對狀態
  * @param {string[]|null} left
  * @param {string[]|null} right
+ * @param {ColumnRuleSet} [columnRules]
  * @returns {'same'|'different'|'left-only'|'right-only'}
  */
-function computeRowStatus(left, right) {
+function computeRowStatus(left, right, columnRules) {
   if (!right) return 'left-only'
   if (!left) return 'right-only'
   const maxLen = Math.max(left.length, right.length)
   for (let i = 0; i < maxLen; i++) {
-    if ((left[i] ?? '') !== (right[i] ?? '')) return 'different'
+    if (!cellsEqual(left[i], right[i], columnRuleAt(columnRules, i))) return 'different'
   }
   return 'same'
 }
@@ -274,12 +512,13 @@ function computeRowStatus(left, right) {
  * @param {string[]|null} leftRow
  * @param {string[]|null} rightRow
  * @param {number} colCount
+ * @param {ColumnRuleSet} [columnRules]
  * @returns {boolean[]}
  */
-function computeCellDiffs(leftRow, rightRow, colCount) {
+function computeCellDiffs(leftRow, rightRow, colCount, columnRules) {
   const diffs = []
   for (let i = 0; i < colCount; i++) {
-    diffs.push((leftRow?.[i] ?? '') !== (rightRow?.[i] ?? ''))
+    diffs.push(!cellsEqual(leftRow?.[i], rightRow?.[i], columnRuleAt(columnRules, i)))
   }
   return diffs
 }
@@ -368,13 +607,23 @@ export class TableCompare {
   /**
    * @param {object} [options]
    * @param {boolean} [options.hasHeader]          第一行是否為標題行（預設 true）
-   * @param {number}  [options.keyColumn]           對齊用的 key 欄索引（-1 表示按位置，預設 0）
+   * @param {number|number[]} [options.keyColumn]  對齊用的 key 欄索引；單一數字（-1 表示按位置，
+   *                                               預設 0）或多欄組合鍵（如 `[0, 2]`）
    * @param {boolean} [options.ignoreColumnOrder]  忽略欄位排序差異（預設 false）
+   * @param {ColumnRuleSet} [options.columnRules]  每欄比對規則（text/numeric/date/ignore）
    */
   constructor(options = {}) {
     this._hasHeader = options.hasHeader ?? true
-    this._keyColumn = options.keyColumn ?? 0
+    /** @type {number[]} 空陣列代表按位置對齊 */
+    this._keyColumns = normaliseKeyColumns(options.keyColumn ?? 0)
     this._ignoreColumnOrder = options.ignoreColumnOrder ?? false
+
+    /** @type {Record<number, ColumnRule>} 只存非預設規則，預設 text 一律不落地 */
+    this._columnRules = {}
+    this._applyColumnRuleSet(options.columnRules)
+
+    /** @type {{ left: number[]|null, right: number[]|null }} Resize-to-fit 結果 */
+    this._colWidths = { left: null, right: null }
 
     /** @type {string|null} */
     this._leftPath = null
@@ -564,6 +813,7 @@ export class TableCompare {
     ;[this._leftContent, this._rightContent] = [this._rightContent, this._leftContent]
     ;[this._leftParsed, this._rightParsed] = [this._rightParsed, this._leftParsed]
     ;[this._leftHeaders, this._rightHeaders] = [this._rightHeaders, this._leftHeaders]
+    this._colWidths = { left: this._colWidths.right, right: this._colWidths.left }
 
     this._updatePathDisplay('left', this._leftPath ?? '（未選擇）')
     this._updatePathDisplay('right', this._rightPath ?? '（未選擇）')
@@ -576,6 +826,130 @@ export class TableCompare {
     this._recomputeFind()
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
     return this
+  }
+
+  // ── S16: Column handling ─────────────────────────────────────────────────────
+
+  /**
+   * 目前的 key 欄組合。空陣列代表按位置對齊。
+   * @returns {number[]}
+   */
+  getKeyColumns() {
+    return [...this._keyColumns]
+  }
+
+  /**
+   * 設定 key 欄。接受單一數字（-1 = 按位置）或多欄陣列。
+   * @param {number|number[]} cols
+   * @returns {this}
+   */
+  setKeyColumns(cols) {
+    this._keyColumns = normaliseKeyColumns(cols)
+    this._syncKeyInput()
+    this._parseAndRefresh()
+    return this
+  }
+
+  /**
+   * 目前所有非預設的欄位規則（欄索引 → 規則）。
+   * @returns {Record<number, ColumnRule>}
+   */
+  getColumnRules() {
+    return { ...this._columnRules }
+  }
+
+  /**
+   * 設定單一欄位的比對方式。傳 null 或 mode='text' 代表還原為預設字串比對。
+   *
+   * @param {number} index
+   * @param {{ mode: ColumnMode, tolerance?: number }|null} rule
+   * @returns {this}
+   */
+  setColumnRule(index, rule) {
+    if (!Number.isInteger(index) || index < 0) return this
+    if (!rule || rule.mode === 'text' || !COLUMN_MODES.has(rule.mode)) {
+      delete this._columnRules[index]
+    } else {
+      this._columnRules[index] = columnRuleAt({ [index]: rule }, index)
+    }
+    this._recompare()
+    return this
+  }
+
+  /**
+   * 批次覆寫欄位規則（未列出的欄位還原為預設）。
+   * @param {ColumnRuleSet} rules
+   * @returns {this}
+   */
+  setColumnRules(rules) {
+    this._columnRules = {}
+    this._applyColumnRuleSet(rules)
+    this._recompare()
+    return this
+  }
+
+  /** 開啟欄位設定面板 */
+  openColumnSettings() {
+    if (!this._dom.root) return
+    this._buildColumnPanel()
+    if (this._dom.colPanel) this._dom.colPanel.style.display = 'flex'
+  }
+
+  /** 關閉欄位設定面板 */
+  closeColumnSettings() {
+    if (this._dom.colPanel) this._dom.colPanel.style.display = 'none'
+  }
+
+  /**
+   * 依內容自動調整欄寬。再呼叫一次會還原為自動配寬。
+   *
+   * 只取樣目前虛擬視窗內的列（必要時退回前 200 列），因為量測整張表在
+   * 十萬列的 CSV 上要掃描全部資料，卻不會讓結果更好。
+   *
+   * @returns {this}
+   */
+  resizeColumnsToFit() {
+    if (this._colWidths.left || this._colWidths.right) {
+      this._colWidths = { left: null, right: null }
+      this._applyColumnWidths()
+      return this
+    }
+
+    const rows = this._visibleRows ?? []
+    const first = this._windowFirst ?? 0
+    const last = this._windowLast ?? Math.min(rows.length, first + 200)
+    const sample = rows.slice(first, last)
+
+    const leftCols = this._leftColCount ?? (this._leftParsed?.[0]?.length ?? 0)
+    const rightCols = this._rightColCount ?? (this._rightParsed?.[0]?.length ?? 0)
+
+    this._colWidths = {
+      left: measureColumnWidths(
+        sample.map((r) => r.leftRow), leftCols, this._hasHeader ? this._leftHeaders : null),
+      right: measureColumnWidths(
+        sample.map((r) => r.rightRow), rightCols, this._hasHeader ? this._rightHeaders : null),
+    }
+    this._applyColumnWidths()
+    return this
+  }
+
+  /**
+   * @param {ColumnRuleSet} rules
+   */
+  _applyColumnRuleSet(rules) {
+    if (!rules) return
+    for (const key of Object.keys(rules)) {
+      const index = Number(key)
+      if (!Number.isInteger(index) || index < 0) continue
+      const rule = columnRuleAt(rules, index)
+      if (rule.mode !== 'text') this._columnRules[index] = rule
+    }
+  }
+
+  /** 規則或 key 欄變更後重新比對並重繪（不需重新解析檔案內容） */
+  _recompare() {
+    this._compare()
+    this._renderTable()
   }
 
   // ── S16-T1: Find ─────────────────────────────────────────────────────────────
@@ -862,6 +1236,16 @@ export class TableCompare {
     this._dom.stats = stats
     root.appendChild(stats)
 
+    // Column settings overlay — contents are built on open, because the column
+    // list depends on whichever files are loaded at that moment.
+    const colPanel = el('div', { className: 'tc-col-panel' })
+    colPanel.style.display = 'none'
+    this._dom.colPanel = colPanel
+    colPanel.addEventListener('click', (e) => {
+      if (e.target === colPanel) this.closeColumnSettings()
+    })
+    root.appendChild(colPanel)
+
     this._container.appendChild(root)
     this._dom.root = root
 
@@ -879,13 +1263,29 @@ export class TableCompare {
     // Separator
     toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
 
-    // Key column input
+    // Key column input — comma-separated so composite keys ("0,2") fit the
+    // same control that used to take a single index.
     const keyLabel = el('label')
     keyLabel.appendChild(document.createTextNode('Key 欄（-1=無）：'))
-    const keyInput = el('input', { type: 'number', min: '-1', value: String(this._keyColumn) })
+    const keyInput = el('input', {
+      type: 'text',
+      className: 'tc-key-input',
+      value: this._keyColumnsText(),
+    })
+    keyInput.title = '對齊用的 key 欄索引，可用逗號組合多欄（例：0,2）；-1 表示按位置對齊'
     this._dom.keyInput = keyInput
     keyLabel.appendChild(keyInput)
     toolbar.appendChild(keyLabel)
+
+    // Column settings + resize-to-fit
+    const btnColumns = el('button', { id: 'tc-btn-columns', className: 'tc-btn' }, '⚙ 欄位設定…')
+    this._dom.btnColumns = btnColumns
+    toolbar.appendChild(btnColumns)
+
+    const btnFit = el('button', { id: 'tc-btn-fit', className: 'tc-btn' }, '↔ 自動欄寬')
+    btnFit.title = '依內容調整欄寬（再按一次還原）'
+    this._dom.btnFit = btnFit
+    toolbar.appendChild(btnFit)
 
     // Separator
     toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
@@ -1010,6 +1410,122 @@ export class TableCompare {
     return lbl
   }
 
+  /** @returns {string} */
+  _keyColumnsText() {
+    return this._keyColumns.length ? this._keyColumns.join(',') : '-1'
+  }
+
+  _syncKeyInput() {
+    if (this._dom.keyInput) this._dom.keyInput.value = this._keyColumnsText()
+  }
+
+  /** @returns {number} 兩側欄數的最大值 */
+  _totalColumnCount() {
+    return Math.max(
+      this._leftParsed?.[0]?.length ?? 0,
+      this._rightParsed?.[0]?.length ?? 0,
+    )
+  }
+
+  /**
+   * 產生欄位設定面板的內容。每次開啟都重建，因為欄數與標題會隨載入的檔案改變。
+   */
+  _buildColumnPanel() {
+    const panel = this._dom.colPanel
+    if (!panel) return
+    panel.innerHTML = ''
+
+    const box = el('div', { className: 'tc-col-panel-box' })
+    box.appendChild(el('h3', { className: 'tc-col-panel-title' }, '欄位設定'))
+
+    const colCount = this._totalColumnCount()
+    const headers = this._hasHeader ? (this._leftHeaders ?? this._rightHeaders) : null
+
+    const list = el('div', { className: 'tc-col-panel-list' })
+    if (colCount === 0) {
+      list.appendChild(el('div', { className: 'tc-col-panel-empty' }, '尚未載入資料'))
+    }
+
+    for (let i = 0; i < colCount; i++) {
+      list.appendChild(this._buildColumnPanelRow(i, headers?.[i] ?? ''))
+    }
+    box.appendChild(list)
+
+    const footer = el('div', { className: 'tc-col-panel-footer' })
+    const btnReset = el('button', { className: 'tc-btn' }, '全部還原')
+    btnReset.addEventListener('click', () => {
+      this.setColumnRules(null)
+      this._buildColumnPanel()
+    })
+    const btnClose = el('button', { className: 'tc-btn' }, '關閉')
+    btnClose.addEventListener('click', () => this.closeColumnSettings())
+    footer.appendChild(btnReset)
+    footer.appendChild(btnClose)
+    box.appendChild(footer)
+
+    panel.appendChild(box)
+  }
+
+  /**
+   * @param {number} index
+   * @param {string} headerName
+   * @returns {HTMLElement}
+   */
+  _buildColumnPanelRow(index, headerName) {
+    const rule = columnRuleAt(this._columnRules, index)
+    const row = el('div', { className: 'tc-col-row' })
+
+    row.appendChild(el('span', { className: 'tc-col-name' },
+      headerName ? `${index} · ${headerName}` : `第 ${index} 欄`))
+
+    const keyBox = el('input', { type: 'checkbox', className: 'tc-col-key' })
+    keyBox.checked = this._keyColumns.includes(index)
+    const keyLabel = el('label', { className: 'tc-col-key-label' })
+    keyLabel.appendChild(keyBox)
+    keyLabel.appendChild(document.createTextNode(' Key'))
+    row.appendChild(keyLabel)
+
+    const modeSel = el('select', { className: 'tc-col-mode' })
+    for (const [value, label] of [
+      ['text', '文字'], ['numeric', '數值'], ['date', '日期'], ['ignore', '忽略'],
+    ]) {
+      const opt = el('option', { value }, label)
+      modeSel.appendChild(opt)
+    }
+    modeSel.value = rule.mode
+    row.appendChild(modeSel)
+
+    const tolInput = el('input', {
+      type: 'number', step: 'any', min: '0', className: 'tc-col-tol', value: String(rule.tolerance),
+    })
+    const unit = el('span', { className: 'tc-col-tol-unit' }, rule.mode === 'date' ? '秒' : '')
+    const syncTolState = () => {
+      const usesTolerance = modeSel.value === 'numeric' || modeSel.value === 'date'
+      tolInput.disabled = !usesTolerance
+      unit.textContent = modeSel.value === 'date' ? '秒' : ''
+    }
+    syncTolState()
+    row.appendChild(tolInput)
+    row.appendChild(unit)
+
+    const apply = () => {
+      syncTolState()
+      const mode = /** @type {ColumnMode} */ (modeSel.value)
+      this.setColumnRule(index, { mode, tolerance: Number(tolInput.value) || 0 })
+    }
+    modeSel.addEventListener('change', apply)
+    tolInput.addEventListener('change', apply)
+
+    keyBox.addEventListener('change', () => {
+      const next = keyBox.checked
+        ? [...this._keyColumns, index]
+        : this._keyColumns.filter((c) => c !== index)
+      this.setKeyColumns(next)
+    })
+
+    return row
+  }
+
   _buildPathRow() {
     const row = el('div', { className: 'tc-path-row' })
 
@@ -1041,7 +1557,7 @@ export class TableCompare {
   _bindEvents() {
     const { btnOpenLeft, btnOpenRight, btnRefresh,
             cbHeader, cbSame, cbDiffOnly, cbColOrder, keyInput,
-            btnExport, btnExportStats, cbSort } = this._dom
+            btnExport, btnExportStats, cbSort, btnColumns, btnFit } = this._dom
 
     btnOpenLeft.addEventListener('click', () => this.openLeft())
     btnOpenRight.addEventListener('click', () => this.openRight())
@@ -1088,10 +1604,11 @@ export class TableCompare {
     })
 
     keyInput.addEventListener('change', () => {
-      const val = parseInt(keyInput.value, 10)
-      this._keyColumn = isNaN(val) ? 0 : val
-      this._parseAndRefresh()
+      this.setKeyColumns(keyInput.value.split(','))
     })
+
+    btnColumns.addEventListener('click', () => this.openColumnSettings())
+    btnFit.addEventListener('click', () => this.resizeColumnsToFit())
 
     // Sync scroll between left and right panes, and repaint the virtual window.
     const { leftScroll, rightScroll } = this._dom
@@ -1157,6 +1674,9 @@ export class TableCompare {
       } else if (e.key === 'F3') {
         e.preventDefault()
         this._stepFind(e.shiftKey ? -1 : 1)
+      } else if (e.key === 'Escape' && this._dom.colPanel?.style.display === 'flex') {
+        e.preventDefault()
+        this.closeColumnSettings()
       }
     }
     document.addEventListener('keydown', this._keyHandler)
@@ -1377,12 +1897,14 @@ export class TableCompare {
     this._leftHeaders = leftHeaders
     this._rightHeaders = rightHeaders
 
-    // T15: sort before compare — sort each side by key column (or col 0 when keyColumn=-1)
+    // T15: sort before compare — sort each side by the key columns (or col 0
+    // when aligning by position), using the same canonical form as alignment so
+    // numeric/date columns group consistently.
     if (this._sortBeforeCompare) {
-      const sortCol = this._keyColumn >= 0 ? this._keyColumn : 0
+      const sortCols = this._keyColumns.length ? this._keyColumns : [0]
       const sortFn = (a, b) => {
-        const av = a[sortCol] ?? ''
-        const bv = b[sortCol] ?? ''
+        const av = buildRowKey(a, sortCols, this._columnRules)
+        const bv = buildRowKey(b, sortCols, this._columnRules)
         return av < bv ? -1 : av > bv ? 1 : 0
       }
       leftData  = leftData.slice().sort(sortFn)
@@ -1392,10 +1914,11 @@ export class TableCompare {
     this._alignedRows = alignRows(
       leftData,
       rightData,
-      this._keyColumn,
+      this._keyColumns,
       leftHeaders,
       rightHeaders,
       this._ignoreColumnOrder,
+      this._columnRules,
     )
     this._refreshRowIndex()
   }
@@ -1506,6 +2029,8 @@ export class TableCompare {
     this._windowFirst = null
     this._windowLast = null
     this._renderTableWindow()
+    // The <table> elements above are new, so any fitted widths must be re-applied.
+    this._applyColumnWidths()
     this._renderStats()
     // Match positions are expressed as _visibleRows indices, which the filter
     // pass above may have just shifted.
@@ -1561,14 +2086,58 @@ export class TableCompare {
    * getStats() and again by exportHtml().
    *
    * @param {object} alignedRow
+   * @param {number} [colCount]
    */
   _cellDiffsFor(alignedRow, colCount) {
     const cols = colCount ?? this._colCount ?? 0
     if (!alignedRow._cellDiffs || alignedRow._cellDiffs.length !== cols) {
       alignedRow._cellDiffs = computeCellDiffs(
-        alignedRow.leftRow, alignedRow.rightRow, cols)
+        alignedRow.leftRow, alignedRow.rightRow, cols, this._columnRules)
     }
     return alignedRow._cellDiffs
+  }
+
+  /**
+   * 把 resize-to-fit 的結果套到表格與標題列。
+   *
+   * 標題列是 flex 容器而表格是 <table>，兩者必須各自上寬度才會對齊；表格側
+   * 用 <colgroup> 搭配 fixed layout，才不會被 auto layout 依內容重新分配。
+   */
+  _applyColumnWidths() {
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const widths = this._colWidths[side]
+      const table = this._dom[`${side}Table`]
+      const headerEl = this._dom[`${side}Header`]
+
+      if (table) {
+        table.classList.toggle('tc-table--fitted', !!widths)
+        table.querySelector('colgroup')?.remove()
+        if (widths) {
+          const cg = document.createElement('colgroup')
+          // Leading <col> pairs with the row-number cell.
+          const numCol = document.createElement('col')
+          numCol.style.width = '36px'
+          cg.appendChild(numCol)
+          for (const w of widths) {
+            const col = document.createElement('col')
+            col.style.width = `${w}px`
+            cg.appendChild(col)
+          }
+          table.insertBefore(cg, table.firstChild)
+        }
+      }
+
+      if (headerEl) {
+        const cells = headerEl.querySelectorAll('.tc-cell')
+        for (let i = 0; i < cells.length; i++) {
+          const w = widths?.[i]
+          const px = w ? `${w}px` : ''
+          cells[i].style.width = px
+          cells[i].style.minWidth = px
+          cells[i].style.maxWidth = px
+        }
+      }
+    }
   }
 
   /**
@@ -1746,4 +2315,6 @@ export class TableCompare {
 export {
   parseTable, alignRows, computeRowStatus, computeCellDiffs,
   findCellMatches, diffRowIndices, stepIndexClamped, stepIndexWrapped,
+  parseNumericValue, parseDateValue, cellsEqual, columnRuleAt,
+  normaliseKeyColumns, buildRowKey, measureColumnWidths, DEFAULT_COLUMN_RULE,
 }
