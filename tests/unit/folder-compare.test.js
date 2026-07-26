@@ -446,7 +446,7 @@ describe('T55: showLeftNewer / showRightNewer filter', () => {
 // ── T56: expandAll / collapseAll ──────────────────────────────────────────────
 
 describe('T56: expandAll', () => {
-  it('should add expand keys for all directory rows', () => {
+  it('should add expand keys for all directory rows', async () => {
     if (!FolderCompare) return
     const fc = buildFC([
       makeRow({ name: 'src', status: 'same', leftPath: '/left/src', rightPath: '/right/src', isDir: true }),
@@ -455,18 +455,18 @@ describe('T56: expandAll', () => {
     ])
     // Stub _applyFilterAndRender to avoid DOM ops
     fc._applyFilterAndRender = vi.fn()
-    fc.expandAll()
+    await fc.expandAll()
     expect(fc._expanded.size).toBe(2) // only directories
     expect(fc._applyFilterAndRender).toHaveBeenCalledOnce()
   })
 
-  it('should not add file rows to _expanded', () => {
+  it('should not add file rows to _expanded', async () => {
     if (!FolderCompare) return
     const fc = buildFC([
       makeRow({ name: 'readme.md', status: 'same', leftPath: '/left/readme.md', rightPath: '/right/readme.md' }),
     ])
     fc._applyFilterAndRender = vi.fn()
-    fc.expandAll()
+    await fc.expandAll()
     expect(fc._expanded.size).toBe(0)
   })
 })

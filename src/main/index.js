@@ -314,7 +314,11 @@ ipcMain.handle('read-dir', async (_event, dirPath) => {
         return {
           name: entry.name,
           path: fullPath,
-          isDirectory: entry.isDirectory(),
+          // stat() follows symlinks; Dirent.isDirectory() does not, so using
+          // the Dirent classified a symlinked directory as a plain file and
+          // the row could never be expanded.
+          isDirectory: s.isDirectory(),
+          isSymbolicLink: entry.isSymbolicLink(),
           size: s.size,
           mtime: s.mtime.toISOString()
         }

@@ -228,7 +228,7 @@ describe('T55: combined Left/Right Newer filter (both off)', () => {
 // ── T56: Expand/Collapse recursion guards ────────────────────────────────────
 
 describe('T56: expandAll on mixed rows / collapseAll clears set', () => {
-  it('expandAll adds only directory rows to _expanded', () => {
+  it('expandAll adds only directory rows to _expanded', async () => {
     if (!FolderCompare) return
     const fc = buildFC([
       makeRow({ name: 'src',  status: 'same', leftPath: '/left/src',  rightPath: '/right/src',  isDir: true }),
@@ -237,7 +237,7 @@ describe('T56: expandAll on mixed rows / collapseAll clears set', () => {
       makeRow({ name: 'b.js', status: 'same', leftPath: '/left/b.js', rightPath: '/right/b.js', isDir: false }),
     ])
     fc._applyFilterAndRender = vi.fn()
-    fc.expandAll()
+    await fc.expandAll()
     expect(fc._expanded.size).toBe(2)
   })
 

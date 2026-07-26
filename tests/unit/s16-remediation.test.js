@@ -1,11 +1,180 @@
 /**
+ * @vitest-environment jsdom
+ *
  * Sprint 16 — remediation regression tests.
  *
  * Covers defects found by the code-review pass that the existing suites
  * missed because they only exercised toy-sized inputs.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { hexCompleteByteDiff } from '../../src/renderer/src/views/hex-compare.js'
+import { FolderCompare, flattenRows, rollupStatus } from '../../src/renderer/src/views/folder-compare.js'
+
+// ── Folder compare tree model ───────────────────────────────────────────────
+
+/** @param {object} o */
+function row({ name = 'f', status = 'same', left = null, right = null, children = null, isDir = false } = {}) {
+  return {
+    name,
+    status,
+    left:  left  ? { path: left,  isDirectory: isDir, size: 1, mtime: '2024-01-01T00:00:00.000Z', name } : null,
+    right: right ? { path: right, isDirectory: isDir, size: 1, mtime: '2024-01-01T00:00:00.000Z', name } : null,
+    children,
+  }
+}
+
+function buildFC(rows = []) {
+  window.electronAPI = { readDir: vi.fn().mockResolvedValue([]) }
+  const fc = new FolderCompare({ leftPath: '/l', rightPath: '/r' })
+  fc._rows = rows
+  fc._dom = { list: document.createElement('div') }
+  return fc
+}
+
+describe('flattenRows', () => {
+  it('walks nested children depth-first and stamps depth', () => {
+    const tree = [
+      row({ name: 'src', isDir: true, left: '/l/src', right: '/r/src', children: [
+        row({ name: 'a.js', left: '/l/src/a.js', right: '/r/src/a.js' }),
+        row({ name: 'deep', isDir: true, left: '/l/src/deep', right: '/r/src/deep', children: [
+          row({ name: 'b.js', left: '/l/src/deep/b.js' , status: 'left-only' }),
+        ] }),
+      ] }),
+      row({ name: 'top.txt', left: '/l/top.txt', right: '/r/top.txt' }),
+    ]
+    const flat = flattenRows(tree)
+    expect(flat.map((r) => r.name)).toEqual(['src', 'a.js', 'deep', 'b.js', 'top.txt'])
+    expect(flat.map((r) => r.depth)).toEqual([0, 1, 1, 2, 0])
+  })
+
+  it('returns an empty array for null/empty input', () => {
+    expect(flattenRows(null)).toEqual([])
+    expect(flattenRows([])).toEqual([])
+  })
+})
+
+describe('rollupStatus', () => {
+  it('marks a directory different when any descendant differs', () => {
+    const dir = row({ name: 'd', isDir: true, left: '/l/d', right: '/r/d', children: [
+      row({ name: 'ok.txt', status: 'same' }),
+      row({ name: 'bad.txt', status: 'different' }),
+    ] })
+    expect(rollupStatus(dir)).toBe('different')
+  })
+
+  it('propagates a single-sided newer status', () => {
+    const dir = row({ name: 'd', isDir: true, left: '/l/d', right: '/r/d', children: [
+      row({ name: 'ok.txt', status: 'same' }),
+      row({ name: 'n.txt', status: 'left-newer' }),
+    ] })
+    expect(rollupStatus(dir)).toBe('left-newer')
+  })
+
+  it('reports different when both sides have newer files', () => {
+    const dir = row({ name: 'd', isDir: true, left: '/l/d', right: '/r/d', children: [
+      row({ name: 'a', status: 'left-newer' }),
+      row({ name: 'b', status: 'right-newer' }),
+    ] })
+    expect(rollupStatus(dir)).toBe('different')
+  })
+
+  it('rolls up through more than one level', () => {
+    const dir = row({ name: 'top', isDir: true, left: '/l/t', right: '/r/t', children: [
+      row({ name: 'mid', isDir: true, left: '/l/t/m', right: '/r/t/m', children: [
+        row({ name: 'leaf', status: 'different' }),
+      ] }),
+    ] })
+    expect(rollupStatus(dir)).toBe('different')
+  })
+
+  it('stays same when every descendant matches', () => {
+    const dir = row({ name: 'd', isDir: true, left: '/l/d', right: '/r/d', children: [
+      row({ name: 'a', status: 'same' }),
+      row({ name: 'b', status: 'same' }),
+    ] })
+    expect(rollupStatus(dir)).toBe('same')
+  })
+
+  it('leaves orphan directories alone', () => {
+    expect(rollupStatus(row({ name: 'd', status: 'left-only', left: '/l/d', isDir: true }))).toBe('left-only')
+  })
+
+  it('does not guess when children have not been loaded', () => {
+    expect(rollupStatus(row({ name: 'd', status: 'same', left: '/l/d', right: '/r/d', isDir: true }))).toBe('same')
+  })
+})
+
+describe('FolderCompare.getRowStats', () => {
+  it('counts hyphenated statuses that the underscore keys previously missed', () => {
+    const fc = buildFC([
+      row({ name: 'a', status: 'left-only',   left: '/l/a' }),
+      row({ name: 'b', status: 'right-only',  right: '/r/b' }),
+      row({ name: 'c', status: 'left-newer',  left: '/l/c', right: '/r/c' }),
+      row({ name: 'd', status: 'right-newer', left: '/l/d', right: '/r/d' }),
+      row({ name: 'e', status: 'same',        left: '/l/e', right: '/r/e' }),
+      row({ name: 'f', status: 'different',   left: '/l/f', right: '/r/f' }),
+    ])
+    const stats = fc.getRowStats()
+    expect(stats.left_only).toBe(1)
+    expect(stats.right_only).toBe(1)
+    expect(stats.left_newer).toBe(1)
+    expect(stats.right_newer).toBe(1)
+    expect(stats.same).toBe(1)
+    expect(stats.different).toBe(1)
+    expect(stats.total).toBe(6)
+  })
+
+  it('includes rows inside expanded subdirectories', () => {
+    const fc = buildFC([
+      row({ name: 'dir', isDir: true, left: '/l/dir', right: '/r/dir', children: [
+        row({ name: 'x', status: 'different', left: '/l/dir/x', right: '/r/dir/x' }),
+        row({ name: 'y', status: 'left-only', left: '/l/dir/y' }),
+      ] }),
+    ])
+    const stats = fc.getRowStats()
+    expect(stats.different).toBe(1)
+    expect(stats.left_only).toBe(1)
+    expect(stats.total).toBe(3) // the directory row itself plus both children
+  })
+})
+
+describe('FolderCompare HTML report', () => {
+  it('renders nested rows and localised status labels', () => {
+    const fc = buildFC([
+      row({ name: 'dir', isDir: true, left: '/l/dir', right: '/r/dir', children: [
+        row({ name: 'child.txt', status: 'left-only', left: '/l/dir/child.txt' }),
+      ] }),
+    ])
+    const html = fc.buildHtmlReport()
+    expect(html).toContain('child.txt')
+    expect(html).toContain('僅左側')
+    // Status label lookup used to fall through to the raw hyphenated value.
+    expect(html).not.toContain('>left-only<')
+  })
+})
+
+describe('FolderCompare.expandAll', () => {
+  it('actually loads children rather than only setting flags', async () => {
+    window.electronAPI = {
+      readDir: vi.fn().mockImplementation(async (p) => {
+        if (p === '/l/dir' || p === '/r/dir') {
+          return [{ name: 'leaf.txt', path: `${p}/leaf.txt`, isDirectory: false, size: 1, mtime: '2024-01-01T00:00:00.000Z' }]
+        }
+        return []
+      }),
+    }
+    const fc = new FolderCompare({ leftPath: '/l', rightPath: '/r' })
+    fc._dom = { list: document.createElement('div') }
+    fc._rows = [row({ name: 'dir', isDir: true, left: '/l/dir', right: '/r/dir' })]
+    fc._applyFilterAndRender = vi.fn()
+
+    await fc.expandAll()
+
+    expect(fc._rows[0].children).toHaveLength(1)
+    expect(fc._rows[0].children[0].name).toBe('leaf.txt')
+    expect(fc._expanded.size).toBe(1)
+  })
+})
 
 // ── Hex Complete-mode byte diff ─────────────────────────────────────────────
 

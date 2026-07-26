@@ -76,6 +76,12 @@ function globMatch(str, pattern) {
   return new RegExp(`^${re}$`, 'i').test(str)
 }
 
+/**
+ * Upper bound on directories loaded by a single Expand All, so a deep tree
+ * cannot fire an unbounded number of readDir IPC calls.
+ */
+const MAX_EXPAND_ALL_DIRS = 2000
+
 // ── compareEntries ────────────────────────────────────────────────────────────
 
 /**
@@ -88,7 +94,7 @@ function globMatch(str, pattern) {
  *   name, status, left: FileEntry|null, right: FileEntry|null
  * }
  */
-function compareEntries(leftEntries, rightEntries, mode) {
+function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0) {
   const leftMap = new Map(leftEntries.map((e) => [e.name, e]))
   const rightMap = new Map(rightEntries.map((e) => [e.name, e]))
   const allNames = new Set([...leftMap.keys(), ...rightMap.keys()])
@@ -107,21 +113,27 @@ function compareEntries(leftEntries, rightEntries, mode) {
   for (const name of sorted) {
     const left = leftMap.get(name) ?? null
     const right = rightMap.get(name) ?? null
-    const status = computeStatus(left, right, mode)
-    rows.push({ name, status, left, right })
+    const status = computeStatus(left, right, mode, mtimeTolerance)
+    // `children` is null until the directory is expanded or a full scan pulls
+    // it in; an empty array means "loaded, and it has no entries".
+    rows.push({ name, status, left, right, children: null })
   }
   return rows
 }
 
 /**
  * 依 mode 計算單一檔案/目錄的狀態
+ * @param {FileEntry|null} left
+ * @param {FileEntry|null} right
+ * @param {'name'|'size'|'mtime'|'both'} mode
+ * @param {number} [mtimeTolerance] 秒；時間差在容差內視為相同（跨檔案系統複製常見）
  * @returns {'same'|'left-only'|'right-only'|'different'|'left-newer'|'right-newer'}
  */
-function computeStatus(left, right, mode) {
+function computeStatus(left, right, mode, mtimeTolerance = 0) {
   if (!right) return 'left-only'
   if (!left) return 'right-only'
 
-  // 目錄：僅依名稱
+  // 目錄本身沒有大小/內容可比；狀態改由子項 rollup 決定（見 _rollupStatus）。
   if (left.isDirectory && right.isDirectory) return 'same'
 
   if (mode === 'name') return 'same'
@@ -129,7 +141,7 @@ function computeStatus(left, right, mode) {
   const sizeDiff = left.size !== right.size
   const lTime = new Date(left.mtime).getTime()
   const rTime = new Date(right.mtime).getTime()
-  const timeDiff = lTime !== rTime
+  const timeDiff = Math.abs(lTime - rTime) > mtimeTolerance * 1000
 
   if (mode === 'size') {
     return sizeDiff ? 'different' : 'same'
@@ -145,6 +157,58 @@ function computeStatus(left, right, mode) {
   if (sizeDiff) return 'different'
   // size 相同但時間不同
   return lTime > rTime ? 'left-newer' : 'right-newer'
+}
+
+/**
+ * 深度優先攤平樹狀 CompareRow，並標注每列 depth。
+ *
+ * 報表與統計都以此為單一來源，避免「只有頂層進得了報表」的問題。
+ *
+ * @param {CompareRow[]} rows
+ * @param {number} [depth]
+ * @returns {CompareRow[]} 每個元素帶有 depth 欄位
+ */
+export function flattenRows(rows, depth = 0) {
+  const out = []
+  for (const row of rows ?? []) {
+    out.push({ ...row, depth })
+    if (row.children?.length) {
+      out.push(...flattenRows(row.children, depth + 1))
+    }
+  }
+  return out
+}
+
+/**
+ * 依已載入的子項回推目錄狀態。
+ *
+ * BeyondCompare 的目錄列會反映「底下有沒有差異」；原本的實作把兩側都存在的
+ * 目錄一律當成 'same'，使用者從摺疊的樹上看不出哪裡有差異。
+ *
+ * 子項尚未載入（children === null）時維持原狀態，不臆測。
+ *
+ * @param {CompareRow} row
+ * @returns {CompareRow['status']}
+ */
+export function rollupStatus(row) {
+  if (row.status === 'left-only' || row.status === 'right-only') return row.status
+  if (!row.children) return row.status
+
+  let sawLeftNewer = false
+  let sawRightNewer = false
+  let sawOther = false
+  for (const child of row.children) {
+    const s = child.children ? rollupStatus(child) : child.status
+    if (s === 'same') continue
+    if (s === 'left-newer') sawLeftNewer = true
+    else if (s === 'right-newer') sawRightNewer = true
+    else sawOther = true
+  }
+  if (sawOther) return 'different'
+  if (sawLeftNewer && sawRightNewer) return 'different'
+  if (sawLeftNewer) return 'left-newer'
+  if (sawRightNewer) return 'right-newer'
+  return 'same'
 }
 
 // ── FolderCompare Class ───────────────────────────────────────────────────────
@@ -175,8 +239,18 @@ export class FolderCompare {
     // Expanded directories: Set of "side:path"
     this._expanded = new Set()
 
-    // Cached rows after compare+filter
+    // Root of the compare tree. Each row may carry `children` once loaded.
     this._rows = []
+
+    // expandKey → CompareRow, rebuilt on every full render so click handlers
+    // can reach the real model object instead of rebuilding a stub from
+    // dataset attributes.
+    /** @type {Map<string, CompareRow>} */
+    this._rowByKey = new Map()
+
+    // 時間戳容差（秒）。跨檔案系統複製（NTFS ↔ FAT32）會有 1–2 秒誤差，
+    // 預設 2 秒與 BeyondCompare 的 FAT 容差一致。
+    this._mtimeTolerance = options.mtimeTolerance ?? 2
 
     // Event handlers map
     this._handlers = {}
@@ -322,9 +396,13 @@ export class FolderCompare {
    */
   getRowStats() {
     const stats = { same: 0, different: 0, left_only: 0, right_only: 0, left_newer: 0, right_newer: 0, total: 0 }
-    for (const row of (this._rows ?? [])) {
-      if (row && Object.prototype.hasOwnProperty.call(stats, row.status)) {
-        stats[row.status]++
+    // row.status uses hyphens ('left-only'); the stat keys use underscores, so
+    // the counters have to be looked up through a normalising step — indexing
+    // with the raw status silently counted nothing but same/different.
+    for (const row of flattenRows(this._rows ?? [])) {
+      const key = String(row?.status ?? '').replace(/-/g, '_')
+      if (Object.prototype.hasOwnProperty.call(stats, key) && key !== 'total') {
+        stats[key]++
       }
     }
     stats.total = stats.same + stats.different + stats.left_only + stats.right_only + stats.left_newer + stats.right_newer
@@ -351,8 +429,9 @@ export class FolderCompare {
     const fmtSize = (n) => n == null ? '' : n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(1)} KB` : `${(n/1048576).toFixed(1)} MB`
     const fmtDate = (s) => s ? new Date(s).toLocaleString('zh-TW') : ''
 
-    const rows = (this._rows ?? []).map(row => {
-      const bg = statusColor[row.status] ?? '#fff'
+    const rows = flattenRows(this._rows ?? []).map(row => {
+      const key = String(row.status ?? '').replace(/-/g, '_')
+      const bg = statusColor[key] ?? '#fff'
       const indent = '  '.repeat((row.depth ?? 0))
       const name = indent + esc(row.name ?? '')
       const lSize = fmtSize(row.left?.size)
@@ -360,7 +439,7 @@ export class FolderCompare {
       const lDate = fmtDate(row.left?.mtime)
       const rDate = fmtDate(row.right?.mtime)
       return `<tr style="background:${bg}">
-  <td>${name}</td><td>${statusLabel[row.status] ?? row.status}</td>
+  <td>${name}</td><td>${statusLabel[key] ?? row.status}</td>
   <td>${lSize}</td><td>${lDate}</td>
   <td>${rSize}</td><td>${rDate}</td>
 </tr>`
@@ -793,13 +872,17 @@ ${rows}
 
   // ── T56: Expand/Collapse All ─────────────────────────────────────────────────
 
-  /** 遞迴收集所有頂層 isDir=true 的 entry key 並加入 _expanded */
-  expandAll() {
-    for (const row of this._rows) {
-      if (row.left?.isDirectory || row.right?.isDirectory) {
-        const expandKey = this._expandKey(0, row)
-        this._expanded.add(expandKey)
-      }
+  /**
+   * 遞迴展開整棵樹，實際載入每一層的子項。
+   *
+   * 舊版只在頂層設旗標而不載入資料，展開後畫面是空的佔位容器。
+   * 以 MAX_EXPAND_ALL_DIRS 為上限，避免在超大目錄樹上打爆 IPC。
+   */
+  async expandAll() {
+    const budget = { loaded: 0 }
+    await this._expandSubtree(this._rows, 0, budget)
+    if (budget.loaded >= MAX_EXPAND_ALL_DIRS) {
+      console.warn(`FolderCompare.expandAll: stopped after ${MAX_EXPAND_ALL_DIRS} directories`)
     }
     this._applyFilterAndRender()
   }
@@ -1278,7 +1361,7 @@ ${rows}
     })
 
     // T56: Expand All / Collapse All
-    btnExpandAll?.addEventListener('click', () => this.expandAll())
+    btnExpandAll?.addEventListener('click', () => void this.expandAll())
     btnCollapseAll?.addEventListener('click', () => this.collapseAll())
 
     // T51: Advanced selection dropdown
@@ -1463,7 +1546,7 @@ ${rows}
 
     // 先以 'both'（名稱+大小+時間）做初步比對；content 模式再進一步以 MD5 確認
     const baseMode = this._mode === 'content' ? 'both' : this._mode
-    this._rows = compareEntries(this._leftEntries, this._rightEntries, baseMode)
+    this._rows = compareEntries(this._leftEntries, this._rightEntries, baseMode, this._mtimeTolerance)
 
     if (this._mode === 'content' && window.electronAPI?.hashFile) {
       await this._applyContentHash()
@@ -1476,8 +1559,8 @@ ${rows}
    * 對需要進一步確認的列（size 相同但 mtime 不同，或 'different'）
    * 計算雙側 MD5；若 hash 相同則改為 'same'。
    */
-  async _applyContentHash() {
-    const candidates = this._rows.filter(row =>
+  async _applyContentHash(rows = this._rows) {
+    const candidates = rows.filter(row =>
       !row.left?.isDirectory &&
       !row.right?.isDirectory &&
       row.left?.path &&
@@ -1574,8 +1657,9 @@ ${rows}
     if (!target) return
 
     if (!parentEl) {
-      // 頂層：清空後重繪
+      // 頂層：清空後重繪，並重建 expandKey → row 的索引供點擊事件查詢。
       target.innerHTML = ''
+      this._rowByKey = new Map()
     }
 
     if (!rows.length) {
@@ -1592,21 +1676,91 @@ ${rows}
 
     const fragment = document.createDocumentFragment()
     for (const row of rows) {
+      const expandKey = this._expandKey(depth, row)
+      this._rowByKey.set(expandKey, row)
+
       const rowEl = this._buildRow(row, depth)
       fragment.appendChild(rowEl)
 
-      // 如果是已展開的目錄，插入子列表容器
-      const expandKey = this._expandKey(depth, row)
-      if (row.status === 'same' && row.left?.isDirectory && this._expanded.has(expandKey)) {
-        const subContainer = el('div', {
-          className: 'fc-sublist',
-          'data-expand-key': expandKey,
-        })
-        fragment.appendChild(subContainer)
-        // 子目錄內容由 _onRowClick 異步填入
+      const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
+      if (!isDir || !this._expanded.has(expandKey)) continue
+
+      const subContainer = el('div', {
+        className: 'fc-sublist',
+        'data-expand-key': expandKey,
+      })
+      fragment.appendChild(subContainer)
+
+      if (row.children) {
+        const visibleChildren = row.children.filter((r) => this._isRowVisible(r))
+        this._renderRows(visibleChildren, subContainer, depth + 1)
+      } else {
+        // 尚未載入：顯示佔位，由 _expandRow 補上後重繪。
+        subContainer.appendChild(el('div', { className: 'fc-loading' }, '⌛ 載入中…'))
       }
     }
     target.appendChild(fragment)
+  }
+
+  /**
+   * 讀取某個目錄列的子項並寫進資料模型（含 content-hash 與狀態 rollup）。
+   *
+   * 之前子項只存在於 DOM，所以報表、統計、目錄狀態全都看不到展開後的內容。
+   *
+   * @param {CompareRow} row
+   * @returns {Promise<void>}
+   */
+  async _loadChildren(row) {
+    if (row.children) return
+    const leftPath = row.left?.isDirectory ? row.left.path : null
+    const rightPath = row.right?.isDirectory ? row.right.path : null
+    if (!leftPath && !rightPath) {
+      row.children = []
+      return
+    }
+    const baseMode = this._mode === 'content' ? 'both' : this._mode
+    const [leftChildren, rightChildren] = await Promise.all([
+      leftPath  ? window.electronAPI.readDir(leftPath)  : Promise.resolve([]),
+      rightPath ? window.electronAPI.readDir(rightPath) : Promise.resolve([]),
+    ])
+    row.children = compareEntries(leftChildren, rightChildren, baseMode, this._mtimeTolerance)
+    if (this._mode === 'content' && window.electronAPI?.hashFile) {
+      await this._applyContentHash(row.children)
+    }
+    this._refreshRollups()
+  }
+
+  /** 由葉往根重算所有已載入目錄的狀態。 */
+  _refreshRollups() {
+    for (const row of this._rows ?? []) {
+      row.status = rollupStatus(row)
+    }
+  }
+
+  /**
+   * 遞迴載入某個子樹的所有層級，並把它們標記為展開。
+   * @param {CompareRow[]} rows
+   * @param {number} depth
+   * @param {{ loaded: number }} budget
+   */
+  async _expandSubtree(rows, depth, budget) {
+    for (const row of rows) {
+      if (budget.loaded >= MAX_EXPAND_ALL_DIRS) return
+      const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
+      if (!isDir) continue
+      this._expanded.add(this._expandKey(depth, row))
+      if (!row.children) {
+        budget.loaded++
+        try {
+          await this._loadChildren(row)
+        } catch (err) {
+          console.error('FolderCompare._expandSubtree error:', err)
+          row.children = []
+          continue
+        }
+      }
+      await this._expandSubtree(row.children, depth + 1, budget)
+    }
   }
 
   _expandKey(depth, row) {
@@ -1641,13 +1795,14 @@ ${rows}
     rowEl.appendChild(cb)
 
     // Left cell
+    const expanded = isDir && this._expanded.has(this._expandKey(depth, row))
     const leftCell = this._buildCell(row.left, isDir, depth,
-      row.status === 'right-only', row.status, 'left')
+      row.status === 'right-only', row.status, 'left', expanded)
     // Separator
     const sep = el('div', { className: 'fc-row-sep' })
     // Right cell
     const rightCell = this._buildCell(row.right, isDir, depth,
-      row.status === 'left-only', row.status, 'right')
+      row.status === 'left-only', row.status, 'right', expanded)
 
     rowEl.appendChild(leftCell)
     rowEl.appendChild(sep)
@@ -1663,8 +1818,9 @@ ${rows}
    * @param {boolean} isEmpty - 孤兒側（對側沒有此檔案）
    * @param {string} status
    * @param {'left'|'right'} side
+   * @param {boolean} [expanded] - 目錄是否已展開（決定 ▶ / ▼）
    */
-  _buildCell(entry, isDir, depth, isEmpty, status, side) {
+  _buildCell(entry, isDir, depth, isEmpty, status, side, expanded = false) {
     if (isEmpty || !entry) {
       return el('div', { className: 'fc-cell fc-cell-empty fc-cell-' + side })
     }
@@ -1679,7 +1835,7 @@ ${rows}
       prefix.appendChild(indent)
     }
     if (isDir) {
-      prefix.appendChild(el('span', { className: 'fc-toggle' }, '▶'))
+      prefix.appendChild(el('span', { className: 'fc-toggle' }, expanded ? '▼' : '▶'))
     } else {
       prefix.appendChild(el('span', { className: 'fc-toggle' }, ''))
     }
@@ -1750,20 +1906,16 @@ ${rows}
     const leftPath = rowEl.dataset.leftPath
     const rightPath = rowEl.dataset.rightPath
     const name = rowEl.dataset.name
-
-    // Reconstruct a minimal row object to compute expand key
-    const row = {
+    const expandKey = this._expandKey(depth, {
       name,
-      status: rowEl.dataset.status,
-      left:  leftPath  ? { path: leftPath,  isDirectory: true } : null,
-      right: rightPath ? { path: rightPath, isDirectory: true } : null,
-    }
-    const expandKey = this._expandKey(depth, row)
+      left:  leftPath  ? { path: leftPath }  : null,
+      right: rightPath ? { path: rightPath } : null,
+    })
 
     if (this._expanded.has(expandKey)) {
-      this._collapseDir(rowEl, expandKey)
+      this._collapseDir(expandKey)
     } else {
-      this._expandDir(rowEl, expandKey, leftPath, rightPath, depth + 1)
+      void this._expandDir(expandKey)
     }
   }
 
@@ -1978,62 +2130,47 @@ ${rows}
 
   // ── Private: Directory expand/collapse ──────────────────────────────────────
 
-  async _expandDir(rowEl, expandKey, leftPath, rightPath, childDepth) {
+  /**
+   * 展開某個目錄列：載入子項到模型後重繪。
+   * @param {string} expandKey
+   */
+  async _expandDir(expandKey) {
+    const row = this._rowByKey.get(expandKey)
+    if (!row) return
     this._expanded.add(expandKey)
 
-    // Update toggle arrow
-    const toggle = rowEl.querySelector('.fc-toggle')
-    if (toggle) toggle.textContent = '▼'
-
-    // Check for existing sub-container
-    let subContainer = rowEl.nextElementSibling
-    if (subContainer?.dataset?.expandKey === expandKey) {
-      subContainer.style.display = ''
+    if (row.children) {
+      this._rerenderPreservingScroll()
       return
     }
 
-    // Create sub-container and insert after rowEl
-    subContainer = el('div', {
-      className: 'fc-sublist',
-      'data-expand-key': expandKey,
-    })
-    rowEl.insertAdjacentElement('afterend', subContainer)
-
-    // Loading indicator
-    subContainer.appendChild(el('div', { className: 'fc-loading' }, '⌛ 載入中…'))
-
+    // 先畫出佔位（_renderRows 會處理 children === null 的情況）
+    this._rerenderPreservingScroll()
     try {
-      const [leftChildren, rightChildren] = await Promise.all([
-        leftPath  ? window.electronAPI.readDir(leftPath)  : Promise.resolve([]),
-        rightPath ? window.electronAPI.readDir(rightPath) : Promise.resolve([]),
-      ])
-
-      const childRows = compareEntries(leftChildren, rightChildren, this._mode)
-      const visible = childRows.filter((r) => this._isRowVisible(r))
-
-      subContainer.innerHTML = ''
-      this._renderRows(visible, subContainer, childDepth)
+      await this._loadChildren(row)
     } catch (err) {
       console.error('FolderCompare._expandDir error:', err)
-      subContainer.innerHTML = ''
-      subContainer.appendChild(
-        el('div', { className: 'fc-loading' }, `⚠️ ${err.message}`)
-      )
+      row.children = []
     }
+    this._rerenderPreservingScroll()
   }
 
-  _collapseDir(rowEl, expandKey) {
+  /**
+   * 收合某個目錄列。子項保留在模型中，之後再展開不需重新讀取，
+   * 報表與統計也仍看得到。
+   * @param {string} expandKey
+   */
+  _collapseDir(expandKey) {
     this._expanded.delete(expandKey)
+    this._rerenderPreservingScroll()
+  }
 
-    // Update toggle arrow
-    const toggle = rowEl.querySelector('.fc-toggle')
-    if (toggle) toggle.textContent = '▶'
-
-    // Hide sub-container
-    const subContainer = rowEl.nextElementSibling
-    if (subContainer?.dataset?.expandKey === expandKey) {
-      subContainer.style.display = 'none'
-    }
+  /** 重繪列表並還原捲動位置，避免展開/收合時畫面跳回頂端。 */
+  _rerenderPreservingScroll() {
+    const list = this._dom.list
+    const top = list?.scrollTop ?? 0
+    this._applyFilterAndRender()
+    if (list) list.scrollTop = top
   }
 
   // ── Private: Path display update ────────────────────────────────────────────
