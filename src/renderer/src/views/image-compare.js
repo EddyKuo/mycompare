@@ -638,6 +638,40 @@ export class ImageCompare {
     this._mounted = true
   }
 
+  /**
+   * Snapshot of the view's comparison settings, for the named-config store.
+   * @returns {object}
+   */
+  getConfig() {
+    return {
+      threshold: this._threshold,
+      algorithm: this._algorithm,
+      blendMode: this._blendMode,
+      autoScale: this._autoScale,
+      mismatchRange: this._mismatchRange,
+      highlightColor: this._highlightColor,
+    }
+  }
+
+  /**
+   * @param {object} cfg
+   */
+  applyConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return
+    if (typeof cfg.threshold === 'number' && cfg.threshold >= 0 && cfg.threshold <= 1) {
+      this._threshold = cfg.threshold
+    }
+    if (['exact', 'tolerance', 'grayscale'].includes(cfg.algorithm)) this._algorithm = cfg.algorithm
+    if (['normal', 'difference', 'blend'].includes(cfg.blendMode)) this._blendMode = cfg.blendMode
+    if (typeof cfg.autoScale === 'boolean') this._autoScale = cfg.autoScale
+    if (typeof cfg.mismatchRange === 'boolean') this._mismatchRange = cfg.mismatchRange
+    if (typeof cfg.highlightColor === 'string'
+        && Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, cfg.highlightColor)) {
+      this._highlightColor = cfg.highlightColor
+    }
+    this.refresh()
+  }
+
   /** 銷毀元件，清除 DOM 與事件 */
   destroy() {
     this._mounted = false

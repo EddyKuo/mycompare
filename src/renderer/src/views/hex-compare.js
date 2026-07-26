@@ -518,6 +518,34 @@ export class HexCompare {
     })
   }
 
+  // ── Public: settings snapshot ───────────────────────────────────────────────
+
+  /**
+   * Snapshot of the view's comparison settings, for the named-config store.
+   * Paths and file contents are deliberately excluded — a saved config is
+   * meant to be applied to any pair of files.
+   *
+   * @returns {{ bytesPerRow: number, diffAlgorithm: string }}
+   */
+  getConfig() {
+    return {
+      bytesPerRow: this._bytesPerRow,
+      diffAlgorithm: this._diffAlgorithm,
+    }
+  }
+
+  /**
+   * @param {{ bytesPerRow?: number, diffAlgorithm?: string }} cfg
+   */
+  applyConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return
+    if ([8, 16, 32].includes(cfg.bytesPerRow)) this._bytesPerRow = cfg.bytesPerRow
+    if (cfg.diffAlgorithm === 'fast' || cfg.diffAlgorithm === 'complete') {
+      this._diffAlgorithm = cfg.diffAlgorithm
+    }
+    this.refresh()
+  }
+
   // ── Public: reports ─────────────────────────────────────────────────────────
 
   /**

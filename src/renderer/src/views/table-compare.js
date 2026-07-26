@@ -1182,6 +1182,31 @@ export class TableCompare {
   }
 
   /**
+   * Snapshot of the view's comparison settings, for the named-config store.
+   * @returns {object}
+   */
+  getConfig() {
+    return {
+      hasHeader: this._hasHeader,
+      keyColumns: this.getKeyColumns(),
+      ignoreColumnOrder: this._ignoreColumnOrder,
+      columnRules: JSON.parse(JSON.stringify(this.getColumnRules() ?? {})),
+    }
+  }
+
+  /**
+   * @param {object} cfg
+   */
+  applyConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return
+    if (typeof cfg.hasHeader === 'boolean') this._hasHeader = cfg.hasHeader
+    if (typeof cfg.ignoreColumnOrder === 'boolean') this._ignoreColumnOrder = cfg.ignoreColumnOrder
+    if (cfg.keyColumns !== undefined) this.setKeyColumns(cfg.keyColumns)
+    if (cfg.columnRules && typeof cfg.columnRules === 'object') this.setColumnRules(cfg.columnRules)
+    this.refresh()
+  }
+
+  /**
    * Plain-text report of the differing rows.
    *
    * Lists differences only, and caps the listing: a table that differs

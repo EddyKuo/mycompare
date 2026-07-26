@@ -840,9 +840,24 @@ const workspaceStore = new WorkspaceStore()
  * Currently only TextCompare implements the contract.
  * @returns {{ view: object, type: 'text' | null }}
  */
+/**
+ * The view whose settings the named-config modal should read and write.
+ *
+ * Configs are keyed by session type, so a folder config is never offered while
+ * a text comparison is open.
+ */
 function _getActiveConfigurableView() {
-  if (currentView === 'text' && textCompare) return { view: textCompare, type: 'text' }
-  return { view: null, type: null }
+  const byType = {
+    text: textCompare,
+    folder: folderCompare,
+    table: tableCompare,
+    image: imageCompare,
+    hex: hexCompare,
+  }
+  const view = byType[currentView]
+  return view && typeof view.getConfig === 'function'
+    ? { view, type: currentView }
+    : { view: null, type: null }
 }
 
 function openConfigModal() {

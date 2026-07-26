@@ -724,6 +724,38 @@ export class FolderCompare {
     await this.setRight(result.path)
   }
 
+  /**
+   * Snapshot of the view's comparison settings, for the named-config store.
+   * Paths are excluded so a config can be applied to any pair of folders.
+   * @returns {object}
+   */
+  getConfig() {
+    return {
+      mode: this._mode,
+      viewPreset: this._viewPreset,
+      mtimeTolerance: this._mtimeTolerance,
+      filterStr: this._filterStr,
+      columns: [...this._columns],
+    }
+  }
+
+  /**
+   * @param {object} cfg
+   */
+  applyConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return
+    if (['name', 'size', 'mtime', 'both', 'content'].includes(cfg.mode)) this._mode = cfg.mode
+    if (typeof cfg.mtimeTolerance === 'number' && cfg.mtimeTolerance >= 0) {
+      this._mtimeTolerance = cfg.mtimeTolerance
+    }
+    if (typeof cfg.filterStr === 'string') this._filterStr = cfg.filterStr
+    if (Array.isArray(cfg.columns)) this.setColumns(cfg.columns)
+    if (cfg.viewPreset && VIEW_PRESETS[cfg.viewPreset]) this.setViewPreset(cfg.viewPreset)
+    // A mode change alters comparison results, so re-scan rather than just
+    // re-render; without paths there is nothing to do yet.
+    if (this._leftPath || this._rightPath) void this._compareAndRender()
+  }
+
   /** 開啟檔名搜尋列（Search ▸ Find Filename）。 */
   openFindBar() {
     this._openFindBar()
