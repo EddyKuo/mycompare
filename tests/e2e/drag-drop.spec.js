@@ -81,3 +81,21 @@ test('non-array and junk input is handled', async () => {
   expect(results[0]).toEqual([])
   expect(results[1]).toEqual([])
 })
+
+test('read-dir reports attributes the folder view can display', async () => {
+  const entries = await win.evaluate(async (d) => {
+    await window.electronAPI.acceptDroppedPaths([d])
+    return window.electronAPI.readDir(d)
+  }, dir)
+
+  expect(entries.length).toBeGreaterThan(0)
+  const file = entries.find((e) => e.name === 'a.txt')
+  expect(file).toBeTruthy()
+  expect(typeof file.readOnly).toBe('boolean')
+  expect(typeof file.ctime).toBe('string')
+  // hidden is null where the platform cannot say, never a guess.
+  expect(file.hidden === null || typeof file.hidden === 'boolean').toBe(true)
+
+  const sub = entries.find((e) => e.name === 'sub')
+  expect(sub.isDirectory).toBe(true)
+})

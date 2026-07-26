@@ -354,6 +354,31 @@ ipcMain.handle('open-zip', async (event) => {
   return { zipPath, entries }
 })
 
+/**
+ * Attribute flags for a directory entry.
+ *
+ * Folder compare offers an Attributes column that could previously only report
+ * "directory" and "symlink", because this handler returned nothing else.
+ *
+ * Read-only is derivable everywhere: Windows maps the read-only attribute onto
+ * the mode's write bits, and on Unix the owner-write bit is the direct
+ * equivalent. Hidden and system are not — Node's Stats carries no attribute
+ * bits on any platform, so on Windows they would need a native call this app
+ * does not make. `hidden` is therefore reported only where the dot convention
+ * genuinely defines it, and left null elsewhere rather than guessed, so the UI
+ * can distinguish "not hidden" from "cannot tell".
+ *
+ * @param {string} name
+ * @param {import('fs').Stats} s
+ * @returns {{ readOnly: boolean, hidden: boolean|null }}
+ */
+function fileAttributes(name, s) {
+  return {
+    readOnly: (s.mode & 0o200) === 0,
+    hidden: process.platform === 'win32' ? null : name.startsWith('.'),
+  }
+}
+
 // IPC: 讀取資料夾內容（一層）
 ipcMain.handle('read-dir', async (_event, dirPath) => {
   const safe = validatePath(dirPath)
@@ -372,7 +397,9 @@ ipcMain.handle('read-dir', async (_event, dirPath) => {
           isDirectory: s.isDirectory(),
           isSymbolicLink: entry.isSymbolicLink(),
           size: s.size,
-          mtime: s.mtime.toISOString()
+          mtime: s.mtime.toISOString(),
+          ctime: s.ctime.toISOString(),
+          ...fileAttributes(entry.name, s)
         }
       } catch {
         // Permission denied / broken symlink — skip
