@@ -114,6 +114,13 @@ export function validatePath(p) {
   if (p.includes('::')) {
     throw new Error('Invalid path: zip-virtual paths cannot be passed to fs IPC')
   }
+  // Virtual schemes name things that have no file behind them — a snapshot
+  // entry, a remote object. Letting one through would read whatever happens to
+  // sit at that location instead.
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(p)
+  if (scheme) {
+    throw new Error(`Invalid path: ${scheme[1]}:// paths cannot be passed to fs IPC`)
+  }
   if (!isAbsolute(p)) {
     throw new Error('Invalid path: must be absolute')
   }

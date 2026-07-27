@@ -47,6 +47,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readMetadata: (path) => ipcRenderer.invoke('read-metadata', path),
   exportRegistryKey: (keyPath) => ipcRenderer.invoke('export-registry-key', { keyPath }),
   readRegFile: (path) => ipcRenderer.invoke('read-reg-file', path),
+
+  // Remote connections. Each call names a profile the user created; nothing
+  // here reaches the network on its own.
+  remoteListProfiles: () => ipcRenderer.invoke('remote-list-profiles'),
+  remoteSaveProfile: (profile) => ipcRenderer.invoke('remote-save-profile', profile),
+  remoteDeleteProfile: (id) => ipcRenderer.invoke('remote-delete-profile', id),
+  remoteListDir: (profileId, dir, secret) =>
+    ipcRenderer.invoke('remote-list-dir', { profileId, dir, secret }),
+  remoteReadFile: (profileId, path, maxBytes, secret) =>
+    ipcRenderer.invoke('remote-read-file', { profileId, path, maxBytes, secret }),
+  remoteDisconnect: (profileId) => ipcRenderer.invoke('remote-disconnect', profileId),
   renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
   mkdirFolder: (dirPath) => ipcRenderer.invoke('mkdir-folder', dirPath),
   toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),

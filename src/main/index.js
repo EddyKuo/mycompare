@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electron'
 import { join, extname, dirname, basename } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open } from 'fs/promises'
 import { watch } from 'fs'
@@ -10,6 +10,7 @@ import { parseScript, describeScript, isMutating } from './script.js'
 import { runScript } from './script-runner.js'
 import { writeSnapshot, readSnapshot, snapshotLevel } from './snapshot.js'
 import { readArchive, readArchiveEntry } from './archive.js'
+import { registerRemoteIpc } from './remote-ipc.js'
 
 // ── T33 (S12-W): File Watcher — capped to avoid resource exhaustion ──
 const MAX_WATCHERS = 64
@@ -165,6 +166,15 @@ app.whenReady().then(async () => {
 
   const win = createWindow()
   buildAppMenu(win)
+
+  // Remote support is registered but dormant: nothing here connects until a
+  // profile exists and the renderer asks for it.
+  registerRemoteIpc({
+    ipcMain,
+    userDataPath: () => app.getPath('userData'),
+    fs: { readFile, writeFile, mkdir },
+    crypto: safeStorage,
+  })
 
   const cliFiles = cli.paths
   // S12-S01: CLI args are user-trusted — register them as allowed roots.

@@ -1589,6 +1589,125 @@ async function exportRegistry() {
   }
 }
 
+/**
+ * Manage remote connection profiles.
+ *
+ * Creating a profile is the point at which the user supplies a host and
+ * credentials; nothing connects until a comparison is actually opened.
+ */
+async function manageRemoteProfiles() {
+  const api = window.electronAPI
+  if (!api?.remoteListProfiles) { showStatus('此版本未包含遠端連線功能'); return }
+
+  let profiles
+  try {
+    profiles = await api.remoteListProfiles()
+  } catch (err) {
+    showStatus(`讀取連線設定失敗：${err.message}`)
+    return
+  }
+
+  const summary = profiles.length
+    ? profiles.map((p, i) => `${i + 1}. ${p.name}（${p.kind} ${p.host || p.bucket || ''}）`).join('\n')
+    : '（尚無連線設定）'
+  const choice = prompt(
+    `目前的遠端連線：
+${summary}
+
+` +
+    '輸入 new 新增，或輸入編號後加 del 刪除（例如「1 del」）：')
+  if (!choice) return
+
+  if (choice.trim().toLowerCase() === 'new') {
+    await createRemoteProfile()
+    return
+  }
+  const del = /^(\d+)\s+del$/i.exec(choice.trim())
+  if (del) {
+    const target = profiles[Number(del[1]) - 1]
+    if (!target) { showStatus('沒有該編號'); return }
+    try {
+      await api.remoteDeleteProfile(target.id)
+      showStatus(`已刪除「${target.name}」`)
+    } catch (err) {
+      showStatus(`刪除失敗：${err.message}`)
+    }
+  }
+}
+
+/** Collect a new profile from the user. */
+async function createRemoteProfile() {
+  const kind = prompt('連線類型（ftp / ftps / s3）：', 'ftp')?.trim().toLowerCase()
+  if (!kind) return
+  const name = prompt('這個連線的名稱：')?.trim()
+  if (!name) return
+
+  /** @type {Record<string, unknown>} */
+  const profile = { name, kind, saveSecret: false }
+  if (kind === 's3') {
+    profile.bucket = prompt('Bucket：')?.trim()
+    profile.region = prompt('Region（例如 us-east-1）：')?.trim()
+    profile.user = prompt('Access Key ID：')?.trim()
+  } else {
+    profile.host = prompt('主機：')?.trim()
+    profile.user = prompt('使用者名稱：')?.trim()
+    profile.path = prompt('起始路徑（可留空）：')?.trim() ?? ''
+  }
+
+  // The password is deliberately not persisted unless asked for: it can only
+  // be stored encrypted, and where the OS cannot encrypt it must not be stored
+  // at all.
+  profile.saveSecret = confirm('要記住密碼嗎？（只會以作業系統加密後儲存；無法加密時不會儲存）')
+  if (profile.saveSecret) {
+    profile.secret = prompt(kind === 's3' ? 'Secret Access Key：' : '密碼：') ?? ''
+  }
+
+  try {
+    const saved = await window.electronAPI.remoteSaveProfile(profile)
+    showStatus(`已儲存連線「${saved.name}」`)
+  } catch (err) {
+    showStatus(`儲存失敗：${err.message}`)
+  }
+}
+
+/**
+ * Open a remote folder as one side of a comparison.
+ *
+ * This is where the app first reaches the network, and only because the user
+ * picked a profile and asked for it.
+ */
+async function openRemoteFolder() {
+  const api = window.electronAPI
+  if (!api?.remoteListDir) { showStatus('此版本未包含遠端連線功能'); return }
+
+  let profiles = []
+  try {
+    profiles = await api.remoteListProfiles()
+  } catch { /* fall through to the empty case */ }
+  if (!profiles.length) {
+    showStatus('尚無遠端連線設定，請先從「遠端連線設定…」新增')
+    return
+  }
+
+  const pick = prompt(
+    `選擇連線：
+${profiles.map((p, i) => `${i + 1}. ${p.name}`).join('\n')}`, '1')
+  const profile = profiles[Number(pick) - 1]
+  if (!profile) return
+
+  const secret = profile.hasSecret
+    ? undefined
+    : (prompt(`「${profile.name}」的密碼：`) ?? undefined)
+
+  showStatus(`連線至 ${profile.name}…`)
+  try {
+    const rows = await api.remoteListDir(profile.id, '', secret)
+    showStatus(`${profile.name}：${rows.length} 個項目（遠端瀏覽為唯讀）`)
+  } catch (err) {
+    showStatus(`連線失敗：${err.message}`)
+  }
+}
+
 /** Open a .reg file and report what it contains. */
 async function openRegFile() {
   try {
@@ -1721,6 +1840,8 @@ function setupMenuActions() {
     'session.snapshot.open':      () => void openSnapshot(),
     'session.registry.export':    () => void exportRegistry(),
     'session.registry.open':      () => void openRegFile(),
+    'session.remote.profiles':    () => void manageRemoteProfiles(),
+    'session.remote.open':        () => void openRemoteFolder(),
 
     'session.swap': () => {
       const view = { text: textCompare, folder: folderCompare, hex: hexCompare, table: tableCompare }[currentView]
