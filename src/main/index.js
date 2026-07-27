@@ -11,6 +11,7 @@ import { runScript } from './script-runner.js'
 import { writeSnapshot, readSnapshot, snapshotLevel } from './snapshot.js'
 import { readArchive, readArchiveEntry } from './archive.js'
 import { registerRemoteIpc } from './remote-ipc.js'
+import { backupFile, normaliseBackupOptions } from './backup.js'
 
 // ── T33 (S12-W): File Watcher — capped to avoid resource exhaustion ──
 const MAX_WATCHERS = 64
@@ -394,10 +395,12 @@ ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encod
     : await dialog.showSaveDialog(opts)
   if (canceled || !filePath) return false
   registerRoot(filePath)
-  if (backup !== false) await backupExisting(filePath)
+  const backupResult = await backupExisting(filePath, backup)
   // Write back in the file's original encoding, not unconditionally UTF-8.
   await writeFile(filePath, encodeContent(content, encoding))
-  return true
+  // The caller decides what to do about a failed backup; hiding it would let
+  // the user believe a previous version was kept when none was.
+  return { saved: true, path: filePath, backup: backupResult }
 })
 
 /**
@@ -410,17 +413,25 @@ ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encod
  * @param {string} filePath already registered as an allowed root
  * @returns {Promise<void>}
  */
-async function backupExisting(filePath) {
-  try {
-    await stat(filePath)
-  } catch {
-    return // nothing there yet, nothing to preserve
+async function backupExisting(filePath, backup) {
+  const options = normaliseBackupOptions(backup)
+  // A custom backup folder is a renderer-supplied path, so it has to clear the
+  // allow-list like any other write target — otherwise "where to keep backups"
+  // becomes a way to write a copy of the file anywhere on disk.
+  if (options.folder) {
+    try {
+      options.folder = validatePath(options.folder)
+    } catch (err) {
+      console.error('[save-file] backup folder rejected:', err)
+      return { backedUp: false, path: null, reason: 'folder-not-allowed' }
+    }
   }
-  try {
-    await copyFile(filePath, `${filePath}.bak`)
-  } catch (err) {
-    console.error('[save-file] backup failed:', err)
+  const result = await backupFile(filePath, options, { stat, copyFile, mkdir })
+  if (!result.backedUp && result.reason && result.reason !== 'absent'
+      && result.reason !== 'disabled') {
+    console.error('[save-file] backup failed:', result.reason)
   }
+  return result
 }
 
 // IPC: 開啟 Zip 檔案並回傳虛擬目錄項目清單
