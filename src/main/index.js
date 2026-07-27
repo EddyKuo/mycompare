@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electro
 import { join, extname, dirname, basename } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod } from 'fs/promises'
 import { watch } from 'fs'
+import { execFile } from 'child_process'
 import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
 import { buildAppMenu } from './menu.js'
@@ -536,6 +537,33 @@ function fileAttributes(name, s) {
     hidden: process.platform === 'win32' ? null : name.startsWith('.'),
   }
 }
+
+/**
+ * Open a file in the OS's associated application, or let the user pick one.
+ *
+ * `withPicker` shells out to the Windows "Open with" dialog, which Electron
+ * exposes no API for. It runs through execFile with a fixed argument list —
+ * never a shell string — so a filename containing quotes or `&` is an argument
+ * and not a command.
+ */
+ipcMain.handle('open-with', async (_event, filePath, options) => {
+  const safe = validatePath(filePath)
+  await stat(safe) // fail here rather than in a dialog that shrugs
+
+  if (options?.withPicker === true && process.platform === 'win32') {
+    await new Promise((resolve, reject) => {
+      execFile('rundll32.exe', ['shell32.dll,OpenAs_RunDLL', safe],
+        (err) => (err ? reject(err) : resolve(undefined)))
+    })
+    return { opened: true, path: safe, picker: true }
+  }
+
+  // openPath resolves with a message rather than rejecting; an empty string
+  // means success. Returning it as-is would report every failure as a success.
+  const message = await shell.openPath(safe)
+  if (message) throw new Error(message)
+  return { opened: true, path: safe, picker: false }
+})
 
 // IPC: 清除或設定唯讀屬性
 ipcMain.handle('set-read-only', async (_event, filePath, readOnly) => {
