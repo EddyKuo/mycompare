@@ -947,3 +947,10 @@
 .fc-btn-cancel:hover {
   background: var(--diff-delete-bg);
 }
+
+/* A mode the view changed on the user's behalf, explained where the other
+   counts appear rather than in a dialog they would have to dismiss. */
+.fc-stat-note {
+  color: var(--text-secondary);
+  font-style: italic;
+}

@@ -168,3 +168,157 @@ describe('FolderCompare remote lifecycle', () => {
     expect(fc._isWritableSide('right')).toBe(false)
   })
 })
+
+describe('虛擬來源不能被寫入操作誤觸', () => {
+  /** @type {FolderCompare} */
+  let fc
+  /** @type {string[]} */
+  let alerts
+
+  beforeEach(() => {
+    fc = new FolderCompare({})
+    alerts = []
+    vi.spyOn(window, 'alert').mockImplementation((m) => { alerts.push(String(m)) })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.electronAPI = {
+      readDir: vi.fn().mockResolvedValue([]),
+      copyFile: vi.fn().mockResolvedValue(true),
+      deleteFile: vi.fn().mockResolvedValue(true),
+      remoteDisconnect: vi.fn().mockResolvedValue(true),
+    }
+  })
+
+  it('批次複製時檢查來源側，不只檢查目的側', async () => {
+    // 目的側是真實資料夾就放行，會讓每個 job 各自在 path validator 失敗，
+    // 使用者只看到「0 項成功，N 項失敗」，看不出這個組合本來就做不到。
+    fc._leftSource = { kind: 'archive', root: '/t/a.zip' }
+    fc._leftPath = '/t/a.zip'
+    fc._rightPath = '/t/out'
+    fc._rows = [{
+      status: 'left-only',
+      left: { path: '/t/a.zip::a.txt', name: 'a.txt', isDirectory: false },
+      right: null,
+    }]
+    fc._selectedNames = new Set(['/t/a.zip::a.txt'])
+
+    await fc._batchCopyToRight()
+    expect(window.electronAPI.copyFile).not.toHaveBeenCalled()
+    expect(alerts.join(' ')).toMatch(/壓縮檔/)
+  })
+
+  it('copySelectedTo 檢查來源側', async () => {
+    fc._leftSource = { kind: 'snapshot', root: '/t/s.mcss' }
+    fc._leftPath = '/t/s.mcss'
+    fc._rightPath = '/t/out'
+    fc._selectedNames = new Set(['snapshot://a.txt'])
+    fc._rows = [{
+      status: 'left-only',
+      left: { path: 'snapshot://a.txt', name: 'a.txt', isDirectory: false },
+      right: null,
+    }]
+
+    await fc.copySelectedTo('right')
+    expect(window.electronAPI.copyFile).not.toHaveBeenCalled()
+    expect(alerts.join(' ')).toMatch(/快照/)
+  })
+
+  it('批次刪除只擋被刪除的那一側', async () => {
+    fc._rightSource = { kind: 'remote', root: 'remote://p1/', profileId: 'p1' }
+    fc._rows = [{
+      status: 'right-only',
+      left: null,
+      right: { path: 'remote://p1/a.txt', name: 'a.txt', isDirectory: false },
+    }]
+    fc._selectedNames = new Set(['remote://p1/a.txt'])
+
+    await fc._batchDelete('right')
+    expect(window.electronAPI.deleteFile).not.toHaveBeenCalled()
+    expect(alerts.join(' ')).toMatch(/遠端/)
+  })
+
+  it('同步模式在任一側是虛擬來源時不開啟', () => {
+    fc._leftSource = { kind: 'archive', root: '/t/a.zip' }
+    expect(fc.toggleSyncMode()).toBe(false)
+    expect(fc._syncMode).toBe(false)
+    expect(alerts.join(' ')).toMatch(/壓縮檔/)
+  })
+
+  it('兩側都是真實資料夾時，同步模式照常開啟', () => {
+    expect(fc.toggleSyncMode()).toBe(true)
+    expect(fc._syncMode).toBe(true)
+    expect(alerts).toEqual([])
+  })
+})
+
+describe('共用同一個遠端設定的兩側', () => {
+  beforeEach(() => {
+    window.electronAPI = {
+      readDir: vi.fn().mockResolvedValue([]),
+      remoteListDir: vi.fn().mockResolvedValue([]),
+      remoteDisconnect: vi.fn().mockResolvedValue(true),
+    }
+  })
+
+  it('關閉時仍然會斷線', async () => {
+    // 兩側共用同一個 profile 時，逐側檢查「對側是否還在用」會讓兩側互相禮讓，
+    // 結果誰都沒關，連線一直留到 server 端的閒置逾時。
+    const fc = new FolderCompare({})
+    await fc.setSource('left', { kind: 'remote', root: 'remote://p1/a', profileId: 'p1' })
+    await fc.setSource('right', { kind: 'remote', root: 'remote://p1/b', profileId: 'p1' })
+    window.electronAPI.remoteDisconnect.mockClear()
+
+    await fc.disconnectAll()
+    expect(window.electronAPI.remoteDisconnect).toHaveBeenCalledTimes(1)
+    expect(window.electronAPI.remoteDisconnect).toHaveBeenCalledWith('p1')
+  })
+
+  it('斷線後通知呼叫端把密碼忘掉', async () => {
+    const forgotten = []
+    const fc = new FolderCompare({})
+    fc._onRemoteClosed = (ids) => forgotten.push(...ids)
+    await fc.setSource('left', { kind: 'remote', root: 'remote://p1/', profileId: 'p1' })
+    await fc.disconnectAll()
+    expect(forgotten).toEqual(['p1'])
+  })
+})
+
+describe('快照側停用內容比對', () => {
+  it('選了內容模式再載入快照時會退回中繼資料比對並說明', async () => {
+    const fc = new FolderCompare({})
+    window.electronAPI = {
+      readDir: vi.fn().mockResolvedValue([]),
+      readSnapshotDir: vi.fn().mockResolvedValue([]),
+    }
+    fc._mode = 'content'
+    await fc.setSource('left', { kind: 'snapshot', root: '/t/s.mcss' })
+
+    // 快照不存內容，留著內容模式只會讓每一列各自報同一個錯。
+    expect(fc._contentModesAvailable()).toBe(false)
+    expect(fc._mode).toBe('both')
+    expect(fc._modeNote).toMatch(/快照/)
+  })
+
+  it('兩側都是真實資料夾時不干涉', async () => {
+    const fc = new FolderCompare({})
+    window.electronAPI = { readDir: vi.fn().mockResolvedValue([]) }
+    fc._mode = 'content'
+    await fc.setSource('left', { kind: 'fs', root: '/t/x' })
+    expect(fc._contentModesAvailable()).toBe(true)
+    expect(fc._mode).toBe('content')
+  })
+})
+
+describe('sourceKindOf 對真實檔名中的冒號', () => {
+  it('容器不像壓縮檔時視為一般檔案', () => {
+    // 冒號在 Windows 以外都是合法的檔名字元，`/data/build::2024/report.txt`
+    // 是一個普通檔案；當成壓縮檔項目會送錯 reader 而讀不到。
+    expect(sourceKindOf('/data/build::2024/report.txt')).toBe('fs')
+    expect(sourceKindOf('/srv/notes::draft')).toBe('fs')
+  })
+
+  it('容器看起來是壓縮檔時才視為壓縮檔項目', () => {
+    for (const p of ['/t/a.zip::x', '/t/a.7z::x', '/t/a.tar.gz::x', 'C:\t\a.JAR::x']) {
+      expect(sourceKindOf(p)).toBe('archive')
+    }
+  })
+})

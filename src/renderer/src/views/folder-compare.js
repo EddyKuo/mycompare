@@ -513,6 +513,13 @@ export function entryAttrTitle(entry) {
  */
 
 /**
+ * Extensions the archive reader can open, matched against the part of a
+ * virtual path before `::`.
+ */
+const ARCHIVE_EXT =
+  /\.(zip|jar|war|ear|7z|tar|tgz|tbz2?|txz|gz|bz2|xz)$/i
+
+/**
  * Classify a path by the store that can actually read it.
  * @param {string|null|undefined} path
  * @returns {SourceKind}
@@ -521,7 +528,12 @@ export function sourceKindOf(path) {
   const p = String(path ?? '')
   if (p.startsWith('snapshot://')) return 'snapshot'
   if (p.startsWith('remote://')) return 'remote'
-  if (p.includes('::')) return 'archive'
+  // `::` alone is not enough. A colon is a legal filename character
+  // everywhere except Windows, so `/data/build::2024/report.txt` is an
+  // ordinary file — and treating it as an archive entry would send it to the
+  // archive reader and fail. The container has to look like an archive too.
+  const i = p.indexOf('::')
+  if (i > 0 && ARCHIVE_EXT.test(p.slice(0, i))) return 'archive'
   return 'fs'
 }
 
@@ -953,6 +965,9 @@ export class FolderCompare {
     /** @type {FolderSource|null} */
     this._rightSource = null
 
+    /** Explains a compare mode the view changed on the user's behalf. */
+    this._modeNote = ''
+
     // Batch selection: Set of path keys (leftPath || rightPath)
     this._selectedNames = new Set()
 
@@ -1278,8 +1293,44 @@ export class FolderCompare {
       if (source.kind !== 'archive') this._rightZipEntries = null
     }
     this._updatePathDisplay(side, this._sourceLabel(side))
+    this._syncModeAvailability()
     this._expanded.clear()
     await this._scan()
+  }
+
+  /**
+   * Whether a content-reading compare mode can run at all.
+   *
+   * A snapshot records structure and timestamps, never bytes, so there is
+   * nothing for MD5 or the rules diff to read. Leaving those modes selectable
+   * means every row fails individually with the same message; taking them off
+   * the menu says once, up front, what the snapshot can and cannot answer.
+   */
+  _contentModesAvailable() {
+    return this._leftSource?.kind !== 'snapshot' && this._rightSource?.kind !== 'snapshot'
+  }
+
+  /** Reflect `_contentModesAvailable()` in the toolbar, switching mode if needed. */
+  _syncModeAvailability() {
+    const available = this._contentModesAvailable()
+    const select = this._dom.modeSelect
+    if (select) {
+      for (const opt of select.querySelectorAll('option')) {
+        if (opt.value === 'content' || opt.value === 'rules') {
+          opt.disabled = !available
+          opt.title = available ? '' : '快照未保存檔案內容，無法做內容比對'
+        }
+      }
+    }
+    if (!available && (this._mode === 'content' || this._mode === 'rules')) {
+      this._mode = 'both'
+      if (select) select.value = 'both'
+      // Changing the mode out from under the user is only acceptable if they
+      // are told; the stats bar is where this view already speaks.
+      this._modeNote = '快照未保存檔案內容，已改用「名稱+大小+時間」比對'
+    } else if (available) {
+      this._modeNote = ''
+    }
   }
 
   /** @param {'left'|'right'} side */
@@ -1300,6 +1351,27 @@ export class FolderCompare {
    */
   _isWritableSide(side) {
     return (this._sourceOf(side)?.kind ?? 'fs') === 'fs'
+  }
+
+  /**
+   * Refuse a file operation that cannot work, and say why.
+   *
+   * The per-file failure it replaces is the worse outcome: every job fails in
+   * the path validator and the user is told "0 succeeded, N failed" with no
+   * hint that the pairing was never capable of it.
+   *
+   * @param {Array<'left'|'right'>} sides sides the operation reads or writes
+   * @returns {boolean} whether the operation may proceed
+   */
+  _requireWritable(sides) {
+    for (const side of sides) {
+      if (this._isWritableSide(side)) continue
+      const kind = this._sourceOf(side)?.kind ?? 'fs'
+      const what = { archive: '壓縮檔', snapshot: '快照', remote: '遠端' }[kind] ?? '此來源'
+      alert(`${side === 'left' ? '左' : '右'}側是${what}，僅供瀏覽，無法進行檔案操作`)
+      return false
+    }
+    return true
   }
 
   /**
@@ -1343,14 +1415,36 @@ export class FolderCompare {
     } catch (err) {
       console.error('FolderCompare: remote disconnect failed:', err)
     }
+    this._onRemoteClosed?.([src.profileId])
   }
 
-  /** Close every remote session this view opened. */
+  /**
+   * Close every remote session this view opened.
+   *
+   * Deliberately not two `_disconnectRemote` calls: that helper skips a
+   * profile the *other* side is still using, and when both sides share one
+   * profile neither call has cleared the other yet, so both skip and the
+   * session is never closed. Collecting the profiles first sidesteps the
+   * ordering entirely.
+   */
   async disconnectAll() {
-    await this._disconnectRemote('left')
-    await this._disconnectRemote('right')
+    const profiles = new Set(
+      ['left', 'right']
+        .map((side) => this._sourceOf(/** @type {'left'|'right'} */ (side)))
+        .filter((src) => src?.kind === 'remote' && src.profileId)
+        .map((src) => src.profileId))
+
     this._leftSource = this._leftSource?.kind === 'remote' ? null : this._leftSource
     this._rightSource = this._rightSource?.kind === 'remote' ? null : this._rightSource
+
+    for (const id of profiles) {
+      try {
+        await window.electronAPI?.remoteDisconnect?.(id)
+      } catch (err) {
+        console.error('FolderCompare: remote disconnect failed:', err)
+      }
+    }
+    this._onRemoteClosed?.([...profiles])
   }
 
   /** 直接設定左側路徑後自動掃描 */
@@ -1373,6 +1467,10 @@ export class FolderCompare {
    * @returns {boolean}
    */
   toggleSyncMode() {
+    // Sync copies and deletes on both sides, so it needs both to be real
+    // directories. Refusing at the toggle beats building a plan that can only
+    // fail file by file once the user presses execute.
+    if (!this._syncMode && !this._requireWritable(['left', 'right'])) return false
     this._syncMode = !this._syncMode
     this._emit('sync-mode-changed', { syncMode: this._syncMode })
     // Update toolbar button appearance
@@ -1668,6 +1766,8 @@ ${rows}
   /** 執行同步操作並顯示摘要 */
   async _executeSyncOps() {
     if (!this._syncOps?.length) return
+    // A side can be swapped for a virtual one after sync mode was entered.
+    if (!this._requireWritable(['left', 'right'])) return
     const root = this._dom.root
     const panel = root?.querySelector('.sync-panel')
     const execBtn = panel?.querySelector('#btn-sync-execute')
@@ -1721,6 +1821,7 @@ ${rows}
    */
   async _batchCopyToRight() {
     if (!this._rightPath) { alert('請先選擇右側資料夾'); return }
+    if (!this._requireWritable(['left', 'right'])) return
     const rows = this._rows.filter(
       (r) => r.status === 'left-only' && r.left?.path && this._selectedNames.has(r.left.path)
     )
@@ -1747,6 +1848,7 @@ ${rows}
    */
   async _batchCopyToLeft() {
     if (!this._leftPath) { alert('請先選擇左側資料夾'); return }
+    if (!this._requireWritable(['left', 'right'])) return
     const rows = this._rows.filter(
       (r) => r.status === 'right-only' && r.right?.path && this._selectedNames.has(r.right.path)
     )
@@ -1773,6 +1875,7 @@ ${rows}
    * @param {'left'|'right'} side
    */
   async _batchDelete(side) {
+    if (!this._requireWritable([side])) return
     if (!confirm(`確定要刪除 ${this._selectedNames.size} 個選取的檔案嗎？`)) return
     const paths = []
     for (const row of this._rows) {
@@ -1813,12 +1916,10 @@ ${rows}
       alert(target === 'right' ? '請先選擇右側資料夾' : '請先選擇左側資料夾')
       return
     }
-    // copy-file only understands filesystem paths; failing here is clearer
-    // than letting every job fail one by one in the path validator.
-    if (!this._isWritableSide(target)) {
-      alert(`${target === 'right' ? '右' : '左'}側為唯讀來源（壓縮檔／快照／遠端），無法寫入`)
-      return
-    }
+    // Both ends matter: copy-file understands filesystem paths only, so an
+    // archive entry as the *source* fails exactly as an unwritable target
+    // does. Checking the target alone let every job fail one by one instead.
+    if (!this._requireWritable([target, target === 'right' ? 'left' : 'right'])) return
 
     const keys = this._selectedNames.size
       ? this._selectedNames
@@ -3392,6 +3493,9 @@ ${rows}
     const stats = this._dom.stats
     stats.innerHTML = ''
 
+    if (this._modeNote) {
+      stats.appendChild(el('span', { className: 'fc-stat-item fc-stat-note' }, this._modeNote))
+    }
     if (!rows.length) return
 
     const counts = {}

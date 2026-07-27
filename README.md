@@ -41,7 +41,8 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
 - 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz、7z
-- 遠端連線：FTP / FTPS / S3（連線設定檔、密碼以系統金鑰庫保存）
+- 遠端連線：FTP / FTPS / SFTP / S3（連線設定檔、密碼以系統金鑰庫保存）。
+  SFTP 一定會驗證主機金鑰：沒見過的金鑰會顯示指紋讓你確認，金鑰變更則直接拒絕連線
 - MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對
 - 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份

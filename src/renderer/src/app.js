@@ -194,11 +194,21 @@ let mergeCompare = null
 
 /**
  * Passwords for remote profiles the user chose not to save, keyed by profile
- * id. In memory only, for the lifetime of the window: every remote IPC call
- * needs the secret again, and asking once per file would be unusable.
+ * id. In memory only, and dropped as soon as the session that needed them
+ * closes — keeping them for the window's lifetime would leave the password of
+ * every profile browsed since launch resident long after the user believed
+ * they had disconnected.
  * @type {Map<string, string|undefined>}
  */
 const _remoteSecrets = new Map()
+
+/**
+ * Forget the cached passwords for profiles whose sessions have closed.
+ * @param {string[]} profileIds
+ */
+function forgetRemoteSecrets(profileIds) {
+  for (const id of profileIds ?? []) _remoteSecrets.delete(id)
+}
 
 /** How to name a path's backing store in a message. */
 const SOURCE_LABELS = Object.freeze({
@@ -1813,6 +1823,7 @@ async function openRemoteCompare(profile, secret, startDir = '', side = 'left') 
 
     tabMgr.addTab('folder', `遠端：${profile.name}`)
     showFolderCompare()
+    if (folderCompare) folderCompare._onRemoteClosed = forgetRemoteSecrets
     await folderCompare?.setSource(side, {
       kind: 'remote',
       root: `remote://${profile.id}/${startDir}`.replace(/\/+$/, '/'),
