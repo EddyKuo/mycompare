@@ -1,6 +1,8 @@
 /* ── Folder Compare View ── */
 
 .folder-compare {
+  /* Anchor for .fc-modal-backdrop, which must cover this view and nothing else. */
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -953,4 +955,202 @@
 .fc-stat-note {
   color: var(--text-secondary);
   font-style: italic;
+}
+
+/* ── Navigation: Back / Forward / Up One Level ── */
+.fc-btn-nav {
+  font-size: 12px;
+  padding: 2px 8px;
+  height: 24px;
+  min-width: 26px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.fc-btn-nav:hover:not(:disabled) {
+  background: var(--bg-toolbar);
+  border-color: var(--accent);
+}
+
+.fc-btn-nav:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── Include / Exclude filter panel ── */
+.fc-btn-filter {
+  font-size: 12px;
+  padding: 2px 8px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.fc-btn-filter:hover {
+  background: var(--bg-toolbar);
+  border-color: var(--accent);
+}
+
+.fc-filter-panel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.fc-filter-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.fc-filter-label {
+  color: var(--text-secondary);
+}
+
+.fc-filter-input {
+  font-size: 12px;
+  padding: 2px 6px;
+  height: 24px;
+  width: 160px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  outline: none;
+}
+
+.fc-filter-input:focus {
+  border-color: var(--accent);
+}
+
+.fc-filter-apply,
+.fc-filter-clear {
+  font-size: 12px;
+  padding: 2px 10px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.fc-filter-apply:hover,
+.fc-filter-clear:hover {
+  border-color: var(--accent);
+}
+
+/* ── Delete confirmation modal ──
+   A native confirm() cannot carry the recycle-bin / permanent choice, so the
+   one destructive dialog in this view gets a real one. */
+.fc-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.fc-modal {
+  min-width: 340px;
+  max-width: 560px;
+  max-height: 80%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  font-size: 13px;
+}
+
+.fc-modal-title {
+  font-weight: 600;
+}
+
+.fc-modal-list {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 6px 8px;
+  background: var(--bg-secondary);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+
+.fc-modal-list-item {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fc-modal-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.fc-modal-check input[type="checkbox"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.fc-modal-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.fc-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.fc-modal-cancel,
+.fc-modal-ok {
+  font-size: 12px;
+  padding: 4px 14px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.fc-modal-ok {
+  border-color: var(--diff-delete-border);
+  color: var(--diff-delete-border);
+  font-weight: 600;
+}
+
+.fc-modal-ok:hover {
+  background: var(--diff-delete-bg);
+}
+
+.fc-modal-cancel:hover {
+  background: var(--bg-toolbar);
 }

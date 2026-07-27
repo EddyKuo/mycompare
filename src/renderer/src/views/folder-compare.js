@@ -64,6 +64,175 @@ function matchesFilter(name, filterStr, opts = {}) {
 }
 
 /**
+ * Beyond Compare's four filter fields.
+ *
+ * @typedef {object} FilterFields
+ * @property {string} includeFiles
+ * @property {string} excludeFiles
+ * @property {string} includeFolders
+ * @property {string} excludeFolders
+ */
+
+/** @type {FilterFields} */
+export const EMPTY_FILTER_FIELDS = {
+  includeFiles: '',
+  excludeFiles: '',
+  includeFolders: '',
+  excludeFolders: '',
+}
+
+/**
+ * Coerce anything into a full FilterFields, dropping unknown keys.
+ * @param {unknown} raw
+ * @returns {FilterFields}
+ */
+export function normalizeFilterFields(raw) {
+  const src = (raw && typeof raw === 'object') ? raw : {}
+  /** @type {FilterFields} */
+  const out = { ...EMPTY_FILTER_FIELDS }
+  for (const key of Object.keys(EMPTY_FILTER_FIELDS)) {
+    if (typeof src[key] === 'string') out[key] = src[key]
+  }
+  return out
+}
+
+/**
+ * Apply the four BC filter fields to one entry.
+ *
+ * Each field only sees the kind it names: a file mask must not decide whether
+ * a folder is shown, or typing `*.js` would collapse the whole tree by hiding
+ * every directory that could contain a match. Exclusion wins over inclusion,
+ * as it does in BC.
+ *
+ * The exclude fields are written as ordinary masks ("exclude these"), so they
+ * are matched with include semantics and the *hit* is what excludes.
+ *
+ * @param {string} name
+ * @param {FilterFields} fields
+ * @param {{ isDirectory?: boolean, relativePath?: string }} [opts]
+ * @returns {boolean}
+ */
+export function matchesFolderFilters(name, fields, opts = {}) {
+  const f = normalizeFilterFields(fields)
+  const isDir = !!opts.isDirectory
+  const include = isDir ? f.includeFolders : f.includeFiles
+  const exclude = isDir ? f.excludeFolders : f.excludeFiles
+
+  if (exclude.trim() && matchesMasks(parseMasks(exclude), name, opts)) return false
+  if (include.trim() && !matchesMasks(parseMasks(include), name, opts)) return false
+  return true
+}
+
+/**
+ * Parent directory of a filesystem path, or null when there is none.
+ *
+ * Stops at a drive root (`C:\`), a POSIX root (`/`) and a UNC share
+ * (`\\server\share`) — climbing past any of those lands somewhere the user
+ * never opened, which the path validator would reject anyway.
+ *
+ * @param {string|null|undefined} p
+ * @returns {string|null}
+ */
+export function parentPath(p) {
+  const raw = String(p ?? '')
+  if (!raw) return null
+
+  const unc = /^\\\\[^\\/]+[\\/][^\\/]+[\\/]?$/.test(raw)
+  if (unc) return null
+
+  const trimmed = raw.replace(/[\\/]+$/, '')
+  if (!trimmed) return null                       // '/' or '\' — already root
+  if (/^[a-zA-Z]:$/.test(trimmed)) return null    // 'C:\' — already root
+
+  const cut = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'))
+  if (cut < 0) return null
+  const head = trimmed.slice(0, cut)
+  if (!head) return '/'                           // '/usr' → '/'
+  if (/^[a-zA-Z]:$/.test(head)) return `${head}\\` // 'C:\\tmp' → 'C:\\'
+  if (/^\\\\[^\\/]+$/.test(head)) return null      // would climb above the share
+  return head
+}
+
+/**
+ * Labels of the jobs whose *target* is read-only.
+ * @param {Array<{ label?: string, targetReadOnly?: boolean }>} jobs
+ * @returns {string[]}
+ */
+export function readOnlyLabels(jobs) {
+  return (jobs ?? []).filter((j) => j?.targetReadOnly).map((j) => j?.label ?? '')
+}
+
+/** How many read-only names to name before saying "…and N more". */
+const READ_ONLY_SAMPLE = 8
+
+/**
+ * Text of the read-only confirmation.
+ *
+ * Both buttons do something: this is a choice between overwriting and
+ * skipping, not between running and aborting, because "N 項失敗" with no
+ * explanation is exactly the outcome this dialog exists to replace.
+ *
+ * @param {string[]} labels
+ * @param {string} action  what is about to happen, e.g. '覆寫'
+ * @returns {string}
+ */
+export function formatReadOnlyPrompt(labels, action) {
+  const list = labels.slice(0, READ_ONLY_SAMPLE).map((l) => `　• ${l}`).join('\n')
+  const more = labels.length > READ_ONLY_SAMPLE
+    ? `\n　…另有 ${labels.length - READ_ONLY_SAMPLE} 項`
+    : ''
+  return `有 ${labels.length} 個目標檔案是唯讀的：\n${list}${more}\n\n` +
+    `按「確定」仍嘗試${action}（若系統拒絕，會逐項列出失敗原因）\n` +
+    `按「取消」略過這些唯讀檔案，其餘照常執行`
+}
+
+/**
+ * @typedef {object} DeleteOutcome
+ * @property {number} trashed          moved to the recycle bin
+ * @property {number} permanent        deleted outright
+ * @property {Array<{ path: string, message: string }>} failures
+ */
+
+/**
+ * Summary line for a delete run.
+ *
+ * Where the files went is the part users need and the part the old code never
+ * said: "N 項成功" is the same sentence whether the data is recoverable or not.
+ *
+ * @param {DeleteOutcome} outcome
+ * @returns {string}
+ */
+export function formatDeleteSummary(outcome) {
+  const parts = []
+  if (outcome.trashed) parts.push(`已移至資源回收桶：${outcome.trashed} 項`)
+  if (outcome.permanent) parts.push(`已永久刪除：${outcome.permanent} 項`)
+  if (outcome.failures.length) parts.push(`失敗：${outcome.failures.length} 項`)
+  if (!parts.length) parts.push('沒有刪除任何項目')
+  const detail = outcome.failures.length
+    ? '\n\n' + outcome.failures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
+    : ''
+  return parts.join('；') + detail
+}
+
+/**
+ * Whether a delete failed because the platform has no usable recycle bin.
+ *
+ * The main process refuses rather than unlinking behind the user's back, so
+ * this is the signal to offer permanent deletion as an explicit choice.
+ *
+ * @param {Array<{ message: string }>} failures
+ * @returns {boolean}
+ */
+export function isRecycleBinUnavailable(failures) {
+  return failures.length > 0 && failures.every((f) => /資源回收桶/.test(f?.message ?? ''))
+}
+
+/** Message text of an unknown thrown value. */
+function errText(err) {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
  * Upper bound on directories loaded by a single Expand All, so a deep tree
  * cannot fire an unbounded number of readDir IPC calls.
  */
@@ -524,6 +693,25 @@ const ARCHIVE_EXT =
   /\.(zip|jar|war|ear|7z|tar|tgz|tbz2?|txz|gz|bz2|xz)$/i
 
 /**
+ * Open-dialog filters for every format `main/archive.js` can decode.
+ *
+ * A multi-part extension such as `.tar.gz` is matched by its last component,
+ * which is how Electron's dialog filters work, so `gz` covers both a lone
+ * gzip member and a gzipped tar — `detectFormat()` tells them apart by content.
+ */
+export const ARCHIVE_DIALOG_FILTERS = [
+  {
+    name: '封存檔',
+    extensions: ['zip', 'jar', 'war', 'ear', '7z', 'tar', 'tgz', 'tbz', 'tbz2', 'txz', 'gz', 'bz2', 'xz'],
+  },
+  { name: 'Zip 家族 (zip/jar/war/ear)', extensions: ['zip', 'jar', 'war', 'ear'] },
+  { name: 'Tar 家族 (tar/tgz/tbz2/txz)', extensions: ['tar', 'tgz', 'tbz', 'tbz2', 'txz'] },
+  { name: '單檔壓縮 (gz/bz2/xz)', extensions: ['gz', 'bz2', 'xz'] },
+  { name: '7-Zip (7z)', extensions: ['7z'] },
+  { name: '所有檔案', extensions: ['*'] },
+]
+
+/**
  * Classify a path by the store that can actually read it.
  * @param {string|null|undefined} path
  * @returns {SourceKind}
@@ -894,7 +1082,19 @@ export class FolderCompare {
     this._showLeftNewer = true   // T55
     this._showRightNewer = true  // T55
     this._viewPreset = 'all'
+    // Quick filter. Kept alongside the four BC fields below rather than folded
+    // into them: it is the only field that applies to files *and* folders, so
+    // an existing `-node_modules` in a saved session keeps hiding the folder.
     this._filterStr = ''
+    /** @type {FilterFields} BC's Include/Exclude Files/Folders */
+    this._filterFields = normalizeFilterFields(options.filterFields)
+
+    // Navigation history of {left,right} source pairs, for Back/Forward.
+    /** @type {Array<{ left: FolderSource|null, right: FolderSource|null }>} */
+    this._navHistory = []
+    this._navIndex = -1
+    /** Set while replaying history, so the replay is not recorded as a step. */
+    this._navRestoring = false
 
     // Column set and sort order are a global preference rather than per-tab
     // state, so a newly opened comparison looks like the last one.
@@ -1161,6 +1361,60 @@ export class FolderCompare {
     btnLeftNewer?.classList.toggle('fc-btn-filter-toggle--active', this._showLeftNewer)
     btnRightNewer?.classList.toggle('fc-btn-filter-toggle--active', this._showRightNewer)
     if (viewPreset) viewPreset.value = this._viewPreset
+    if (this._dom.filter) this._dom.filter.value = this._filterStr
+  }
+
+  // ── Include / Exclude filters ───────────────────────────────────────────────
+
+  /** @returns {FilterFields} */
+  getFilterFields() {
+    return { ...this._filterFields }
+  }
+
+  /**
+   * Merge in new mask fields and re-filter.
+   * @param {Partial<FilterFields>} partial
+   * @returns {FilterFields}
+   */
+  setFilterFields(partial) {
+    this._filterFields = normalizeFilterFields({ ...this._filterFields, ...(partial ?? {}) })
+    this._syncFilterFieldControls()
+    this._applyFilterAndRender()
+    return this.getFilterFields()
+  }
+
+  /** BC's Clear button: empty every mask field, including the quick filter. */
+  clearFilters() {
+    this._filterStr = ''
+    this._filterFields = { ...EMPTY_FILTER_FIELDS }
+    if (this._dom.filter) this._dom.filter.value = ''
+    this._syncFilterFieldControls()
+    this._applyFilterAndRender()
+  }
+
+  /** Push the mask fields back onto the panel inputs. */
+  _syncFilterFieldControls() {
+    for (const [key, input] of Object.entries(this._dom.filterInputs ?? {})) {
+      if (input) input.value = this._filterFields[key] ?? ''
+    }
+  }
+
+  /** Read the panel inputs into the mask fields. */
+  _readFilterPanel() {
+    /** @type {Partial<FilterFields>} */
+    const next = {}
+    for (const [key, input] of Object.entries(this._dom.filterInputs ?? {})) {
+      next[key] = input?.value ?? ''
+    }
+    this._filterFields = normalizeFilterFields({ ...this._filterFields, ...next })
+    this._applyFilterAndRender()
+  }
+
+  /** 顯示 / 隱藏 Include/Exclude 篩選面板 */
+  toggleFilterPanel() {
+    const panel = this._dom.filterPanel
+    if (!panel) return
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none'
   }
 
   /** 把 UI 渲染到 containerEl */
@@ -1170,8 +1424,10 @@ export class FolderCompare {
     this._bindEvents()
     // Auto-scan if paths were provided via constructor options
     if (this._leftPath || this._rightPath) {
+      this._recordNav()
       this._scan()
     }
+    this._syncNavButtons()
   }
 
   /** 呼叫 electronAPI.openFolder 取得左側路徑並掃描 */
@@ -1199,6 +1455,7 @@ export class FolderCompare {
       viewPreset: this._viewPreset,
       mtimeTolerance: this._mtimeTolerance,
       filterStr: this._filterStr,
+      filterFields: { ...this._filterFields },
       columns: [...this._columns],
       rulesOptions: this.getRulesOptions(),
       // The six flags are stored alongside the preset because a hand-tuned
@@ -1233,6 +1490,8 @@ export class FolderCompare {
       this._mtimeTolerance = settings.mtimeTolerance
     }
     if (typeof settings.filterStr === 'string') this._filterStr = settings.filterStr
+    if (settings.filterFields) this._filterFields = normalizeFilterFields(settings.filterFields)
+    this._syncFilterFieldControls()
     if (Array.isArray(settings.columns)) this.setColumns(settings.columns)
     if (settings.viewPreset && VIEW_PRESETS[settings.viewPreset]) {
       this.setViewPreset(settings.viewPreset)
@@ -1366,22 +1625,43 @@ export class FolderCompare {
     this._updatePathDisplay('left', this._sourceLabel('left'))
     this._updatePathDisplay('right', this._sourceLabel('right'))
     this._expanded.clear()
+    this._recordNav()
     await this._scan()
   }
 
-  /** 開啟左側壓縮檔 */
-  async openZipLeft() {
-    const result = await window.electronAPI.openZip()
-    if (!result) return
-    await this.openArchiveSide('left', result.zipPath, result.entries)
+  /**
+   * Pick an archive and put it on one side.
+   *
+   * Goes through `read-archive`, which decodes every format `main/archive.js`
+   * supports; the old `open-zip` path was JSZip-only, so tar/gzip/bzip2/xz/7z
+   * had a decoder, an IPC channel and tests but no way in from the UI.
+   *
+   * The file dialog is `openFileBinary` with a one-byte ceiling because what
+   * is needed here is the *path* plus the root registration a dialog performs
+   * — the archive itself is re-read in the main process by `read-archive`, and
+   * shipping its bytes through IPC only to discard them would be pure cost.
+   *
+   * @param {'left'|'right'} side
+   */
+  async openArchive(side) {
+    const picked = await window.electronAPI.openFileBinary({
+      filters: ARCHIVE_DIALOG_FILTERS,
+      maxBytes: 1,
+    })
+    if (!picked?.path) return
+    try {
+      await this.openArchiveSide(side, picked.path)
+    } catch (err) {
+      console.error('FolderCompare.openArchive failed:', picked.path, err)
+      alert(`無法開啟封存檔「${picked.path}」：\n${errText(err)}`)
+    }
   }
 
-  /** 開啟右側壓縮檔 */
-  async openZipRight() {
-    const result = await window.electronAPI.openZip()
-    if (!result) return
-    await this.openArchiveSide('right', result.zipPath, result.entries)
-  }
+  /** 開啟左側封存檔 */
+  async openArchiveLeft() { await this.openArchive('left') }
+
+  /** 開啟右側封存檔 */
+  async openArchiveRight() { await this.openArchive('right') }
 
   /**
    * Put an archive on one side of the comparison.
@@ -1432,7 +1712,152 @@ export class FolderCompare {
     this._syncModeAvailability()
     this._expanded.clear()
     this._pendingFirstDiff = true
+    this._recordNav()
     await this._scan()
+  }
+
+  // ── Navigation history & Up One Level ───────────────────────────────────────
+
+  /**
+   * Push the current pair of sources onto the history.
+   *
+   * Recorded per side change rather than per pair, matching what the user did:
+   * opening the left folder and then the right one are two steps they can walk
+   * back through one at a time.
+   */
+  _recordNav() {
+    if (this._navRestoring) return
+    const entry = { left: this._currentSource('left'), right: this._currentSource('right') }
+    const top = this._navHistory[this._navIndex]
+    if (top && top.left?.root === entry.left?.root && top.right?.root === entry.right?.root) return
+    // A new step invalidates whatever was ahead of the cursor.
+    this._navHistory.splice(this._navIndex + 1)
+    this._navHistory.push(entry)
+    this._navIndex = this._navHistory.length - 1
+    this._syncNavButtons()
+  }
+
+  /** @returns {boolean} */
+  canGoBack() { return this._navIndex > 0 }
+
+  /** @returns {boolean} */
+  canGoForward() { return this._navIndex >= 0 && this._navIndex < this._navHistory.length - 1 }
+
+  /** Session ▸ Back（Alt+←）。 @returns {Promise<boolean>} whether it moved */
+  async goBack() {
+    if (!this.canGoBack()) return false
+    this._navIndex--
+    await this._restoreNav(this._navHistory[this._navIndex])
+    return true
+  }
+
+  /** Session ▸ Forward（Alt+→）。 @returns {Promise<boolean>} whether it moved */
+  async goForward() {
+    if (!this.canGoForward()) return false
+    this._navIndex++
+    await this._restoreNav(this._navHistory[this._navIndex])
+    return true
+  }
+
+  /**
+   * @param {{ left: FolderSource|null, right: FolderSource|null }} entry
+   * @returns {Promise<void>}
+   */
+  async _restoreNav(entry) {
+    this._navRestoring = true
+    try {
+      await this._setBothSources(entry.left, entry.right)
+    } finally {
+      this._navRestoring = false
+      this._syncNavButtons()
+    }
+  }
+
+  /**
+   * Point both sides at once and scan once.
+   *
+   * Two `setSource()` calls would scan twice and record two history steps for
+   * what the user experienced as one move.
+   *
+   * @param {FolderSource|null} left
+   * @param {FolderSource|null} right
+   */
+  async _setBothSources(left, right) {
+    await this._disconnectRemote('left')
+    await this._disconnectRemote('right')
+
+    this._leftSource = left
+    this._rightSource = right
+    this._leftPath = left?.root ?? null
+    this._rightPath = right?.root ?? null
+    if (left?.kind !== 'archive') this._leftZipEntries = null
+    if (right?.kind !== 'archive') this._rightZipEntries = null
+
+    this._updatePathDisplay('left', this._sourceLabel('left'))
+    this._updatePathDisplay('right', this._sourceLabel('right'))
+    this._syncModeAvailability()
+    this._expanded.clear()
+    this._pendingFirstDiff = true
+    this._recordNav()
+    await this._scan()
+  }
+
+  /**
+   * Parent folder of one side, or null when there is none to climb to.
+   * Only filesystem sides move: an archive, a snapshot and a remote listing
+   * each have a root that is the top of what was opened.
+   *
+   * @param {'left'|'right'} side
+   * @returns {FolderSource|null}
+   */
+  _parentSourceOf(side) {
+    const src = this._currentSource(side)
+    if (src?.kind !== 'fs') return null
+    const parent = parentPath(src.root)
+    return parent ? { kind: 'fs', root: parent } : null
+  }
+
+  /**
+   * The side's source, synthesised from its path when the side was set up
+   * before `setSource()` existed (constructor options, session restore).
+   * @param {'left'|'right'} side
+   * @returns {FolderSource|null}
+   */
+  _currentSource(side) {
+    const src = this._sourceOf(side)
+    if (src) return src
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    return path ? { kind: 'fs', root: path } : null
+  }
+
+  /** @returns {boolean} whether either side can move up */
+  canGoUp() {
+    return !!(this._parentSourceOf('left') || this._parentSourceOf('right'))
+  }
+
+  /**
+   * Session ▸ Up One Level（Alt+↑）：兩側各往上一層，已在最上層的一側原地不動。
+   * @returns {Promise<boolean>} whether it moved
+   */
+  async upOneLevel() {
+    const left = this._parentSourceOf('left')
+    const right = this._parentSourceOf('right')
+    if (!left && !right) {
+      alert('已經在最上層了（封存檔、快照與遠端來源沒有上一層）')
+      return false
+    }
+    // A side already at its top stays where it is rather than being cleared.
+    await this._setBothSources(left ?? this._currentSource('left'),
+      right ?? this._currentSource('right'))
+    return true
+  }
+
+  /** Enable/disable the three navigation buttons to match the history. */
+  _syncNavButtons() {
+    const { btnBack, btnForward, btnUp } = this._dom
+    if (btnBack) btnBack.disabled = !this.canGoBack()
+    if (btnForward) btnForward.disabled = !this.canGoForward()
+    if (btnUp) btnUp.disabled = !this.canGoUp()
   }
 
   /**
@@ -1509,6 +1934,205 @@ export class FolderCompare {
       return false
     }
     return true
+  }
+
+  // ── Deleting ────────────────────────────────────────────────────────────────
+
+  /**
+   * Ask before deleting, and let the user pick the recycle bin or permanent.
+   *
+   * A native `confirm()` cannot carry the choice, and the choice matters:
+   * everything here deletes in bulk from a list the user skimmed, so the
+   * default has to be the recoverable one and the irreversible one has to be
+   * a deliberate act.
+   *
+   * @param {string[]} labels paths about to be deleted
+   * @param {{ permanent?: boolean }} [opts] initial state of the checkbox
+   * @returns {Promise<{ ok: boolean, permanent: boolean }>}
+   */
+  _confirmDelete(labels, opts = {}) {
+    const host = this._dom.root ?? document.body
+    return new Promise((resolve) => {
+      const backdrop = el('div', { className: 'fc-modal-backdrop' })
+      const modal = el('div', { className: 'fc-modal', role: 'dialog', 'aria-modal': 'true' })
+
+      modal.appendChild(el('div', { className: 'fc-modal-title' },
+        `刪除 ${labels.length} 個項目`))
+
+      const list = el('div', { className: 'fc-modal-list' })
+      for (const label of labels.slice(0, 100)) {
+        list.appendChild(el('div', { className: 'fc-modal-list-item' }, label))
+      }
+      if (labels.length > 100) {
+        list.appendChild(el('div', { className: 'fc-modal-list-item' },
+          `…另有 ${labels.length - 100} 項`))
+      }
+      modal.appendChild(list)
+
+      const cbPermanent = el('input', { type: 'checkbox', className: 'fc-del-permanent' })
+      cbPermanent.checked = !!opts.permanent
+      const cbLabel = el('label', { className: 'fc-modal-check' })
+      cbLabel.appendChild(cbPermanent)
+      cbLabel.appendChild(document.createTextNode(' 永久刪除（不經資源回收桶，無法復原）'))
+      modal.appendChild(cbLabel)
+
+      const hint = el('div', { className: 'fc-modal-hint' },
+        '預設會移至系統的資源回收桶，之後仍可還原。')
+      modal.appendChild(hint)
+
+      const actions = el('div', { className: 'fc-modal-actions' })
+      const btnCancel = el('button', { className: 'fc-modal-cancel' }, '取消')
+      const btnOk = el('button', { className: 'fc-modal-ok' }, '刪除')
+      actions.append(btnCancel, btnOk)
+      modal.appendChild(actions)
+
+      backdrop.appendChild(modal)
+      host.appendChild(backdrop)
+
+      let settled = false
+      const finish = (ok) => {
+        if (settled) return
+        settled = true
+        const permanent = cbPermanent.checked
+        backdrop.remove()
+        document.removeEventListener('keydown', onKey, true)
+        resolve({ ok, permanent })
+      }
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(false) }
+        else if (e.key === 'Enter') { e.preventDefault(); finish(true) }
+      }
+
+      btnCancel.addEventListener('click', () => finish(false))
+      btnOk.addEventListener('click', () => finish(true))
+      backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish(false) })
+      document.addEventListener('keydown', onKey, true)
+      btnOk.focus()
+    })
+  }
+
+  /**
+   * Delete a list of paths, reporting where each one went.
+   *
+   * @param {string[]} paths
+   * @param {{ permanent: boolean }} opts
+   * @returns {Promise<DeleteOutcome>}
+   */
+  async _deletePaths(paths, opts) {
+    /** @type {DeleteOutcome} */
+    const outcome = { trashed: 0, permanent: 0, failures: [] }
+    for (const path of paths) {
+      try {
+        // Omitting the options object entirely is the recycle-bin request; the
+        // main process refuses rather than silently unlinking when there is no
+        // bin, and that refusal is surfaced below instead of being retried.
+        const res = await window.electronAPI.deleteFile(
+          path, opts.permanent ? { permanent: true } : undefined)
+        if (res?.permanent) outcome.permanent++
+        else outcome.trashed++
+      } catch (err) {
+        console.error('FolderCompare delete failed:', path, err)
+        outcome.failures.push({ path, message: errText(err) })
+      }
+    }
+    return outcome
+  }
+
+  /**
+   * Confirm, delete, report — the single path every delete in this view takes.
+   *
+   * @param {Array<{ path: string, readOnly?: boolean }>} targets
+   * @param {{ permanent?: boolean }} [opts]
+   * @returns {Promise<boolean>} whether anything was deleted
+   */
+  async _runDelete(targets, opts = {}) {
+    if (!targets.length) { alert('沒有可刪除的項目'); return false }
+
+    const choice = await this._confirmDelete(targets.map((t) => t.path), opts)
+    if (!choice.ok) return false
+
+    // Read-only only blocks the permanent route: trashItem moves the file
+    // rather than writing to it, so a read-only file lands in the bin fine.
+    let list = targets
+    if (choice.permanent) {
+      const jobs = targets.map((t) => ({ label: t.path, targetReadOnly: !!t.readOnly, target: t }))
+      const kept = this._resolveReadOnly(jobs, '永久刪除')
+      list = kept.map((j) => j.target)
+      if (!list.length) { alert('所有選取的項目都是唯讀，已全部略過'); return false }
+    }
+
+    let outcome = await this._deletePaths(list.map((t) => t.path), { permanent: choice.permanent })
+
+    // The main process refuses to fall back on its own. Offering the fallback
+    // here — named, counted, and only after the user says so — is the whole
+    // point of that refusal.
+    if (!choice.permanent && isRecycleBinUnavailable(outcome.failures)) {
+      const retry = confirm(
+        `${outcome.failures.length} 個項目無法移至資源回收桶：\n` +
+        `${outcome.failures[0].message}\n\n改為「永久刪除」這些項目嗎？此操作無法復原。`)
+      if (retry) {
+        const again = await this._deletePaths(
+          outcome.failures.map((f) => f.path), { permanent: true })
+        outcome = {
+          trashed: outcome.trashed,
+          permanent: outcome.permanent + again.permanent,
+          failures: again.failures,
+        }
+      }
+    }
+
+    alert(formatDeleteSummary(outcome))
+    this._selectedNames.clear()
+    await this.refresh()
+    return outcome.trashed + outcome.permanent > 0
+  }
+
+  /**
+   * Delete whatever is checked — or the focused row when nothing is.
+   * @param {{ permanent?: boolean }} [opts]
+   * @returns {Promise<boolean>}
+   */
+  async deleteSelected(opts = {}) {
+    const keys = this._selectedNames.size
+      ? this._selectedNames
+      : new Set(this._focusedKey ? [this._focusedKey] : [])
+    if (!keys.size) { alert('請先勾選要刪除的項目'); return false }
+
+    /** @type {Array<{ path: string, readOnly?: boolean }>} */
+    const targets = []
+    for (const row of flattenRows(this._rows ?? [])) {
+      for (const entry of [row.left, row.right]) {
+        if (!entry?.path || !keys.has(entry.path)) continue
+        const side = entry === row.left ? 'left' : 'right'
+        if (!this._isWritableSide(side)) continue
+        targets.push({ path: entry.path, readOnly: !!entry.readOnly })
+      }
+    }
+    if (!targets.length) {
+      alert('選取的項目都不在可寫入的檔案系統來源上，無法刪除')
+      return false
+    }
+    return this._runDelete(targets, opts)
+  }
+
+  // ── Read-only targets ───────────────────────────────────────────────────────
+
+  /**
+   * Drop or keep the jobs whose target is read-only, after asking.
+   *
+   * The old code just ran them: the write failed inside the main process and
+   * the user was told "N 項失敗" with nothing naming the cause.
+   *
+   * @template {{ label: string, targetReadOnly?: boolean }} T
+   * @param {T[]} jobs
+   * @param {string} action  verb for the prompt, e.g. '覆寫'
+   * @returns {T[]} the jobs to actually run
+   */
+  _resolveReadOnly(jobs, action) {
+    const labels = readOnlyLabels(jobs)
+    if (!labels.length) return jobs
+    const overwrite = confirm(formatReadOnlyPrompt(labels, action))
+    return overwrite ? jobs : jobs.filter((j) => !j.targetReadOnly)
   }
 
   /**
@@ -1810,6 +2434,17 @@ ${rows}
   /** 根據 _rows 和 syncDirection 建立操作清單 */
   async _buildSyncOps() {
     this._syncOps = []
+    // The destination entry is what a copy has to write over, so its read-only
+    // flag travels with the op rather than being looked up again at execute
+    // time, when the row is no longer at hand.
+    const copyOp = (from, to) => ({
+      op: 'copy',
+      src: from.path,
+      dest: this._buildDestPath(from.path, to === 'left' ? 'left' : 'right'),
+      label: from.path,
+      targetReadOnly: false,
+    })
+
     for (const row of this._rows) {
       if (row.left?.isDirectory || row.right?.isDirectory) continue
       const dir = this._syncDirection
@@ -1817,25 +2452,25 @@ ${rows}
 
       if (dir === 'left-to-right') {
         if (status === 'left-only' || status === 'different' || status === 'left-newer') {
-          this._syncOps.push({ op: 'copy', src: row.left.path, dest: this._buildDestPath(row.left.path, 'right'), label: row.left.path })
+          this._syncOps.push({ ...copyOp(row.left, 'right'), targetReadOnly: !!row.right?.readOnly })
         } else if (status === 'right-only') {
-          this._syncOps.push({ op: 'delete', path: row.right.path, label: row.right.path })
+          this._syncOps.push({ op: 'delete', path: row.right.path, label: row.right.path, targetReadOnly: !!row.right.readOnly })
         }
       } else if (dir === 'right-to-left') {
         if (status === 'right-only' || status === 'different' || status === 'right-newer') {
-          this._syncOps.push({ op: 'copy', src: row.right.path, dest: this._buildDestPath(row.right.path, 'left'), label: row.right.path })
+          this._syncOps.push({ ...copyOp(row.right, 'left'), targetReadOnly: !!row.left?.readOnly })
         } else if (status === 'left-only') {
-          this._syncOps.push({ op: 'delete', path: row.left.path, label: row.left.path })
+          this._syncOps.push({ op: 'delete', path: row.left.path, label: row.left.path, targetReadOnly: !!row.left.readOnly })
         }
       } else { // bidirectional: 各取較新，孤兒雙向複製
         if (status === 'left-only') {
-          this._syncOps.push({ op: 'copy', src: row.left.path, dest: this._buildDestPath(row.left.path, 'right'), label: row.left.path })
+          this._syncOps.push({ ...copyOp(row.left, 'right'), targetReadOnly: !!row.right?.readOnly })
         } else if (status === 'right-only') {
-          this._syncOps.push({ op: 'copy', src: row.right.path, dest: this._buildDestPath(row.right.path, 'left'), label: row.right.path })
+          this._syncOps.push({ ...copyOp(row.right, 'left'), targetReadOnly: !!row.left?.readOnly })
         } else if (status === 'left-newer') {
-          this._syncOps.push({ op: 'copy', src: row.left.path, dest: this._buildDestPath(row.left.path, 'right'), label: row.left.path })
+          this._syncOps.push({ ...copyOp(row.left, 'right'), targetReadOnly: !!row.right?.readOnly })
         } else if (status === 'right-newer') {
-          this._syncOps.push({ op: 'copy', src: row.right.path, dest: this._buildDestPath(row.right.path, 'left'), label: row.right.path })
+          this._syncOps.push({ ...copyOp(row.right, 'left'), targetReadOnly: !!row.left?.readOnly })
         }
       }
     }
@@ -1913,33 +2548,59 @@ ${rows}
     // S15-U11: single batch confirm rather than per-file prompt (the old code
     // popped one native confirm() per delete — a 500-file sync was 500 dialogs).
     const deletes = this._syncOps.filter(op => op.op === 'delete')
-    let allowDelete = true
+    /** @type {{ ok: boolean, permanent: boolean }} */
+    let deleteChoice = { ok: false, permanent: false }
     if (deletes.length > 0) {
-      // eslint-disable-next-line no-alert
-      allowDelete = confirm(`即將刪除 ${deletes.length} 個檔案/資料夾，確定執行？`)
+      deleteChoice = await this._confirmDelete(deletes.map((op) => op.path))
     }
 
+    const copies = this._resolveReadOnly(
+      this._syncOps.filter((op) => op.op === 'copy'), '覆寫')
+    const copyKeep = new Set(copies)
+
     let done = 0, failed = 0, skipped = 0
+    /** @type {DeleteOutcome} */
+    const deleteOutcome = { trashed: 0, permanent: 0, failures: [] }
+    /** @type {Array<{ path: string, message: string }>} */
+    const copyFailures = []
+
     for (const op of this._syncOps) {
-      try {
-        if (op.op === 'copy') {
+      if (op.op === 'copy') {
+        if (!copyKeep.has(op)) { skipped++; continue }
+        try {
           await window.electronAPI.copyFile(op.src, op.dest)
           done++
-        } else if (op.op === 'delete') {
-          if (!allowDelete) { skipped++; continue }
-          await window.electronAPI.deleteFile(op.path)
-          done++
+        } catch (e) {
+          failed++
+          copyFailures.push({ path: op.dest, message: errText(e) })
+          console.error('Sync copy failed:', op, e)
         }
-      } catch (e) {
-        failed++
-        console.error('Sync op failed:', op, e)
+        continue
+      }
+      if (op.op === 'delete') {
+        if (!deleteChoice.ok) { skipped++; continue }
+        if (deleteChoice.permanent && op.targetReadOnly) { skipped++; continue }
+        const one = await this._deletePaths([op.path],
+          { permanent: deleteChoice.permanent })
+        deleteOutcome.trashed += one.trashed
+        deleteOutcome.permanent += one.permanent
+        deleteOutcome.failures.push(...one.failures)
+        if (one.failures.length) failed++
+        else done++
       }
     }
 
     this._syncOps = []
-    const suffix = failed ? `，${failed} 項失敗` : ''
-    const skipSuffix = skipped ? `，${skipped} 項已略過` : ''
-    alert(`同步完成：${done} 項成功${suffix}${skipSuffix}`)
+    const lines = [`同步完成：${done} 項成功`]
+    if (failed) lines.push(`${failed} 項失敗`)
+    if (skipped) lines.push(`${skipped} 項已略過`)
+    const detail = (deleteOutcome.trashed || deleteOutcome.permanent || deleteOutcome.failures.length)
+      ? `\n\n刪除：${formatDeleteSummary(deleteOutcome)}`
+      : ''
+    const copyDetail = copyFailures.length
+      ? '\n\n複製失敗：\n' + copyFailures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
+      : ''
+    alert(lines.join('，') + detail + copyDetail)
     await this.refresh()
   }
 
@@ -2013,28 +2674,15 @@ ${rows}
    */
   async _batchDelete(side) {
     if (!this._requireWritable([side])) return
-    if (!confirm(`確定要刪除 ${this._selectedNames.size} 個選取的檔案嗎？`)) return
-    const paths = []
+    /** @type {Array<{ path: string, readOnly?: boolean }>} */
+    const targets = []
     for (const row of this._rows) {
-      const path = side === 'left' ? row.left?.path : row.right?.path
-      if (path && this._selectedNames.has(path)) {
-        paths.push(path)
+      const entry = side === 'left' ? row.left : row.right
+      if (entry?.path && this._selectedNames.has(entry.path)) {
+        targets.push({ path: entry.path, readOnly: !!entry.readOnly })
       }
     }
-    if (!paths.length) { alert('沒有可刪除的項目'); return }
-    let done = 0, failed = 0
-    for (const path of paths) {
-      try {
-        await window.electronAPI.deleteFile(path)
-        done++
-      } catch (e) {
-        failed++
-        console.error('batchDelete failed:', path, e)
-      }
-    }
-    alert(`批次刪除完成：${done} 項成功${failed ? `，${failed} 項失敗` : ''}`)
-    this._selectedNames.clear()
-    await this.refresh()
+    await this._runDelete(targets)
   }
 
   // ── Copy across (Ctrl+R / Ctrl+L) ───────────────────────────────────────────
@@ -2063,28 +2711,42 @@ ${rows}
       : new Set(this._focusedKey ? [this._focusedKey] : [])
     if (!keys.size) return
 
-    const jobs = []
+    let jobs = []
     for (const row of flattenRows(this._rows ?? [])) {
       const key = row.left?.path || row.right?.path
       if (!key || !keys.has(key)) continue
       const src = target === 'right' ? row.left : row.right
       if (!src?.path || src.isDirectory) continue
-      jobs.push({ src: src.path, dest: this._destPathFor(row, target) })
+      const dst = target === 'right' ? row.right : row.left
+      jobs.push({
+        src: src.path,
+        dest: this._destPathFor(row, target),
+        label: dst?.path ?? this._destPathFor(row, target),
+        targetReadOnly: !!dst?.readOnly,
+      })
     }
     if (!jobs.length) { alert('沒有可複製的項目'); return }
     if (!confirm(`確定要複製 ${jobs.length} 個檔案到${target === 'right' ? '右' : '左'}側？`)) return
 
-    let done = 0, failed = 0
+    jobs = this._resolveReadOnly(jobs, '覆寫')
+    if (!jobs.length) { alert('目標全部是唯讀檔案，已略過'); return }
+
+    let done = 0
+    /** @type {Array<{ path: string, message: string }>} */
+    const failures = []
     for (const job of jobs) {
       try {
         await window.electronAPI.copyFile(job.src, job.dest)
         done++
       } catch (e) {
-        failed++
+        failures.push({ path: job.dest, message: errText(e) })
         console.error('copySelectedTo failed:', job, e)
       }
     }
-    alert(`複製完成：${done} 項成功${failed ? `，${failed} 項失敗` : ''}`)
+    const detail = failures.length
+      ? '\n\n失敗：\n' + failures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
+      : ''
+    alert(`複製完成：${done} 項成功${failures.length ? `，${failures.length} 項失敗` : ''}${detail}`)
     await this.refresh()
   }
 
@@ -2439,6 +3101,9 @@ ${rows}
     // Toolbar
     root.appendChild(this._buildToolbar())
 
+    // Include/Exclude mask panel (hidden by default)
+    root.appendChild(this._buildFilterPanel())
+
     // Rules panel (hidden by default)
     root.appendChild(this._buildRulesPanel())
 
@@ -2476,6 +3141,19 @@ ${rows}
 
   _buildToolbar() {
     const toolbar = el('div', { className: 'fc-toolbar' })
+
+    // Navigation: Back / Forward / Up One Level. Disabled until there is
+    // somewhere to go, so the buttons say what is possible.
+    const btnBack = el('button', { className: 'fc-btn-nav', title: '上一頁（Alt+←）' }, '◀')
+    const btnForward = el('button', { className: 'fc-btn-nav', title: '下一頁（Alt+→）' }, '▶')
+    const btnUp = el('button', { className: 'fc-btn-nav', title: '上一層（Alt+↑）' }, '⬆')
+    btnBack.disabled = true
+    btnForward.disabled = true
+    btnUp.disabled = true
+    this._dom.btnBack = btnBack
+    this._dom.btnForward = btnForward
+    this._dom.btnUp = btnUp
+    toolbar.append(btnBack, btnForward, btnUp)
 
     // Compare mode select
     const modeSelect = el('select', { className: 'fc-compare-mode' })
@@ -2534,14 +3212,23 @@ ${rows}
     this._dom.btnRightNewer = btnRightNewer
     toolbar.appendChild(btnRightNewer)
 
-    // Filter input
+    // Quick filter input: one mask string over files and folders alike.
     const filter = el('input', {
       type: 'text',
       className: 'fc-filter',
-      placeholder: '篩選（如 *.js）',
+      placeholder: '快速篩選（如 *.js）',
+      title: '同時套用於檔案與資料夾；BC 的四欄遮罩見「⚗ 篩選」',
     })
+    filter.value = this._filterStr
     this._dom.filter = filter
     toolbar.appendChild(filter)
+
+    const btnFilter = el('button', {
+      className: 'fc-btn-filter',
+      title: 'Include / Exclude 檔案與資料夾遮罩',
+    }, '⚗ 篩選')
+    this._dom.btnFilter = btnFilter
+    toolbar.appendChild(btnFilter)
 
     // Refresh button
     const btnRefresh = el('button', { className: 'fc-btn-refresh' }, '↺ 重新整理')
@@ -2648,6 +3335,53 @@ ${rows}
     toolbar.appendChild(batchWrap)
 
     return toolbar
+  }
+
+  /**
+   * Beyond Compare's four file-mask fields.
+   *
+   * Separate fields rather than one string because the two axes are
+   * independent: a mask that names files must not decide whether a folder is
+   * shown, and "everything except" is not expressible by prefixing `-` when
+   * the same box also has to carry the include list.
+   *
+   * @returns {HTMLElement}
+   */
+  _buildFilterPanel() {
+    const panel = el('div', { className: 'fc-filter-panel', style: 'display:none' })
+
+    /** @type {Array<[keyof FilterFields, string, string]>} */
+    const fields = [
+      ['includeFiles', '包含檔案', '*.js;*.ts'],
+      ['excludeFiles', '排除檔案', '*.tmp;*.log'],
+      ['includeFolders', '包含資料夾', 'src;test'],
+      ['excludeFolders', '排除資料夾', 'node_modules;.git'],
+    ]
+    this._dom.filterInputs = {}
+    for (const [key, label, placeholder] of fields) {
+      const wrap = el('label', { className: 'fc-filter-field' })
+      wrap.appendChild(el('span', { className: 'fc-filter-label' }, label))
+      const input = el('input', {
+        type: 'text',
+        className: 'fc-filter-input',
+        'data-field': key,
+        placeholder,
+        title: '遮罩語法：; 分隔、? 與 * 萬用字元、[a-z] 字元集、-mask 排除',
+      })
+      input.value = this._filterFields[key]
+      this._dom.filterInputs[key] = input
+      wrap.appendChild(input)
+      panel.appendChild(wrap)
+    }
+
+    const btnApply = el('button', { className: 'fc-filter-apply' }, '套用')
+    const btnClear = el('button', { className: 'fc-filter-clear' }, '清除')
+    this._dom.filterApply = btnApply
+    this._dom.filterClear = btnClear
+    panel.append(btnApply, btnClear)
+
+    this._dom.filterPanel = panel
+    return panel
   }
 
   /**
@@ -2817,7 +3551,8 @@ ${rows}
     // Left
     const leftCell = el('div', { className: 'fc-path-cell' })
     const btnLeft = el('button', { className: 'fc-open-btn', 'data-side': 'left' }, '開啟資料夾…')
-    const btnZipLeft = el('button', { className: 'fc-open-btn', 'data-side': 'left', title: '開啟 Zip 檔案作為虛擬資料夾' }, '開啟 Zip…')
+    const btnZipLeft = el('button', { className: 'fc-open-btn', 'data-side': 'left', title: '開啟封存檔作為虛擬資料夾（zip/jar/war/ear/tar/tgz/tbz2/txz/gz/bz2/xz/7z）' },
+      '開啟封存檔…')
     const dispLeft = el('span', { className: 'fc-path-display', 'data-side': 'left' },
       this._leftPath ?? '（未選擇）')
     this._dom.btnOpenLeft = btnLeft
@@ -2831,7 +3566,8 @@ ${rows}
     // Right
     const rightCell = el('div', { className: 'fc-path-cell' })
     const btnRight = el('button', { className: 'fc-open-btn', 'data-side': 'right' }, '開啟資料夾…')
-    const btnZipRight = el('button', { className: 'fc-open-btn', 'data-side': 'right', title: '開啟 Zip 檔案作為虛擬資料夾' }, '開啟 Zip…')
+    const btnZipRight = el('button', { className: 'fc-open-btn', 'data-side': 'right', title: '開啟封存檔作為虛擬資料夾（zip/jar/war/ear/tar/tgz/tbz2/txz/gz/bz2/xz/7z）' },
+      '開啟封存檔…')
     const dispRight = el('span', { className: 'fc-path-display', 'data-side': 'right' },
       this._rightPath ?? '（未選擇）')
     this._dom.btnOpenRight = btnRight
@@ -2911,6 +3647,12 @@ ${rows}
     })))
   }
 
+  /** Whether focus is in a control that consumes ordinary key presses. */
+  _isTypingTarget() {
+    const tag = document.activeElement?.tagName
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+  }
+
   // ── Private: Event binding ──────────────────────────────────────────────────
 
   _bindEvents() {
@@ -2923,8 +3665,24 @@ ${rows}
 
     btnOpenLeft.addEventListener('click', () => this.openLeft())
     btnOpenRight.addEventListener('click', () => this.openRight())
-    btnZipLeft?.addEventListener('click', () => this.openZipLeft())
-    btnZipRight?.addEventListener('click', () => this.openZipRight())
+    btnZipLeft?.addEventListener('click', () => void this.openArchiveLeft())
+    btnZipRight?.addEventListener('click', () => void this.openArchiveRight())
+
+    this._dom.btnBack?.addEventListener('click', () => void this.goBack())
+    this._dom.btnForward?.addEventListener('click', () => void this.goForward())
+    this._dom.btnUp?.addEventListener('click', () => void this.upOneLevel())
+
+    this._dom.btnFilter?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this.toggleFilterPanel()
+    })
+    this._dom.filterApply?.addEventListener('click', () => this._readFilterPanel())
+    this._dom.filterClear?.addEventListener('click', () => this.clearFilters())
+    for (const input of Object.values(this._dom.filterInputs ?? {})) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); this._readFilterPanel() }
+      })
+    }
 
     btnSync.addEventListener('click', () => this.toggleSyncMode())
 
@@ -3111,6 +3869,21 @@ ${rows}
       } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'l' || e.key === 'L')) {
         e.preventDefault()
         void this.copySelectedTo('left')
+      } else if (e.altKey && !e.ctrlKey && e.key === 'ArrowUp') {
+        e.preventDefault()
+        void this.upOneLevel()
+      } else if (e.altKey && !e.ctrlKey && e.key === 'ArrowLeft') {
+        e.preventDefault()
+        void this.goBack()
+      } else if (e.altKey && !e.ctrlKey && e.key === 'ArrowRight') {
+        e.preventDefault()
+        void this.goForward()
+      } else if (e.key === 'Delete' && !e.ctrlKey && !e.altKey) {
+        // Typing in a box, or answering the delete dialog itself, must not be
+        // read as a command to delete files.
+        if (this._isTypingTarget() || this._dom.root?.querySelector('.fc-modal-backdrop')) return
+        e.preventDefault()
+        void this.deleteSelected({ permanent: e.shiftKey })
       }
     }
     document.addEventListener('keydown', this._onDocumentKeydown)
@@ -3305,14 +4078,16 @@ ${rows}
       return false
     }
 
-    // Filter string
-    if (this._filterStr.trim()) {
-      return matchesFilter(row.name, this._filterStr, {
-        isDirectory: !!(row.left?.isDirectory || row.right?.isDirectory),
-        relativePath: this._relativePathOf(row),
-      })
+    const opts = {
+      isDirectory: !!(row.left?.isDirectory || row.right?.isDirectory),
+      relativePath: this._relativePathOf(row),
     }
-    return true
+
+    // Quick filter: one mask string over both files and folders.
+    if (this._filterStr.trim() && !matchesFilter(row.name, this._filterStr, opts)) {
+      return false
+    }
+    return matchesFolderFilters(row.name, this._filterFields, opts)
   }
 
   /**
@@ -3732,6 +4507,19 @@ ${rows}
     const leftPath = rowEl.dataset.leftPath  || ''
     const rightPath= rowEl.dataset.rightPath || ''
     const name     = rowEl.dataset.name      || ''
+    // The model row carries the attributes the dataset does not, so the
+    // read-only warnings below can be raised before the write is attempted.
+    const modelRow = this._flatEntryOf(rowEl)?.row ?? null
+    const leftReadOnly = !!modelRow?.left?.readOnly
+    const rightReadOnly = !!modelRow?.right?.readOnly
+
+    /**
+     * Warn once before overwriting a read-only destination.
+     * @param {boolean} readOnly
+     * @param {string} label
+     */
+    const okToOverwrite = (readOnly, label) =>
+      !readOnly || confirm(formatReadOnlyPrompt([label], '覆寫'))
 
     const items = []
     // Only filesystem paths can be handed to Explorer or to the write
@@ -3778,6 +4566,7 @@ ${rows}
             label: '複製左側 → 覆蓋右側',
             action: async () => {
               if (!confirm(`確定要用左側檔案覆蓋右側的「${name}」嗎？`)) return
+              if (!okToOverwrite(rightReadOnly, rightPath)) return
               try {
                 await window.electronAPI.copyFile(leftPath, rightPath)
                 await this.refresh()
@@ -3788,6 +4577,7 @@ ${rows}
             label: '複製右側 → 覆蓋左側',
             action: async () => {
               if (!confirm(`確定要用右側檔案覆蓋左側的「${name}」嗎？`)) return
+              if (!okToOverwrite(leftReadOnly, leftPath)) return
               try {
                 await window.electronAPI.copyFile(rightPath, leftPath)
                 await this.refresh()
@@ -3814,13 +4604,7 @@ ${rows}
         items.push({ separator: true })
         items.push({
           label: `刪除（左側「${name}」）`,
-          action: async () => {
-            if (!confirm(`確定要刪除左側的「${name}」嗎？此操作無法復原。`)) return
-            try {
-              await window.electronAPI.deleteFile(leftPath)
-              await this.refresh()
-            } catch (err) { alert(`刪除失敗：${err.message}`) }
-          }
+          action: () => this._runDelete([{ path: leftPath, readOnly: leftReadOnly }])
         })
       }
 
@@ -3840,13 +4624,7 @@ ${rows}
         items.push({ separator: true })
         items.push({
           label: `刪除（右側「${name}」）`,
-          action: async () => {
-            if (!confirm(`確定要刪除右側的「${name}」嗎？此操作無法復原。`)) return
-            try {
-              await window.electronAPI.deleteFile(rightPath)
-              await this.refresh()
-            } catch (err) { alert(`刪除失敗：${err.message}`) }
-          }
+          action: () => this._runDelete([{ path: rightPath, readOnly: rightReadOnly }])
         })
       }
     }
