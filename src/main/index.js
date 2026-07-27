@@ -279,8 +279,12 @@ ipcMain.handle('accept-dropped-paths', async (_event, paths) => {
 ipcMain.handle('read-file', async (_event, filePath, forcedEncoding) => {
   const safe = validatePath(filePath)
   const buffer = await readFile(safe)
-  const { content, encoding, detected } = decodeBuffer(buffer, forcedEncoding)
-  return { path: safe, content, encoding, detected }
+  const { content, encoding, detected, confidence, hasBom } =
+    decodeBuffer(buffer, forcedEncoding)
+  // confidence travels so the view can mark a guess as a guess: a short
+  // non-UTF-8 sample is genuinely ambiguous, and the honest response is to
+  // point the user at the manual override rather than assert a label.
+  return { path: safe, content, encoding, detected, confidence, hasBom }
 })
 
 /**

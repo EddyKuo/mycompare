@@ -104,8 +104,10 @@ describe('forced encoding', () => {
     expect(COMMON_ENCODINGS).toContain('UTF-8')
     expect(COMMON_ENCODINGS).toContain('Big5')
     expect(COMMON_ENCODINGS).toContain('Shift_JIS')
+    // The `-BOM` entries are this project's own names for "same encoding, with
+    // the mark" — iconv has no such name, so the suffix comes off first.
     for (const enc of COMMON_ENCODINGS) {
-      expect(iconv.encodingExists(enc), enc).toBe(true)
+      expect(iconv.encodingExists(enc.replace(/-BOM$/, '')), enc).toBe(true)
     }
   })
 })
