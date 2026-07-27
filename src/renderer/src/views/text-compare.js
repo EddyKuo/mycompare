@@ -26,7 +26,7 @@ import { tagConfig, readConfig } from '../core/named-config-store.js';
 import { toast } from '../core/toast.js';
 import {
   getGrammarForPath, tokenizeLines, maskLine, linesEqualIgnoringElements,
-  lineWeight, elementsOf, getUserGrammars, setUserGrammars,
+  lineWeight, elementsOf, getUserGrammars, setUserGrammars, isRiskyRegexSource,
 } from '../core/grammar.js';
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
@@ -1005,6 +1005,227 @@ function createCollapsedEl(start, end, count, expanded = false) {
 const _settings = new SettingsStore();
 
 // ---------------------------------------------------------------------------
+// 1.4 / 1.7 — Text Replacements
+//
+// BC's match→replacement pairs: both sides are rewritten before they are
+// compared, so text that is equivalent but written differently lines up as
+// equal. The rewrite is for comparison only — every pane still shows, edits
+// and saves the original bytes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Open-dialog filters for the formats `main/archive.js` decodes.
+ *
+ * Duplicated from folder-compare rather than imported: pulling that module in
+ * would drag the entire folder view and its stylesheet into every text-only
+ * bundle path for the sake of one array of strings.
+ */
+const ARCHIVE_DIALOG_FILTERS = [
+  {
+    name: '封存檔',
+    extensions: ['zip', 'jar', 'war', 'ear', '7z', 'tar', 'tgz', 'tbz', 'tbz2', 'txz', 'gz', 'bz2', 'xz'],
+  },
+  { name: '所有檔案', extensions: ['*'] },
+];
+
+/** Most rules one session may hold. */
+export const MAX_REPLACEMENT_RULES = 50;
+
+/** Longest line a replacement is attempted on, and the cap on the result. */
+export const MAX_REPLACEMENT_LINE = 10000;
+
+/**
+ * @typedef {{
+ *   match: string,
+ *   replacement: string,
+ *   regex: boolean,
+ *   caseSensitive: boolean,
+ * }} ReplacementRule
+ */
+
+/** @param {string} s */
+function _escapeLiteral(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Parse the rules a user typed, one per line.
+ *
+ * Format: `match => replacement`, optionally prefixed with `re:` (regex),
+ * `i:` (case-insensitive) or `rei:` (both). Lines starting with `#` and blank
+ * lines are comments.
+ *
+ * Rejected lines are reported rather than skipped: a rule that silently does
+ * nothing is worse than no rule, because the user believes it is running.
+ *
+ * @param {string} text
+ * @returns {{ rules: ReplacementRule[], errors: string[] }}
+ */
+export function parseReplacementRules(text) {
+  /** @type {ReplacementRule[]} */
+  const rules = [];
+  /** @type {string[]} */
+  const errors = [];
+  const lines = String(text ?? '').split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = raw.replace(/\r$/, '').trim();
+    if (line === '' || line.startsWith('#')) continue;
+
+    if (rules.length >= MAX_REPLACEMENT_RULES) {
+      errors.push(`第 ${i + 1} 行：規則數超過上限 ${MAX_REPLACEMENT_RULES}，其後略過`);
+      break;
+    }
+
+    const prefixed = /^(rei|ir|re|i)\s*:\s*(.*)$/i.exec(line);
+    const flags = prefixed ? prefixed[1].toLowerCase() : '';
+    const rest = prefixed ? prefixed[2] : line;
+
+    // The first ` => ` wins, so a bare `=>` inside the pattern needs no
+    // escaping as long as it is not surrounded by spaces.
+    let cut = rest.indexOf(' => ');
+    let sepLen = 4;
+    if (cut < 0) { cut = rest.indexOf('=>'); sepLen = 2; }
+    if (cut < 0) {
+      errors.push(`第 ${i + 1} 行：缺少 " => " 分隔符`);
+      continue;
+    }
+
+    const match = rest.slice(0, cut).trim();
+    const replacement = rest.slice(cut + sepLen).trim();
+    if (match === '') {
+      errors.push(`第 ${i + 1} 行：比對字串不可為空`);
+      continue;
+    }
+
+    rules.push({
+      match,
+      replacement,
+      regex: flags.includes('re'),
+      caseSensitive: !flags.includes('i'),
+    });
+  }
+
+  return { rules, errors };
+}
+
+/**
+ * Render rules back into the editable text form.
+ * @param {ReplacementRule[]} rules
+ * @returns {string}
+ */
+export function formatReplacementRules(rules) {
+  return (Array.isArray(rules) ? rules : []).map((r) => {
+    const flags = `${r.regex ? 're' : ''}${r.caseSensitive ? '' : 'i'}`;
+    return `${flags ? `${flags}: ` : ''}${r.match} => ${r.replacement}`;
+  }).join('\n');
+}
+
+/**
+ * Compile rules into runnable regexes.
+ *
+ * A user-supplied pattern is screened for catastrophic backtracking before it
+ * is ever executed — the same screen `core/grammar.js` applies to its own
+ * user-supplied regexes. A rejected rule is reported and dropped; it never
+ * runs in a degraded form.
+ *
+ * @param {ReplacementRule[]} rules
+ * @returns {{ compiled: Array<{ re: RegExp, replacement: string }>, errors: string[] }}
+ */
+export function compileReplacementRules(rules) {
+  /** @type {Array<{ re: RegExp, replacement: string }>} */
+  const compiled = [];
+  /** @type {string[]} */
+  const errors = [];
+
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    const match = String(rule?.match ?? '');
+    const replacement = String(rule?.replacement ?? '');
+    if (match === '') continue;
+    // A rule that changes the line count would break every line number the
+    // diff, the caret and the manual-ignore marks are expressed in.
+    if (/[\r\n]/.test(match) || /[\r\n]/.test(replacement)) {
+      errors.push(`規則「${match}」含有換行字元，不支援`);
+      continue;
+    }
+
+    const source = rule?.regex ? match : _escapeLiteral(match);
+    if (rule?.regex) {
+      const risk = isRiskyRegexSource(source);
+      if (risk) {
+        errors.push(`規則「${match}」被拒絕：${risk}`);
+        continue;
+      }
+    }
+    try {
+      compiled.push({
+        re: new RegExp(source, rule?.caseSensitive === false ? 'gi' : 'g'),
+        replacement,
+      });
+    } catch (err) {
+      errors.push(`規則「${match}」無效：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return { compiled, errors };
+}
+
+/**
+ * Rewrite text for comparison.
+ *
+ * Applied per line, keeping each line's own terminator, so the result has
+ * exactly the same number of lines as the input — which is what lets the
+ * original text be put back afterwards by line number.
+ *
+ * @param {string} text
+ * @param {Array<{ re: RegExp, replacement: string }>} compiled
+ * @returns {string}
+ */
+export function applyReplacements(text, compiled) {
+  const src = String(text ?? '');
+  if (!Array.isArray(compiled) || compiled.length === 0) return src;
+
+  return splitLinesKeepEol(src).map((line) => {
+    const { body, eol } = splitEol(line);
+    if (body.length > MAX_REPLACEMENT_LINE) return line;
+    let out = body;
+    for (const { re, replacement } of compiled) {
+      re.lastIndex = 0;
+      out = out.replace(re, replacement);
+      // A rule can grow a line; capping stops a chain of them from turning one
+      // line into something the renderer has to lay out.
+      if (out.length > MAX_REPLACEMENT_LINE) { out = out.slice(0, MAX_REPLACEMENT_LINE); break; }
+    }
+    return out + eol;
+  }).join('');
+}
+
+/**
+ * Put the on-disk text back onto a diff computed over rewritten content.
+ *
+ * The types stay as computed — that is the whole point, equivalent lines came
+ * back `equal` — while every pane, every export and every edit goes on seeing
+ * what the file actually contains.
+ *
+ * @param {import('../core/diff-engine.js').DiffLine[]} diff mutated in place
+ * @param {string[]} leftLines  original lines, EOL kept
+ * @param {string[]} rightLines original lines, EOL kept
+ * @returns {import('../core/diff-engine.js').DiffLine[]} the same array
+ */
+export function restoreOriginalDiffText(diff, leftLines, rightLines) {
+  for (const dl of diff ?? []) {
+    if (dl.leftLine != null && leftLines[dl.leftLine - 1] != null) {
+      dl.leftText = leftLines[dl.leftLine - 1];
+    }
+    if (dl.rightLine != null && rightLines[dl.rightLine - 1] != null) {
+      dl.rightText = rightLines[dl.rightLine - 1];
+    }
+  }
+  return diff;
+}
+
+// ---------------------------------------------------------------------------
 // TextCompare class
 // ---------------------------------------------------------------------------
 
@@ -1295,6 +1516,13 @@ export class TextCompare {
     /** Saved panes from before Isolate, so it can be undone. @type {Array<object>} */
     this._isolateStack = [];
 
+    /** 1.7 Replacements: match→replacement pairs applied before comparing. */
+    /** @type {ReplacementRule[]} */
+    this._replacements = [];
+    /** Compiled form of `_replacements`; empty means the feature is inert. */
+    /** @type {Array<{ re: RegExp, replacement: string }>} */
+    this._replacementsCompiled = [];
+
     this._mounted = false;
   }
 
@@ -1534,6 +1762,15 @@ export class TextCompare {
       } else if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
         e.preventDefault();
         void this.openPatchFile();
+      } else if (e.ctrlKey && e.shiftKey && (e.key === 'R' || e.key === 'r')) {
+        e.preventDefault();
+        this.openReplacementsDialog();
+      } else if (e.ctrlKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) {
+        e.preventDefault();
+        void this.mergeFilesWithBase();
+      } else if (e.ctrlKey && e.shiftKey && (e.key === 'A' || e.key === 'a')) {
+        e.preventDefault();
+        void this.openFromArchive(this.activeSide());
       } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'i' || e.key === 'I')) {
         e.preventDefault();
         this.toggleIgnoreSelection();
@@ -2900,11 +3137,29 @@ ${rows}
         leftWeights: weights?.left,
         rightWeights: weights?.right,
       };
+      // 1.7 Replacements rewrite both sides *for the comparison only*; the
+      // original text is put back below so nothing downstream ever sees the
+      // rewritten form.
+      const active = this._replacementsCompiled.length > 0;
+      const leftForDiff = active
+        ? applyReplacements(this._leftContent, this._replacementsCompiled)
+        : this._leftContent;
+      const rightForDiff = active
+        ? applyReplacements(this._rightContent, this._replacementsCompiled)
+        : this._rightContent;
+
       // 1.4 Align With: anchors cut the files into regions that are diffed
       // independently, which is what forces the pinned lines onto one row.
       this._diffResult = this._alignAnchors.length > 0
-        ? diffWithAnchors(this._leftContent, this._rightContent, this._alignAnchors, diffOpts)
-        : diffLines(this._leftContent, this._rightContent, diffOpts);
+        ? diffWithAnchors(leftForDiff, rightForDiff, this._alignAnchors, diffOpts)
+        : diffLines(leftForDiff, rightForDiff, diffOpts);
+
+      if (active) {
+        restoreOriginalDiffText(
+          this._diffResult,
+          splitLinesKeepEol(this._leftContent),
+          splitLinesKeepEol(this._rightContent));
+      }
     }
 
     // Apply ignore / unimportant patterns
@@ -3320,6 +3575,324 @@ ${rows}
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Public: modal helper
+  //
+  // A native <dialog> rather than markup in index.html: these three commands
+  // are owned by this view, and a dialog it builds itself cannot be left
+  // half-wired in a template the view does not control.
+  // -------------------------------------------------------------------------
+
+  /**
+   * @param {{
+   *   title: string,
+   *   hint?: string,
+   *   build: (body: HTMLElement) => void,
+   *   confirmLabel?: string,
+   *   onConfirm: () => boolean|void,
+   * }} spec
+   * @returns {HTMLDialogElement}
+   */
+  _openDialog(spec) {
+    const dlg = /** @type {HTMLDialogElement} */ (document.createElement('dialog'));
+    dlg.className = 'tc-dialog';
+    // Set here rather than in a stylesheet: this view's styles live in
+    // main.css, which is shared, and a <dialog> with no rules at all inherits
+    // the UA's white canvas — unreadable under the dark theme.
+    Object.assign(dlg.style, {
+      maxWidth: 'min(680px, 90vw)',
+      maxHeight: '80vh',
+      overflow: 'auto',
+      padding: '14px',
+      border: '1px solid var(--border-color, #ccc)',
+      borderRadius: '6px',
+      background: 'var(--bg-primary, #fff)',
+      color: 'var(--text-primary, #222)',
+      fontSize: '13px',
+    });
+
+    const h = document.createElement('h3');
+    h.textContent = spec.title;
+    dlg.appendChild(h);
+
+    if (spec.hint) {
+      const p = document.createElement('p');
+      p.textContent = spec.hint;
+      dlg.appendChild(p);
+    }
+
+    const body = document.createElement('div');
+    body.style.display = 'flex';
+    body.style.flexDirection = 'column';
+    body.style.gap = '6px';
+    spec.build(body);
+    dlg.appendChild(body);
+
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.gap = '6px';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.marginTop = '10px';
+    const ok = document.createElement('button');
+    ok.type = 'button';
+    ok.textContent = spec.confirmLabel ?? '套用';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = '取消';
+    actions.append(ok, cancel);
+    dlg.appendChild(actions);
+
+    const close = () => {
+      // close() throws on a dialog that was opened by attribute rather than
+      // showModal(), which is the path taken where showModal is unavailable.
+      if (typeof dlg.close === 'function' && dlg.open) dlg.close();
+      dlg.remove();
+    };
+    ok.addEventListener('click', () => { if (spec.onConfirm() !== false) close(); });
+    cancel.addEventListener('click', close);
+    dlg.addEventListener('cancel', close);
+
+    document.body.appendChild(dlg);
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+    return dlg;
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: 1.7 — Text Replacements
+  // -------------------------------------------------------------------------
+
+  /**
+   * Replace the whole rule set.
+   *
+   * @param {ReplacementRule[]} rules
+   * @returns {string[]} compile errors; the accepted rules still take effect
+   */
+  setReplacements(rules) {
+    const list = Array.isArray(rules) ? rules.slice(0, MAX_REPLACEMENT_RULES) : [];
+    const { compiled, errors } = compileReplacementRules(list);
+    this._replacements = list;
+    this._replacementsCompiled = compiled;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return errors;
+  }
+
+  /** @returns {ReplacementRule[]} */
+  getReplacements() {
+    return this._replacements.map((r) => ({ ...r }));
+  }
+
+  /** Edit the replacement rules. */
+  openReplacementsDialog() {
+    let textarea = null;
+    let errorBox = null;
+    this._openDialog({
+      title: '文字取代規則（比對前套用）',
+      hint: '每行一條：「比對 => 取代」。前綴 re: 視為正規表示式、i: 不分大小寫、rei: 兩者皆是；# 開頭為註解。'
+        + '兩側只在比對時改寫，畫面與存檔仍是原始內容。',
+      build: (body) => {
+        textarea = document.createElement('textarea');
+        textarea.className = 'tc-dialog-textarea';
+        textarea.spellcheck = false;
+        textarea.rows = 10;
+        textarea.style.fontFamily = 'var(--font-mono, monospace)';
+        textarea.style.whiteSpace = 'pre';
+        textarea.value = formatReplacementRules(this._replacements);
+        body.appendChild(textarea);
+        errorBox = document.createElement('div');
+        errorBox.className = 'tc-dialog-errors';
+        errorBox.style.whiteSpace = 'pre-wrap';
+        errorBox.style.color = 'var(--diff-delete-fg, #b91c1c)';
+        body.appendChild(errorBox);
+      },
+      onConfirm: () => {
+        const { rules, errors } = parseReplacementRules(textarea?.value ?? '');
+        const compileErrors = this.setReplacements(rules);
+        const all = [...errors, ...compileErrors];
+        if (all.length > 0) {
+          // Kept open with the reasons visible: closing on a rejected rule
+          // would leave the user believing it is running.
+          if (errorBox) errorBox.textContent = all.join('\n');
+          toast(`有 ${all.length} 條規則未套用`, { type: 'error', durationMs: 6000 });
+          return false;
+        }
+        toast(rules.length > 0 ? `已套用 ${rules.length} 條取代規則` : '已清除所有取代規則',
+          { type: 'success' });
+        return true;
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: 1.2 — Merge Files (hand off to a 3-way merge session)
+  // -------------------------------------------------------------------------
+
+  /**
+   * BC's Merge Files: continue this two-file comparison as a three-way merge.
+   *
+   * The host owns tabs and views, so this can only ask. With no listener the
+   * command reports that rather than appearing to work.
+   *
+   * @param {{ basePath?: string, baseContent?: string }} [base]
+   * @returns {boolean} whether the request was handed off
+   */
+  mergeFiles(base = {}) {
+    if (!this._leftContent && !this._rightContent) {
+      toast('請先載入要合併的檔案', { type: 'error' });
+      return false;
+    }
+    if (!this._listeners.get('merge-files')?.size) {
+      toast('主視窗未接上「轉為三向合併」，無法開啟合併工作階段', { type: 'error', durationMs: 6000 });
+      return false;
+    }
+    this._emit('merge-files', {
+      left:  { path: this._leftPath,  content: this._leftContent },
+      base:  { path: base.basePath ?? '', content: base.baseContent ?? '' },
+      right: { path: this._rightPath, content: this._rightContent },
+    });
+    return true;
+  }
+
+  /**
+   * Pick a common ancestor, then hand off.
+   * @returns {Promise<boolean>}
+   */
+  async mergeFilesWithBase() {
+    let result;
+    try {
+      result = await window.electronAPI.openFile();
+    } catch (err) {
+      toast(`選擇基準檔失敗：${err instanceof Error ? err.message : String(err)}`, { type: 'error' });
+      return false;
+    }
+    if (!result) return false;
+    return this.mergeFiles({ basePath: result.path, baseContent: result.content });
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: 1.1 — open one file out of an archive
+  // -------------------------------------------------------------------------
+
+  /**
+   * Load a single member of an archive into one pane.
+   *
+   * The pane keeps the `archive::entry` virtual path, which is the form every
+   * other reader in the app already understands, so a later reload or reveal
+   * routes itself.
+   *
+   * @param {'left'|'right'} side
+   * @returns {Promise<boolean>} whether a file was loaded
+   */
+  async openFromArchive(side) {
+    let chosen;
+    try {
+      // openFileBinary rather than openFile: the archive's *bytes* are of no
+      // use here, only its path, and this is the dialog that also registers
+      // the file as a readable root for the readArchive call below. maxBytes
+      // keeps it from slurping a gigabyte to throw it away.
+      chosen = await window.electronAPI.openFileBinary({
+        filters: ARCHIVE_DIALOG_FILTERS,
+        maxBytes: 1,
+      });
+    } catch (err) {
+      toast(`選擇封存檔失敗：${err instanceof Error ? err.message : String(err)}`, { type: 'error' });
+      return false;
+    }
+    if (!chosen?.path) return false;
+    return this.openArchiveEntry(side, chosen.path);
+  }
+
+  /**
+   * List an archive and load the member the user picks.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} archivePath
+   * @returns {Promise<boolean>}
+   */
+  async openArchiveEntry(side, archivePath) {
+    let listing;
+    try {
+      listing = await window.electronAPI.readArchive(archivePath);
+    } catch (err) {
+      toast(`無法讀取封存檔：${err instanceof Error ? err.message : String(err)}`,
+        { type: 'error', durationMs: 8000 });
+      return false;
+    }
+
+    const files = (listing?.entries ?? []).filter((e) => e && !e.isDirectory);
+    if (files.length === 0) {
+      toast('這個封存檔裡沒有檔案', { type: 'error' });
+      return false;
+    }
+
+    // Entry paths come back as `archive::relative`; the relative half is what
+    // the picker shows and what readArchiveEntry wants.
+    const relOf = (p) => {
+      const s = String(p ?? '');
+      const i = s.indexOf('::');
+      return i >= 0 ? s.slice(i + 2) : s;
+    };
+
+    return new Promise((resolve) => {
+      let select = null;
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+
+      const dlg = this._openDialog({
+        title: `從封存檔載入到${side === 'left' ? '左' : '右'}側`,
+        hint: `${archivePath}（${files.length} 個檔案）`,
+        confirmLabel: '載入',
+        build: (body) => {
+          select = document.createElement('select');
+          select.className = 'tc-dialog-list';
+          select.size = Math.min(14, Math.max(4, files.length));
+          for (const entry of files) {
+            const opt = document.createElement('option');
+            opt.value = relOf(entry.path);
+            opt.textContent = `${relOf(entry.path)}　(${entry.size} bytes)`;
+            select.appendChild(opt);
+          }
+          select.selectedIndex = 0;
+          body.appendChild(select);
+        },
+        onConfirm: () => {
+          const entry = select?.value ?? '';
+          if (!entry) { toast('請先選一個檔案', { type: 'error' }); return false; }
+          void this._loadArchiveEntry(side, archivePath, entry).then(done);
+          return true;
+        },
+      });
+      dlg.addEventListener('cancel', () => done(false));
+    });
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {string} archivePath
+   * @param {string} entryPath
+   * @returns {Promise<boolean>}
+   */
+  async _loadArchiveEntry(side, archivePath, entryPath) {
+    try {
+      const base64 = await window.electronAPI.readArchiveEntry(archivePath, entryPath);
+      const binary = atob(String(base64 ?? ''));
+      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+      // Archive members carry no encoding declaration; UTF-8 is the only
+      // defensible default, and the per-side "reload with encoding" command
+      // is the escape hatch when it is wrong.
+      const content = new TextDecoder('utf-8').decode(bytes);
+      const virtualPath = `${archivePath}::${entryPath}`;
+      if (side === 'left') this.setLeft(virtualPath, content, 'UTF-8');
+      else this.setRight(virtualPath, content, 'UTF-8');
+      toast(`已載入 ${entryPath}`, { type: 'success' });
+      return true;
+    } catch (err) {
+      toast(`無法取出 ${entryPath}：${err instanceof Error ? err.message : String(err)}`,
+        { type: 'error', durationMs: 8000 });
+      return false;
+    }
+  }
+
   /**
    * Return the current view settings as a plain JSON-serialisable object.
    * Used by T61 Session Settings Dialog to persist a snapshot under a name.
@@ -3353,6 +3926,9 @@ ${rows}
       alignAnchors:       this.getAlignAnchors(),
       tabWidth:           this._tabWidth,
       indentWithTabs:     this._indentWithTabs,
+      // 1.7: the replacement pairs are a comparison setting, so they belong in
+      // a named config exactly like the ignore patterns do.
+      replacements:       this.getReplacements(),
     })
   }
 
@@ -3395,6 +3971,14 @@ ${rows}
         splitLinesKeepEol(this._leftContent).length,
         splitLinesKeepEol(this._rightContent).length,
       )
+    }
+    if (Array.isArray(settings.replacements)) {
+      // Compiled here rather than at diff time so a snapshot carrying a
+      // rejected pattern says so once, instead of failing silently per re-diff.
+      const errs = compileReplacementRules(settings.replacements).errors
+      this._replacements = settings.replacements.slice(0, MAX_REPLACEMENT_RULES)
+      this._replacementsCompiled = compileReplacementRules(this._replacements).compiled
+      if (errs.length > 0) toast(`部分取代規則無法載入：${errs.join('；')}`, { type: 'error', durationMs: 6000 })
     }
     if (Number.isInteger(settings.tabWidth)) this.setTabWidth(settings.tabWidth)
     if (typeof settings.indentWithTabs === 'boolean') this._indentWithTabs = settings.indentWithTabs
@@ -4403,6 +4987,27 @@ ${rows}
     items.push({
       label: '開啟 Patch 檔… (Ctrl+Shift+P)',
       action: () => { void this.openPatchFile(); },
+    });
+    items.push({
+      label: `從封存檔載入到${side === 'left' ? '左' : '右'}側… (Ctrl+Shift+A)`,
+      action: () => { void this.openFromArchive(side); },
+    });
+
+    // 1.7 Replacements / 1.2 Merge Files
+    items.push({ separator: true });
+    items.push({
+      label: `文字取代規則…（${this._replacements.length}） (Ctrl+Shift+R)`,
+      action: () => this.openReplacementsDialog(),
+    });
+    items.push({
+      label: '轉為三向合併（選擇基準檔）… (Ctrl+Shift+M)',
+      disabled: !this._leftContent && !this._rightContent,
+      action: () => { void this.mergeFilesWithBase(); },
+    });
+    items.push({
+      label: '轉為三向合併（無基準檔）',
+      disabled: !this._leftContent && !this._rightContent,
+      action: () => { this.mergeFiles(); },
     });
 
     // T43: Bookmark items

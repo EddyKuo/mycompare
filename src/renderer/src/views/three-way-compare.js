@@ -8,7 +8,7 @@ import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, getNavOptions } from '../core/diff-nav.js'
 import { renderTextTable, reportHeader } from '../core/report.js'
 import { toast } from '../core/toast.js'
-import { getGrammarForPath, computeLineWeights } from '../core/grammar.js'
+import { getGrammarForPath, computeLineWeights, isRiskyRegexSource } from '../core/grammar.js'
 // Imported here rather than from the renderer entry so the view stays
 // self-contained; the bundler emits it once no matter how many tabs mount.
 import '../styles/merge-compare.css'
@@ -58,12 +58,253 @@ function _arraysEqual(a, b) {
 }
 
 /**
+ * Ceiling for the conflict proximity threshold. Past this the whole file
+ * collapses into one conflict, which is the same as having no merge at all.
+ */
+export const MAX_CONFLICT_PROXIMITY = 100
+
+/**
+ * Coerce an arbitrary value into a usable proximity threshold.
+ *
+ * Zero is the default and reproduces the "only genuinely overlapping edits
+ * conflict" behaviour exactly, so raising it is always an opt-in.
+ *
+ * @param {unknown} n
+ * @returns {number}
+ */
+export function normalizeConflictProximity(n) {
+  const v = Math.floor(Number(n))
+  if (!Number.isFinite(v) || v < 0) return 0
+  return Math.min(MAX_CONFLICT_PROXIMITY, v)
+}
+
+/**
+ * Clean a list of manually forced conflict ranges.
+ *
+ * Ranges are half-open over 0-based base line indices. Out-of-range, empty and
+ * overlapping entries are folded away here rather than in the merge loop,
+ * which would otherwise have to defend against each of them on every line.
+ *
+ * @param {unknown} ranges
+ * @param {number} baseLineCount
+ * @returns {Array<{ start: number, end: number }>} sorted, disjoint
+ */
+export function normalizeForcedRanges(ranges, baseLineCount) {
+  const max = Math.max(0, Math.floor(Number(baseLineCount) || 0))
+  const cleaned = []
+  for (const r of Array.isArray(ranges) ? ranges : []) {
+    const start = Math.max(0, Math.min(max, Math.floor(Number(r?.start))))
+    const end = Math.max(0, Math.min(max, Math.floor(Number(r?.end))))
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue
+    cleaned.push({ start, end })
+  }
+  cleaned.sort((a, b) => a.start - b.start || a.end - b.end)
+
+  /** @type {Array<{ start: number, end: number }>} */
+  const merged = []
+  for (const r of cleaned) {
+    const last = merged[merged.length - 1]
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end)
+    else merged.push({ ...r })
+  }
+  return merged
+}
+
+/**
+ * Rebuild one side's version of a base range from the hunks it applied there.
+ *
+ * The obvious shortcut — "the side's lines are just the hunk's newLines" —
+ * only holds when the cluster is exactly one hunk covering the whole range.
+ * As soon as two edits are grouped (which a proximity threshold above zero
+ * makes routine) the base lines *between* them belong to both sides and would
+ * otherwise be dropped from the conflict card and from the output.
+ *
+ * @param {string[]} baseLines
+ * @param {Array<{ baseStart: number, baseEnd: number, newLines: string[] }>} hunks
+ *   sorted, non-overlapping, all inside [start, end)
+ * @param {number} start
+ * @param {number} end
+ * @returns {string[]}
+ */
+export function applyHunkRange(baseLines, hunks, start, end) {
+  const out = []
+  let cursor = start
+  for (const h of hunks) {
+    if (h.baseStart > cursor) out.push(...baseLines.slice(cursor, Math.min(h.baseStart, end)))
+    out.push(...h.newLines)
+    cursor = Math.max(cursor, h.baseEnd)
+  }
+  if (cursor < end) out.push(...baseLines.slice(cursor, end))
+  return out
+}
+
+/**
+ * Turn base lines plus each side's hunks into merge segments.
+ *
+ * Extracted from the view so the two rules that decide what a conflict *is* —
+ * the proximity threshold and the manual marks — can be tested without a DOM,
+ * and so the equality used to decide "both sides made the same edit" can be
+ * swapped for one that ignores unimportant differences.
+ *
+ * @param {string[]} baseLines
+ * @param {Array<{ baseStart: number, baseEnd: number, newLines: string[] }>} leftHunks
+ * @param {Array<{ baseStart: number, baseEnd: number, newLines: string[] }>} rightHunks
+ * @param {{
+ *   proximity?: number,
+ *   forced?: Array<{ start: number, end: number }>,
+ *   equals?: (a: string[], b: string[]) => boolean,
+ * }} [opts]
+ * @returns {{ segments: MergeSegment[], hasConflicts: boolean }}
+ */
+export function mergeHunkSegments(baseLines, leftHunks, rightHunks, opts = {}) {
+  const lines = baseLines || []
+  const lh = leftHunks || []
+  const rh = rightHunks || []
+  const proximity = normalizeConflictProximity(opts.proximity ?? 0)
+  const forced = normalizeForcedRanges(opts.forced ?? [], lines.length)
+  const equals = opts.equals ?? _arraysEqual
+
+  /** @type {MergeSegment[]} */
+  const segments = []
+  let hasConflicts = false
+  let conflictId = 0
+
+  /** @type {string[]} */
+  let pendingNormal = []
+  const flushNormal = () => {
+    if (pendingNormal.length > 0) {
+      segments.push({ type: 'normal', lines: pendingNormal, kind: 'same' })
+      pendingNormal = []
+    }
+  }
+
+  let i = 0, li = 0, ri = 0
+  while (i < lines.length || li < lh.length || ri < rh.length) {
+    const forcedHere = forced.find((f) => f.start === i)
+    const triggered = forcedHere != null ||
+      (lh[li] && lh[li].baseStart === i) ||
+      (rh[ri] && rh[ri].baseStart === i)
+
+    if (!triggered) {
+      if (i < lines.length) { pendingNormal.push(lines[i]); i++; continue }
+      // A hunk left behind by a range that already swallowed it. Skipping it
+      // rather than breaking keeps a malformed diff from truncating the merge.
+      if (lh[li] && lh[li].baseStart < i) { li++; continue }
+      if (rh[ri] && rh[ri].baseStart < i) { ri++; continue }
+      break
+    }
+
+    const liBefore = li
+    const riBefore = ri
+    /** @type {Array<{ baseStart: number, baseEnd: number, newLines: string[] }>} */
+    const lTaken = []
+    /** @type {Array<{ baseStart: number, baseEnd: number, newLines: string[] }>} */
+    const rTaken = []
+    let end = i
+    let isForced = false
+    if (forcedHere) { isForced = true; end = Math.max(end, forcedHere.end) }
+
+    // Grow the cluster until nothing else reaches into it. Iterated rather
+    // than done in one pass because absorbing a hunk moves `end` forward,
+    // which can bring a further hunk within the threshold.
+    let grew = true
+    while (grew) {
+      grew = false
+      while (lh[li] && (lh[li].baseStart === i || lh[li].baseStart < end + proximity)) {
+        const h = lh[li++]
+        lTaken.push(h)
+        if (h.baseEnd > end) { end = h.baseEnd; grew = true }
+      }
+      while (rh[ri] && (rh[ri].baseStart === i || rh[ri].baseStart < end + proximity)) {
+        const h = rh[ri++]
+        rTaken.push(h)
+        if (h.baseEnd > end) { end = h.baseEnd; grew = true }
+      }
+      for (const f of forced) {
+        if (f.start >= i && f.start < end + proximity && f.end > end) {
+          end = f.end
+          isForced = true
+          grew = true
+        }
+      }
+    }
+
+    const baseSlice = lines.slice(i, end)
+    const leftLines = lTaken.length ? applyHunkRange(lines, lTaken, i, end) : baseSlice
+    const rightLines = rTaken.length ? applyHunkRange(lines, rTaken, i, end) : baseSlice
+
+    flushNormal()
+    if (isForced || (lTaken.length > 0 && rTaken.length > 0 && !equals(leftLines, rightLines))) {
+      hasConflicts = true
+      segments.push({
+        type: 'conflict',
+        id: conflictId++,
+        leftLines,
+        baseLines: baseSlice,
+        rightLines,
+        // Kept so navigation can compute a scroll offset without walking the
+        // segment list to reconstruct base positions.
+        baseStart: i,
+      })
+    } else if (lTaken.length > 0 && rTaken.length > 0) {
+      segments.push({
+        type: 'normal',
+        lines: leftLines,
+        kind: equals(leftLines, baseSlice) ? 'same' : 'both',
+      })
+    } else if (lTaken.length > 0) {
+      segments.push({
+        type: 'normal',
+        lines: leftLines,
+        kind: equals(leftLines, baseSlice) ? 'same' : 'left',
+      })
+    } else if (rTaken.length > 0) {
+      segments.push({
+        type: 'normal',
+        lines: rightLines,
+        kind: equals(rightLines, baseSlice) ? 'same' : 'right',
+      })
+    } else {
+      // Forced range with no edits under it: still a conflict, handled above.
+      segments.push({ type: 'normal', lines: baseSlice, kind: 'same' })
+    }
+
+    // A pure insertion has zero width in base coordinates, so `i` must stay
+    // put — advancing it would skip the base line the insertion sits before.
+    // Progress is still guaranteed because the hunk itself was consumed; the
+    // fallback only covers a malformed hunk list that consumed nothing.
+    if (end > i) i = end
+    else if (li === liBefore && ri === riBefore && !isForced) i++
+  }
+  flushNormal()
+
+  return { segments, hasConflicts }
+}
+
+/**
  * @typedef {'same'|'left'|'right'|'both'} NormalSegmentKind
  * @typedef {{ type: 'normal', lines: string[], kind?: NormalSegmentKind }} NormalSegment
  * @typedef {{ type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[], baseStart?: number }} ConflictSegment
  * @typedef {NormalSegment | ConflictSegment} MergeSegment
- * @typedef {'left'|'right'|'base'|'both'} ConflictChoice
+ *
+ * `both` is BC's "Take Left Then Right"; `both-rl` the reverse order. Two
+ * distinct values rather than one plus an order flag, because the order is a
+ * property of the resolution and has to survive in the same place the choice
+ * does (reports, config snapshots, the card's active button).
+ *
+ * @typedef {'left'|'right'|'base'|'both'|'both-rl'} ConflictChoice
  */
+
+/** Every value `setConflictChoice` / `resolveAll` accept. @type {ConflictChoice[]} */
+export const CONFLICT_CHOICES = ['left', 'right', 'base', 'both', 'both-rl']
+
+/**
+ * @param {unknown} c
+ * @returns {c is ConflictChoice}
+ */
+export function isConflictChoice(c) {
+  return typeof c === 'string' && CONFLICT_CHOICES.includes(/** @type {ConflictChoice} */ (c))
+}
 
 /**
  * How a segment relates to the base, which is the only thing the display
@@ -270,6 +511,7 @@ export function buildMergedText(segments, choices) {
     if (choice === 'right') return seg.rightLines.join('\n')
     if (choice === 'base')  return seg.baseLines.join('\n')
     if (choice === 'both')  return [...seg.leftLines, ...seg.rightLines].join('\n')
+    if (choice === 'both-rl') return [...seg.rightLines, ...seg.leftLines].join('\n')
     return ['<<<<<<< LEFT', ...seg.leftLines, '||||||| BASE', ...seg.baseLines, '=======', ...seg.rightLines, '>>>>>>> RIGHT'].join('\n')
   }).join('\n')
 }
@@ -489,7 +731,8 @@ const CHOICE_LABELS = {
   left: '採用左側',
   right: '採用右側',
   base: '採用基準',
-  both: '採用兩者',
+  both: '採用兩者（左→右）',
+  'both-rl': '採用兩者（右→左）',
   none: '未解決',
 }
 
@@ -612,6 +855,42 @@ export class ThreeWayCompare {
      * @type {'none'|'left'|'right'}
      */
     this._favor = 'none'
+
+    /**
+     * BC's conflict proximity: edits this many base lines apart are treated as
+     * one conflict. Zero — only genuinely overlapping edits conflict — is the
+     * default so raising it is always the user's decision.
+     */
+    this._conflictProximity = 0
+
+    /**
+     * Base ranges the user forced into a conflict, half-open and 0-based.
+     * @type {Array<{ start: number, end: number }>}
+     */
+    this._manualConflicts = []
+
+    /** BC's Ignore Unimportant Differences. */
+    this._ignoreUnimportant = false
+    /** Regex sources whose matches are stripped before lines are compared. @type {string[]} */
+    this._unimportantPatterns = []
+    /** Compiled `_unimportantPatterns`, keyed by source. @type {Map<string, RegExp|null>} */
+    this._unimportantCache = new Map()
+
+    /**
+     * The output pane's free-text edit. Null means "the output is whatever the
+     * conflict choices produce"; a string means the user has taken it over,
+     * which is the only state in which this view holds unsaved work.
+     * @type {string|null}
+     */
+    this._outputOverride = null
+    /** Whether the output pane is showing its editor rather than the cards. */
+    this._outputEditing = false
+    /** True once an override has been made and not yet saved or discarded. */
+    this._outputDirty = false
+
+    // Bound once: it is handed to a pure function on every merge, and a fresh
+    // closure per merge would defeat nothing but cost an allocation.
+    this._segmentEquals = (a, b) => this._linesEqual(a, b)
   }
 
   // ---------------------------------------------------------------------------
@@ -635,6 +914,15 @@ export class ThreeWayCompare {
     if (path != null) this[`_${side}Path`] = path
     const pathEl = this._pathEl(side)
     if (pathEl && path != null) pathEl.textContent = path
+    // New content invalidates both: an override written against the previous
+    // merge would silently become the output for a document it never saw, and
+    // marks are base line ranges that a new ancestor renumbers.
+    this._outputOverride = null
+    this._outputDirty = false
+    if (side === 'base') {
+      this._manualConflicts = normalizeForcedRanges(
+        this._manualConflicts, (this._baseContent || '').split('\n').length)
+    }
     this._pendingFirstDiff = true
     this._runMerge()
     this._emit('paths-changed', {
@@ -794,6 +1082,13 @@ export class ThreeWayCompare {
    */
   setConflictChoice(id, choice) {
     if (!this._conflictChoices.has(id)) return
+    if (!isConflictChoice(choice)) return
+    // A hand-edited output is the user's text, not a projection of the
+    // choices; silently regenerating it here would delete their work.
+    if (this._outputOverride != null) {
+      this._reportError('輸出已手動編輯，請先「捨棄手動編輯」再選擇衝突來源。')
+      return
+    }
     this._conflictChoices.set(id, choice)
     this._renderOutputPane()
     // BC's "go to next difference after copying to other side": resolving a
@@ -809,13 +1104,314 @@ export class ThreeWayCompare {
    * @returns {number} how many conflicts were changed
    */
   resolveAll(choice) {
-    if (choice !== 'left' && choice !== 'right' && choice !== 'base' && choice !== 'both') return 0
+    if (!isConflictChoice(choice)) return 0
+    if (this._outputOverride != null) {
+      this._reportError('輸出已手動編輯，請先「捨棄手動編輯」再批次解決衝突。')
+      return 0
+    }
     let n = 0
     for (const [id, cur] of this._conflictChoices) {
       if (cur == null) { this._conflictChoices.set(id, choice); n++ }
     }
     if (n > 0) this._renderOutputPane()
     return n
+  }
+
+  // ---------------------------------------------------------------------------
+  // Unimportant differences
+  // ---------------------------------------------------------------------------
+
+  /**
+   * @param {string} src
+   * @returns {RegExp|null}
+   */
+  _compileUnimportant(src) {
+    if (this._unimportantCache.has(src)) return this._unimportantCache.get(src) ?? null
+    // The patterns come from the user, so a source that can backtrack
+    // exponentially is refused rather than run — the same screen the grammar
+    // system applies to its own user-supplied regexes.
+    const risk = isRiskyRegexSource(src)
+    let re = null
+    if (risk) {
+      this._reportError(`忽略樣式「${src}」未套用：${risk}`)
+    } else {
+      try {
+        re = new RegExp(src, 'g')
+      } catch (err) {
+        this._reportError(`忽略樣式「${src}」無效：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    this._unimportantCache.set(src, re)
+    return re
+  }
+
+  /**
+   * One line with every unimportant match removed.
+   * @param {string} line
+   * @returns {string}
+   */
+  _stripUnimportant(line) {
+    let out = String(line ?? '')
+    for (const src of this._unimportantPatterns) {
+      const re = this._compileUnimportant(src)
+      if (!re) continue
+      re.lastIndex = 0
+      out = out.replace(re, '')
+    }
+    return out
+  }
+
+  /**
+   * Whether two runs of lines count as the same content.
+   *
+   * With Ignore Unimportant Differences on, "the same" means the same once the
+   * unimportant patterns are removed — which is what turns a pair of edits
+   * that differ only cosmetically into an auto-merge instead of a conflict.
+   *
+   * @param {string[]} a
+   * @param {string[]} b
+   * @returns {boolean}
+   */
+  _linesEqual(a, b) {
+    if (_arraysEqual(a, b)) return true
+    if (!this._ignoreUnimportant || this._unimportantPatterns.length === 0) return false
+    if (!a || !b || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (this._stripUnimportant(a[i]) !== this._stripUnimportant(b[i])) return false
+    }
+    return true
+  }
+
+  /**
+   * BC's Ignore Unimportant Differences.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} the resulting state
+   */
+  setIgnoreUnimportant(on) {
+    const next = on ?? !this._ignoreUnimportant
+    if (next === this._ignoreUnimportant) return next
+    this._ignoreUnimportant = next
+    this._runMerge()
+    this._syncUnimportantControls()
+    return next
+  }
+
+  /** @returns {boolean} */
+  getIgnoreUnimportant() {
+    return this._ignoreUnimportant
+  }
+
+  /**
+   * Replace the unimportant-pattern list. Sources are kept verbatim so the
+   * editor can show what the user typed; screening happens at compile time.
+   *
+   * @param {string[]} patterns
+   * @returns {string[]} the list actually stored
+   */
+  setUnimportantPatterns(patterns) {
+    this._unimportantPatterns = (Array.isArray(patterns) ? patterns : [])
+      .map((p) => String(p ?? '').trim())
+      .filter(Boolean)
+    this._unimportantCache.clear()
+    this._runMerge()
+    this._syncUnimportantControls()
+    return [...this._unimportantPatterns]
+  }
+
+  /** @returns {string[]} */
+  getUnimportantPatterns() {
+    return [...this._unimportantPatterns]
+  }
+
+  // ---------------------------------------------------------------------------
+  // Conflict proximity / manual conflicts
+  // ---------------------------------------------------------------------------
+
+  /**
+   * BC's conflict proximity: how close two opposing edits have to be, in base
+   * lines, before they are reported as one conflict instead of two independent
+   * changes that merge cleanly.
+   *
+   * @param {unknown} n
+   * @returns {number} the value actually stored
+   */
+  setConflictProximity(n) {
+    const next = normalizeConflictProximity(n)
+    if (next === this._conflictProximity) return next
+    this._conflictProximity = next
+    this._runMerge()
+    return next
+  }
+
+  /** @returns {number} */
+  getConflictProximity() {
+    return this._conflictProximity
+  }
+
+  /**
+   * Force a run of base lines to be reported as a conflict, whatever the
+   * diffs say. BC's manual Conflict mark: the merge is right but the change
+   * needs a human, and only the human knows that.
+   *
+   * @param {number} startLine 1-based, inclusive
+   * @param {number} endLine   1-based, inclusive
+   * @returns {boolean} whether a mark was added
+   */
+  markConflictRange(startLine, endLine) {
+    const total = (this._baseContent || '').split('\n').length
+    const a = Math.floor(Number(startLine))
+    const b = Math.floor(Number(endLine))
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false
+    const start = Math.max(0, Math.min(a, b) - 1)
+    const end = Math.min(total, Math.max(a, b))
+    if (end <= start) return false
+
+    this._manualConflicts = normalizeForcedRanges(
+      [...this._manualConflicts, { start, end }], total)
+    this._runMerge()
+    return true
+  }
+
+  /** @returns {number} how many marks were removed */
+  clearManualConflicts() {
+    const n = this._manualConflicts.length
+    if (n === 0) return 0
+    this._manualConflicts = []
+    this._runMerge()
+    return n
+  }
+
+  /** @returns {Array<{ start: number, end: number }>} 0-based, half-open */
+  getManualConflicts() {
+    return this._manualConflicts.map((r) => ({ ...r }))
+  }
+
+  // ---------------------------------------------------------------------------
+  // Editable output
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Take over the merged output as free text.
+   *
+   * @param {string} text
+   * @returns {boolean} whether the override changed
+   */
+  setOutputText(text) {
+    const next = String(text ?? '')
+    if (this._outputOverride === next) return false
+    this._outputOverride = next
+    this._outputDirty = true
+    this._renderOutputPane()
+    this._emit('output-changed', { edited: true })
+    return true
+  }
+
+  /** @returns {string} the text a save would write */
+  getOutputText() {
+    return this._buildOutputText()
+  }
+
+  /** @returns {boolean} whether the output is hand-edited rather than generated */
+  isOutputEdited() {
+    return this._outputOverride != null
+  }
+
+  /**
+   * Throw the hand edit away and go back to the generated merge.
+   * @returns {boolean} whether there was anything to discard
+   */
+  discardOutputEdits() {
+    if (this._outputOverride == null) return false
+    this._outputOverride = null
+    this._outputDirty = false
+    this._renderOutputPane()
+    this._emit('output-changed', { edited: false })
+    return true
+  }
+
+  /**
+   * Show the output as an editor, or back as conflict cards.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} the resulting state
+   */
+  setOutputEditing(on) {
+    this._outputEditing = on ?? !this._outputEditing
+    this._renderOutputPane()
+    return this._outputEditing
+  }
+
+  /** @returns {boolean} */
+  isOutputEditing() {
+    return this._outputEditing
+  }
+
+  /**
+   * Matches the contract the table and hex views expose, so the host's
+   * close guard needs no special case for this view.
+   * @returns {boolean}
+   */
+  hasUnsavedEdits() {
+    return this._outputDirty && this._outputOverride != null
+  }
+
+  /** @returns {boolean} whether the tab may be closed */
+  confirmClose() {
+    if (!this.hasUnsavedEdits()) return true
+    return window.confirm('合併輸出有未儲存的手動編輯，確定要關閉並捨棄嗎？')
+  }
+
+  // ---------------------------------------------------------------------------
+  // Info
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Everything the Info dialog reports, without the layout — so the numbers
+   * can be asserted without a DOM.
+   *
+   * @returns {{
+   *   sources: Array<{ side: 'left'|'base'|'right', label: string, path: string,
+   *     lines: number, chars: number }>,
+   *   conflicts: { total: number, resolved: number, unresolved: number },
+   *   segments: Record<SegmentKind, number>,
+   *   settings: { algorithm: string, proximity: number, favor: string,
+   *     ignoreUnimportant: boolean, manualConflicts: number },
+   * }}
+   */
+  getInfo() {
+    const sources = /** @type {Array<'left'|'base'|'right'>} */ (['left', 'base', 'right'])
+      .map((side) => {
+        const content = this[`_${side}Content`] ?? ''
+        return {
+          side,
+          label: SIDE_LABELS[side],
+          path: this[`_${side}Path`] ?? '',
+          // An empty document is zero lines, not the one split() reports.
+          lines: content === '' ? 0 : content.split('\n').length,
+          chars: content.length,
+        }
+      })
+
+    /** @type {Record<SegmentKind, number>} */
+    const segments = { same: 0, left: 0, right: 0, both: 0, conflict: 0 }
+    for (const seg of this._segments) {
+      const kind = segmentKind(seg)
+      const rows = seg.type === 'conflict' ? seg.baseLines.length : seg.lines.length
+      segments[kind] += rows
+    }
+
+    const summary = this.getConflictSummary()
+    return {
+      sources,
+      conflicts: { total: summary.total, resolved: summary.resolved, unresolved: summary.unresolved },
+      segments,
+      settings: {
+        algorithm: this._algorithm,
+        proximity: this._conflictProximity,
+        favor: this._favor,
+        ignoreUnimportant: this._ignoreUnimportant,
+        manualConflicts: this._manualConflicts.length,
+      },
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1193,6 +1789,12 @@ ${body}
       contextLines: this._contextLines,
       favor: this._favor,
       alignByGrammar: this._alignByGrammar,
+      conflictProximity: this._conflictProximity,
+      ignoreUnimportant: this._ignoreUnimportant,
+      unimportantPatterns: [...this._unimportantPatterns],
+      // Base line ranges, so a snapshot taken on the same ancestor restores
+      // the same marks; they are re-clamped on the way back in.
+      manualConflicts: this.getManualConflicts(),
     })
   }
 
@@ -1214,6 +1816,17 @@ ${body}
     if (c.contextLines != null) this._contextLines = normalizeContextLines(c.contextLines)
     if (c.favor === 'none' || c.favor === 'left' || c.favor === 'right') this._favor = c.favor
     if (typeof c.alignByGrammar === 'boolean') this._alignByGrammar = c.alignByGrammar
+    if (c.conflictProximity != null) this._conflictProximity = normalizeConflictProximity(c.conflictProximity)
+    if (typeof c.ignoreUnimportant === 'boolean') this._ignoreUnimportant = c.ignoreUnimportant
+    if (Array.isArray(c.unimportantPatterns)) {
+      this._unimportantPatterns = c.unimportantPatterns
+        .map((p) => String(p ?? '').trim()).filter(Boolean)
+      this._unimportantCache.clear()
+    }
+    if (Array.isArray(c.manualConflicts)) {
+      this._manualConflicts = normalizeForcedRanges(
+        c.manualConflicts, (this._baseContent || '').split('\n').length)
+    }
 
     this._runMerge()
   }
@@ -1262,6 +1875,7 @@ ${body}
     this._contentEls = { left: null, base: null, right: null }
     this._outputEl = null
     this._outputPaneEl = null
+    this._outputEditing = false
   }
 
   /**
@@ -1315,9 +1929,30 @@ ${body}
               <option value="histogram">Histogram</option>
             </select>
           </label>
+          <label class="mw-proximity-label" title="相鄰這麼多基準行以內的兩側變更，視為同一個衝突">鄰近
+            <input class="mw-proximity-input" type="number" min="0" max="${MAX_CONFLICT_PROXIMITY}" step="1" />
+          </label>
+          <label class="mw-unimportant-label" title="忽略不重要的差異：符合樣式的部分不列入比較">
+            <input class="mw-unimportant-check" type="checkbox" />忽略不重要差異
+          </label>
+          <button class="mw-btn-unimportant-edit" title="編輯不重要差異的樣式（每行一條正規表示式）">樣式…</button>
           <span class="mw-toolbar-sep"></span>
           <button class="mw-btn-all-left">全部採用左側</button>
           <button class="mw-btn-all-right">全部採用右側</button>
+          <label class="mw-resolve-all-label" title="把未解決的衝突一次全部套用同一種來源">全部
+            <select class="mw-resolve-all-select">
+              <option value="base">採用基準</option>
+              <option value="both">兩者（左→右）</option>
+              <option value="both-rl">兩者（右→左）</option>
+              <option value="left">採用左側</option>
+              <option value="right">採用右側</option>
+            </select>
+          </label>
+          <button class="mw-btn-resolve-all">套用</button>
+          <span class="mw-toolbar-sep"></span>
+          <button class="mw-btn-mark-conflict" title="把基準窗格中選取的行強制標記為衝突">標記衝突</button>
+          <button class="mw-btn-clear-conflicts" title="清除所有手動標記的衝突">清除標記</button>
+          <button class="mw-btn-info" title="合併統計資訊">ℹ 資訊</button>
           <label class="mw-favor-label" title="自動以某一側解決衝突，之後重新合併也照辦">偏好
             <select class="mw-favor-select">
               <option value="none">不偏好</option>
@@ -1365,6 +2000,9 @@ ${body}
         <div class="mw-output-pane">
           <div class="mw-output-header">
             <span>合併輸出</span>
+            <span class="mw-output-edited-badge" hidden>已手動編輯</span>
+            <button class="mw-btn-edit-output" title="直接編輯合併結果">編輯輸出</button>
+            <button class="mw-btn-discard-output" title="捨棄手動編輯，回到由衝突選擇產生的結果" hidden>捨棄手動編輯</button>
             <button class="mw-btn-save">儲存輸出…</button>
           </div>
           <div class="mw-output-content"></div>
@@ -1468,9 +2106,26 @@ ${body}
       const content = this._buildOutputText()
       try {
         await window.electronAPI.saveFile('merged-output.txt', content)
+        // Saved work is no longer unsaved; leaving the flag set would make the
+        // close guard ask about edits the user has already written out.
+        this._outputDirty = false
+        this._syncOutputControls()
       } catch (err) {
         this._reportError(`儲存輸出失敗：${err instanceof Error ? err.message : String(err)}`)
       }
+    })
+
+    // Editable output
+    this._q('.mw-btn-edit-output')?.addEventListener('click', () => {
+      this.setOutputEditing(!this._outputEditing)
+      if (this._outputEditing) this._outputEl?.focus()
+    })
+    this._q('.mw-btn-discard-output')?.addEventListener('click', () => {
+      if (!this.discardOutputEdits()) this._reportError('目前沒有手動編輯可以捨棄。')
+    })
+    this._outputEl?.addEventListener('input', () => {
+      if (!this._outputEl) return
+      this.setOutputText(this._outputEl.value)
     })
 
     // S16-M01: conflict navigation / filter / batch resolve toolbar
@@ -1506,6 +2161,38 @@ ${body}
     favorSelect?.addEventListener('change', () => {
       this.setFavor(/** @type {'none'|'left'|'right'} */ (favorSelect.value))
     })
+
+    const proximityInput = /** @type {HTMLInputElement|null} */ (this._q('.mw-proximity-input'))
+    if (proximityInput) {
+      proximityInput.value = String(this._conflictProximity)
+      // 'change', not 'input': every keystroke would re-run the whole merge.
+      proximityInput.addEventListener('change', () => {
+        proximityInput.value = String(this.setConflictProximity(proximityInput.value))
+      })
+    }
+
+    const unimportantCheck = /** @type {HTMLInputElement|null} */ (this._q('.mw-unimportant-check'))
+    unimportantCheck?.addEventListener('change', () => {
+      this.setIgnoreUnimportant(unimportantCheck.checked)
+    })
+    this._q('.mw-btn-unimportant-edit')?.addEventListener('click', () => this._openUnimportantEditor())
+
+    const resolveAllSelect = /** @type {HTMLSelectElement|null} */ (this._q('.mw-resolve-all-select'))
+    this._q('.mw-btn-resolve-all')?.addEventListener('click', () => {
+      const choice = /** @type {ConflictChoice} */ (resolveAllSelect?.value ?? 'both')
+      const n = this.resolveAll(choice)
+      if (n === 0 && this._outputOverride == null) {
+        this._emit('status', { message: '沒有未解決的衝突可套用。' })
+      }
+    })
+
+    this._q('.mw-btn-mark-conflict')?.addEventListener('click', () => this._markConflictFromSelection())
+    this._q('.mw-btn-clear-conflicts')?.addEventListener('click', () => {
+      const n = this.clearManualConflicts()
+      this._emit('status', { message: n > 0 ? `已清除 ${n} 個手動衝突標記` : '沒有手動衝突標記' })
+      if (n === 0) toast('沒有手動衝突標記')
+    })
+    this._q('.mw-btn-info')?.addEventListener('click', () => this.showInfo())
 
     this._q('.mw-btn-parent-folders')?.addEventListener('click', () => this.mergeParentFolders())
 
@@ -1714,6 +2401,262 @@ ${body}
     if (select && select.value !== this._favor) select.value = this._favor
   }
 
+  /** Keep the proximity box and the unimportant controls in step. */
+  _syncUnimportantControls() {
+    const prox = /** @type {HTMLInputElement|null} */ (this._q('.mw-proximity-input'))
+    if (prox && prox.value !== String(this._conflictProximity)) {
+      prox.value = String(this._conflictProximity)
+    }
+    const check = /** @type {HTMLInputElement|null} */ (this._q('.mw-unimportant-check'))
+    if (check && check.checked !== this._ignoreUnimportant) check.checked = this._ignoreUnimportant
+    const btn = this._q('.mw-btn-unimportant-edit')
+    if (btn) btn.textContent = `樣式…（${this._unimportantPatterns.length}）`
+    const clear = /** @type {HTMLButtonElement|null} */ (this._q('.mw-btn-clear-conflicts'))
+    if (clear) clear.disabled = this._manualConflicts.length === 0
+  }
+
+  /** Reflect the output pane's edit state in its header. */
+  _syncOutputControls() {
+    const edited = this._outputOverride != null
+    const badge = this._q('.mw-output-edited-badge')
+    if (badge) badge.hidden = !edited
+    const discard = this._q('.mw-btn-discard-output')
+    if (discard) discard.hidden = !edited
+    const edit = this._q('.mw-btn-edit-output')
+    if (edit) {
+      edit.textContent = this._outputEditing ? '結束編輯' : '編輯輸出'
+      edit.classList.toggle('active', this._outputEditing)
+    }
+    const pane = this._q('.mw-output-pane')
+    if (pane) {
+      pane.classList.toggle('mw-output-pane--edited', edited)
+      // The card list and the editor are siblings, so the one that is not in
+      // use has to be taken out of the layout or it keeps its share of the pane.
+      pane.classList.toggle('mw-output-pane--editing', this._outputEditing)
+    }
+  }
+
+  /**
+   * Base pane line numbers covered by the current selection.
+   *
+   * Only meaningful with the filter on 'all': every other mode drops the line
+   * numbers precisely because its rows are not contiguous, so there is nothing
+   * to map a selection back onto.
+   *
+   * @returns {number[]} 1-based, ascending
+   */
+  _selectedBaseLines() {
+    const pane = this._contentEls.base
+    const sel = typeof window.getSelection === 'function' ? window.getSelection() : null
+    if (!pane || !sel || sel.rangeCount === 0 || sel.isCollapsed) return []
+
+    /** @type {Set<number>} */
+    const lines = new Set()
+    const add = (node) => {
+      const n = Number(node?.dataset?.line)
+      if (Number.isFinite(n) && n > 0) lines.add(n)
+    }
+
+    // Rows the range spans.
+    for (const node of pane.querySelectorAll('.mw-line[data-line]')) {
+      if (sel.containsNode(node, true)) add(node)
+    }
+
+    // A selection that sits *inside* one row contains no row, so the loop above
+    // finds nothing — double-clicking a word and marking it would silently do
+    // nothing. The endpoints are walked up to their row to cover that case.
+    for (const end of [sel.anchorNode, sel.focusNode]) {
+      const el = end?.nodeType === 1 ? end : end?.parentElement
+      const row = el?.closest?.('.mw-line[data-line]')
+      if (row && pane.contains(row)) add(row)
+    }
+
+    return [...lines].sort((a, b) => a - b)
+  }
+
+  /** Toolbar entry point for the manual conflict mark. */
+  _markConflictFromSelection() {
+    if (this._showFilter !== 'all') {
+      this._reportError('請先把「顯示」切回全部：篩選後的列沒有基準行號可對應。')
+      return
+    }
+    const lines = this._selectedBaseLines()
+    if (lines.length === 0) {
+      this._reportError('請先在基準窗格中選取要標記為衝突的行。')
+      return
+    }
+    if (!this.markConflictRange(lines[0], lines[lines.length - 1])) {
+      this._reportError('選取的範圍不在基準檔案內，未標記。')
+      return
+    }
+    this._emit('status', { message: `已把基準第 ${lines[0]}–${lines[lines.length - 1]} 行標記為衝突` })
+  }
+
+  /**
+   * A modal built on the same shell the compare-to-output preview uses.
+   *
+   * @param {string} title
+   * @param {(body: HTMLElement) => void} fill
+   * @param {Array<{ label: string, primary?: boolean, run: () => boolean|void }>} [actions]
+   *   returning false keeps the dialog open, so a validation error can be shown
+   */
+  _openModal(title, fill, actions = []) {
+    const host = this._container ?? document.body
+    const backdrop = document.createElement('div')
+    backdrop.className = 'mw-modal-backdrop'
+    const modal = document.createElement('div')
+    modal.className = 'mw-modal'
+
+    const titleEl = document.createElement('div')
+    titleEl.className = 'mw-modal-title'
+    titleEl.textContent = title
+    modal.appendChild(titleEl)
+
+    const body = document.createElement('div')
+    body.className = 'mw-modal-body'
+    fill(body)
+    modal.appendChild(body)
+
+    const actionsEl = document.createElement('div')
+    actionsEl.className = 'mw-modal-actions'
+
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      backdrop.remove()
+      document.removeEventListener('keydown', onKey, true)
+    }
+    const onKey = (/** @type {KeyboardEvent} */ e) => {
+      if (e.key === 'Escape') { e.preventDefault(); finish() }
+    }
+
+    for (const action of actions) {
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'mw-modal-close' + (action.primary ? ' mw-modal-primary' : '')
+      btn.textContent = action.label
+      btn.addEventListener('click', () => {
+        if (action.run() !== false) finish()
+      })
+      actionsEl.appendChild(btn)
+    }
+
+    const close = document.createElement('button')
+    close.type = 'button'
+    close.className = 'mw-modal-close'
+    close.textContent = actions.length ? '取消' : '關閉'
+    close.addEventListener('click', finish)
+    actionsEl.appendChild(close)
+
+    modal.appendChild(actionsEl)
+    backdrop.appendChild(modal)
+    host.appendChild(backdrop)
+
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish() })
+    document.addEventListener('keydown', onKey, true)
+    close.focus()
+    return { backdrop, modal, body, close }
+  }
+
+  /** BC's Text Merge Info. */
+  showInfo() {
+    const info = this.getInfo()
+    this._openModal('三向合併資訊', (body) => {
+      const rows = info.sources.map((s) => [
+        s.label, s.path || '（未載入）', String(s.lines), String(s.chars),
+      ])
+      body.appendChild(this._infoTable(
+        ['來源', '路徑', '行數', '字元數'], rows))
+
+      body.appendChild(this._infoTable(
+        ['分類', '基準行數'],
+        [
+          ['未變更', String(info.segments.same)],
+          ['僅左側變更', String(info.segments.left)],
+          ['僅右側變更', String(info.segments.right)],
+          ['兩側相同變更', String(info.segments.both)],
+          ['衝突', String(info.segments.conflict)],
+        ]))
+
+      body.appendChild(this._infoTable(
+        ['項目', '值'],
+        [
+          ['衝突總數', String(info.conflicts.total)],
+          ['已解決', String(info.conflicts.resolved)],
+          ['未解決', String(info.conflicts.unresolved)],
+          ['對齊演算法', info.settings.algorithm],
+          ['衝突鄰近門檻', String(info.settings.proximity)],
+          ['偏好', info.settings.favor],
+          ['忽略不重要差異', info.settings.ignoreUnimportant ? '是' : '否'],
+          ['手動衝突標記', String(info.settings.manualConflicts)],
+          ['輸出狀態', this._outputOverride != null ? '已手動編輯' : '由衝突選擇產生'],
+        ]))
+    })
+  }
+
+  /**
+   * @param {string[]} headers
+   * @param {string[][]} rows
+   * @returns {HTMLElement}
+   */
+  _infoTable(headers, rows) {
+    const table = document.createElement('table')
+    table.className = 'mw-info-table'
+    const thead = document.createElement('thead')
+    const htr = document.createElement('tr')
+    for (const h of headers) {
+      const th = document.createElement('th')
+      th.textContent = h
+      htr.appendChild(th)
+    }
+    thead.appendChild(htr)
+    table.appendChild(thead)
+
+    const tbody = document.createElement('tbody')
+    for (const row of rows) {
+      const tr = document.createElement('tr')
+      for (const cell of row) {
+        const td = document.createElement('td')
+        // File paths are attacker-controlled; textContent keeps them inert.
+        td.textContent = cell
+        tr.appendChild(td)
+      }
+      tbody.appendChild(tr)
+    }
+    table.appendChild(tbody)
+    return table
+  }
+
+  /** Edit the unimportant-difference patterns, one regex per line. */
+  _openUnimportantEditor() {
+    let textarea = null
+    this._openModal('不重要差異樣式（每行一條正規表示式）', (body) => {
+      const hint = document.createElement('div')
+      hint.className = 'mw-modal-hint'
+      hint.textContent = '符合的部分在比較時會被移除。可能造成災難性回溯的樣式會被拒絕並回報。'
+      body.appendChild(hint)
+      textarea = document.createElement('textarea')
+      textarea.className = 'mw-modal-textarea'
+      textarea.spellcheck = false
+      textarea.value = this._unimportantPatterns.join('\n')
+      body.appendChild(textarea)
+    }, [{
+      label: '套用',
+      primary: true,
+      run: () => {
+        const list = String(textarea?.value ?? '').split('\n')
+        this.setUnimportantPatterns(list)
+        // Compiling reports its own rejections through _reportError, so a
+        // pattern that was dropped never passes for one that is running.
+        for (const src of this._unimportantPatterns) this._compileUnimportant(src)
+        if (this._unimportantPatterns.length > 0 && !this._ignoreUnimportant) {
+          this.setIgnoreUnimportant(true)
+        }
+      },
+    }])
+  }
+
   /**
    * Enable Merge Parent Folders only when it can actually do something.
    *
@@ -1791,6 +2734,8 @@ ${body}
     this._updateAlgoSelect()
     this._syncContextInput()
     this._syncFavorSelect()
+    this._syncUnimportantControls()
+    this._syncOutputControls()
     this._syncParentFoldersButton()
     this._consumePendingFirstDiff()
 
@@ -1951,83 +2896,11 @@ ${body}
     const leftHunks  = _buildHunks(leftDiff)
     const rightHunks = _buildHunks(rightDiff)
 
-    /** @type {MergeSegment[]} */
-    const segments = []
-    let hasConflicts = false
-    let conflictId = 0
-
-    /** @type {string[]} */
-    let pendingNormal = []
-    const flushNormal = () => {
-      if (pendingNormal.length > 0) {
-        // Runs of base lines neither side touched.
-        segments.push({ type: 'normal', lines: pendingNormal, kind: 'same' })
-        pendingNormal = []
-      }
-    }
-
-    let i = 0, li = 0, ri = 0
-    while (i < baseLines.length || li < leftHunks.length || ri < rightHunks.length) {
-      const lh = leftHunks[li]
-      const rh = rightHunks[ri]
-      const lhAt = lh && lh.baseStart === i
-      const rhAt = rh && rh.baseStart === i
-      // A hunk that starts AT or strictly before `i + 1` and contains another
-      // hunk on the other side that also starts within its base range is an
-      // overlap → conflict.
-      const overlap =
-        (lhAt && rh && rh.baseStart < lh.baseEnd) ||
-        (rhAt && lh && lh.baseStart < rh.baseEnd)
-
-      if (overlap || (lhAt && rhAt)) {
-        flushNormal()
-        const endBase = Math.max(lh ? lh.baseEnd : i, rh ? rh.baseEnd : i)
-        const baseSlice = baseLines.slice(i, endBase)
-        const leftLines  = lh ? lh.newLines : baseSlice
-        const rightLines = rh ? rh.newLines : baseSlice
-        if (_arraysEqual(leftLines, rightLines)) {
-          // Both sides made the identical edit — not a real conflict. It is
-          // still a change unless the "edit" happens to reproduce the base.
-          segments.push({
-            type: 'normal',
-            lines: leftLines,
-            kind: _arraysEqual(leftLines, baseSlice) ? 'same' : 'both',
-          })
-        } else {
-          hasConflicts = true
-          segments.push({
-            type: 'conflict',
-            id: conflictId++,
-            leftLines, baseLines: baseSlice, rightLines,
-            // Kept so navigation can compute a scroll offset without walking
-            // the segment list to reconstruct base positions.
-            baseStart: i,
-          })
-        }
-        i = endBase
-        if (lh && lh.baseStart < endBase) li++
-        if (rh && rh.baseStart < endBase) ri++
-      } else if (lhAt) {
-        flushNormal()
-        segments.push({ type: 'normal', lines: lh.newLines, kind: 'left' })
-        i = lh.baseEnd
-        li++
-      } else if (rhAt) {
-        flushNormal()
-        segments.push({ type: 'normal', lines: rh.newLines, kind: 'right' })
-        i = rh.baseEnd
-        ri++
-      } else if (i < baseLines.length) {
-        pendingNormal.push(baseLines[i])
-        i++
-      } else {
-        // Out-of-range hunks (defensive): skip
-        if (lh && lh.baseStart < i) li++
-        else if (rh && rh.baseStart < i) ri++
-        else break
-      }
-    }
-    flushNormal()
+    const { segments, hasConflicts } = mergeHunkSegments(baseLines, leftHunks, rightHunks, {
+      proximity: this._conflictProximity,
+      forced: this._manualConflicts,
+      equals: this._segmentEquals,
+    })
 
     return { leftDiff, rightDiff, segments, hasConflicts }
   }
@@ -2039,6 +2912,7 @@ ${body}
    * @returns {string}
    */
   _buildOutputText() {
+    if (this._outputOverride != null) return this._outputOverride
     return buildMergedText(this._segments, this._conflictChoices)
   }
 
@@ -2050,8 +2924,33 @@ ${body}
     const pane = this._outputPaneEl
     if (!pane) return
 
+    this._syncOutputControls()
+
+    // In edit mode the textarea *is* the output; rebuilding the cards behind
+    // it would only cost work nobody can see.
+    if (this._outputEditing) {
+      pane.innerHTML = ''
+      this._syncOutputTextarea()
+      return
+    }
+
     pane.innerHTML = ''
     const frag = document.createDocumentFragment()
+
+    if (this._outputOverride != null) {
+      // The cards cannot describe hand-written text, and showing them anyway
+      // would imply the choices still drive the output.
+      const note = document.createElement('div')
+      note.className = 'mw-output-edited-note'
+      note.textContent = '輸出已手動編輯：衝突選擇暫停套用，可「捨棄手動編輯」還原。'
+      pane.appendChild(note)
+      const pre = document.createElement('pre')
+      pre.className = 'mw-normal-seg mw-normal-seg--edited'
+      pre.textContent = this._elideLines(this._outputOverride.split('\n'))
+      pane.appendChild(pre)
+      this._syncOutputTextarea()
+      return
+    }
 
     for (const seg of this._segments) {
       if (seg.type === 'normal') {
@@ -2083,7 +2982,12 @@ ${body}
         const btnBoth = document.createElement('button')
         btnBoth.className = 'mw-choice-btn mw-choice-both'
         btnBoth.dataset.id = String(seg.id)
-        btnBoth.textContent = '接受兩者'
+        btnBoth.textContent = '兩者（左→右）'
+
+        const btnBothRl = document.createElement('button')
+        btnBothRl.className = 'mw-choice-btn mw-choice-both-rl'
+        btnBothRl.dataset.id = String(seg.id)
+        btnBothRl.textContent = '兩者（右→左）'
 
         const btnRight = document.createElement('button')
         btnRight.className = 'mw-choice-btn mw-choice-right'
@@ -2095,11 +2999,13 @@ ${body}
         if (existing === 'left')  btnLeft.classList.add('active')
         if (existing === 'base')  btnBase.classList.add('active')
         if (existing === 'both')  btnBoth.classList.add('active')
+        if (existing === 'both-rl') btnBothRl.classList.add('active')
         if (existing === 'right') btnRight.classList.add('active')
 
         choicesDiv.appendChild(btnLeft)
         choicesDiv.appendChild(btnBase)
         choicesDiv.appendChild(btnBoth)
+        choicesDiv.appendChild(btnBothRl)
         choicesDiv.appendChild(btnRight)
 
         const previewDiv = document.createElement('div')
@@ -2128,6 +3034,7 @@ ${body}
         if (btn.classList.contains('mw-choice-left'))  choice = 'left'
         else if (btn.classList.contains('mw-choice-right')) choice = 'right'
         else if (btn.classList.contains('mw-choice-base')) choice = 'base'
+        else if (btn.classList.contains('mw-choice-both-rl')) choice = 'both-rl'
         else choice = 'both'
 
         this._conflictChoices.set(id, choice)
@@ -2158,9 +3065,14 @@ ${body}
    * Sync the hidden textarea with the current buildOutputText result.
    */
   _syncOutputTextarea() {
-    if (this._outputEl) {
-      this._outputEl.value = this._buildOutputText()
-    }
+    const el = this._outputEl
+    if (!el) return
+    const text = this._buildOutputText()
+    // Guarded: this runs from the textarea's own input handler, and assigning
+    // an identical value would still reset the caret to the end.
+    if (el.value !== text) el.value = text
+    el.classList.toggle('mw-output-textarea--visible', this._outputEditing)
+    el.readOnly = !this._outputEditing
   }
 
   /**
@@ -2219,6 +3131,10 @@ ${body}
   _makeLine(type, lineNum, text) {
     const div = document.createElement('div')
     div.className = `mw-line mw-line--${type}`
+
+    // Carried on the row so a selection can be mapped back to base line
+    // numbers; filtered modes pass null precisely because they cannot.
+    if (lineNum != null) div.dataset.line = String(lineNum)
 
     const numEl = document.createElement('span')
     numEl.className = 'mw-linenum'

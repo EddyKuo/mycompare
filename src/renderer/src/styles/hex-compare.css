@@ -617,3 +617,97 @@
   color: #fff;
   border-color: var(--accent-color, #4a90d9);
 }
+
+/* ── S24: over/under layout ──────────────────────────────────────────────────── */
+
+/* Grid rather than a flipped flex axis: the thumbnail has to sit beside *both*
+   stacked panes, and a column flex container can only put it below one. */
+.hx-body.over-under {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+.hx-body.over-under > .hx-pane[data-side="left"]  { grid-column: 1; grid-row: 1; }
+.hx-body.over-under > .hx-pane[data-side="right"] { grid-column: 1; grid-row: 2; }
+
+.hx-body.over-under.with-thumb {
+  grid-template-columns: 1fr var(--hx-thumb-width, 14px);
+}
+
+.hx-body.over-under.with-thumb > .hx-thumb {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+.hx-body.over-under > .hx-pane {
+  border-right: none;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.hx-body.over-under > .hx-pane:last-of-type {
+  border-bottom: none;
+}
+
+/* ── S24: whole-file difference thumbnail ────────────────────────────────────── */
+
+.hx-thumb {
+  width: var(--hx-thumb-width, 14px);
+  min-width: var(--hx-thumb-width, 14px);
+  flex-shrink: 0;
+  padding: 2px;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+  cursor: pointer;
+}
+
+.hx-thumb-strip {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.hx-thumb-mark {
+  position: absolute;
+  left: 0;
+  right: 0;
+  min-height: 1px;
+}
+
+.hx-thumb-mark.different  { background: var(--diff-replace-border); }
+.hx-thumb-mark.left-only  { background: var(--diff-insert-border); }
+.hx-thumb-mark.right-only { background: var(--diff-delete-border); }
+
+.hx-thumb-viewport {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border: 1px solid var(--accent-color, #4a90d9);
+  background: rgba(74, 144, 217, 0.18);
+  pointer-events: none;
+}
+
+/* ── S24: replace row ────────────────────────────────────────────────────────── */
+
+.hx-replace-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+}
+
+.hx-replace-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.hx-toolbar .hx-find-btn.active {
+  background: var(--accent-color, #4a90d9);
+  color: #fff;
+  border-color: var(--accent-color, #4a90d9);
+}

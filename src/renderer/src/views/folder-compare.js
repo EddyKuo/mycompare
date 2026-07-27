@@ -307,6 +307,374 @@ export function statusVisibleUnder(status, flags) {
   }
 }
 
+// ── Other Filters (size / date / attributes) ────────────────────────────────
+//
+// Beyond Compare's second filter tab. Kept separate from the four mask fields
+// because these axes are numeric and dated rather than textual, and because
+// they must never apply to a folder: excluding a directory by its own size or
+// timestamp hides every file underneath it, which is the opposite of what a
+// "files smaller than 1 MB" filter is asked to do.
+
+/**
+ * @typedef {object} OtherFilters
+ * @property {string} minSize      size expression, '' = no bound
+ * @property {string} maxSize
+ * @property {string} modifiedAfter   YYYY-MM-DD, '' = no bound
+ * @property {string} modifiedBefore
+ * @property {'any'|'yes'|'no'} readOnly
+ * @property {'any'|'yes'|'no'} hidden
+ */
+
+/** @type {OtherFilters} */
+export const EMPTY_OTHER_FILTERS = {
+  minSize: '',
+  maxSize: '',
+  modifiedAfter: '',
+  modifiedBefore: '',
+  readOnly: 'any',
+  hidden: 'any',
+}
+
+/**
+ * Bytes named by a size expression such as `10`, `512K`, `4.5M`, `2 GB`.
+ *
+ * @param {string} raw
+ * @returns {number|null} null when the text names no size at all
+ */
+export function parseSizeInput(raw) {
+  const text = String(raw ?? '').trim()
+  if (!text) return null
+  const m = /^(\d+(?:\.\d+)?)\s*([kmgt]?)b?$/i.exec(text)
+  if (!m) return null
+  const scale = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4 }[m[2].toLowerCase()]
+  const value = Number(m[1]) * scale
+  return Number.isFinite(value) ? Math.round(value) : null
+}
+
+/**
+ * Epoch ms of a `YYYY-MM-DD` box, or null.
+ * @param {string} raw
+ * @param {boolean} endOfDay treat the date as its last millisecond
+ * @returns {number|null}
+ */
+export function parseDateInput(raw, endOfDay = false) {
+  const text = String(raw ?? '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null
+  const t = new Date(`${text}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}`).getTime()
+  return Number.isFinite(t) ? t : null
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {OtherFilters}
+ */
+export function normalizeOtherFilters(raw) {
+  const src = (raw && typeof raw === 'object') ? raw : {}
+  /** @type {OtherFilters} */
+  const out = { ...EMPTY_OTHER_FILTERS }
+  for (const key of ['minSize', 'maxSize', 'modifiedAfter', 'modifiedBefore']) {
+    if (typeof src[key] === 'string') out[key] = src[key]
+  }
+  for (const key of ['readOnly', 'hidden']) {
+    if (src[key] === 'yes' || src[key] === 'no' || src[key] === 'any') out[key] = src[key]
+  }
+  return out
+}
+
+/** @param {OtherFilters} filters @returns {boolean} whether anything is set */
+export function otherFiltersActive(filters) {
+  const f = normalizeOtherFilters(filters)
+  return Object.keys(EMPTY_OTHER_FILTERS).some((key) => f[key] !== EMPTY_OTHER_FILTERS[key])
+}
+
+/**
+ * Decide whether a row survives the size / date / attribute filters.
+ *
+ * A row passes when *either* side passes, so a filter never hides half of a
+ * matched pair — the pair is the unit the view shows.
+ *
+ * @param {CompareRow} row
+ * @param {OtherFilters} filters
+ * @returns {boolean}
+ */
+export function matchesOtherFilters(row, filters) {
+  const f = normalizeOtherFilters(filters)
+  if (!otherFiltersActive(f)) return true
+  // Directories carry no size or content of their own; filtering on those
+  // would hide the files the filter was written to find.
+  if (isDirRow(row)) return true
+
+  const min = parseSizeInput(f.minSize)
+  const max = parseSizeInput(f.maxSize)
+  const after = parseDateInput(f.modifiedAfter, false)
+  const before = parseDateInput(f.modifiedBefore, true)
+
+  /** @param {FileEntry|null|undefined} entry */
+  const passes = (entry) => {
+    if (!entry) return false
+    const size = Number(entry.size)
+    if (min !== null && !(Number.isFinite(size) && size >= min)) return false
+    if (max !== null && !(Number.isFinite(size) && size <= max)) return false
+    if (after !== null || before !== null) {
+      const t = new Date(entry.mtime).getTime()
+      if (!Number.isFinite(t)) return false
+      if (after !== null && t < after) return false
+      if (before !== null && t > before) return false
+    }
+    if (f.readOnly !== 'any' && !!entry.readOnly !== (f.readOnly === 'yes')) return false
+    // `hidden` is undefined when the listing did not ask for attributes; an
+    // unknown value cannot satisfy a yes/no test, so it fails rather than
+    // being counted as "not hidden".
+    if (f.hidden !== 'any') {
+      if (typeof entry.hidden !== 'boolean') return false
+      if (entry.hidden !== (f.hidden === 'yes')) return false
+    }
+    return true
+  }
+
+  return passes(row.left) || passes(row.right)
+}
+
+// ── Archives as folders ─────────────────────────────────────────────────────
+
+/**
+ * @typedef {object} ArchiveOptions
+ * @property {boolean} expand          list an archive's entries as child rows
+ * @property {string} extensions       mask deciding what counts as an archive
+ * @property {boolean} compareContents grade an archive pair by its entry list
+ *                                     rather than by the container's own bytes
+ */
+
+/** @type {ArchiveOptions} */
+export const DEFAULT_ARCHIVE_OPTIONS = {
+  expand: false,
+  extensions: '*.zip;*.jar;*.war;*.ear;*.7z;*.tar;*.tgz;*.gz;*.bz2;*.xz',
+  compareContents: false,
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {ArchiveOptions}
+ */
+export function normalizeArchiveOptions(raw) {
+  const src = (raw && typeof raw === 'object') ? raw : {}
+  return {
+    expand: typeof src.expand === 'boolean' ? src.expand : DEFAULT_ARCHIVE_OPTIONS.expand,
+    extensions: typeof src.extensions === 'string' && src.extensions.trim()
+      ? src.extensions
+      : DEFAULT_ARCHIVE_OPTIONS.extensions,
+    compareContents: typeof src.compareContents === 'boolean'
+      ? src.compareContents
+      : DEFAULT_ARCHIVE_OPTIONS.compareContents,
+  }
+}
+
+/**
+ * @param {string} name
+ * @param {string} extensions mask list, `;` separated
+ * @returns {boolean}
+ */
+export function isArchiveName(name, extensions) {
+  if (!name) return false
+  return matchesMasks(parseMasks(extensions ?? ''), name, {})
+}
+
+/**
+ * Grade a pair of archives by what they contain.
+ *
+ * Two archives built from the same tree at different times differ byte for
+ * byte — timestamps and compression order are recorded in the container — so
+ * the container's own size and mtime say nothing useful. The entry list does.
+ *
+ * @param {Array<{ name: string, size?: number, isDirectory?: boolean }>} left
+ * @param {Array<{ name: string, size?: number, isDirectory?: boolean }>} right
+ * @returns {'same'|'different'}
+ */
+export function classifyArchivePair(left, right) {
+  /** @param {Array<{ name: string, size?: number, isDirectory?: boolean }>} list */
+  const key = (list) => (list ?? [])
+    .filter((e) => !e.isDirectory)
+    .map((e) => `${e.name}\0${Number(e.size) || 0}`)
+    .sort()
+  const a = key(left)
+  const b = key(right)
+  if (a.length !== b.length) return 'different'
+  return a.every((v, i) => v === b[i]) ? 'same' : 'different'
+}
+
+// ── Flat mode (Ignore Folder Structure) ─────────────────────────────────────
+
+/**
+ * Pair two flat lists of files by base name, ignoring where they sit.
+ *
+ * Names repeated within one side are paired in path order and the surplus
+ * becomes orphans, so `a/x.js` + `b/x.js` on the left against one `x.js` on
+ * the right yields one pair and one left orphan rather than dropping a file.
+ *
+ * @param {FileEntry[]} leftFiles
+ * @param {FileEntry[]} rightFiles
+ * @param {'name'|'size'|'mtime'|'both'} mode
+ * @param {number} [mtimeTolerance]
+ * @param {{ compareAttributes?: boolean }} [opts]
+ * @returns {CompareRow[]}
+ */
+export function pairFlatEntries(leftFiles, rightFiles, mode, mtimeTolerance = 0, opts = {}) {
+  /** @param {FileEntry[]} files */
+  const group = (files) => {
+    /** @type {Map<string, FileEntry[]>} */
+    const map = new Map()
+    for (const entry of files ?? []) {
+      if (!entry || entry.isDirectory) continue
+      const list = map.get(entry.name)
+      if (list) list.push(entry)
+      else map.set(entry.name, [entry])
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => String(a.path).localeCompare(String(b.path)))
+    }
+    return map
+  }
+
+  const leftMap = group(leftFiles)
+  const rightMap = group(rightFiles)
+  const names = [...new Set([...leftMap.keys(), ...rightMap.keys()])]
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+
+  /** @type {CompareRow[]} */
+  const rows = []
+  for (const name of names) {
+    const lefts = leftMap.get(name) ?? []
+    const rights = rightMap.get(name) ?? []
+    const count = Math.max(lefts.length, rights.length)
+    for (let i = 0; i < count; i++) {
+      const left = lefts[i] ?? null
+      const right = rights[i] ?? null
+      rows.push({
+        name,
+        status: computeStatus(left, right, mode, mtimeTolerance, opts),
+        left,
+        right,
+        children: [],
+      })
+    }
+  }
+  return rows
+}
+
+// ── Folder Sync: Update vs Mirror ───────────────────────────────────────────
+
+/**
+ * @typedef {'update'|'mirror'} SyncAction
+ *   update — bring the destination up to date; nothing is ever deleted, and a
+ *            file that is newer on the destination is left alone
+ *   mirror — make the destination identical to the source, which means
+ *            overwriting newer destination files and deleting the ones the
+ *            source does not have
+ */
+
+/**
+ * @typedef {object} SyncOp
+ * @property {'copy'|'delete'} op
+ * @property {string} [src]
+ * @property {string} [dest]
+ * @property {string} [path]
+ * @property {string} label
+ * @property {boolean} targetReadOnly
+ */
+
+/**
+ * Turn compare rows into the copy/delete list a sync would perform.
+ *
+ * Pure, because the difference between Update and Mirror is exactly a set of
+ * delete operations and that difference has to be assertable without touching
+ * a filesystem.
+ *
+ * @param {CompareRow[]} rows
+ * @param {object} opts
+ * @param {'left-to-right'|'right-to-left'|'bidirectional'} opts.direction
+ * @param {SyncAction} opts.action
+ * @param {(srcPath: string, targetSide: 'left'|'right') => string} opts.destFor
+ * @returns {SyncOp[]}
+ */
+export function buildSyncOps(rows, opts) {
+  const { direction, action, destFor } = opts
+  /** @type {SyncOp[]} */
+  const ops = []
+
+  /**
+   * @param {FileEntry} from
+   * @param {'left'|'right'} to
+   * @param {FileEntry|null|undefined} target
+   */
+  const copy = (from, to, target) => ops.push({
+    op: 'copy',
+    src: from.path,
+    dest: destFor(from.path, to),
+    label: from.path,
+    targetReadOnly: !!target?.readOnly,
+  })
+
+  /** @param {FileEntry} entry */
+  const del = (entry) => ops.push({
+    op: 'delete',
+    path: entry.path,
+    label: entry.path,
+    targetReadOnly: !!entry.readOnly,
+  })
+
+  for (const row of rows ?? []) {
+    if (row.left?.isDirectory || row.right?.isDirectory) continue
+    const status = row.status
+
+    if (direction === 'bidirectional') {
+      // Mirroring in both directions is not a thing: each side would have to
+      // become the other. Bidirectional is Update only, which is why the UI
+      // disables Mirror when this direction is picked.
+      if (status === 'left-only' || status === 'left-newer') copy(row.left, 'right', row.right)
+      else if (status === 'right-only' || status === 'right-newer') copy(row.right, 'left', row.left)
+      continue
+    }
+
+    const fromKey = direction === 'left-to-right' ? 'left' : 'right'
+    const toKey = direction === 'left-to-right' ? 'right' : 'left'
+    const sourceOrphan = `${fromKey}-only`
+    const targetOrphan = `${toKey}-only`
+    const sourceNewer = `${fromKey}-newer`
+    const targetNewer = `${toKey}-newer`
+
+    if (status === sourceOrphan) {
+      copy(row[fromKey], toKey, row[toKey])
+    } else if (status === sourceNewer || status === 'different') {
+      copy(row[fromKey], toKey, row[toKey])
+    } else if (status === targetNewer) {
+      // Update leaves a newer destination alone; that is the whole difference
+      // between "bring up to date" and "make identical".
+      if (action === 'mirror') copy(row[fromKey], toKey, row[toKey])
+    } else if (status === targetOrphan) {
+      if (action === 'mirror') del(row[toKey])
+    }
+  }
+  return ops
+}
+
+/**
+ * Human label for a direction/action pair, used by the confirmation text so a
+ * destructive run never announces itself in the same words as a safe one.
+ *
+ * @param {'left-to-right'|'right-to-left'|'bidirectional'} direction
+ * @param {SyncAction} action
+ * @returns {string}
+ */
+export function syncModeLabel(direction, action) {
+  const dir = direction === 'left-to-right' ? '左 → 右'
+    : direction === 'right-to-left' ? '右 → 左'
+      : '雙向'
+  if (direction === 'bidirectional') return `${dir}（更新：各取較新，不刪除）`
+  return action === 'mirror'
+    ? `${dir}（鏡像：目的地會變得與來源完全一致，多餘的檔案會被刪除）`
+    : `${dir}（更新：只覆寫較舊的檔案，不刪除任何東西）`
+}
+
 // ── Rules-based content comparison ──────────────────────────────────────────
 
 /**
@@ -597,7 +965,9 @@ export function saveFolderColumns(ids) {
  * @returns {boolean}
  */
 function isDirRow(row) {
-  return !!(row?.left?.isDirectory || row?.right?.isDirectory)
+  // `container` is set only on archive rows that the archive options asked to
+  // expand; without it the flag is absent and the check is the original one.
+  return !!(row?.left?.isDirectory || row?.right?.isDirectory || row?.container)
 }
 
 /**
@@ -1435,6 +1805,23 @@ function computeStatus(left, right, mode, mtimeTolerance = 0, opts = {}) {
  * @param {number} [depth]
  * @returns {CompareRow[]} 每個元素帶有 depth 欄位
  */
+/**
+ * Depth-first walk yielding the *model* rows.
+ *
+ * {@link flattenRows} copies each row so callers can attach a depth without
+ * touching the tree; anything that writes a verdict back has to see the real
+ * object, or the grading lands on a throwaway copy and nothing changes.
+ *
+ * @param {CompareRow[]} rows
+ * @returns {Generator<CompareRow>}
+ */
+export function* eachRow(rows) {
+  for (const row of rows ?? []) {
+    yield row
+    if (row.children?.length) yield* eachRow(row.children)
+  }
+}
+
 export function flattenRows(rows, depth = 0) {
   const out = []
   for (const row of rows ?? []) {
@@ -1679,6 +2066,18 @@ export class FolderCompare {
     this._filterStr = ''
     /** @type {FilterFields} BC's Include/Exclude Files/Folders */
     this._filterFields = normalizeFilterFields(options.filterFields)
+    /** @type {OtherFilters} BC's "Other Filters" tab: size / date / attributes */
+    this._otherFilters = normalizeOtherFilters(options.otherFilters)
+
+    // BC's "Compare Files Only": folder structure stops being a difference of
+    // its own. Directories stay on screen — they are the only way to reach the
+    // files — but they no longer count, hide or navigate as differences.
+    this._filesOnly = false
+    // BC's "Ignore Folder Structure": every file in the tree at one level,
+    // paired by base name rather than by relative path.
+    this._flatMode = false
+    // Folder-level master switch for rules-mode unimportant differences.
+    this._ignoreUnimportant = false
 
     // Navigation history of {left,right} source pairs, for Back/Forward.
     /** @type {Array<{ left: FolderSource|null, right: FolderSource|null }>} */
@@ -1753,6 +2152,9 @@ export class FolderCompare {
     // Sync mode state
     this._syncMode = false
     this._syncDirection = 'left-to-right' // 'left-to-right' | 'right-to-left' | 'bidirectional'
+    /** @type {SyncAction} update never deletes; mirror does */
+    this._syncAction = 'update'
+    /** @type {SyncOp[]} */
     this._syncOps = []
 
     // Flattened archive entries, kept per side because an archive is listed
@@ -1782,6 +2184,13 @@ export class FolderCompare {
 
     // P2-26: whether read-only/hidden take part in the status decision.
     this._compareAttributes = !!options.compareAttributes
+    // Whether a differing version resource makes a pair different.
+    this._compareVersion = !!options.compareVersion
+
+    /** @type {ArchiveOptions} BC's "Compare within Archives" criteria */
+    this._archiveOptions = normalizeArchiveOptions(options.archiveOptions)
+    /** @type {Map<string, FileEntry[]>} archive path → its flattened entries */
+    this._archiveEntryCache = new Map()
 
     // P2-23: version text keyed by absolute path. Survives re-renders and
     // rescans, so scrolling back over a row never repeats its IPC.
@@ -2028,6 +2437,7 @@ export class FolderCompare {
   clearFilters() {
     this._filterStr = ''
     this._filterFields = { ...EMPTY_FILTER_FIELDS }
+    this._otherFilters = { ...EMPTY_OTHER_FILTERS }
     if (this._dom.filter) this._dom.filter.value = ''
     this._syncFilterFieldControls()
     this._applyFilterAndRender()
@@ -2038,9 +2448,10 @@ export class FolderCompare {
     for (const [key, input] of Object.entries(this._dom.filterInputs ?? {})) {
       if (input) input.value = this._filterFields[key] ?? ''
     }
+    this._syncOtherFilterControls()
   }
 
-  /** Read the panel inputs into the mask fields. */
+  /** Read the panel inputs into the mask fields and the other filters. */
   _readFilterPanel() {
     /** @type {Partial<FilterFields>} */
     const next = {}
@@ -2048,6 +2459,23 @@ export class FolderCompare {
       next[key] = input?.value ?? ''
     }
     this._filterFields = normalizeFilterFields({ ...this._filterFields, ...next })
+
+    /** @type {Partial<OtherFilters>} */
+    const other = {}
+    for (const [key, input] of Object.entries(this._dom.otherFilterInputs ?? {})) {
+      other[key] = input?.value ?? ''
+    }
+    // A size box that parses to nothing would silently filter nothing at all;
+    // saying so beats leaving the user to wonder why "1 meg" did not apply.
+    for (const key of ['minSize', 'maxSize']) {
+      const raw = String(other[key] ?? '').trim()
+      if (raw && parseSizeInput(raw) === null) {
+        alert(`「${raw}」不是可辨識的大小；請用 100、64K、2.5M 這樣的寫法。`)
+        return
+      }
+    }
+    this._otherFilters = normalizeOtherFilters({ ...this._otherFilters, ...other })
+
     this._applyFilterAndRender()
   }
 
@@ -2096,8 +2524,14 @@ export class FolderCompare {
       viewPreset: this._viewPreset,
       mtimeTolerance: this._mtimeTolerance,
       compareAttributes: this._compareAttributes,
+      compareVersion: this._compareVersion,
+      filesOnly: this._filesOnly,
+      flatMode: this._flatMode,
+      ignoreUnimportant: this._ignoreUnimportant,
+      archiveOptions: this.getArchiveOptions(),
       filterStr: this._filterStr,
       filterFields: { ...this._filterFields },
+      otherFilters: { ...this._otherFilters },
       columns: [...this._columns],
       rulesOptions: this.getRulesOptions(),
       // The six flags are stored alongside the preset because a hand-tuned
@@ -2136,8 +2570,21 @@ export class FolderCompare {
     if (typeof settings.compareAttributes === 'boolean') {
       this._compareAttributes = settings.compareAttributes
     }
+    if (typeof settings.compareVersion === 'boolean') {
+      this._compareVersion = settings.compareVersion
+    }
+    if (typeof settings.filesOnly === 'boolean') this._filesOnly = settings.filesOnly
+    if (typeof settings.flatMode === 'boolean') this._flatMode = settings.flatMode
+    if (typeof settings.ignoreUnimportant === 'boolean') {
+      this._ignoreUnimportant = settings.ignoreUnimportant
+    }
+    if (settings.archiveOptions) {
+      this._archiveOptions = normalizeArchiveOptions({
+        ...this._archiveOptions, ...settings.archiveOptions })
+    }
     if (typeof settings.filterStr === 'string') this._filterStr = settings.filterStr
     if (settings.filterFields) this._filterFields = normalizeFilterFields(settings.filterFields)
+    if (settings.otherFilters) this._otherFilters = normalizeOtherFilters(settings.otherFilters)
     if (Array.isArray(settings.columns)) this._columns = saveFolderColumns(settings.columns)
     if (settings.viewPreset && VIEW_PRESETS[settings.viewPreset]) {
       const preset = VIEW_PRESETS[settings.viewPreset]
@@ -2179,6 +2626,7 @@ export class FolderCompare {
     this._syncFilterFieldControls()
     this._syncFilterControls()
     this._syncAttributeControl()
+    this._syncViewModeControls()
     this._rebuildHeader()
 
     if (opts.scope === 'default' && !saveFolderDefaults(this.getConfig())) {
@@ -2235,6 +2683,300 @@ export class FolderCompare {
   /** Push the compare-attributes flag back onto its checkbox. */
   _syncAttributeControl() {
     if (this._dom.cbCompareAttrs) this._dom.cbCompareAttrs.checked = this._compareAttributes
+    if (this._dom.cbCompareVersion) this._dom.cbCompareVersion.checked = this._compareVersion
+  }
+
+  // ── Version as a comparison criterion ───────────────────────────────────────
+
+  /** @returns {boolean} */
+  getCompareVersion() {
+    return this._compareVersion
+  }
+
+  /**
+   * BC's "Version information" comparison criterion.
+   *
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setCompareVersion(on) {
+    const next = !!on
+    if (next === this._compareVersion) return next
+    this._compareVersion = next
+    this._syncAttributeControl()
+    if (this._leftPath || this._rightPath) void this._compareAndRender()
+    return next
+  }
+
+  /**
+   * Read both sides' version resources and mark the pairs that disagree.
+   *
+   * Only differing versions change a verdict. Equal versions are *not* taken
+   * as proof of equality: two builds can carry the same version string and
+   * different bytes, and reporting them as identical would hide a real change.
+   *
+   * Bounded by {@link MAX_VERSION_PREFETCH} for the same reason the column is
+   * lazy — a source tree must not turn into 50k metadata round trips — and the
+   * status line says so when the cap bites, rather than quietly grading part
+   * of the tree.
+   *
+   * @param {CompareRow[]} rows
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<void>}
+   */
+  async _applyVersionCompare(rows = this._rows, signal) {
+    if (!window.electronAPI?.readMetadata) return
+
+    /** @type {CompareRow[]} */
+    const candidates = []
+    let skipped = 0
+    for (const row of eachRow(rows ?? [])) {
+      const { left, right } = row
+      if (!left?.path || !right?.path) continue
+      if (left.isDirectory || right.isDirectory) continue
+      if (sourceKindOf(left.path) !== 'fs' || sourceKindOf(right.path) !== 'fs') continue
+      if (!hasVersionCandidateExt(left.name) && !hasVersionCandidateExt(right.name)) continue
+      if (candidates.length >= MAX_VERSION_PREFETCH) { skipped++; continue }
+      candidates.push(row)
+    }
+    if (skipped) {
+      this._setScanStatus(`版本比對：超過 ${MAX_VERSION_PREFETCH} 對檔案，其餘 ${skipped} 對未比對`)
+    }
+    if (!candidates.length) return
+
+    /**
+     * @param {FileEntry} entry
+     * @returns {Promise<string>}
+     */
+    const versionOf = async (entry) => {
+      const cached = this._versionCache.get(entry.path)
+      if (cached !== undefined) return cached
+      try {
+        const meta = await window.electronAPI.readMetadata(entry.path)
+        const text = versionTextFromMetadata(meta)
+        this._resolveVersion(entry, text, versionTitleFromMetadata(meta))
+        return text
+      } catch (err) {
+        // An unreadable resource is not a difference; saying so beats
+        // inventing one, and the warning keeps the failure visible.
+        console.warn('FolderCompare: version comparison lookup failed:', entry.path, err)
+        this._resolveVersion(entry, '—', `無法讀取版本資訊：${errText(err)}`)
+        return ''
+      }
+    }
+
+    await _runWithConcurrency(candidates, VERSION_CONCURRENCY, async (row) => {
+      if (signal?.aborted) return
+      const [lv, rv] = await Promise.all([versionOf(row.left), versionOf(row.right)])
+      if (signal?.aborted) return
+      if (!lv || !rv || lv === rv || lv === '—' || rv === '—') return
+      row.status = 'different'
+      row.unimportant = false
+      this._tickProgress()
+    })
+  }
+
+  // ── Compare Files Only / Ignore Folder Structure / Ignore Unimportant ───────
+
+  /** @returns {boolean} */
+  getFilesOnly() {
+    return this._filesOnly
+  }
+
+  /**
+   * BC's "Compare Files Only": folder structure differences stop counting.
+   *
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setFilesOnly(on) {
+    this._filesOnly = !!on
+    this._syncViewModeControls()
+    this._applyFilterAndRender()
+    return this._filesOnly
+  }
+
+  /** @returns {boolean} the new state */
+  toggleFilesOnly() {
+    return this.setFilesOnly(!this._filesOnly)
+  }
+
+  /** @returns {boolean} */
+  getFlatMode() {
+    return this._flatMode
+  }
+
+  /**
+   * BC's "Ignore Folder Structure": compare every file in both trees at one
+   * level, paired by base name.
+   *
+   * Turning it on has to walk both trees in full — the lazy tree only knows
+   * what the user expanded — so it goes through the cancellable scan path.
+   *
+   * @param {boolean} on
+   * @returns {Promise<boolean>} the new state
+   */
+  async setFlatMode(on) {
+    const next = !!on
+    if (next === this._flatMode) return next
+    this._flatMode = next
+    this._syncViewModeControls()
+    if (this._leftPath || this._rightPath) await this._compareAndRender()
+    return this._flatMode
+  }
+
+  /** @returns {Promise<boolean>} */
+  async toggleFlatMode() {
+    return this.setFlatMode(!this._flatMode)
+  }
+
+  /** @returns {boolean} */
+  getIgnoreUnimportant() {
+    return this._ignoreUnimportant
+  }
+
+  /**
+   * Folder-level master switch for the rules mode's unimportant differences.
+   *
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setIgnoreUnimportant(on) {
+    this._ignoreUnimportant = !!on
+    this._syncViewModeControls()
+    this._applyFilterAndRender()
+    return this._ignoreUnimportant
+  }
+
+  /** @returns {boolean} the new state */
+  toggleIgnoreUnimportant() {
+    return this.setIgnoreUnimportant(!this._ignoreUnimportant)
+  }
+
+  /** Push the three view-mode flags back onto their toolbar controls. */
+  _syncViewModeControls() {
+    const { cbFilesOnly, cbFlatMode, cbIgnoreUnimportant } = this._dom
+    if (cbFilesOnly) cbFilesOnly.checked = this._filesOnly
+    if (cbFlatMode) cbFlatMode.checked = this._flatMode
+    if (cbIgnoreUnimportant) cbIgnoreUnimportant.checked = this._ignoreUnimportant
+  }
+
+  /**
+   * Whether a row is a difference for counting and navigation.
+   *
+   * @param {CompareRow} row
+   * @returns {boolean}
+   */
+  _countsAsDifference(row) {
+    if (!row || row.status === 'same') return false
+    if (this._ignoreUnimportant && row.unimportant) return false
+    if (this._filesOnly && isDirRow(row)) return false
+    return true
+  }
+
+  // ── Compare within Archives ─────────────────────────────────────────────────
+
+  /** @returns {ArchiveOptions} */
+  getArchiveOptions() {
+    return { ...this._archiveOptions }
+  }
+
+  /**
+   * @param {Partial<ArchiveOptions>} partial
+   * @returns {ArchiveOptions}
+   */
+  setArchiveOptions(partial) {
+    const before = this._archiveOptions
+    this._archiveOptions = normalizeArchiveOptions({ ...before, ...(partial ?? {}) })
+    // A changed extension list or expansion flag invalidates which rows are
+    // containers, and the cached entry lists were keyed by a decision that no
+    // longer holds.
+    if (before.extensions !== this._archiveOptions.extensions) this._archiveEntryCache.clear()
+    if (this._leftPath || this._rightPath) void this._compareAndRender()
+    return this.getArchiveOptions()
+  }
+
+  /**
+   * BC's "Compare within Archives" criteria, as a dialog.
+   *
+   * @returns {Promise<ArchiveOptions|null>} the applied options, or null on cancel
+   */
+  openArchiveOptionsDialog() {
+    const host = this._dom.root ?? document.body
+    return new Promise((resolve) => {
+      const backdrop = el('div', { className: 'fc-modal-backdrop fc-archive-backdrop' })
+      const modal = el('div', { className: 'fc-modal', role: 'dialog', 'aria-modal': 'true' })
+      modal.appendChild(el('div', { className: 'fc-modal-title' }, '封存檔比對條件'))
+
+      const cbExpand = el('input', { type: 'checkbox', className: 'fc-archive-expand' })
+      cbExpand.checked = this._archiveOptions.expand
+      const expandWrap = el('label', { className: 'fc-modal-check' })
+      expandWrap.appendChild(cbExpand)
+      expandWrap.appendChild(document.createTextNode(' 把封存檔當成資料夾展開（列出裡面的檔案）'))
+      modal.appendChild(expandWrap)
+
+      const cbContents = el('input', { type: 'checkbox', className: 'fc-archive-contents' })
+      cbContents.checked = this._archiveOptions.compareContents
+      const contentsWrap = el('label', { className: 'fc-modal-check' })
+      contentsWrap.appendChild(cbContents)
+      contentsWrap.appendChild(document.createTextNode(' 以內容清單判定兩個封存檔是否相同'))
+      modal.appendChild(contentsWrap)
+
+      modal.appendChild(el('div', { className: 'fc-modal-hint' },
+        '同一份內容重新壓縮後，容器本身的位元組必定不同（時間戳與壓縮順序都寫在裡面），'
+        + '所以只比大小與時間會永遠報成差異。勾選後改以「檔名 + 大小」的清單判定。'))
+
+      const maskLabel = el('label', { className: 'fc-modal-field' })
+      maskLabel.appendChild(el('span', {}, '算作封存檔的副檔名'))
+      const maskInput = el('input', {
+        type: 'text',
+        className: 'fc-archive-extensions',
+        title: '遮罩語法同篩選欄位；; 分隔',
+      })
+      maskInput.value = this._archiveOptions.extensions
+      maskLabel.appendChild(maskInput)
+      modal.appendChild(maskLabel)
+
+      const actions = el('div', { className: 'fc-modal-actions' })
+      const btnCancel = el('button', { className: 'fc-modal-cancel' }, '取消')
+      const btnOk = el('button', { className: 'fc-modal-ok' }, '套用')
+      actions.append(btnCancel, btnOk)
+      modal.appendChild(actions)
+
+      backdrop.appendChild(modal)
+      host.appendChild(backdrop)
+      this._dom.archiveModal = backdrop
+
+      let settled = false
+      /** @param {ArchiveOptions|null} result */
+      const finish = (result) => {
+        if (settled) return
+        settled = true
+        backdrop.remove()
+        this._dom.archiveModal = null
+        document.removeEventListener('keydown', onKey, true)
+        resolve(result)
+      }
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(null) }
+      }
+
+      btnCancel.addEventListener('click', () => finish(null))
+      btnOk.addEventListener('click', () => {
+        if (!maskInput.value.trim()) {
+          alert('副檔名遮罩不可空白；留空會讓「封存檔」失去定義。')
+          return
+        }
+        finish(this.setArchiveOptions({
+          expand: cbExpand.checked,
+          compareContents: cbContents.checked,
+          extensions: maskInput.value,
+        }))
+      })
+      backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish(null) })
+      document.addEventListener('keydown', onKey, true)
+      btnOk.focus()
+    })
   }
 
 
@@ -2253,8 +2995,7 @@ export class FolderCompare {
     const out = []
     const flat = this._visibleRows ?? []
     for (let i = 0; i < flat.length; i++) {
-      const status = flat[i]?.row?.status
-      if (status && status !== 'same') out.push(i)
+      if (this._countsAsDifference(flat[i]?.row)) out.push(i)
     }
     return out
   }
@@ -3160,7 +3901,11 @@ ${errText(err)}`)
    * @returns {boolean}
    */
   _needsAttributes() {
-    return this._compareAttributes || this._columns.includes('attrs')
+    // The hidden filter is the third consumer: without the extra read every
+    // entry's `hidden` is undefined and the filter would hide the whole tree.
+    return this._compareAttributes
+      || this._columns.includes('attrs')
+      || this._otherFilters.hidden !== 'any'
   }
 
   /**
@@ -3254,7 +3999,11 @@ ${errText(err)}`)
     // the counters have to be looked up through a normalising step — indexing
     // with the raw status silently counted nothing but same/different.
     for (const row of flattenRows(this._rows ?? [])) {
-      const key = String(row?.status ?? '').replace(/-/g, '_')
+      // Compare Files Only and the ignore-unimportant switch both say certain
+      // rows are not differences; the counters have to agree with the tree and
+      // with difference navigation, or the status bar contradicts F7.
+      const counted = this._countsAsDifference(row) ? row.status : 'same'
+      const key = String(counted).replace(/-/g, '_')
       if (Object.prototype.hasOwnProperty.call(stats, key) && key !== 'total') {
         stats[key]++
       }
@@ -3465,12 +4214,21 @@ ${rows}
 
     const panel = document.createElement('div')
     panel.className = 'sync-panel'
+    // Update and Mirror are separate controls rather than six directions
+    // because the destructive half of the choice is the *action*, and burying
+    // it in a direction label is how "sync left to right" came to silently
+    // delete files.
     panel.innerHTML = `
       <div class="sync-options">
-        <label><input type="radio" name="sync-dir" value="left-to-right" checked> 左側 → 右側（鏡像到右側）</label>
-        <label><input type="radio" name="sync-dir" value="right-to-left"> 右側 → 左側（鏡像到左側）</label>
+        <label><input type="radio" name="sync-dir" value="left-to-right" checked> 左側 → 右側</label>
+        <label><input type="radio" name="sync-dir" value="right-to-left"> 右側 → 左側</label>
         <label><input type="radio" name="sync-dir" value="bidirectional"> 雙向（各取較新版本）</label>
       </div>
+      <div class="sync-options sync-options--action">
+        <label><input type="radio" name="sync-action" value="update" checked> 更新（只覆寫較舊的檔案，不刪除）</label>
+        <label><input type="radio" name="sync-action" value="mirror"> 鏡像（讓目的地完全一致，會刪除多餘檔案）</label>
+      </div>
+      <div class="sync-mode-note"></div>
       <div class="sync-actions">
         <button class="sync-btn" id="btn-sync-preview">預覽操作</button>
         <button class="sync-btn sync-btn--primary" id="btn-sync-execute" disabled>執行同步</button>
@@ -3485,16 +4243,47 @@ ${rows}
       root.insertBefore(panel, root.firstChild)
     }
 
+    /** @type {HTMLInputElement[]} */
+    const actionRadios = [...panel.querySelectorAll('input[name="sync-action"]')]
+    const note = panel.querySelector('.sync-mode-note')
+    const invalidatePreview = () => {
+      panel.querySelector('#btn-sync-execute').disabled = true
+      this._syncOps = []
+      const existing = panel.querySelector('.sync-preview')
+      if (existing) existing.remove()
+      panel.classList.toggle('sync-panel--mirror', this._syncAction === 'mirror'
+        && this._syncDirection !== 'bidirectional')
+      if (note) note.textContent = syncModeLabel(this._syncDirection, this._syncAction)
+    }
+
     // Radio change
     panel.querySelectorAll('input[name="sync-dir"]').forEach(radio => {
       radio.addEventListener('change', (e) => {
         this._syncDirection = e.target.value
-        panel.querySelector('#btn-sync-execute').disabled = true
-        this._syncOps = []
-        const existing = panel.querySelector('.sync-preview')
-        if (existing) existing.remove()
+        // Mirroring in both directions has no meaning: each side would have to
+        // become the other. The control says so instead of quietly ignoring it.
+        const bidi = this._syncDirection === 'bidirectional'
+        for (const r of actionRadios) {
+          if (r.value !== 'mirror') continue
+          r.disabled = bidi
+          if (bidi && r.checked) {
+            this._syncAction = 'update'
+            const update = actionRadios.find((x) => x.value === 'update')
+            if (update) update.checked = true
+          }
+        }
+        invalidatePreview()
       })
     })
+
+    for (const radio of actionRadios) {
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return
+        this._syncAction = radio.value === 'mirror' ? 'mirror' : 'update'
+        invalidatePreview()
+      })
+    }
+    invalidatePreview()
 
     // Preview button
     panel.querySelector('#btn-sync-preview').addEventListener('click', async () => {
@@ -3509,49 +4298,19 @@ ${rows}
     })
   }
 
-  /** 根據 _rows 和 syncDirection 建立操作清單 */
+  /**
+   * Build the copy/delete list for the current direction and action.
+   *
+   * Walks the whole loaded tree rather than the top level: an expanded folder's
+   * files were invisible to the sync before, so a "mirror" that the preview
+   * called complete left every subdirectory untouched.
+   */
   async _buildSyncOps() {
-    this._syncOps = []
-    // The destination entry is what a copy has to write over, so its read-only
-    // flag travels with the op rather than being looked up again at execute
-    // time, when the row is no longer at hand.
-    const copyOp = (from, to) => ({
-      op: 'copy',
-      src: from.path,
-      dest: this._buildDestPath(from.path, to === 'left' ? 'left' : 'right'),
-      label: from.path,
-      targetReadOnly: false,
+    this._syncOps = buildSyncOps(flattenRows(this._rows ?? []), {
+      direction: this._syncDirection,
+      action: this._syncAction,
+      destFor: (srcPath, targetSide) => this._buildDestPath(srcPath, targetSide),
     })
-
-    for (const row of this._rows) {
-      if (row.left?.isDirectory || row.right?.isDirectory) continue
-      const dir = this._syncDirection
-      const status = row.status
-
-      if (dir === 'left-to-right') {
-        if (status === 'left-only' || status === 'different' || status === 'left-newer') {
-          this._syncOps.push({ ...copyOp(row.left, 'right'), targetReadOnly: !!row.right?.readOnly })
-        } else if (status === 'right-only') {
-          this._syncOps.push({ op: 'delete', path: row.right.path, label: row.right.path, targetReadOnly: !!row.right.readOnly })
-        }
-      } else if (dir === 'right-to-left') {
-        if (status === 'right-only' || status === 'different' || status === 'right-newer') {
-          this._syncOps.push({ ...copyOp(row.right, 'left'), targetReadOnly: !!row.left?.readOnly })
-        } else if (status === 'left-only') {
-          this._syncOps.push({ op: 'delete', path: row.left.path, label: row.left.path, targetReadOnly: !!row.left.readOnly })
-        }
-      } else { // bidirectional: 各取較新，孤兒雙向複製
-        if (status === 'left-only') {
-          this._syncOps.push({ ...copyOp(row.left, 'right'), targetReadOnly: !!row.right?.readOnly })
-        } else if (status === 'right-only') {
-          this._syncOps.push({ ...copyOp(row.right, 'left'), targetReadOnly: !!row.left?.readOnly })
-        } else if (status === 'left-newer') {
-          this._syncOps.push({ ...copyOp(row.left, 'right'), targetReadOnly: !!row.right?.readOnly })
-        } else if (status === 'right-newer') {
-          this._syncOps.push({ ...copyOp(row.right, 'left'), targetReadOnly: !!row.left?.readOnly })
-        }
-      }
-    }
   }
 
   /**
@@ -3629,6 +4388,18 @@ ${rows}
     /** @type {{ ok: boolean, permanent: boolean }} */
     let deleteChoice = { ok: false, permanent: false }
     if (deletes.length > 0) {
+      // Mirror is the only path that deletes, and it deletes files the user
+      // never selected — they are simply absent from the source. Naming the
+      // count and the mode before the delete dialog makes that explicit; the
+      // dialog itself only asks recycle-bin versus permanent.
+      const target = this._syncDirection === 'right-to-left' ? '左' : '右'
+      if (!confirm(
+        `鏡像同步會刪除${target}側 ${deletes.length} 個來源沒有的檔案。\n\n`
+        + `${syncModeLabel(this._syncDirection, this._syncAction)}\n\n`
+        + '要繼續嗎？（下一步可選擇資源回收桶或永久刪除）')) {
+        if (execBtn) execBtn.disabled = false
+        return
+      }
       deleteChoice = await this._confirmDelete(deletes.map((op) => op.path))
     }
 
@@ -3897,6 +4668,85 @@ ${rows}
     alert(`複製完成：${done} 項成功${failures.length ? `，${failures.length} 項失敗` : ''}${detail}`)
   }
 
+  /**
+   * BC's "Move To…": move the selected files into any folder.
+   *
+   * Distinct from {@link moveSelectedTo}, which swaps a file between the two
+   * compared sides. This one takes a destination the comparison knows nothing
+   * about, and like every move it reports the half-finished state — copied but
+   * not deleted — rather than counting it as success.
+   *
+   * @param {'left'|'right'} [source]
+   * @param {string} [destRoot]
+   * @returns {Promise<void>}
+   */
+  async moveSelectedToFolder(source, destRoot) {
+    return this._moveRowsToFolder(this._selectedRows(), source, destRoot)
+  }
+
+  /**
+   * @param {CompareRow[]} rows
+   * @param {'left'|'right'} [source]
+   * @param {string} [destRoot]
+   * @returns {Promise<void>}
+   */
+  async _moveRowsToFolder(rows, source, destRoot) {
+    // The source side is written to as well as read: the file is deleted from
+    // it once the copy lands.
+    if (!this._requireWritable(source ? [source] : ['left', 'right'])) return
+    if (!rows?.length) { alert('請先勾選要移動的項目'); return }
+
+    let dest = destRoot
+    if (!dest) {
+      const picked = await window.electronAPI.openFolder()
+      if (!picked) return
+      dest = picked.path ?? picked
+    }
+    if (!dest) return
+
+    const sep = dest.includes('\\') ? '\\' : '/'
+    const base = dest.replace(/[\\/]+$/, '')
+
+    /** @type {Array<{ src: string, dest: string, dir: string }>} */
+    const jobs = []
+    for (const row of rows) {
+      const preferred = source ?? (row.left?.path ? 'left' : 'right')
+      const entry = row[preferred] ?? row.left ?? row.right
+      if (!entry?.path || entry.isDirectory) continue
+      if (sourceKindOf(entry.path) !== 'fs') continue
+      const rel = this._relativePathOf(row, preferred).replace(/^[\\/]+/, '')
+      const target = base + sep + rel
+      jobs.push({ src: entry.path, dest: target, dir: target.slice(0, target.length - row.name.length) })
+    }
+    if (!jobs.length) { alert('選取的項目中沒有可移動的檔案（目錄與虛擬來源不參與）'); return }
+    if (!confirm(`確定要將 ${jobs.length} 個檔案移動到：\n${base}\n？\n成功後來源檔案會被刪除。`)) return
+
+    /** @type {MoveResult[]} */
+    const results = []
+    /** @type {Array<{ path: string, message: string }>} */
+    const mkdirFailures = []
+    for (const job of jobs) {
+      try {
+        const dir = job.dir.replace(/[\\/]+$/, '')
+        if (dir && dir !== base) await window.electronAPI.mkdirFolder(dir)
+      } catch (err) {
+        // Without the folder the move cannot even start, so it is reported as
+        // a failure of that job rather than attempted and mis-blamed on rename.
+        mkdirFailures.push({ path: job.dest, message: errText(err) })
+        continue
+      }
+      results.push(await runMoveOne({ src: job.src, dest: job.dest }, window.electronAPI))
+    }
+
+    const detail = mkdirFailures.length
+      ? '\n\n無法建立目的地資料夾（來源未動）：\n'
+        + mkdirFailures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
+      : ''
+    alert(formatMoveSummary(results) + detail)
+    this._selectedNames.clear()
+    await this.refresh()
+  }
+
   // ── Touch (timestamp sync) ──────────────────────────────────────────────────
 
   /**
@@ -4093,6 +4943,14 @@ ${rows}
    * @returns {string}
    */
   _destPathFor(row, target) {
+    // In flat mode a pair need not share a relative path — `a/x.js` can be
+    // matched with `b/x.js` — so the file the user saw on the target side is
+    // the destination. Deriving it from the source's relative path would write
+    // a new file next to the one they meant to overwrite.
+    const counterpart = row?.[target]
+    if (counterpart?.path && !counterpart.isDirectory && sourceKindOf(counterpart.path) === 'fs') {
+      return counterpart.path
+    }
     const base = target === 'right' ? this._rightPath : this._leftPath
     const rel = this._relativePathOf(row, target === 'right' ? 'left' : 'right')
     const sep = base.includes('\\') ? '\\' : '/'
@@ -4138,6 +4996,34 @@ ${rows}
   /** 勾選所有 right-only rows */
   selectOrphansRight() {
     this._selectByStatus(['right-only'], 'right')
+  }
+
+  /** 勾選所有孤兒（左右兩側） */
+  selectOrphansBoth() {
+    this._selectByStatus(['left-only', 'right-only'], 'both')
+  }
+
+  /**
+   * BC's Edit ▸ Select All Files: every file in the loaded tree, and no folder.
+   *
+   * The toolbar's 全選 checkbox selects whatever rows are rendered, folders
+   * included — which then have to be skipped one by one by every batch
+   * operation, because copy, move and touch all work on files. This is the
+   * selection those operations can actually act on.
+   *
+   * @returns {number} how many rows were selected
+   */
+  selectAllFiles() {
+    this._selectedNames.clear()
+    for (const row of flattenRows(this._rows ?? [])) {
+      if (isDirRow(row)) continue
+      const key = row.left?.path || row.right?.path
+      if (key) this._selectedNames.add(key)
+    }
+    this._updateBatchButton()
+    this._syncCheckboxesFromSelected()
+    if (this._dom.cbSelectAll) this._dom.cbSelectAll.checked = false
+    return this._selectedNames.size
   }
 
   /** 反選目前所有勾選狀態 */
@@ -4548,6 +5434,25 @@ ${rows}
     this._dom.btnRightNewer = btnRightNewer
     toolbar.appendChild(btnRightNewer)
 
+    // BC's three folder-level display/comparison switches. Checkboxes rather
+    // than another preset entry: each is orthogonal to the preset list and to
+    // the other two.
+    const cbFilesOnly = this._buildCheckbox('fc-files-only', '只比檔案', this._filesOnly)
+    cbFilesOnly.title = '忽略資料夾結構差異：資料夾仍顯示（否則看不到底下的檔案），但不列入差異計數與差異導航'
+    this._dom.cbFilesOnly = cbFilesOnly.querySelector('input')
+    toolbar.appendChild(cbFilesOnly)
+
+    const cbFlatMode = this._buildCheckbox('fc-flat-mode', '攤平', this._flatMode)
+    cbFlatMode.title = '忽略資料夾結構：兩側所有檔案攤平成一層，只依檔名配對（會完整掃描兩側目錄樹）'
+    this._dom.cbFlatMode = cbFlatMode.querySelector('input')
+    toolbar.appendChild(cbFlatMode)
+
+    const cbIgnoreUnimportant = this._buildCheckbox(
+      'fc-ignore-unimportant', '忽略不重要', this._ignoreUnimportant)
+    cbIgnoreUnimportant.title = '「內容(規則)」模式判定為不重要的差異，視同相同'
+    this._dom.cbIgnoreUnimportant = cbIgnoreUnimportant.querySelector('input')
+    toolbar.appendChild(cbIgnoreUnimportant)
+
     // Quick filter input: one mask string over files and folders alike.
     const filter = el('input', {
       type: 'text',
@@ -4635,6 +5540,8 @@ ${rows}
       { label: '選取兩側較新', action: 'select-newer-both' },
       { label: '選取左側孤兒', action: 'select-orphans-left' },
       { label: '選取右側孤兒', action: 'select-orphans-right' },
+      { label: '選取兩側孤兒', action: 'select-orphans-both' },
+      { label: '選取全部檔案（不含資料夾）', action: 'select-all-files' },
       { label: '反選', action: 'invert-selection' },
     ]
     for (const item of selectItems) {
@@ -4677,6 +5584,7 @@ ${rows}
       { label: '移動選取到左側',             action: 'move-to-left' },
       { label: '互換選取（左右對調）',       action: 'exchange' },
       { label: '複製選取到其他資料夾…',      action: 'copy-to-folder' },
+      { label: '移動選取到其他資料夾…',      action: 'move-to-folder' },
       { label: '同步時間戳（左 → 右）',      action: 'touch-to-right' },
       { label: '同步時間戳（右 → 左）',      action: 'touch-to-left' },
     ]
@@ -4706,6 +5614,23 @@ ${rows}
   _buildFilterPanel() {
     const panel = el('div', { className: 'fc-filter-panel', style: 'display:none' })
 
+    // Two tabs, as in BC: masks answer "which names", the other filters answer
+    // "which sizes, dates and attributes". Mixing them into one row makes the
+    // panel unreadable and hides the fact that they combine with AND.
+    const tabs = el('div', { className: 'fc-filter-tabs' })
+    for (const [id, label] of [['masks', '名稱遮罩'], ['other', '其他篩選']]) {
+      tabs.appendChild(el('button', {
+        className: 'fc-filter-tab',
+        'data-tab': id,
+      }, label))
+    }
+    this._dom.filterTabs = tabs
+    panel.appendChild(tabs)
+
+    const masks = el('div', { className: 'fc-filter-page fc-filter-page--masks' })
+    this._dom.filterPageMasks = masks
+    panel.appendChild(masks)
+
     /** @type {Array<[keyof FilterFields, string, string]>} */
     const fields = [
       ['includeFiles', '包含檔案', '*.js;*.ts'],
@@ -4727,8 +5652,10 @@ ${rows}
       input.value = this._filterFields[key]
       this._dom.filterInputs[key] = input
       wrap.appendChild(input)
-      panel.appendChild(wrap)
+      masks.appendChild(wrap)
     }
+
+    panel.appendChild(this._buildOtherFilterPage())
 
     const btnApply = el('button', { className: 'fc-filter-apply' }, '套用')
     const btnClear = el('button', { className: 'fc-filter-clear' }, '清除')
@@ -4737,7 +5664,105 @@ ${rows}
     panel.append(btnApply, btnClear)
 
     this._dom.filterPanel = panel
+    this._selectFilterTab('masks')
     return panel
+  }
+
+  /**
+   * BC's "Other Filters" tab: size range, modification date range and
+   * attribute state.
+   *
+   * @returns {HTMLElement}
+   */
+  _buildOtherFilterPage() {
+    const page = el('div', { className: 'fc-filter-page fc-filter-page--other' })
+    this._dom.filterPageOther = page
+    this._dom.otherFilterInputs = {}
+
+    /** @type {Array<[keyof OtherFilters, string, string, string]>} */
+    const textFields = [
+      ['minSize', '最小大小', '例：100、64K、2.5M', '空白 = 不限。可用 K / M / G / T 後綴'],
+      ['maxSize', '最大大小', '例：1M', '空白 = 不限。可用 K / M / G / T 後綴'],
+    ]
+    for (const [key, label, placeholder, title] of textFields) {
+      const wrap = el('label', { className: 'fc-filter-field' })
+      wrap.appendChild(el('span', { className: 'fc-filter-label' }, label))
+      const input = el('input', {
+        type: 'text', className: 'fc-other-input', 'data-other': key, placeholder, title,
+      })
+      input.value = this._otherFilters[key]
+      this._dom.otherFilterInputs[key] = input
+      wrap.appendChild(input)
+      page.appendChild(wrap)
+    }
+
+    for (const [key, label] of [['modifiedAfter', '修改時間起'], ['modifiedBefore', '修改時間迄']]) {
+      const wrap = el('label', { className: 'fc-filter-field' })
+      wrap.appendChild(el('span', { className: 'fc-filter-label' }, label))
+      const input = el('input', {
+        type: 'date', className: 'fc-other-input', 'data-other': key, title: '空白 = 不限',
+      })
+      input.value = this._otherFilters[key]
+      this._dom.otherFilterInputs[key] = input
+      wrap.appendChild(input)
+      page.appendChild(wrap)
+    }
+
+    /** @type {Array<[keyof OtherFilters, string, string]>} */
+    const selects = [
+      ['readOnly', '唯讀', '依唯讀屬性篩選'],
+      ['hidden', '隱藏', '依隱藏屬性篩選；屬性未讀取時（未開啟屬性欄或屬性比對）不會有任何列符合'],
+    ]
+    for (const [key, label, title] of selects) {
+      const wrap = el('label', { className: 'fc-filter-field', title })
+      wrap.appendChild(el('span', { className: 'fc-filter-label' }, label))
+      const select = el('select', { className: 'fc-filter-select', 'data-other': key })
+      for (const [value, text] of [['any', '不限'], ['yes', '是'], ['no', '否']]) {
+        const opt = el('option', { value }, text)
+        if (value === this._otherFilters[key]) opt.setAttribute('selected', '')
+        select.appendChild(opt)
+      }
+      select.value = this._otherFilters[key]
+      this._dom.otherFilterInputs[key] = select
+      wrap.appendChild(select)
+      page.appendChild(wrap)
+    }
+    return page
+  }
+
+  /**
+   * @param {'masks'|'other'} tab
+   */
+  _selectFilterTab(tab) {
+    const { filterTabs, filterPageMasks, filterPageOther } = this._dom
+    if (filterPageMasks) filterPageMasks.style.display = tab === 'masks' ? 'flex' : 'none'
+    if (filterPageOther) filterPageOther.style.display = tab === 'other' ? 'flex' : 'none'
+    for (const btn of filterTabs?.querySelectorAll('.fc-filter-tab') ?? []) {
+      btn.classList.toggle('fc-filter-tab--active', btn.dataset.tab === tab)
+    }
+  }
+
+  /** @returns {OtherFilters} */
+  getOtherFilters() {
+    return { ...this._otherFilters }
+  }
+
+  /**
+   * @param {Partial<OtherFilters>} partial
+   * @returns {OtherFilters}
+   */
+  setOtherFilters(partial) {
+    this._otherFilters = normalizeOtherFilters({ ...this._otherFilters, ...(partial ?? {}) })
+    this._syncOtherFilterControls()
+    this._applyFilterAndRender()
+    return this.getOtherFilters()
+  }
+
+  /** Push the other-filter values back onto the panel controls. */
+  _syncOtherFilterControls() {
+    for (const [key, input] of Object.entries(this._dom.otherFilterInputs ?? {})) {
+      if (input) input.value = this._otherFilters[key]
+    }
   }
 
   /**
@@ -4811,6 +5836,26 @@ ${rows}
     this._dom.cbCompareAttrs = cbAttrs
     panel.appendChild(attrsWrap)
 
+    // Same shape as the attributes criterion: an extra test applied on top of
+    // whichever mode is selected, not a mode of its own.
+    const cbVersion = el('input', { type: 'checkbox', className: 'fc-rules-cb fc-compare-version' })
+    cbVersion.checked = this._compareVersion
+    const versionWrap = el('label', {
+      className: 'fc-rules-toggle',
+      title: '版本資源不同即視為差異（僅 exe/dll/sys 等有版本資源的格式；相同版本不代表內容相同，因此不會反過來判定為相同）',
+    })
+    versionWrap.appendChild(cbVersion)
+    versionWrap.appendChild(document.createTextNode(' 比對版本'))
+    this._dom.cbCompareVersion = cbVersion
+    panel.appendChild(versionWrap)
+
+    const btnArchives = el('button', {
+      className: 'fc-rules-archives',
+      title: '封存檔比對條件：是否展開為資料夾、哪些副檔名算封存檔、是否以內容清單判定差異',
+    }, '封存檔…')
+    this._dom.btnArchiveOptions = btnArchives
+    panel.appendChild(btnArchives)
+
     const btnApply = el('button', { className: 'fc-rules-apply' }, '套用')
     this._dom.rulesApply = btnApply
     panel.appendChild(btnApply)
@@ -4848,10 +5893,13 @@ ${rows}
     // its own rescan — so the flag is written first and the rescan is only
     // forced when setRulesOptions did not already do it.
     const attrsBefore = this._compareAttributes
+    const versionBefore = this._compareVersion
     this._compareAttributes = !!this._dom.cbCompareAttrs?.checked
+    this._compareVersion = !!this._dom.cbCompareVersion?.checked
     this.setRulesOptions(next)
-    if (attrsBefore !== this._compareAttributes && this._mode !== 'rules'
-        && (this._leftPath || this._rightPath)) {
+    const criteriaChanged = attrsBefore !== this._compareAttributes
+      || versionBefore !== this._compareVersion
+    if (criteriaChanged && this._mode !== 'rules' && (this._leftPath || this._rightPath)) {
       void this._compareAndRender()
     }
   }
@@ -5092,6 +6140,24 @@ ${rows}
       this.toggleRulesPanel()
     })
     this._dom.rulesApply?.addEventListener('click', () => this._readRulesPanel())
+    this._dom.btnArchiveOptions?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      void this.openArchiveOptionsDialog()
+    })
+
+    this._dom.cbFilesOnly?.addEventListener('change', () => {
+      this.setFilesOnly(!!this._dom.cbFilesOnly.checked)
+    })
+    this._dom.cbFlatMode?.addEventListener('change', () => {
+      void this.setFlatMode(!!this._dom.cbFlatMode.checked)
+    })
+    this._dom.cbIgnoreUnimportant?.addEventListener('change', () => {
+      this.setIgnoreUnimportant(!!this._dom.cbIgnoreUnimportant.checked)
+    })
+    this._dom.filterTabs?.addEventListener('click', (e) => {
+      const btn = e.target.closest('.fc-filter-tab')
+      if (btn) this._selectFilterTab(btn.dataset.tab === 'other' ? 'other' : 'masks')
+    })
     this._dom.btnSettings?.addEventListener('click', (e) => {
       e.stopPropagation()
       void this.openSettingsDialog()
@@ -5125,6 +6191,8 @@ ${rows}
       else if (action === 'select-newer-both')   this.selectNewerBoth()
       else if (action === 'select-orphans-left') this.selectOrphansLeft()
       else if (action === 'select-orphans-right')this.selectOrphansRight()
+      else if (action === 'select-orphans-both') this.selectOrphansBoth()
+      else if (action === 'select-all-files')    this.selectAllFiles()
       else if (action === 'invert-selection')    this.invertSelection()
     })
 
@@ -5180,6 +6248,7 @@ ${rows}
       else if (action === 'move-to-left') await this.moveSelectedTo('left')
       else if (action === 'exchange') await this.exchangeSelected()
       else if (action === 'copy-to-folder') await this.copySelectedToFolder()
+      else if (action === 'move-to-folder') await this.moveSelectedToFolder()
       else if (action === 'touch-to-right') await this.touchSelected('left-to-right')
       else if (action === 'touch-to-left') await this.touchSelected('right-to-left')
     })
@@ -5338,11 +6407,13 @@ ${rows}
     const owned = signal ? null : this._beginScan()
     const sig = signal ?? owned.signal
 
-    // 先以 'both'（名稱+大小+時間）做初步比對；content / rules 模式再進一步確認
-    this._rows = compareEntries(
-      this._leftEntries, this._rightEntries, this._baseMode(), this._mtimeTolerance, this._compareOpts())
-
     try {
+      // 先以 'both'（名稱+大小+時間）做初步比對；content / rules 模式再進一步確認
+      this._rows = this._flatMode
+        ? await this._buildFlatRows(sig)
+        : compareEntries(this._leftEntries, this._rightEntries,
+          this._baseMode(), this._mtimeTolerance, this._compareOpts())
+      this._markArchiveContainers(this._rows)
       await this._applyDeepCompare(this._rows, sig)
     } finally {
       if (owned) this._endScan(owned)
@@ -5366,6 +6437,152 @@ ${rows}
       await this._applyContentHash(rows, signal)
     } else if (this._mode === 'rules') {
       await this._applyRulesCompare(rows, signal)
+    }
+    // Both of these are extra criteria rather than modes, so they run after
+    // whichever mode was chosen and may only tighten its verdict.
+    if (this._archiveOptions.compareContents) await this._applyArchiveCompare(rows, signal)
+    if (this._compareVersion) await this._applyVersionCompare(rows, signal)
+  }
+
+  /**
+   * Walk both trees in full and pair every file by base name.
+   *
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<CompareRow[]>}
+   */
+  async _buildFlatRows(signal) {
+    const budget = { loaded: 0 }
+    const [left, right] = await Promise.all([
+      this._leftPath ? this._collectFiles('left', this._leftPath, budget, signal) : Promise.resolve([]),
+      this._rightPath ? this._collectFiles('right', this._rightPath, budget, signal) : Promise.resolve([]),
+    ])
+    if (budget.loaded >= MAX_EXPAND_ALL_DIRS) {
+      this._setScanStatus(`攤平比對：已達 ${MAX_EXPAND_ALL_DIRS} 個目錄上限，更深的層級未列入`)
+    }
+    return pairFlatEntries(
+      left, right, this._baseMode(), this._mtimeTolerance, this._compareOpts())
+  }
+
+  /**
+   * Every file under one side, recursively.
+   *
+   * Shares {@link MAX_EXPAND_ALL_DIRS} with Expand All: flat mode is the other
+   * operation that reads directories the user never asked for by name, and an
+   * unbounded walk is the same failure in both.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} root
+   * @param {{ loaded: number }} budget
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<FileEntry[]>}
+   */
+  async _collectFiles(side, root, budget, signal) {
+    /** @type {FileEntry[]} */
+    const out = []
+    /** @type {string[]} */
+    const queue = [root]
+    while (queue.length) {
+      if (signal?.aborted) break
+      if (budget.loaded >= MAX_EXPAND_ALL_DIRS) break
+      const dir = queue.shift()
+      budget.loaded++
+      let entries = []
+      try {
+        entries = await this._listDir(side, dir)
+      } catch (err) {
+        // One unreadable directory must not sink the whole flat comparison,
+        // but it must not vanish either.
+        console.error('FolderCompare: flat scan could not read', dir, err)
+        this._setScanStatus(`攤平比對：無法讀取「${dir}」（${errText(err)}）`)
+        continue
+      }
+      for (const entry of entries ?? []) {
+        if (entry.isDirectory) queue.push(entry.path)
+        else out.push(entry)
+      }
+      this._tickProgress(entries?.length ?? 0)
+    }
+    return out
+  }
+
+  /**
+   * Flag archive files as expandable containers, so the tree offers their
+   * entries the way it offers a directory's.
+   *
+   * @param {CompareRow[]} rows
+   */
+  _markArchiveContainers(rows) {
+    const { expand, extensions } = this._archiveOptions
+    for (const row of rows ?? []) {
+      if (row.left?.isDirectory || row.right?.isDirectory) continue
+      const isArchive = expand
+        && (isArchiveName(row.left?.name ?? '', extensions)
+          || isArchiveName(row.right?.name ?? '', extensions))
+      // Written unconditionally so turning the option back off clears the flag
+      // instead of leaving stale containers behind.
+      row.container = !!isArchive
+      if (!isArchive) continue
+      if (!row.children) row.children = null
+    }
+  }
+
+  /**
+   * Grade archive pairs by their entry lists rather than by the container's
+   * own bytes.
+   *
+   * @param {CompareRow[]} rows
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<void>}
+   */
+  async _applyArchiveCompare(rows, signal) {
+    const { extensions } = this._archiveOptions
+    const candidates = [...eachRow(rows ?? [])].filter((row) =>
+      row.left?.path && row.right?.path
+      && !row.left.isDirectory && !row.right.isDirectory
+      && sourceKindOf(row.left.path) === 'fs' && sourceKindOf(row.right.path) === 'fs'
+      && isArchiveName(row.left.name, extensions) && isArchiveName(row.right.name, extensions))
+    if (!candidates.length) return
+
+    for (const row of candidates) {
+      if (signal?.aborted) return
+      const [left, right] = await Promise.all([
+        this._archiveEntriesOf(row.left.path),
+        this._archiveEntriesOf(row.right.path),
+      ])
+      if (signal?.aborted) return
+      // A read failure leaves the metadata verdict alone; _archiveEntriesOf has
+      // already reported it on the status line.
+      if (!left || !right) continue
+      row.status = classifyArchivePair(left, right)
+      row.unimportant = false
+      this._tickProgress()
+    }
+  }
+
+  /**
+   * Entries of one archive, cached by path.
+   *
+   * @param {string} path
+   * @returns {Promise<FileEntry[]|null>} null when the archive could not be read
+   */
+  async _archiveEntriesOf(path) {
+    const cached = this._archiveEntryCache.get(path)
+    if (cached) return cached
+    if (typeof window.electronAPI?.readArchive !== 'function') return null
+    try {
+      const listing = await window.electronAPI.readArchive(path)
+      const raw = Array.isArray(listing) ? listing : (listing?.entries ?? [])
+      // `open-zip` hands back tree-shaped entries; `read-archive` hands back a
+      // flat list whose parent directories still have to be synthesised.
+      const entries = raw.length && raw[0]?.parentPath !== undefined
+        ? raw.map((e) => ({ ...e, isArchiveEntry: true }))
+        : archiveEntriesToFileEntries(path, raw)
+      this._archiveEntryCache.set(path, entries)
+      return entries
+    } catch (err) {
+      console.error('FolderCompare: could not read archive', path, err)
+      this._setScanStatus(`無法讀取封存檔「${path}」：${errText(err)}`)
+      return null
     }
   }
 
@@ -5459,18 +6676,28 @@ ${rows}
   }
 
   _isRowVisible(row) {
-    // A rules-graded row with only unimportant differences sits between the two
-    // buckets: it is "same" for counting, but hiding it while the user is
-    // hunting for differences would lose the one hint that it changed at all.
-    if (row.unimportant) {
-      if (!this._showSame && !this._showDiff) return false
-    } else if (!statusVisibleUnder(row.status, this._viewFlags)) {
+    // Compare Files Only: a directory is scaffolding, not a result. Hiding one
+    // because its own status is filtered out would take every file under it
+    // off screen with it.
+    const structural = this._filesOnly && isDirRow(row)
+
+    if (this._ignoreUnimportant && row.unimportant) {
+      // The master switch says these are not differences, so they follow the
+      // same rule "same" rows do.
+      if (!structural && !this._showSame) return false
+    } else if (row.unimportant) {
+      // A rules-graded row with only unimportant differences sits between the
+      // two buckets: it is "same" for counting, but hiding it while the user is
+      // hunting for differences would lose the one hint that it changed at all.
+      if (!structural && !this._showSame && !this._showDiff) return false
+    } else if (!structural && !statusVisibleUnder(row.status, this._viewFlags)) {
       return false
     }
 
     // The "顯示差異" master toggle also suppresses the newer-on-one-side
     // statuses, which are differences too.
-    if (!this._showDiff && (row.status === 'left-newer' || row.status === 'right-newer')) {
+    if (!structural && !this._showDiff
+        && (row.status === 'left-newer' || row.status === 'right-newer')) {
       return false
     }
 
@@ -5483,7 +6710,8 @@ ${rows}
     if (this._filterStr.trim() && !matchesFilter(row.name, this._filterStr, opts)) {
       return false
     }
-    return matchesFolderFilters(row.name, this._filterFields, opts)
+    if (!matchesFolderFilters(row.name, this._filterFields, opts)) return false
+    return matchesOtherFilters(row, this._otherFilters)
   }
 
   /**
@@ -5626,6 +6854,9 @@ ${rows}
     const leftPath = row.left?.isDirectory ? row.left.path : null
     const rightPath = row.right?.isDirectory ? row.right.path : null
     if (!leftPath && !rightPath) {
+      // An archive expands into its own entry list rather than into a
+      // directory listing; every other file has nothing underneath it.
+      if (row.container) { await this._loadArchiveChildren(row, signal); return }
       row.children = []
       return
     }
@@ -5638,10 +6869,46 @@ ${rows}
     if (signal?.aborted) return
     row.children = compareEntries(
       leftChildren, rightChildren, this._baseMode(), this._mtimeTolerance, this._compareOpts())
+    // Archives nested inside a subfolder have to become containers too, or the
+    // option would only apply to the top level.
+    this._markArchiveContainers(row.children)
     this._tickProgress(row.children.length)
     await this._applyDeepCompare(row.children, signal)
     if (signal?.aborted) { row.children = null; return }
     this._refreshRollups()
+  }
+
+  /**
+   * Expand an archive row into the files it holds.
+   *
+   * Every entry is listed at one level under the archive, keyed by its path
+   * inside the container, because an archive's own directory records are
+   * optional and reconstructing a tree from them would show a shape that the
+   * two archives need not share.
+   *
+   * @param {CompareRow} row
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<void>}
+   */
+  async _loadArchiveChildren(row, signal) {
+    const [left, right] = await Promise.all([
+      row.left?.path ? this._archiveEntriesOf(row.left.path) : Promise.resolve([]),
+      row.right?.path ? this._archiveEntriesOf(row.right.path) : Promise.resolve([]),
+    ])
+    if (signal?.aborted) return
+    if (left === null || right === null) {
+      // The read failed and said so; an empty child list would read as "this
+      // archive is empty", which is a different and wrong claim.
+      row.children = null
+      return
+    }
+    /** @param {FileEntry[]} entries */
+    const files = (entries) => entries
+      .filter((e) => !e.isDirectory)
+      .map((e) => ({ ...e, name: parseVirtualPath(e.path).entry || e.name }))
+    row.children = pairFlatEntries(
+      files(left), files(right), this._baseMode(), this._mtimeTolerance, this._compareOpts())
+    this._tickProgress(row.children.length)
   }
 
   /** 由葉往根重算所有已載入目錄的狀態與「不重要差異」標記。 */
@@ -6275,7 +7542,26 @@ ${rows}
           action: () => void this._copyRowsToFolder(modelRow ? [modelRow] : [], 'right'),
         })
       }
+      if (leftPath) {
+        items.push({
+          label: '移動左側到其他資料夾…（來源會被刪除）',
+          action: () => void this._moveRowsToFolder(modelRow ? [modelRow] : [], 'left'),
+        })
+      }
+      if (rightPath) {
+        items.push({
+          label: '移動右側到其他資料夾…（來源會被刪除）',
+          action: () => void this._moveRowsToFolder(modelRow ? [modelRow] : [], 'right'),
+        })
+      }
     }
+
+    // ── 選取 ──
+    items.push({ separator: true })
+    items.push({
+      label: '選取全部檔案（不含資料夾）',
+      action: () => { this.selectAllFiles() },
+    })
 
     // ── P2-26: 屬性檢視 / 編輯 ──
     if (modelRow && (leftPath || rightPath)) {

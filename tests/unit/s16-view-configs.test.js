@@ -25,13 +25,18 @@ beforeEach(() => {
 describe('HexCompare config', () => {
   it('round-trips a snapshot', () => {
     const a = new HexCompare()
-    a.applyConfig({ bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff' })
+    a.applyConfig({
+      bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff',
+      layout: 'over-under', showThumbnail: true,
+    })
     const b = new HexCompare()
     b.applyConfig(a.getConfig())
     expect(b.getConfig()).toEqual({
       __v: 1, __view: 'hex', bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff',
       // P2-40: panel visibility travels with the config too.
       showDetails: false, showFileInfo: false, showRuler: false,
+      // S24: so does the layout axis and the thumbnail.
+      layout: 'over-under', showThumbnail: true,
     })
   })
 

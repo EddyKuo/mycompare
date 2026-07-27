@@ -46,6 +46,18 @@ const MAX_UNDO_STACK = 500
 /** P2-22: how long re-colouring waits after the last keystroke, in ms. */
 const EDIT_REFLOW_MS = 120
 
+/**
+ * Ceiling on the thumbnail's segment count.
+ *
+ * The thumbnail summarises the whole file, so its cost has to follow its own
+ * height rather than the byte count — one node per row would make the overview
+ * of a 10 MB file more expensive than the virtual scroller it summarises.
+ */
+const THUMB_MAX_MARKS = 400
+
+/** Assumed strip height where the environment reports none (jsdom, hidden). */
+const THUMB_FALLBACK_HEIGHT = 300
+
 // S14-M10: rAF throttle — coalesce calls to the next animation frame.
 function _rafThrottle(fn) {
   let scheduled = false
@@ -439,12 +451,198 @@ export function makeDeleteEdit(doc, offset, count = 1) {
 }
 
 /**
+ * Replace `removeCount` bytes at `offset` with `values`, of any length.
+ *
+ * Overwrite/insert/delete are the equal-length, empty-before and empty-after
+ * cases of this; Replace needs the general one because a hex needle and its
+ * replacement are frequently different lengths.
+ *
+ * @param {HexDoc} doc
+ * @param {number} offset
+ * @param {number} removeCount
+ * @param {Uint8Array|number[]} values
+ * @returns {HexEdit|null} null when out of range or when nothing would change
+ */
+export function makeReplaceEdit(doc, offset, removeCount, values) {
+  const src = makeHexDoc(doc.bytes, doc.flags)
+  const start = Math.trunc(offset)
+  const remove = Math.trunc(removeCount)
+  if (start < 0 || remove < 0 || start + remove > src.bytes.length) return null
+
+  const after = Uint8Array.from(values)
+  if (remove === 0 && after.length === 0) return null
+
+  const before = src.bytes.slice(start, start + remove)
+  const beforeFlags = src.flags.slice(start, start + remove)
+  if (before.length === after.length) {
+    let identical = true
+    for (let i = 0; i < after.length; i++) {
+      if (before[i] !== after[i] || beforeFlags[i] !== 1) { identical = false; break }
+    }
+    if (identical) return null
+  }
+
+  return { offset: start, before, beforeFlags, after, afterFlags: onesFlags(after.length) }
+}
+
+/**
+ * Drop matches that overlap an earlier one.
+ *
+ * `searchHexBytes` reports every position, including overlapping ones (`AA` in
+ * `AAAA` hits at 0, 1 and 2). Replacing all of those would splice into bytes a
+ * previous replacement had already consumed, so the run is taken greedily from
+ * the left, which is what every find-and-replace does.
+ *
+ * @param {number[]} offsets ascending
+ * @param {number} needleLength
+ * @returns {number[]}
+ */
+export function nonOverlappingMatches(offsets, needleLength) {
+  const n = Math.max(1, Math.trunc(needleLength))
+  /** @type {number[]} */
+  const out = []
+  let barrier = -1
+  for (const o of offsets) {
+    if (o < barrier) continue
+    out.push(o)
+    barrier = o + n
+  }
+  return out
+}
+
+/**
+ * @typedef {{ status: 'same'|'different'|'left-only'|'right-only',
+ *             startByte: number, endByte: number }} HexThumbBucket
+ */
+
+/**
+ * Compress the whole comparison into a fixed number of coloured bands.
+ *
+ * Driven by the difference regions rather than by a byte-by-byte rescan so the
+ * thumbnail agrees with the colouring and with difference navigation by
+ * construction, and so its cost is O(buckets + regions) instead of O(bytes).
+ *
+ * @param {number} totalBytes  max of the two file lengths
+ * @param {Array<{ start: number, end: number }>} regions ascending, disjoint
+ * @param {number} leftLength
+ * @param {number} rightLength
+ * @param {number} bucketCount
+ * @returns {HexThumbBucket[]}
+ */
+export function hexThumbnailBuckets(totalBytes, regions, leftLength, rightLength, bucketCount) {
+  const total = Math.max(0, Math.trunc(totalBytes))
+  const n = Math.min(Math.max(0, Math.floor(bucketCount)), total)
+  if (total === 0 || n <= 0) return []
+
+  const list = regions ?? []
+  /** @type {HexThumbBucket[]} */
+  const out = []
+  let ri = 0
+  for (let i = 0; i < n; i++) {
+    const startByte = Math.floor((i * total) / n)
+    const endByte = Math.max(startByte + 1, Math.floor(((i + 1) * total) / n))
+
+    // Regions are ascending and disjoint, so the cursor only ever moves forward.
+    while (ri < list.length && list[ri].end <= startByte) ri++
+
+    /** @type {HexThumbBucket['status']} */
+    let status = 'same'
+    for (let k = ri; k < list.length && list[k].start < endByte; k++) {
+      const r = list[k]
+      const from = Math.max(r.start, startByte)
+      const to = Math.min(r.end, endByte)
+      if (to <= from) continue
+      // A region past one side's end is that side missing bytes, not a change;
+      // "different" wins when the bucket holds both, since it is the stronger
+      // statement about the same bytes.
+      /** @type {HexThumbBucket['status']} */
+      let kind = 'different'
+      if (from >= rightLength && to <= leftLength) kind = 'left-only'
+      else if (from >= leftLength && to <= rightLength) kind = 'right-only'
+      if (status === 'same' || kind === 'different') status = kind
+      if (status === 'different') break
+    }
+    out.push({ status, startByte, endByte })
+  }
+  return out
+}
+
+/**
  * @param {HexDoc} doc
  * @param {HexEdit} edit
  * @returns {HexDoc}
  */
 export function applyHexEdit(doc, edit) {
   return spliceHexDoc(doc, edit.offset, edit.before.length, edit.after, edit.afterFlags)
+}
+
+/**
+ * Apply a group of disjoint splices in one pass.
+ *
+ * Replace All can produce tens of thousands of splices, and one
+ * `spliceHexDoc` each would copy the whole document per replacement — the
+ * quadratic cost lands on exactly the files big enough to want the feature.
+ *
+ * @param {HexDoc} doc
+ * @param {HexEdit[]} edits disjoint, ordered by *descending* offset, with every
+ *   offset expressed in `doc`'s coordinates
+ * @returns {HexDoc}
+ */
+export function applyHexEdits(doc, edits) {
+  if (!edits || edits.length === 0) return makeHexDoc(doc.bytes, doc.flags)
+  if (edits.length === 1) return applyHexEdit(doc, edits[0])
+
+  const src = makeHexDoc(doc.bytes, doc.flags)
+  let outLen = src.bytes.length
+  for (const e of edits) outLen += e.after.length - e.before.length
+
+  const bytes = new Uint8Array(outLen)
+  const flags = new Uint8Array(outLen)
+  let sp = 0
+  let dp = 0
+  // Ascending, so the untouched runs between edits can be copied in order.
+  for (let i = edits.length - 1; i >= 0; i--) {
+    const e = edits[i]
+    const head = e.offset - sp
+    bytes.set(src.bytes.subarray(sp, e.offset), dp)
+    flags.set(src.flags.subarray(sp, e.offset), dp)
+    dp += head
+    bytes.set(e.after, dp)
+    flags.set(e.afterFlags, dp)
+    dp += e.after.length
+    sp = e.offset + e.before.length
+  }
+  bytes.set(src.bytes.subarray(sp), dp)
+  flags.set(src.flags.subarray(sp), dp)
+  return { bytes, flags }
+}
+
+/**
+ * Inverse of a whole group.
+ *
+ * Each edit's `after` run sits at its original offset shifted by the net length
+ * change of every earlier edit, so the inverses cannot simply reuse the
+ * forward offsets the way a single `invertHexEdit` can.
+ *
+ * @param {HexEdit[]} edits descending, in the pre-edit coordinates
+ * @returns {HexEdit[]} descending, in the post-edit coordinates
+ */
+export function invertHexEdits(edits) {
+  /** @type {HexEdit[]} */
+  const out = []
+  let delta = 0
+  for (let i = edits.length - 1; i >= 0; i--) {
+    const e = edits[i]
+    out.push({
+      offset: e.offset + delta,
+      before: e.after,
+      beforeFlags: e.afterFlags,
+      after: e.before,
+      afterFlags: e.beforeFlags,
+    })
+    delta += e.after.length - e.before.length
+  }
+  return out.reverse()
 }
 
 /**
@@ -700,6 +898,8 @@ export class HexCompare {
    * @param {boolean} [options.showDetails=false]   顯示 Hex Details 面板
    * @param {boolean} [options.showFileInfo=false]  顯示 File Info 面板
    * @param {boolean} [options.showRuler=false]     顯示欄位標尺
+   * @param {boolean} [options.showThumbnail=false] 顯示整檔差異縮圖
+   * @param {'side-by-side'|'over-under'} [options.layout='side-by-side']
    */
   constructor(options = {}) {
     /** @type {number} */
@@ -816,9 +1016,14 @@ export class HexCompare {
      *          nibble: 0|1 }|null}
      */
     this._cursor = null
-    /** @type {Array<{ side: 'left'|'right', edit: HexEdit }>} */
+    /**
+     * Undo history. One entry is one user action, which Replace All makes a
+     * group of splices rather than a single one — undoing a hundred
+     * replacements one keypress at a time is not an undo.
+     * @type {Array<{ side: 'left'|'right', edits: HexEdit[] }>}
+     */
     this._undoStack = []
-    /** @type {Array<{ side: 'left'|'right', edit: HexEdit }>} */
+    /** @type {Array<{ side: 'left'|'right', edits: HexEdit[] }>} */
     this._redoStack = []
     /** @type {ReturnType<typeof setTimeout>|null} */
     this._reflowTimer = null
@@ -841,6 +1046,16 @@ export class HexCompare {
      * @type {Map<string, string>}
      */
     this._mtimeCache = new Map()
+
+    // ── S24: over/under layout, thumbnail, replace ────────────────────────────
+    /** @type {'side-by-side'|'over-under'} */
+    this._layoutMode = options.layout === 'over-under' ? 'over-under' : 'side-by-side'
+    /** @type {boolean} 整檔差異縮圖 */
+    this._showThumbnail = options.showThumbnail ?? false
+    /** @type {HexThumbBucket[]} last painted bands, kept for tests and clicks */
+    this._thumbBuckets = []
+    /** @type {boolean} whether the replace row is showing */
+    this._replaceOpen = false
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -898,6 +1113,7 @@ export class HexCompare {
     this._redoStack = []
     this._flags = { left: null, right: null }
     this._modifiedCount = { left: 0, right: 0 }
+    this._thumbBuckets = []
   }
 
   /**
@@ -982,6 +1198,7 @@ export class HexCompare {
     if (this._showRuler) this._renderRulers()
     this._updateDetailsPanel()
     this._updateFileInfoPanel()
+    this._renderThumbnail()
     requestAnimationFrame(() => {
       this._renderPaneContent('left')
       this._renderPaneContent('right')
@@ -1005,6 +1222,8 @@ export class HexCompare {
       showDetails: this._showDetails,
       showFileInfo: this._showFileInfo,
       showRuler: this._showRuler,
+      showThumbnail: this._showThumbnail,
+      layout: this._layoutMode,
     })
   }
 
@@ -1024,7 +1243,14 @@ export class HexCompare {
     if (typeof settings.showDetails === 'boolean') this._showDetails = settings.showDetails
     if (typeof settings.showFileInfo === 'boolean') this._showFileInfo = settings.showFileInfo
     if (typeof settings.showRuler === 'boolean') this._showRuler = settings.showRuler
+    if (settings.layout === 'side-by-side' || settings.layout === 'over-under') {
+      this._layoutMode = settings.layout
+    }
     this._applyPanelVisibility()
+    this._applyLayout()
+    if (typeof settings.showThumbnail === 'boolean') {
+      this.setThumbnailVisible(settings.showThumbnail)
+    }
     this._syncConfigControls()
     this.refresh()
   }
@@ -1491,11 +1717,26 @@ ${body}
    * @returns {boolean}
    */
   _applyEdit(side, edit) {
-    if (!edit) return false
-    this._applyEditRaw(side, edit)
-    pushBounded(this._undoStack, { side, edit }, MAX_UNDO_STACK)
+    return edit ? this._applyEditGroup(side, [edit]) : false
+  }
+
+  /**
+   * Apply several splices as one undoable action.
+   *
+   * `edits` must be ordered by descending offset: applied that way, each one's
+   * offset is still valid in the document the previous ones produced, even when
+   * the replacements change lengths.
+   *
+   * @param {'left'|'right'} side
+   * @param {HexEdit[]} edits
+   * @returns {boolean}
+   */
+  _applyEditGroup(side, edits) {
+    if (!edits || edits.length === 0) return false
+    this._applyEditsRaw(side, edits)
+    pushBounded(this._undoStack, { side, edits }, MAX_UNDO_STACK)
     this._redoStack = []
-    this._afterEdit(side, edit)
+    this._afterEditGroup(side, edits)
     return true
   }
 
@@ -1507,18 +1748,28 @@ ${body}
    * @param {HexEdit} edit
    */
   _applyEditRaw(side, edit) {
-    this._setDoc(side, applyHexEdit(this._doc(side), edit))
-    this._modifiedCount[side] = Math.max(0, this._modifiedCount[side] + modifiedDelta(edit))
+    this._applyEditsRaw(side, [edit])
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {HexEdit[]} edits descending, in the current document's coordinates
+   */
+  _applyEditsRaw(side, edits) {
+    this._setDoc(side, applyHexEdits(this._doc(side), edits))
+    let delta = 0
+    for (const edit of edits) delta += modifiedDelta(edit)
+    this._modifiedCount[side] = Math.max(0, this._modifiedCount[side] + delta)
   }
 
   /** @returns {boolean} true when an edit was undone */
   undo() {
     const entry = this._undoStack.pop()
     if (!entry) return false
-    this._applyEditRaw(entry.side, invertHexEdit(entry.edit))
+    this._applyEditsRaw(entry.side, invertHexEdits(entry.edits))
     pushBounded(this._redoStack, entry, MAX_UNDO_STACK)
-    this._moveCursorTo(entry.side, entry.edit.offset)
-    this._afterEdit(entry.side, entry.edit)
+    this._moveCursorTo(entry.side, entry.edits[entry.edits.length - 1].offset)
+    this._afterEditGroup(entry.side, entry.edits)
     return true
   }
 
@@ -1526,10 +1777,10 @@ ${body}
   redo() {
     const entry = this._redoStack.pop()
     if (!entry) return false
-    this._applyEditRaw(entry.side, entry.edit)
+    this._applyEditsRaw(entry.side, entry.edits)
     pushBounded(this._undoStack, entry, MAX_UNDO_STACK)
-    this._moveCursorTo(entry.side, entry.edit.offset)
-    this._afterEdit(entry.side, entry.edit)
+    this._moveCursorTo(entry.side, entry.edits[entry.edits.length - 1].offset)
+    this._afterEditGroup(entry.side, entry.edits)
     return true
   }
 
@@ -1567,7 +1818,15 @@ ${body}
    * @param {HexEdit} edit
    */
   _afterEdit(side, edit) {
-    if (edit.before.length !== edit.after.length) this._invalidateFind()
+    this._afterEditGroup(side, [edit])
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {HexEdit[]} edits
+   */
+  _afterEditGroup(side, edits) {
+    if (edits.some((e) => e.before.length !== e.after.length)) this._invalidateFind()
     this._updateSizeInfo()
     this._syncEditControls()
     this._renderPaneContent(side)
@@ -1606,6 +1865,7 @@ ${body}
     this._recomputeDiffRegions()
     this._renderPaneContent('left')
     this._renderPaneContent('right')
+    this._renderThumbnail()
   }
 
   // ── Public: saving edited bytes ─────────────────────────────────────────────
@@ -1686,6 +1946,283 @@ ${body}
     return window.confirm(
       `Hex 比對有尚未儲存的修改（${sides.join('、')}）。\n關閉後這些修改會遺失，確定要關閉嗎？`)
   }
+
+  // ── Public: reload from disk (S24) ──────────────────────────────────────────
+
+  /**
+   * Re-read one side from disk, discarding the in-memory copy.
+   *
+   * "重新整理" only repaints what is already loaded; this is the separate BC
+   * action for picking up a file another program has changed. Unsaved edits are
+   * confirmed first because reloading destroys them exactly as closing would.
+   *
+   * @param {'left'|'right'} side
+   * @param {{ confirmed?: boolean }} [opts] `confirmed` skips the prompt when
+   *   the caller has already asked (Reload Both asks once for both sides)
+   * @returns {Promise<boolean>} true when the side was re-read
+   */
+  async reloadSide(side, opts = {}) {
+    const sideName = side === 'left' ? '左側' : '右側'
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    if (!path) {
+      this._notify(`${sideName}沒有檔案路徑，無法重新載入`, true)
+      return false
+    }
+    if (!opts.confirmed && this.hasUnsavedEdits(side)) {
+      const ok = window.confirm(
+        `${sideName}有 ${this._modifiedCount[side]} 個位元組尚未儲存。\n` +
+        '重新載入會從磁碟讀回檔案，這些修改會遺失。要繼續嗎？')
+      if (!ok) return false
+    }
+
+    let result
+    try {
+      result = await window.electronAPI.readFileBinary(path)
+    } catch (err) {
+      this._notify(
+        `重新載入${sideName}失敗：${err instanceof Error ? err.message : String(err)}`, true)
+      return false
+    }
+    if (!result || typeof result.base64 !== 'string') {
+      this._notify(`重新載入${sideName}失敗：讀不到檔案內容`, true)
+      return false
+    }
+
+    // setLeft/setRight clear the undo history and the modified flags for that
+    // side, which is what reloading means.
+    if (side === 'left') this.setLeft(result.path ?? path, result.base64)
+    else this.setRight(result.path ?? path, result.base64)
+    this._notify(`已重新載入${sideName}`, false)
+    return true
+  }
+
+  /**
+   * Re-read whichever sides have a path.
+   * @returns {Promise<boolean>} true when at least one side was re-read
+   */
+  async reloadAll() {
+    /** @type {Array<'left'|'right'>} */
+    const sides = []
+    if (this._leftPath) sides.push('left')
+    if (this._rightPath) sides.push('right')
+    if (sides.length === 0) {
+      this._notify('尚未載入任何檔案，無法重新載入', true)
+      return false
+    }
+    if (this.hasUnsavedEdits()) {
+      const ok = window.confirm(
+        '有尚未儲存的修改。重新載入會從磁碟讀回檔案，這些修改會遺失。要繼續嗎？')
+      if (!ok) return false
+    }
+    let any = false
+    for (const side of sides) {
+      if (await this.reloadSide(side, { confirmed: true })) any = true
+    }
+    return any
+  }
+
+  // ── Public: over/under layout (S24) ─────────────────────────────────────────
+
+  /** @returns {'side-by-side'|'over-under'} */
+  getLayout() { return this._layoutMode }
+
+  /**
+   * @param {'side-by-side'|'over-under'} mode
+   * @returns {'side-by-side'|'over-under'} the mode now in effect
+   */
+  setLayout(mode) {
+    if (mode !== 'side-by-side' && mode !== 'over-under') return this._layoutMode
+    this._layoutMode = mode
+    this._applyLayout()
+    return this._layoutMode
+  }
+
+  /** @returns {'side-by-side'|'over-under'} */
+  toggleLayout() {
+    return this.setLayout(this._layoutMode === 'side-by-side' ? 'over-under' : 'side-by-side')
+  }
+
+  /** Push the layout mode onto the DOM and the toolbar button. */
+  _applyLayout() {
+    const isOver = this._layoutMode === 'over-under'
+    this._dom.body?.classList.toggle('over-under', isOver)
+    const btn = this._dom.btnLayout
+    if (btn) {
+      btn.textContent = isOver ? '⊟ Over' : '⬛ Side'
+      btn.classList.toggle('active', isOver)
+    }
+    // Both panes changed height, so the virtual scroller's visible window did.
+    this._refreshSync()
+    this._renderThumbnail()
+  }
+
+  // ── Public: thumbnail (S24) ─────────────────────────────────────────────────
+
+  /** @returns {boolean} */
+  isThumbnailVisible() { return this._showThumbnail }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setThumbnailVisible(on) {
+    this._showThumbnail = Boolean(on)
+    this._dom.btnThumb?.classList.toggle('active', this._showThumbnail)
+    if (this._dom.thumb) this._dom.thumb.style.display = this._showThumbnail ? '' : 'none'
+    this._dom.body?.classList.toggle('with-thumb', this._showThumbnail)
+    this._renderThumbnail()
+    return this._showThumbnail
+  }
+
+  /** @returns {boolean} */
+  toggleThumbnail() { return this.setThumbnailVisible(!this._showThumbnail) }
+
+  /** @returns {HexThumbBucket[]} the bands last painted (read only) */
+  getThumbnailBuckets() { return this._thumbBuckets }
+
+  /**
+   * Scroll both panes to the position a click on the strip points at.
+   * @param {number} fraction 0..1 from the top of the strip
+   * @returns {number} the byte offset scrolled to, or -1 when nothing is loaded
+   */
+  scrollToThumbFraction(fraction) {
+    const totalBytes = Math.max(this._leftBytes?.length ?? 0, this._rightBytes?.length ?? 0)
+    if (totalBytes === 0) return -1
+    const f = Math.min(1, Math.max(0, Number(fraction) || 0))
+    const offset = Math.min(totalBytes - 1, Math.floor(f * totalBytes))
+    const visual = this._visualIndexOf(Math.floor(offset / this._bytesPerRow))
+    for (const side of /** @type {('left'|'right')[]} */ (['left', 'right'])) {
+      const scroll = this._dom[`scroll_${side}`]
+      if (!scroll) continue
+      scroll.scrollTop = visual * ROW_HEIGHT
+      this._renderVisibleRows(side, scroll)
+    }
+    this._updateThumbViewport()
+    return offset
+  }
+
+  // ── Public: replace (S24) ───────────────────────────────────────────────────
+
+  /**
+   * Replace the currently selected search hit with the replacement bytes.
+   * @returns {boolean} true when a byte run was replaced
+   */
+  replaceCurrent() {
+    const match = this._findMatches[this._findCurrentIdx]
+    if (!match) {
+      this._notify('沒有選取中的搜尋結果可以取代', true)
+      return false
+    }
+    const parsed = this._replaceInputs()
+    if (!parsed) return false
+    if (!this._canEdit(match.side)) return false
+
+    const edit = makeReplaceEdit(
+      this._doc(match.side), match.byteOffset, parsed.needle.length, parsed.replacement)
+    if (!edit) {
+      this._notify('取代結果與原內容相同，未做變更', false)
+      return false
+    }
+    const ok = this._applyEditGroup(match.side, [edit])
+    if (ok) {
+      this._moveCursorTo(match.side, match.byteOffset)
+      // Offsets after the hit moved if the lengths differ, and the bytes under
+      // every remaining hit may have changed, so the hit list is rebuilt.
+      this._runFind()
+      this._notify('已取代 1 處', false)
+    }
+    return ok
+  }
+
+  /**
+   * Replace every non-overlapping occurrence on one side, as a single undoable
+   * action.
+   *
+   * @param {'left'|'right'} [side] defaults to the side holding the cursor
+   * @returns {number} how many occurrences were replaced
+   */
+  replaceAll(side) {
+    const target = side ?? this._cursor?.side ?? this._findMatches[this._findCurrentIdx]?.side ?? 'left'
+    const parsed = this._replaceInputs()
+    if (!parsed) return 0
+    if (!this._canEdit(target)) return 0
+
+    const bytes = target === 'left' ? this._leftBytes : this._rightBytes
+    if (!bytes) return 0
+    const offsets = nonOverlappingMatches(searchHexBytes(bytes, parsed.needle), parsed.needle.length)
+    if (offsets.length === 0) {
+      this._notify(`${target === 'left' ? '左側' : '右側'}找不到要取代的內容`, true)
+      return 0
+    }
+
+    // Descending, so each splice's offset is still correct in the document the
+    // previous splice produced even when the replacement is a different length.
+    const doc = this._doc(target)
+    /** @type {HexEdit[]} */
+    const edits = []
+    for (let i = offsets.length - 1; i >= 0; i--) {
+      const edit = makeReplaceEdit(doc, offsets[i], parsed.needle.length, parsed.replacement)
+      if (edit) edits.push(edit)
+    }
+    if (edits.length === 0) {
+      this._notify('取代結果與原內容相同，未做變更', false)
+      return 0
+    }
+
+    this._applyEditGroup(target, edits)
+    this._moveCursorTo(target, offsets[0])
+    this._runFind()
+    this._notify(`已取代 ${edits.length} 處`, false)
+    return edits.length
+  }
+
+  /**
+   * Read and validate the find/replace inputs.
+   * @returns {{ needle: Uint8Array, replacement: Uint8Array }|null} null after
+   *   reporting why, so no caller has to guess at an empty return
+   */
+  _replaceInputs() {
+    const findInput = this._dom.findInput
+    const replaceInput = this._dom.replaceInput
+    const hexMode = this._dom.findModeCheck?.checked ?? true
+    const needle = this._parseNeedle(findInput?.value ?? '', hexMode)
+    if (!needle || needle.length === 0) {
+      this._notify(hexMode
+        ? '搜尋內容不是合法的 hex（需要成對的十六進位字元）'
+        : '請先輸入搜尋內容', true)
+      return null
+    }
+    // An empty replacement is a deletion, which is legitimate; only an
+    // unparseable one is an error.
+    const text = replaceInput?.value ?? ''
+    const replacement = text.trim() === ''
+      ? new Uint8Array(0)
+      : this._parseNeedle(text, hexMode)
+    if (!replacement) {
+      this._notify('取代內容不是合法的 hex（需要成對的十六進位字元）', true)
+      return null
+    }
+    return { needle, replacement }
+  }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setReplaceOpen(on) {
+    this._replaceOpen = Boolean(on)
+    const row = this._dom.replaceRow
+    if (row) row.style.display = this._replaceOpen ? '' : 'none'
+    this._dom.btnReplaceToggle?.classList.toggle('active', this._replaceOpen)
+    if (this._replaceOpen) this._dom.replaceInput?.focus()
+    return this._replaceOpen
+  }
+
+  /** @returns {boolean} */
+  toggleReplace() { return this.setReplaceOpen(!this._replaceOpen) }
+
+  /** @returns {boolean} */
+  isReplaceOpen() { return this._replaceOpen }
 
   // ── Private: cursor ─────────────────────────────────────────────────────────
 
@@ -1993,6 +2530,8 @@ ${body}
     this._showEmptyState('left')
     this._showEmptyState('right')
     this._applyPanelVisibility()
+    this._applyLayout()
+    this.setThumbnailVisible(this._showThumbnail)
   }
 
   /**
@@ -2130,13 +2669,30 @@ ${body}
       { className: 'hx-panel-btn', id: 'hx-btn-fileinfo', title: '顯示 / 隱藏檔案資訊面板' }, 'ℹ 檔案資訊')
     const btnRuler = el('button',
       { className: 'hx-panel-btn', id: 'hx-btn-ruler', title: '顯示 / 隱藏欄位標尺' }, '📏 標尺')
+    const btnThumb = el('button',
+      { className: 'hx-panel-btn', id: 'hx-btn-thumb', title: '顯示 / 隱藏整檔差異縮圖' }, '🗺 縮圖')
+    const btnLayout = el('button',
+      { className: 'hx-panel-btn', id: 'hx-btn-layout', title: '切換左右並排 / 上下堆疊' },
+      this._layoutMode === 'over-under' ? '⊟ Over' : '⬛ Side')
     this._dom.btnDetails = btnDetails
     this._dom.btnFileInfo = btnFileInfo
     this._dom.btnRuler = btnRuler
+    this._dom.btnThumb = btnThumb
+    this._dom.btnLayout = btnLayout
     panelBar.appendChild(btnDetails)
     panelBar.appendChild(btnFileInfo)
     panelBar.appendChild(btnRuler)
+    panelBar.appendChild(btnThumb)
+    panelBar.appendChild(btnLayout)
     toolbar.appendChild(panelBar)
+
+    // S24: re-read from disk. Distinct from ↺ 重新整理, which only repaints the
+    // bytes already in memory.
+    const btnReload = el('button',
+      { className: 'hx-btn-reload', id: 'hx-btn-reload', title: '從磁碟重新載入兩側檔案（Ctrl+Shift+R）' },
+      '🔄 重新載入')
+    this._dom.btnReload = btnReload
+    toolbar.appendChild(btnReload)
 
     // S16: Swap sides
     const btnSwap = el('button', { className: 'hx-btn-swap', title: '交換左右兩側' }, '⇄ 交換')
@@ -2203,7 +2759,38 @@ ${body}
     this._dom.findCount = findCount
     findBar.appendChild(findCount)
 
+    // S24: replace. Same mode checkbox as the search, so "FF" means the same
+    // thing on both sides of the operation.
+    const btnReplaceToggle = el('button',
+      { className: 'hx-find-btn', id: 'hx-btn-replace-toggle', title: '顯示 / 隱藏取代列（Ctrl+H）' },
+      '↹')
+    this._dom.btnReplaceToggle = btnReplaceToggle
+    findBar.appendChild(btnReplaceToggle)
+
     toolbar.appendChild(findBar)
+
+    const replaceRow = el('div', { className: 'hx-replace-row' })
+    const replaceInput = el('input', {
+      type: 'text',
+      id: 'hx-replace-input',
+      className: 'hx-find-input',
+      placeholder: '取代為（留空 = 刪除）',
+    })
+    const btnReplaceOne = el('button',
+      { className: 'hx-find-btn', id: 'hx-btn-replace-one', title: '取代目前選取的結果' }, '取代')
+    const btnReplaceAll = el('button',
+      { className: 'hx-find-btn', id: 'hx-btn-replace-all', title: '取代此側全部（可一次復原）' },
+      '全部取代')
+    replaceRow.appendChild(el('span', { className: 'hx-replace-label' }, '取代'))
+    replaceRow.appendChild(replaceInput)
+    replaceRow.appendChild(btnReplaceOne)
+    replaceRow.appendChild(btnReplaceAll)
+    replaceRow.style.display = 'none'
+    this._dom.replaceRow = replaceRow
+    this._dom.replaceInput = replaceInput
+    this._dom.btnReplaceOne = btnReplaceOne
+    this._dom.btnReplaceAll = btnReplaceAll
+    toolbar.appendChild(replaceRow)
 
     // ── T11: Goto offset ───────────────────────────────────────────────────────
     const gotoInput = el('input', {
@@ -2246,11 +2833,87 @@ ${body}
 
   _buildBody() {
     const body = el('div', { className: 'hx-body' })
+    this._dom.body = body
 
     body.appendChild(this._buildPane('left'))
     body.appendChild(this._buildPane('right'))
+    body.appendChild(this._buildThumbnail())
 
     return body
+  }
+
+  /**
+   * 整檔差異縮圖：一條與窗格等高的色帶，加上目前視窗的位置指示。
+   * @returns {HTMLElement}
+   */
+  _buildThumbnail() {
+    const thumb = el('div', { className: 'hx-thumb', title: '整檔差異縮圖（點擊跳至該處）' })
+    const strip = el('div', { className: 'hx-thumb-strip' })
+    const viewport = el('div', { className: 'hx-thumb-viewport' })
+    strip.appendChild(viewport)
+    thumb.appendChild(strip)
+    thumb.style.display = 'none'
+    this._dom.thumb = thumb
+    this._dom.thumbStrip = strip
+    this._dom.thumbViewport = viewport
+    return thumb
+  }
+
+  /**
+   * 重畫縮圖。
+   *
+   * 每列一個節點在 10 MB 的檔案上就是六十萬個節點——縮圖本身會比它要摘要的
+   * 虛擬捲動更貴。因此先把整個檔案壓成至多 THUMB_MAX_MARKS 條色帶再畫。
+   */
+  _renderThumbnail() {
+    const strip = this._dom.thumbStrip
+    const viewport = this._dom.thumbViewport
+    if (!strip || !viewport) return
+    if (!this._showThumbnail) {
+      this._thumbBuckets = []
+      return
+    }
+
+    const leftLen = this._leftBytes?.length ?? 0
+    const rightLen = this._rightBytes?.length ?? 0
+    const totalBytes = Math.max(leftLen, rightLen)
+    // jsdom reports 0 for every measurement; fall back so the bands (and the
+    // tests that read them) still mean something without layout.
+    const height = strip.clientHeight || THUMB_FALLBACK_HEIGHT
+    const buckets = hexThumbnailBuckets(
+      totalBytes, this._diffRegions, leftLen, rightLen,
+      Math.min(THUMB_MAX_MARKS, Math.max(1, height)))
+    this._thumbBuckets = buckets
+
+    const frag = document.createDocumentFragment()
+    for (let i = 0; i < buckets.length; i++) {
+      // A "same" band is the background; drawing it would double the node count
+      // for nothing visible.
+      if (buckets[i].status === 'same') continue
+      const mark = el('div', { className: `hx-thumb-mark ${buckets[i].status}` })
+      mark.style.top = `${(i / buckets.length) * 100}%`
+      mark.style.height = `${Math.max(100 / buckets.length, 0.4)}%`
+      frag.appendChild(mark)
+    }
+    strip.replaceChildren(viewport, frag)
+    this._updateThumbViewport()
+  }
+
+  /** 讓縮圖上的視窗指示對應目前的捲動位置。 */
+  _updateThumbViewport() {
+    const viewport = this._dom.thumbViewport
+    const scroll = this._dom.scroll_left
+    if (!viewport || !scroll || !this._showThumbnail) return
+    const total = this._visibleRowCount('left') * ROW_HEIGHT
+    if (total <= 0) {
+      viewport.style.top = '0%'
+      viewport.style.height = '100%'
+      return
+    }
+    const top = Math.min(100, Math.max(0, (scroll.scrollTop / total) * 100))
+    const height = Math.min(100 - top, Math.max(2, ((scroll.clientHeight || 0) / total) * 100))
+    viewport.style.top = `${top}%`
+    viewport.style.height = `${height}%`
   }
 
   /**
@@ -2423,6 +3086,16 @@ ${body}
         findInput.select()
         return
       }
+      if (key === 'h') {
+        e.preventDefault()
+        this.setReplaceOpen(true)
+        return
+      }
+      if (key === 'r' && e.shiftKey) {
+        e.preventDefault()
+        void this.reloadAll()
+        return
+      }
       if (inField) return
       if (key === 'e') {
         e.preventDefault()
@@ -2468,10 +3141,35 @@ ${body}
     btnReport.addEventListener('click', () => void this.exportHtml())
     btnPrint.addEventListener('click',  () => void this.exportHtml({ print: true }))
 
-    const { btnDetails, btnFileInfo, btnRuler } = this._dom
+    const { btnDetails, btnFileInfo, btnRuler, btnThumb, btnLayout, btnReload } = this._dom
     btnDetails.addEventListener('click', () => this.toggleDetails())
     btnFileInfo.addEventListener('click', () => this.toggleFileInfo())
     btnRuler.addEventListener('click', () => this.toggleRuler())
+    btnThumb.addEventListener('click', () => this.toggleThumbnail())
+    btnLayout.addEventListener('click', () => this.toggleLayout())
+    btnReload.addEventListener('click', () => void this.reloadAll())
+
+    this._dom.thumbStrip.addEventListener('click', (/** @type {MouseEvent} */ e) => {
+      const rect = this._dom.thumbStrip.getBoundingClientRect()
+      if (!rect.height) return
+      this.scrollToThumbFraction((e.clientY - rect.top) / rect.height)
+    })
+
+    // ── S24: replace ───────────────────────────────────────────────────────────
+    const { btnReplaceToggle, btnReplaceOne, btnReplaceAll, replaceInput } = this._dom
+    btnReplaceToggle.addEventListener('click', () => this.toggleReplace())
+    btnReplaceOne.addEventListener('click', () => this.replaceCurrent())
+    btnReplaceAll.addEventListener('click', () => this.replaceAll())
+    replaceInput.addEventListener('keydown', (/** @type {KeyboardEvent} */ e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        if (e.shiftKey) this.replaceAll()
+        else this.replaceCurrent()
+      } else if (e.key === 'Escape') {
+        e.preventDefault()
+        this.setReplaceOpen(false)
+      }
+    })
 
     // Diff-navigation keys are owned solely by app.js's SettingsStore binding,
     // which routes to whichever view is active. Binding them here as well made
@@ -3128,8 +3826,30 @@ ${body}
       })
     }
 
-    // P0-5: every other view offers this; hex was the only one without it.
     const path = side === 'left' ? this._leftPath : this._rightPath
+
+    // S24: reload / replace / layout / thumbnail also reachable from here, so
+    // none of them depends on the toolbar being visible.
+    items.push({ separator: true })
+    items.push({
+      label: `從磁碟重新載入${side === 'left' ? '左' : '右'}側`,
+      disabled: !path,
+      action: () => void this.reloadSide(side),
+    })
+    items.push({
+      label: '搜尋並取代…（Ctrl+H）',
+      action: () => this.setReplaceOpen(true),
+    })
+    items.push({
+      label: (this._showThumbnail ? '✓ ' : '　') + '整檔差異縮圖',
+      action: () => this.toggleThumbnail(),
+    })
+    items.push({
+      label: (this._layoutMode === 'over-under' ? '✓ ' : '　') + '上下堆疊佈局',
+      action: () => this.toggleLayout(),
+    })
+
+    // P0-5: every other view offers this; hex was the only one without it.
     items.push({ separator: true })
     items.push({
       label: '在檔案總管中顯示',
@@ -3165,6 +3885,7 @@ ${body}
     scroll_right.scrollLeft = scroll_left.scrollLeft
     this._renderVisibleRows('left',  scroll_left)
     this._renderVisibleRows('right', scroll_right)
+    this._updateThumbViewport()
     this._syncingScroll = false
   }
 
@@ -3176,6 +3897,7 @@ ${body}
     scroll_left.scrollLeft = scroll_right.scrollLeft
     this._renderVisibleRows('left',  scroll_left)
     this._renderVisibleRows('right', scroll_right)
+    this._updateThumbViewport()
     this._syncingScroll = false
   }
 

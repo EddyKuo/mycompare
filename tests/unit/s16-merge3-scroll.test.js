@@ -530,6 +530,12 @@ describe('S16 merge3 — getConfig / applyConfig', () => {
       // S22: Show Context and Favor Left/Right travel with the snapshot too.
       contextLines: 2, favor: 'none',
       alignByGrammar: true,
+      // S25: conflict proximity, unimportant differences and manual conflict
+      // marks are session settings, so they ride along as well.
+      conflictProximity: 0,
+      ignoreUnimportant: false,
+      unimportantPatterns: [],
+      manualConflicts: [],
     })
   })
 

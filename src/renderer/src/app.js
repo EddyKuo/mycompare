@@ -496,6 +496,17 @@ function showTextCompare() {
 
     // Backup outcome of a save — the file is written either way, so this is
     // information rather than a failure.
+    // Text compare can hand its two files to a three-way merge. Only the host
+    // can open a tab, so the view asks rather than trying to do it itself.
+    textCompare.on('merge-files', ({ left, base, right }) => {
+      tabMgr.addTab('merge3', '三向合併')
+      showMerge3()
+      mergeCompare?.setSide('left', left?.content ?? '', left?.path ?? '')
+      mergeCompare?.setSide('base', base?.content ?? '', base?.path ?? '')
+      mergeCompare?.setSide('right', right?.content ?? '', right?.path ?? '')
+      showStatus(base?.path ? '已轉為三向合併' : '已轉為三向合併（無基準檔）')
+    })
+
     textCompare.on('status', ({ message }) => {
       if (message) showStatus(message)
     })
@@ -897,6 +908,12 @@ function _confirmDiscardForTab(tab) {
   if (tab.type === 'hex' && typeof hexCompare?.confirmClose === 'function') {
     const dirty = hexCompare.hasUnsavedEdits?.() === true
     return { ok: hexCompare.confirmClose(), asked: dirty }
+  }
+  // The merge view's output pane became editable, so it now has unsaved work
+  // to lose in exactly the way hex and table do.
+  if (tab.type === 'merge3' && typeof mergeCompare?.confirmClose === 'function') {
+    const dirty = mergeCompare.hasUnsavedEdits?.() === true
+    return { ok: mergeCompare.confirmClose(), asked: dirty }
   }
   return { ok: true, asked: false }
 }
@@ -3239,7 +3256,17 @@ function setupMenuActions() {
     'view.folder.rightNewer':     () => folderCompare?.setViewPreset('right-newer'),
     'view.folder.leftOrphans':    () => folderCompare?.setViewPreset('left-orphans'),
     'view.folder.rightOrphans':   () => folderCompare?.setViewPreset('right-orphans'),
+    'edit.folder.selectAllFiles': () => void _folderNav('selectAllFiles', '選取全部檔案'),
+    'edit.folder.selectOrphansBoth': () => void _folderNav('selectOrphansBoth', '選取兩側孤兒'),
+    'session.folder.moveToFolder': () => void _folderNav('moveSelectedToFolder', '移動到其他資料夾'),
+    'session.folder.archiveOptions': () => void _folderNav('openArchiveOptionsDialog', '封存檔比對設定'),
+    'view.folder.filesOnly': () => void _folderNav('toggleFilesOnly', '只比對檔案'),
+    'view.folder.flatten': () => void _folderNav('toggleFlatMode', '攤平比對'),
+    'view.folder.ignoreUnimportant': () => void _folderNav('toggleIgnoreUnimportant', '忽略不重要差異'),
+
     'view.toggleIgnoreUnimportant': () => {
+      // Folder compare has its own id: routing both through this one would
+      // make the text-only guard below silently swallow the folder case.
       if (currentView !== 'text' || !textCompare) return
       const on = textCompare.setIgnoreUnimportant()
       const chk = el('chk-ignore-unimportant')
@@ -3292,6 +3319,10 @@ function setupMenuActions() {
     'edit.table.copyToRight': () => _tablePanel((v) => { void v.copyRowToRight() }),
     'edit.table.copyToLeft':  () => _tablePanel((v) => { void v.copyRowToLeft() }),
     'edit.table.insertRow':  () => _tablePanel((v) => { v.insertRow('left') }),
+    'view.hex.thumbnail': () => _hexPanel((v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),
+    'view.hex.layout': () => _hexPanel((v) => showStatus(v.toggleLayout() === 'over-under' ? '上下堆疊' : '左右並排')),
+    'file.hex.reload': () => _hexPanel((v) => { void v.reloadAll() }),
+    'search.hex.replace': () => _hexPanel((v) => v.setReplaceOpen(true)),
     'view.table.severity':   () => _tablePanel((v) => showStatus(v.toggleSeverityShading() ? '已顯示差異程度色階' : '已關閉差異程度色階')),
     'view.table.thumbnail':  () => _tablePanel((v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),
     'view.table.details':    () => _tablePanel((v) => showStatus(v.toggleDetails() ? '已顯示詳細資料' : '已隱藏詳細資料')),

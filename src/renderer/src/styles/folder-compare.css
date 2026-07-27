@@ -545,6 +545,28 @@
   color: var(--text-primary);
 }
 
+.sync-options label input:disabled + * ,
+.sync-options input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* Mirror deletes files the user never picked, so the panel has to look
+   different from the one that only copies. */
+.sync-mode-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.sync-panel--mirror {
+  border-left: 3px solid var(--status-different, #d9534f);
+}
+
+.sync-panel--mirror .sync-mode-note {
+  color: var(--status-different, #d9534f);
+  font-weight: 600;
+}
+
 .sync-actions {
   display: flex;
   gap: 8px;
@@ -1013,11 +1035,73 @@
   color: var(--text-primary);
 }
 
+/* The two filter tabs take the full row so the fields below always belong to
+   exactly one of them. */
+.fc-filter-tabs {
+  display: flex;
+  gap: 4px;
+  flex-basis: 100%;
+}
+
+.fc-filter-tab {
+  font-size: 12px;
+  padding: 2px 10px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  border-bottom: none;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border-radius: 3px 3px 0 0;
+  cursor: pointer;
+}
+
+.fc-filter-tab--active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+.fc-filter-page {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex-basis: 100%;
+}
+
 .fc-filter-field {
   display: flex;
   align-items: center;
   gap: 4px;
   white-space: nowrap;
+}
+
+/* Its own class rather than .fc-filter-input: the mask fields are counted by
+   name elsewhere, and sharing the class silently changed what "the filter
+   inputs" means. */
+.fc-other-input {
+  font-size: 12px;
+  padding: 2px 6px;
+  height: 24px;
+  width: 140px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  outline: none;
+}
+
+.fc-other-input:focus {
+  border-color: var(--accent);
+}
+
+.fc-filter-select {
+  font-size: 12px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
 }
 
 .fc-filter-label {

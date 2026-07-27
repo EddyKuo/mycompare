@@ -51,6 +51,8 @@ const TEXT_CONFIG_DEFAULTS = {
   alignAnchors: [],
   tabWidth: 4,
   indentWithTabs: false,
+  // 1.7: the match→replacement pairs are a comparison setting like the rest.
+  replacements: [],
 }
 
 // ── T61 NamedConfigStore CRUD ────────────────────────────────────────────────

@@ -117,6 +117,9 @@ export function buildAppMenu(win) {
         item('交換兩側', 'session.swap'),
         item('重新比對', 'session.recompare', 'F5'),
         { type: 'separator' },
+        item('移動選取到其他資料夾…', 'session.folder.moveToFolder'),
+        item('封存檔比對設定…', 'session.folder.archiveOptions'),
+        { type: 'separator' },
         item('上一層資料夾', 'session.folder.up', 'Alt+Up'),
         item('上一頁', 'session.folder.back', 'Alt+Left'),
         item('下一頁', 'session.folder.forward', 'Alt+Right'),
@@ -139,6 +142,8 @@ export function buildAppMenu(win) {
             item('右 → 左', 'file.touch.rightToLeft')
           ]
         },
+        { type: 'separator' },
+        item('從磁碟重新載入（十六進位）', 'file.hex.reload', 'CmdOrCtrl+Shift+R'),
         { type: 'separator' },
         item('列印預覽…', 'file.printPreview'),
         { type: 'separator' },
@@ -226,6 +231,13 @@ export function buildAppMenu(win) {
           ]
         },
         {
+          label: '資料夾選取',
+          submenu: [
+            item('選取全部檔案（不含資料夾）', 'edit.folder.selectAllFiles'),
+            item('選取兩側孤兒', 'edit.folder.selectOrphansBoth')
+          ]
+        },
+        {
           label: '表格編輯',
           submenu: [
             item('跳至列／欄…', 'edit.table.goto', 'CmdOrCtrl+G'),
@@ -271,6 +283,8 @@ export function buildAppMenu(win) {
         { type: 'separator' },
         item('下一個差異', 'search.nextDiff', 'F8'),
         { type: 'separator' },
+        item('搜尋並取代位元組…', 'search.hex.replace', 'CmdOrCtrl+H'),
+        { type: 'separator' },
         item('下一個行內差異', 'text.nextInlineDiff', 'CmdOrCtrl+F8'),
         item('上一個行內差異', 'text.prevInlineDiff', 'CmdOrCtrl+F7'),
         item('下一個編輯位置', 'text.nextEdit', 'Alt+F8'),
@@ -315,7 +329,9 @@ export function buildAppMenu(win) {
           submenu: [
             item('詳細資料', 'view.hex.details'),
             item('檔案資訊', 'view.hex.fileInfo'),
-            item('標尺', 'view.hex.ruler')
+            item('標尺', 'view.hex.ruler'),
+            item('整檔差異縮圖', 'view.hex.thumbnail'),
+            item('上下堆疊佈局', 'view.hex.layout')
           ]
         },
         {
@@ -326,6 +342,14 @@ export function buildAppMenu(win) {
             item('顯示空白字元', 'view.table.whitespace'),
             item('差異程度色階', 'view.table.severity'),
             item('縮圖', 'view.table.thumbnail')
+          ]
+        },
+        {
+          label: '資料夾比對',
+          submenu: [
+            item('只比對檔案', 'view.folder.filesOnly'),
+            item('攤平比對（忽略資料夾結構）', 'view.folder.flatten'),
+            item('忽略不重要差異', 'view.folder.ignoreUnimportant')
           ]
         },
         item('圖片資訊', 'view.image.info'),

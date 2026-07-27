@@ -191,3 +191,96 @@
   color: inherit;
   cursor: pointer;
 }
+
+/* ── Editable output / manual conflicts / unimportant differences ──────────── */
+
+.mw-proximity-label,
+.mw-unimportant-label,
+.mw-resolve-all-label { display: inline-flex; align-items: center; gap: 4px; }
+
+.mw-proximity-input {
+  width: 48px;
+  padding: 1px 4px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+
+.mw-choice-both-rl.active { background: #ede9fe; border-color: #7c3aed; }
+
+/* The output editor replaces the card list rather than sitting beside it, so
+   it has to fill the pane it takes over. */
+.mw-output-textarea--visible {
+  display: block;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: 0;
+  padding: 4px 8px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+  white-space: pre;
+}
+
+/* BC marks hand-edited output; the amber follows the conflict-card colour so
+   "a human decided this" reads the same in both places. */
+.mw-output-pane--edited .mw-output-header { background: #fff8e1; }
+.mw-output-edited-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #fff3cd;
+  border: 1px solid #e0a000;
+  color: #7a5b00;
+}
+.mw-output-edited-note {
+  font-size: 11px;
+  padding: 4px 8px;
+  color: #7a5b00;
+  background: #fff8e1;
+  border-bottom: 1px solid #f0e0b0;
+}
+.mw-normal-seg--edited { background: #fffdf5; }
+
+/* ── Info / pattern-editor modal ──────────────────────────────────────────── */
+
+.mw-modal-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mw-modal-textarea {
+  min-height: 140px;
+  resize: vertical;
+  padding: 4px 6px;
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+
+.mw-info-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.mw-info-table th,
+.mw-info-table td {
+  padding: 2px 6px;
+  border-bottom: 1px solid var(--border-color, #e2e8f0);
+  text-align: left;
+  word-break: break-all;
+}
+.mw-info-table th { font-weight: 600; background: var(--bg-secondary, #f5f5f5); }
+
+.mw-modal-actions { gap: 6px; }
+.mw-modal-primary { border-color: #2563eb; background: #dbeafe; }
+
+.mw-output-pane--editing .mw-output-content { display: none; }
