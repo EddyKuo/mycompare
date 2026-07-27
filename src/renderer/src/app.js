@@ -289,12 +289,12 @@ export function initApp() {
       showTextCompare()
       if (textCompare && left) {
         window.electronAPI.readFile(left)
-          .then(r => { if (r) textCompare.setLeft(r.path, r.content, r.encoding) })
+          .then(r => { if (r) textCompare.setLeft(r.path, r.content, r.encoding, r.confidence) })
           .catch(() => {})
       }
       if (textCompare && right) {
         window.electronAPI.readFile(right)
-          .then(r => { if (r) textCompare.setRight(r.path, r.content, r.encoding) })
+          .then(r => { if (r) textCompare.setRight(r.path, r.content, r.encoding, r.confidence) })
           .catch(() => {})
       }
     })
@@ -2026,13 +2026,13 @@ async function _restoreOneWorkspaceTab(saved) {
         if (saved.leftPath) {
           try {
             const r = await window.electronAPI.readFile(saved.leftPath)
-            if (r) textCompare.setLeft(r.path, r.content, r.encoding)
+            if (r) textCompare.setLeft(r.path, r.content, r.encoding, r.confidence)
           } catch { /* skip */ }
         }
         if (saved.rightPath) {
           try {
             const r = await window.electronAPI.readFile(saved.rightPath)
-            if (r) textCompare.setRight(r.path, r.content, r.encoding)
+            if (r) textCompare.setRight(r.path, r.content, r.encoding, r.confidence)
           } catch { /* skip */ }
         }
       }

@@ -39,6 +39,17 @@ import {
 // ---------------------------------------------------------------------------
 
 /** Fixed row height in px — must match CSS line-height (1.5 × 13px ≈ 20px) */
+/**
+ * Below this, a detected encoding is shown as a guess rather than a fact.
+ *
+ * chardet reports a confidence out of 100 and will answer for a sample far too
+ * short to be sure — a few lines of Big5 or Shift-JIS is genuinely ambiguous.
+ * The wrong answer is not an error at decode time: the file opens as 亂碼 with
+ * nothing reported as wrong. Marking the label is what sends the user to the
+ * manual override instead of to a bug report.
+ */
+const LOW_CONFIDENCE = 60;
+
 const VS_ROW_HEIGHT = 20;
 
 /**
@@ -3237,7 +3248,7 @@ export class TextCompare {
    * @param {string} path
    * @param {string} content
    */
-  setLeft(path, content, encoding) {
+  setLeft(path, content, encoding, confidence) {
     // T33: unwatch old path before switching
     if (this._leftPath && this._leftPath !== path) {
       _unwatch(this._leftPath);
@@ -3246,6 +3257,11 @@ export class TextCompare {
     this._leftContent = content;
     this._resetPerDocumentState('left');
     if (encoding) this._encodingLeft = encoding;
+    // A detection this weak is a guess, and the status bar says so rather
+    // than presenting it as a fact. main computes this precisely so the
+    // view can mark it; until now nothing read it.
+    this._encodingGuessLeft = typeof confidence === 'number'
+      && confidence > 0 && confidence < LOW_CONFIDENCE;
     this._eolLeft = detectEol(content); // T01
     this._resolveGrammars();
     if (this._pathLeft) this._pathLeft.textContent = path || '（未選擇）';
@@ -3284,7 +3300,7 @@ export class TextCompare {
    * @param {string} path
    * @param {string} content
    */
-  setRight(path, content, encoding) {
+  setRight(path, content, encoding, confidence) {
     // T33: unwatch old path before switching
     if (this._rightPath && this._rightPath !== path) {
       _unwatch(this._rightPath);
@@ -3293,6 +3309,11 @@ export class TextCompare {
     this._rightContent = content;
     this._resetPerDocumentState('right');
     if (encoding) this._encodingRight = encoding;
+    // A detection this weak is a guess, and the status bar says so rather
+    // than presenting it as a fact. main computes this precisely so the
+    // view can mark it; until now nothing read it.
+    this._encodingGuessRight = typeof confidence === 'number'
+      && confidence > 0 && confidence < LOW_CONFIDENCE;
     this._eolRight = detectEol(content); // T01
     this._resolveGrammars();
     if (this._pathRight) this._pathRight.textContent = path || '（未選擇）';
@@ -3463,8 +3484,8 @@ export class TextCompare {
       return false;
     }
 
-    if (side === 'left') this.setLeft(result.path ?? path, result.content, result.encoding);
-    else this.setRight(result.path ?? path, result.content, result.encoding);
+    if (side === 'left') this.setLeft(result.path ?? path, result.content, result.encoding, result.confidence);
+    else this.setRight(result.path ?? path, result.content, result.encoding, result.confidence);
     // setLeft/setRight replace the content but know nothing about edits; the
     // dirty flag has to be cleared here or the tab still claims unsaved work.
     this._modified[side] = false;
@@ -6138,9 +6159,16 @@ ${rows}
         : `${totalLines} 行`;
     }
     if (this._statusEncoding) {
-      this._statusEncoding.textContent = this._encodingLeft === this._encodingRight
-        ? this._encodingLeft
-        : `${this._encodingLeft} / ${this._encodingRight}`;
+      // '?' marks a low-confidence detection. A short non-UTF-8 sample is
+      // genuinely ambiguous, and chardet answers anyway; saying so is what
+      // points the user at 手動指定編碼 instead of at a page of 亂碼.
+      const mark = (enc, guess) => (guess ? `${enc}?` : enc);
+      const l = mark(this._encodingLeft, this._encodingGuessLeft);
+      const r = mark(this._encodingRight, this._encodingGuessRight);
+      this._statusEncoding.textContent = l === r ? l : `${l} / ${r}`;
+      this._statusEncoding.title = (this._encodingGuessLeft || this._encodingGuessRight)
+        ? '編碼是偵測出來的，且樣本不足以確定。可用右鍵選單手動指定編碼。'
+        : '';
     }
     if (this._statusEol) {
       this._statusEol.textContent = this._eolLeft || 'LF';

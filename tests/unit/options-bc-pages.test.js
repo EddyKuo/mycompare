@@ -104,11 +104,16 @@ describe('every preference is reachable and every control is bound', () => {
     // dialog whose settings are all write-only looks complete while changing
     // nothing at all. Fourteen of these eighteen were in exactly that state.
     //
-    // The binding table itself is not a reader: it names every preference by
-    // construction, so counting it would make this check vacuous again.
-    const bindings = APP.slice(APP.indexOf('function setupPreferenceControls'))
-    const bindingBody = bindings.slice(0, bindings.indexOf('\n}\n'))
-    const consumers = SRC.map((s) => (s === APP ? s.replace(bindingBody, '') : s)).join('\n')
+    // A reader is a literal `getPref('name')` anywhere in the sources. The
+    // binding table cannot fake one: it lists preferences as bare strings and
+    // reads them back through a loop variable (`settings.setPref(pref, ...)`),
+    // so the literal form only ever appears at a real point of use. The test
+    // below pins that, because the whole check rests on it.
+    //
+    // An earlier version tried to cut the binding function out of app.js by
+    // slicing to the first `\n}\n`. That span ran to 41KB, swallowed the
+    // readers themselves, and reported working preferences as write-only.
+    const consumers = SRC.join('\n')
 
     const writeOnly = []
     for (const page of NEW_PAGES) {
@@ -117,6 +122,24 @@ describe('every preference is reachable and every control is bound', () => {
       }
     }
     expect(writeOnly, 'stored by a control and consumed by nothing').toEqual([])
+  })
+
+  it('the binding table cannot masquerade as a reader', () => {
+    // What makes the check above meaningful. If the control-binding code ever
+    // starts writing `getPref('someName')` literally, then merely having a
+    // control would satisfy "has a reader" and the check goes hollow — which
+    // is exactly how its predecessor failed.
+    const start = APP.indexOf('function setupPreferenceControls')
+    expect(start).toBeGreaterThan(-1)
+    // Up to the next top-level function declaration, which is a boundary that
+    // does not depend on brace or newline conventions.
+    const rest = APP.slice(start + 1)
+    const end = rest.indexOf('\nfunction ')
+    const body = end === -1 ? rest : rest.slice(0, end)
+
+    const faked = NEW_PAGES.flatMap((page) => PREF_PAGES[page])
+      .filter((pref) => body.includes(`getPref('${pref}')`))
+    expect(faked, 'read literally inside the control binding').toEqual([])
   })
 
   it('no preference is claimed by two pages', () => {
