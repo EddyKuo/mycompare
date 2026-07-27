@@ -100,6 +100,10 @@ export function buildAppMenu(win) {
         item('交換兩側', 'session.swap'),
         item('重新比對', 'session.recompare', 'F5'),
         { type: 'separator' },
+        item('上一層資料夾', 'session.folder.up', 'Alt+Up'),
+        item('上一頁', 'session.folder.back', 'Alt+Left'),
+        item('下一頁', 'session.folder.forward', 'Alt+Right'),
+        { type: 'separator' },
         item('關閉分頁', 'session.close', 'CmdOrCtrl+W'),
         isMac ? { role: 'close' } : { role: 'quit', label: '結束' }
       ]
@@ -109,6 +113,9 @@ export function buildAppMenu(win) {
       submenu: [
         item('開啟左側…', 'file.openLeft'),
         item('開啟右側…', 'file.openRight'),
+        { type: 'separator' },
+        item('開啟封存檔（左側）…', 'file.openArchiveLeft'),
+        item('開啟封存檔（右側）…', 'file.openArchiveRight'),
         { type: 'separator' },
         item('儲存左側', 'file.saveLeft', 'CmdOrCtrl+S'),
         item('儲存右側', 'file.saveRight', 'CmdOrCtrl+Shift+S'),

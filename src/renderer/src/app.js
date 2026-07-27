@@ -1029,6 +1029,24 @@ function _setReportStatus(msg, isError = false) {
  * hardcoded text/folder branch meant a view that gained a report still could
  * not print it, and said nothing when the menu item did nothing.
  */
+/**
+ * Run a folder-view command from the menu.
+ *
+ * @param {string} method
+ * @param {string} label for the message when the command does not apply
+ */
+async function _folderNav(method, label) {
+  if (currentView !== 'folder' || typeof folderCompare?.[method] !== 'function') {
+    showStatus(`${label}僅適用於資料夾比對`)
+    return
+  }
+  try {
+    await folderCompare[method]()
+  } catch (err) {
+    showError(`${label}失敗：${err?.message ?? err}`, err)
+  }
+}
+
 async function printActiveReport() {
   const src = _activeReportSource()
   if (!src.htmlFallback) { showStatus('目前視圖不支援列印報告'); return }
@@ -2271,6 +2289,15 @@ function setupMenuActions() {
       if (currentView === 'text') textCompare?.refresh()
       else if (currentView === 'folder') folderCompare?.refresh()
     },
+    // Folder navigation. Each says why it did nothing rather than leaving a
+    // menu item that appears to do nothing at all.
+    'session.folder.up': () => void _folderNav('upOneLevel', '上一層'),
+    'session.folder.back': () => void _folderNav('goBack', '上一頁'),
+    'session.folder.forward': () => void _folderNav('goForward', '下一頁'),
+
+    'file.openArchiveLeft': () => void _folderNav('openArchiveLeft', '開啟封存檔'),
+    'file.openArchiveRight': () => void _folderNav('openArchiveRight', '開啟封存檔'),
+
     'session.close':      () => {
       const active = tabMgr.activeTab
       if (active) _handleCloseTab(active.id)

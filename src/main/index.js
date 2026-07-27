@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electron'
 import { join, extname, dirname, basename } from 'path'
-import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open } from 'fs/promises'
+import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod } from 'fs/promises'
 import { watch } from 'fs'
 import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
@@ -536,6 +536,21 @@ function fileAttributes(name, s) {
     hidden: process.platform === 'win32' ? null : name.startsWith('.'),
   }
 }
+
+// IPC: 清除或設定唯讀屬性
+ipcMain.handle('set-read-only', async (_event, filePath, readOnly) => {
+  const safe = validatePath(filePath)
+  const info = await stat(safe)
+  // Read-only is the write bits, on both platforms — Windows maps its
+  // attribute onto them. Only those bits are touched, so an existing mode
+  // (group/other permissions on Unix) survives having the flag cleared and
+  // set again, which a fixed 0o644 would quietly discard.
+  const mode = readOnly === false
+    ? info.mode | 0o200
+    : info.mode & ~0o222
+  await chmod(safe, mode)
+  return { path: safe, readOnly: readOnly !== false }
+})
 
 /**
  * Snapshots loaded this session, keyed by the file they came from.
