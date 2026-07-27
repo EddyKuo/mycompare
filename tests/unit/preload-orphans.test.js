@@ -109,6 +109,43 @@ function calledMethods() {
     [...RENDERER.matchAll(/\belectronAPI\??\.([a-zA-Z]\w*)\b/g)].map((m) => m[1]))
 }
 
+/**
+ * A module nothing imports.
+ *
+ * The check above is satisfied by any file in the renderer mentioning the
+ * method — including a module that is itself dead. That is not hypothetical:
+ * window-manager.js was written, referenced both new preload methods, and made
+ * this suite green while nothing imported it, so the feature was as unreachable
+ * as before. One orphan check hiding another is worth closing.
+ */
+describe('every renderer module is imported by something', () => {
+  const ROOT_DIR = join(ROOT, 'src/renderer/src')
+  const files = jsFiles(ROOT_DIR)
+
+  /** Entry points, which are referenced from HTML rather than from JS. */
+  const ENTRIES = new Set(['main.js'])
+
+  it('finds the modules at all', () => {
+    expect(files.length).toBeGreaterThan(15)
+  })
+
+  it('has an importer for each one', () => {
+    const sources = files.map((f) => readFileSync(f, 'utf-8'))
+    const orphans = []
+    for (const full of files) {
+      const name = full.split(/[\\/]/).pop()
+      if (ENTRIES.has(name)) continue
+      const stem = name.replace(/\.js$/, '')
+      // Matches both `from './x.js'` and a dynamic `import('../core/x.js')`,
+      // without caring about the relative prefix.
+      const re = new RegExp(`['"\`][^'"\`]*\\b${stem}\\.js['"\`]`)
+      const imported = files.some((other, i) => other !== full && re.test(sources[i]))
+      if (!imported) orphans.push(name)
+    }
+    expect(orphans, 'renderer modules nothing imports').toEqual([])
+  })
+})
+
 describe('renderer calls land somewhere', () => {
   it('finds the qualified call sites at all', () => {
     expect(calledMethods().size).toBeGreaterThan(20)

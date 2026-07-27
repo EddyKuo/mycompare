@@ -7,7 +7,7 @@
  * the main process stays ignorant of view internals.
  */
 
-import { Menu, shell, app } from 'electron'
+import { Menu, shell, app, BrowserWindow } from 'electron'
 
 /**
  * @param {import('electron').BrowserWindow} win
@@ -15,8 +15,15 @@ import { Menu, shell, app } from 'electron'
  * @param {unknown} [payload]
  */
 function send(win, command, payload) {
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('menu-action', { command, payload })
+  // The menu is application-global, but this template was built bound to one
+  // window. With a second window open, every menu command would drive whichever
+  // window happened to be created first — the focused one would ignore its own
+  // menu while another acted on it. So the focused window wins, and the bound
+  // one is only the fallback for when focus is elsewhere entirely.
+  const focused = BrowserWindow.getFocusedWindow()
+  const target = focused && !focused.isDestroyed() ? focused : win
+  if (target && !target.isDestroyed()) {
+    target.webContents.send('menu-action', { command, payload })
   }
 }
 
@@ -123,6 +130,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
             item('表格比對', 'session.new.table'),
             item('十六進位比對', 'session.new.hex'),
             item('圖片比對', 'session.new.image'),
+            item('中繼資料比對', 'session.new.metadata'),
             item('三向合併', 'session.new.merge3')
           ]
         },

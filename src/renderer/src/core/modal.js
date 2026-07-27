@@ -15,7 +15,13 @@
 
 import { t } from './i18n.js'
 
-const Z_INDEX = 1000
+// The z-index ladder in variables.css puts `--z-modal` at 1000, which is also
+// what the static `.modal-overlay` panels in index.html use. A prompt raised
+// from inside one of those panels has to sit ABOVE it, and DOM order alone is
+// not enough once a view moves its own overlay around. Sitting between
+// --z-modal (1000) and --z-context-menu (2000) keeps it above every in-app
+// panel while still letting menus and toasts render on top.
+const Z_INDEX = 1500
 
 /**
  * @param {{ title?: string, message: string, okText?: string, cancelText?: string }} opts
@@ -118,6 +124,19 @@ function _openModal(cfg) {
     }
 
     const onKey = (e) => {
+      // Stacked modals: only the topmost one reacts, otherwise a single Escape
+      // would collapse the whole stack.
+      const overlays = document.querySelectorAll('.mc-modal-overlay')
+      if (overlays.length && overlays[overlays.length - 1] !== overlay) return
+
+      // Keystrokes aimed at the modal must not also reach the app-wide
+      // shortcut handlers. Those are registered on `document` before this one,
+      // so bubbling would let e.g. Ctrl+F or Delete fire while the user is
+      // typing a new file name. stopPropagation() does not cancel the default
+      // action, so ordinary text entry still works.
+      const target = e.target
+      if (target instanceof Node && overlay.contains(target)) e.stopPropagation()
+
       if (e.key === 'Escape') {
         e.preventDefault(); e.stopPropagation()
         close(cfg.withInput ? null : false)

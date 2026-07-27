@@ -263,8 +263,16 @@ test('Save Session As：以自訂名稱另存，出現在最近的 Session', asy
     rightPath: 'C:/fixtures/b.txt', rightContent: 'b\n',
   }))
 
-  await win.evaluate(() => { window.prompt = () => '我的比對設定 A' })
-  await win.evaluate(() => window.__testAPI.menuCommand('session.saveAs'))
+  // Driven through the real dialog rather than by stubbing window.prompt. The
+  // stub used to pass because app.js called the native prompt — which throws
+  // in Electron, so the command could never have worked for a user. A test
+  // that replaces the broken call cannot notice it is broken.
+  // Not awaited: the command only resolves once the dialog is answered.
+  void win.evaluate(() => window.__testAPI.menuCommand('session.saveAs'))
+  const nameInput = win.locator('.mc-modal-overlay .mc-modal-input')
+  await expect(nameInput).toBeVisible({ timeout: 5000 })
+  await nameInput.fill('我的比對設定 A')
+  await win.locator('.mc-modal-overlay .mc-modal-btn--primary').click()
 
   await expect(win.locator('#status-message')).toContainText('我的比對設定 A')
   await expect(win.locator('.tab-item--active .tab-title')).toContainText('我的比對設定 A')

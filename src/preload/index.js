@@ -78,6 +78,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('set-open-with-defaults', command, args),
   setArchiveLimits: (enabled, maxEntryMB) =>
     ipcRenderer.invoke('set-archive-limits', enabled, maxEntryMB),
+  openNewWindow: (payload) => ipcRenderer.invoke('open-new-window', payload),
+  onAdoptSession: (cb) => _onChannel('adopt-session', cb),
   setMenuVisibility: (hidden) => ipcRenderer.invoke('set-menu-visibility', hidden),
   printToPdf: (html, suggestedName) => ipcRenderer.invoke('print-to-pdf', html, suggestedName),
   toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),

@@ -760,6 +760,42 @@ ipcMain.handle('set-mtime', async (_event, filePath, mtime) => {
  * and not a command.
  */
 /**
+ * Menu commands the user has hidden, so every window agrees.
+ * @type {string[]}
+ */
+let hiddenMenuCommands = []
+
+/**
+ * Open another top-level window, optionally handing it a session to adopt.
+ *
+ * BC lets a session live in its own window as well as in a tab, and lets a tab
+ * be moved out into a new window. Both need a real second BrowserWindow; this
+ * app had exactly one and no way to make another.
+ *
+ * The payload travels the same way CLI arguments do — sent once the new
+ * renderer reports `did-finish-load`, because anything sent before that lands
+ * in a page that has not yet subscribed and is silently lost.
+ *
+ * The window is created before the menu is rebuilt so the menu can bind to it.
+ */
+ipcMain.handle('open-new-window', async (_event, payload) => {
+  const win = createWindow()
+  buildAppMenu(win, hiddenMenuCommands)
+
+  if (payload && typeof payload === 'object') {
+    // Paths inside a moved session were already validated in the window that
+    // opened them, but allowed roots are per-process rather than per-window,
+    // so nothing needs re-registering — and re-registering here would widen
+    // the allow-list from renderer-supplied data, which is the exact hole
+    // validatePath exists to close.
+    win.webContents.once('did-finish-load', () => {
+      if (!win.isDestroyed()) win.webContents.send('adopt-session', payload)
+    })
+  }
+  return { id: win.id }
+})
+
+/**
  * The user's chosen external program for "Open With", pushed from the renderer
  * whenever the preference changes.
  *
@@ -1065,6 +1101,10 @@ ipcMain.handle('set-menu-visibility', (event, hidden) => {
   const win = BrowserWindow.fromWebContents(event.sender)
   if (!win) return false
   const ids = Array.isArray(hidden) ? hidden.filter((h) => typeof h === 'string') : []
+  // Remembered so a window opened later starts with the same menu. Without
+  // this a second window would show commands the user had hidden, and the
+  // difference between two windows of the same app would look like a bug.
+  hiddenMenuCommands = ids
   buildAppMenu(win, ids)
   return true
 })

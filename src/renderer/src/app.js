@@ -3,6 +3,7 @@ import { FolderCompare, parseVirtualPath, sourceKindOf } from './views/folder-co
 import { TableCompare } from './views/table-compare.js'
 import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
 import { HexCompare } from './views/hex-compare.js'
+import { MetadataCompare } from './views/metadata-compare.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { createSession, updateSession } from './core/session.js'
@@ -11,6 +12,11 @@ import { NamedConfigStore } from './core/named-config-store.js'
 import { describeNavResult } from './core/diff-nav.js'
 import { WorkspaceStore } from './core/workspace-store.js'
 import { setActiveView } from './core/active-view.js'
+import { prompt as promptDialog } from './core/modal.js'
+import { showContextMenu } from './core/context-menu.js'
+import {
+  canOpenWindows, openNewWindow, moveTabToNewWindow, onAdoptSession,
+} from './core/window-manager.js'
 import {
   BUILTIN_GRAMMARS,
   compileGrammar,
@@ -148,13 +154,34 @@ class TabManager {
    * @returns {Array<{ type: string, title: string, leftPath: string, rightPath: string, basePath: string }>}
    */
   getSerialisableTabs() {
-    return this._tabs.map(t => ({
+    return this._tabs.map(t => this._serialise(t))
+  }
+
+  /**
+   * One tab's descriptor, for handing to another window.
+   *
+   * Deliberately the same shape workspaces use: paths and view type, never the
+   * loaded contents. The receiving window re-reads from disk, which is both
+   * cheaper than shipping megabytes across IPC and more correct, since the file
+   * may have changed in between.
+   *
+   * @param {string} id
+   * @returns {object|null}
+   */
+  serialisableTab(id) {
+    const tab = this._tabs.find(t => t.id === id)
+    return tab ? this._serialise(tab) : null
+  }
+
+  /** @param {TabRecord} t */
+  _serialise(t) {
+    return {
       type: t.type,
       title: t.title,
       leftPath: t.leftPath,
       rightPath: t.rightPath,
       basePath: t.basePath,
-    }))
+    }
   }
 
   /** Show or hide the tab bar depending on whether there are any tabs. */
@@ -196,9 +223,44 @@ class TabManager {
       item.appendChild(closeBtn)
 
       item.addEventListener('click', () => _handleActivateTab(tab.id))
+      item.addEventListener('contextmenu', (e) => _showTabMenu(e, tab))
       tabBar.appendChild(item)
     })
   }
+}
+
+/**
+ * The tab's own context menu — BC's right-click-a-tab menu.
+ *
+ * "Move Tab to New Window" is the reason this exists: BC lets a session live
+ * in its own window, and this app had one window and no way to make another.
+ *
+ * The tab is closed only after the new window has been asked for and the call
+ * resolved. Closing first would lose the session outright if window creation
+ * failed, and a comparison someone is part-way through is not something to
+ * drop on an error path.
+ *
+ * @param {MouseEvent} e
+ * @param {{ id: string, type: string, title: string, locked?: boolean }} tab
+ */
+function _showTabMenu(e, tab) {
+  const items = []
+
+  if (canOpenWindows()) {
+    items.push({
+      label: '移到新視窗',
+      action: async () => {
+        const state = tabMgr.serialisableTab(tab.id)
+        if (!state) return
+        if (await moveTabToNewWindow(state)) _handleCloseTab(tab.id)
+      },
+    })
+    items.push({ label: '開新視窗', action: () => void openNewWindow() })
+    items.push({ separator: true })
+  }
+
+  items.push({ label: '關閉分頁', action: () => _handleCloseTab(tab.id) })
+  showContextMenu(e, items)
 }
 
 /** @type {TabManager} */
@@ -217,7 +279,7 @@ let _openOptionsPane = () => showStatus('選項對話框尚未初始化')
 // ---------------------------------------------------------------------------
 // 視圖狀態
 // ---------------------------------------------------------------------------
-/** @type {'home' | 'text' | 'folder' | 'table' | 'image' | 'hex' | 'merge3'} */
+/** @type {'home' | 'text' | 'folder' | 'table' | 'image' | 'hex' | 'metadata' | 'merge3'} */
 let currentView = 'home'; setActiveView('home')
 /** @type {TextCompare | null} */
 let textCompare = null
@@ -229,6 +291,8 @@ let tableCompare = null
 let imageCompare = null
 /** @type {HexCompare | null} */
 let hexCompare = null
+/** @type {MetadataCompare | null} */
+let metadataCompare = null
 /** @type {ThreeWayCompare | null} */
 let mergeCompare = null
 
@@ -281,6 +345,18 @@ export function initApp() {
   setupKeyboardShortcuts()
   renderRecentSessions(openSession, removeSession)
   updateToolbar()
+
+  // A window opened by "移到新視窗" is handed the session it should adopt.
+  // openComparison already knows how to route every view type and re-reads the
+  // files from disk, which is what the descriptor deliberately does not carry.
+  onAdoptSession((session) => {
+    void openComparison({
+      type: session.type,
+      leftPath: session.leftPath,
+      rightPath: session.rightPath,
+      basePath: session.basePath,
+    })
+  })
 
   if (window.electronAPI?.onOpenFiles) {
     window.electronAPI.onOpenFiles(({ left, right }) => {
@@ -342,6 +418,22 @@ export function initApp() {
     },
     imageGetStats: () => document.querySelector('.ic-stats')?.textContent ?? '',
 
+    // Metadata compare. Paths only: the parsing happens in the main process,
+    // so a spec has to point the view at a real file, which is also the only
+    // way to prove the IPC is wired.
+    metaSetLeft:  async (path) => {
+      if (!metadataCompare) throw new Error('中繼資料比對尚未建立，請先切換到該視圖')
+      await metadataCompare.setLeft(path)
+    },
+    metaSetRight: async (path) => {
+      if (!metadataCompare) throw new Error('中繼資料比對尚未建立，請先切換到該視圖')
+      await metadataCompare.setRight(path)
+    },
+    metaRows: () => (metadataCompare?.getRows() ?? []).map((r) => ({
+      field: r.field, label: r.label, left: r.left, right: r.right, state: r.state,
+    })),
+    metaNotes: () => metadataCompare?.getNotes() ?? [],
+
     // S15-U01 table
     tableSetLeft:  (path, content) => tableCompare?.setLeft(path, content),
     tableSetRight: (path, content) => tableCompare?.setRight(path, content),
@@ -365,7 +457,7 @@ export function initApp() {
     navDiffIndex: () => {
       const view = {
         text: textCompare, hex: hexCompare, table: tableCompare,
-        image: imageCompare, folder: folderCompare,
+        image: imageCompare, folder: folderCompare, metadata: metadataCompare,
       }[currentView]
       if (currentView === 'merge3') return mergeCompare?.getCurrentConflictIndex?.() ?? -1
       if (currentView === 'text') return textCompare?._currentDiff ?? -1
@@ -452,6 +544,7 @@ function showHome() {
   el('view-table').style.display = 'none'
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -471,6 +564,7 @@ function showTextCompare() {
   el('view-table').style.display = 'none'
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-text').style.display = 'flex'
   el('path-bar').style.display = ''
@@ -543,6 +637,7 @@ function showFolderCompare() {
   el('view-table').style.display = 'none'
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-folder').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -579,6 +674,7 @@ function showTableCompare() {
   el('view-folder').style.display = 'none'
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-table').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -608,6 +704,7 @@ function showImageCompare() {
   el('view-folder').style.display = 'none'
   el('view-table').style.display = 'none'
   el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-image').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -638,6 +735,7 @@ function showHexCompare() {
   el('view-table').style.display = 'none'
   el('view-image').style.display = 'none'
   el('view-merge3').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-hex').style.display = 'flex'
   el('path-bar').style.display = ''
   el('diff-counter').style.display = 'none'
@@ -659,6 +757,36 @@ function showHexCompare() {
   updateToolbar()
 }
 
+function showMetadataCompare() {
+  currentView = 'metadata'; setActiveView('metadata')
+  el('session-home').style.display = 'none'
+  el('view-text').style.display = 'none'
+  el('view-folder').style.display = 'none'
+  el('view-table').style.display = 'none'
+  el('view-image').style.display = 'none'
+  el('view-hex').style.display = 'none'
+  el('view-merge3').style.display = 'none'
+  el('view-metadata').style.display = 'flex'
+  // The view carries its own path row, like the image and folder views do.
+  el('path-bar').style.display = 'none'
+  el('diff-counter').style.display = 'none'
+
+  if (!metadataCompare) {
+    metadataCompare = new MetadataCompare({})
+    metadataCompare.mount(el('view-metadata'))
+    // A failed read has no other way to reach the user.
+    metadataCompare.on('status', _viewStatus)
+    metadataCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('metadata', { leftPath: left ?? '', rightPath: right ?? '' })
+      el('path-left').textContent = left || '（未選擇）'
+      el('path-right').textContent = right || '（未選擇）'
+      _syncActiveTabPaths(left, right)
+      updateToolbar()
+    })
+  }
+  updateToolbar()
+}
+
 function showMerge3() {
   currentView = 'merge3'; setActiveView('merge3')
   el('session-home').style.display = 'none'
@@ -667,6 +795,7 @@ function showMerge3() {
   el('view-table').style.display = 'none'
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'flex'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -865,6 +994,9 @@ function _handleActivateTab(id, force = false) {
     case 'hex':
       showHexCompare()
       break
+    case 'metadata':
+      showMetadataCompare()
+      break
     case 'merge3':
       showMerge3()
       break
@@ -990,6 +1122,9 @@ function _disposeViewIfUnused(type) {
   } else if (type === 'image' && imageCompare) {
     try { imageCompare.destroy?.() } catch { /* ignore */ }
     imageCompare = null
+  } else if (type === 'metadata' && metadataCompare) {
+    try { metadataCompare.destroy?.() } catch { /* ignore */ }
+    metadataCompare = null
   } else if (type === 'table' && tableCompare) {
     try { tableCompare.destroy?.() } catch { /* ignore */ }
     tableCompare = null
@@ -1030,6 +1165,10 @@ function newSession(type, labelText) {
     case 'hex':
       tabMgr.addTab('hex', 'Hex 比對')
       showHexCompare()
+      break
+    case 'metadata':
+      tabMgr.addTab('metadata', '中繼資料比對')
+      showMetadataCompare()
       break
     case 'merge3':
       tabMgr.addTab('merge3', '三向合併')
@@ -1084,6 +1223,7 @@ function setupToolbarButtons() {
     else if (currentView === 'table') tableCompare?.refresh()
     else if (currentView === 'image') imageCompare?.refresh()
     else if (currentView === 'hex') hexCompare?.refresh()
+    else if (currentView === 'metadata') void metadataCompare?.refresh()
     // merge3 has its own open buttons; no global refresh needed
   })
 
@@ -1152,7 +1292,8 @@ function setupToolbarButtons() {
 function _activeViewInstance() {
   return {
     text: textCompare, folder: folderCompare, table: tableCompare,
-    image: imageCompare, hex: hexCompare, merge3: mergeCompare,
+    image: imageCompare, hex: hexCompare, metadata: metadataCompare,
+    merge3: mergeCompare,
   }[currentView] ?? null
 }
 
@@ -1733,6 +1874,7 @@ function _getActiveConfigurableView() {
     table: tableCompare,
     image: imageCompare,
     hex: hexCompare,
+    metadata: metadataCompare,
     // merge3 implements the same contract but was left out of this table, so
     // its settings could be neither saved nor loaded.
     merge3: mergeCompare,
@@ -2108,6 +2250,16 @@ async function _restoreOneWorkspaceTab(saved) {
       }
       break
     }
+    case 'metadata': {
+      tabMgr.addTab('metadata', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showMetadataCompare()
+      if (metadataCompare) {
+        if (saved.leftPath)  await metadataCompare.setLeft(saved.leftPath).catch(() => {})
+        if (saved.rightPath) await metadataCompare.setRight(saved.rightPath).catch(() => {})
+      }
+      break
+    }
     case 'merge3': {
       tabMgr.addTab('merge3', title)
       tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath, basePath: saved.basePath })
@@ -2134,6 +2286,7 @@ function _defaultTitleForType(type) {
     case 'table':  return '表格比對'
     case 'image':  return '圖片比對'
     case 'hex':    return 'Hex 比對'
+    case 'metadata': return '中繼資料比對'
     case 'merge3': return '三向合併'
     default:       return '分頁'
   }
@@ -2146,7 +2299,8 @@ function _defaultTitleForType(type) {
 /** Human name per session type. */
 const VIEW_TYPE_LABELS = Object.freeze({
   text: '文字比對', folder: '資料夾比對', table: '表格比對',
-  image: '圖片比對', hex: 'Hex 比對', merge3: '三向合併',
+  image: '圖片比對', hex: 'Hex 比對', metadata: '中繼資料比對',
+  merge3: '三向合併',
 })
 
 /**
@@ -2270,13 +2424,13 @@ function toggleSessionLock() {
  * one rolling entry per tab named after the files, this creates a separate,
  * durable entry the user named themselves.
  */
-function saveSessionAs() {
+async function saveSessionAs() {
   const found = _activeTabPaths('另存 Session')
   if (!found) return
   const { tab, leftPath, rightPath } = found
 
   const suggested = tab.title || _titleFromPaths(leftPath, rightPath)
-  const name = window.prompt('Session 名稱：', suggested)
+  const name = await promptDialog({ message: 'Session 名稱：', defaultValue: suggested })
   if (name === null) return
   const trimmed = name.trim()
   if (!trimmed) {
@@ -2408,7 +2562,7 @@ async function compareFilesUsing() {
   if (!found) return
   const { tab, leftPath, rightPath } = found
 
-  const choices = ['text', 'table', 'hex', 'image'].filter((t) => t !== tab.type)
+  const choices = ['text', 'table', 'hex', 'image', 'metadata'].filter((t) => t !== tab.type)
   const chosen = await pickViewType(
     `以哪一種比對重新開啟這兩個檔案？（目前為${VIEW_TYPE_LABELS[tab.type] ?? tab.type}）`,
     choices)
@@ -2427,6 +2581,7 @@ function setupPathBarButtons() {
     else if (currentView === 'table') tableCompare?.openLeft()
     else if (currentView === 'image') imageCompare?.openLeft()
     else if (currentView === 'hex') hexCompare?.openLeft()
+    else if (currentView === 'metadata') void metadataCompare?.openLeft()
   })
 
   el('btn-open-right').addEventListener('click', () => {
@@ -2435,6 +2590,7 @@ function setupPathBarButtons() {
     else if (currentView === 'table') tableCompare?.openRight()
     else if (currentView === 'image') imageCompare?.openRight()
     else if (currentView === 'hex') hexCompare?.openRight()
+    else if (currentView === 'metadata') void metadataCompare?.openRight()
   })
 }
 
@@ -2730,6 +2886,16 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
     return
   }
 
+  if (viewType === 'metadata') {
+    tabMgr.addTab('metadata', '中繼資料比對')
+    showMetadataCompare()
+    // Only the paths travel: main/metadata.js reads the few windows it needs
+    // itself, so there is nothing to load here.
+    if (leftPath) await metadataCompare?.setLeft(leftPath)
+    if (rightPath) await metadataCompare?.setRight(rightPath)
+    return
+  }
+
   if (viewType === 'hex') {
     tabMgr.addTab('hex', 'Hex 比對')
     showHexCompare()
@@ -2886,7 +3052,7 @@ async function createSnapshot(crc) {
  * actually lives.
  */
 async function exportRegistry() {
-  const keyPath = prompt('登錄機碼路徑（例如 HKCU\Software\MyApp）：')
+  const keyPath = await promptDialog({ message: '登錄機碼路徑（例如 HKCU\Software\MyApp）：' })
   if (!keyPath) return
   try {
     const result = await window.electronAPI?.exportRegistryKey?.(keyPath)
@@ -2918,12 +3084,13 @@ async function manageRemoteProfiles() {
   const summary = profiles.length
     ? profiles.map((p, i) => `${i + 1}. ${p.name}（${p.kind} ${p.host || p.bucket || ''}）`).join('\n')
     : '（尚無連線設定）'
-  const choice = prompt(
-    `目前的遠端連線：
+  const choice = await promptDialog({
+    message: `目前的遠端連線：
 ${summary}
 
 ` +
-    '輸入 new 新增，或輸入編號後加 del 刪除（例如「1 del」）：')
+    '輸入 new 新增，或輸入編號後加 del 刪除（例如「1 del」）：',
+  })
   if (!choice) return
 
   if (choice.trim().toLowerCase() === 'new') {
@@ -2958,13 +3125,13 @@ const REMOTE_OAUTH_KINDS = Object.freeze(['dropbox', 'onedrive'])
  * feature existed and no user could reach it.
  */
 async function createRemoteProfile() {
-  const kind = prompt(`連線類型（${REMOTE_KINDS.join(' / ')}）：`, 'ftp')?.trim().toLowerCase()
+  const kind = (await promptDialog({ message: `連線類型（${REMOTE_KINDS.join(' / ')}）：`, defaultValue: 'ftp' }))?.trim().toLowerCase()
   if (!kind) return
   if (!REMOTE_KINDS.includes(kind)) {
     showError(`不支援的連線類型：${kind}`)
     return
   }
-  const name = prompt('這個連線的名稱：')?.trim()
+  const name = (await promptDialog({ message: '這個連線的名稱：' }))?.trim()
   if (!name) return
 
   /** @type {Record<string, unknown>} */
@@ -2975,27 +3142,28 @@ async function createRemoteProfile() {
     // secret — it is visible in the browser's address bar during sign-in — so
     // it is an ordinary field, and the save error carries the registration
     // instructions when it is missing or wrong.
-    profile.clientId = prompt(
-      [
+    profile.clientId = (await promptDialog({
+      message: [
         `${kind} 需要你自己申請的應用程式 client ID。`,
         '留空送出可看到申請步驟。',
         '',
         'client ID：',
-      ].join('\n'))?.trim() ?? ''
-    profile.path = prompt('起始路徑（可留空）：')?.trim() ?? ''
+      ].join('\n'),
+    }))?.trim() ?? ''
+    profile.path = (await promptDialog({ message: '起始路徑（可留空）：' }))?.trim() ?? ''
     // The refresh token is obtained on first connect and stored the same way a
     // password would be, so the same "only if the OS can encrypt it" rule
     // applies rather than a second, weaker path.
     profile.saveSecret = confirm(
       '要記住授權嗎？（只會以作業系統加密後儲存；無法加密時每次都要重新授權）')
   } else if (kind === 's3') {
-    profile.bucket = prompt('Bucket：')?.trim()
-    profile.region = prompt('Region（例如 us-east-1）：')?.trim()
-    profile.user = prompt('Access Key ID：')?.trim()
+    profile.bucket = (await promptDialog({ message: 'Bucket：' }))?.trim()
+    profile.region = (await promptDialog({ message: 'Region（例如 us-east-1）：' }))?.trim()
+    profile.user = (await promptDialog({ message: 'Access Key ID：' }))?.trim()
   } else {
-    profile.host = prompt('主機：')?.trim()
-    profile.user = prompt('使用者名稱：')?.trim()
-    profile.path = prompt('起始路徑（可留空）：')?.trim() ?? ''
+    profile.host = (await promptDialog({ message: '主機：' }))?.trim()
+    profile.user = (await promptDialog({ message: '使用者名稱：' }))?.trim()
+    profile.path = (await promptDialog({ message: '起始路徑（可留空）：' }))?.trim() ?? ''
   }
 
   // The password is deliberately not persisted unless asked for: it can only
@@ -3004,7 +3172,9 @@ async function createRemoteProfile() {
   if (!REMOTE_OAUTH_KINDS.includes(kind)) {
     profile.saveSecret = confirm('要記住密碼嗎？（只會以作業系統加密後儲存；無法加密時不會儲存）')
     if (profile.saveSecret) {
-      profile.secret = prompt(kind === 's3' ? 'Secret Access Key：' : '密碼：') ?? ''
+      profile.secret = await promptDialog({
+        message: kind === 's3' ? 'Secret Access Key：' : '密碼：',
+      }) ?? ''
     }
   }
 
@@ -3041,18 +3211,20 @@ async function openRemoteFolder() {
     return
   }
 
-  const pick = prompt(
-    `選擇連線：
-${profiles.map((p, i) => `${i + 1}. ${p.name}`).join('\n')}`, '1')
+  const pick = await promptDialog({
+    message: `選擇連線：
+${profiles.map((p, i) => `${i + 1}. ${p.name}`).join('\n')}`,
+    defaultValue: '1',
+  })
   const profile = profiles[Number(pick) - 1]
   if (!profile) return
 
   const secret = profile.hasSecret
     ? undefined
-    : (prompt(`「${profile.name}」的密碼：`) ?? undefined)
+    : (await promptDialog({ message: `「${profile.name}」的密碼：` }) ?? undefined)
 
-  const startDir = prompt(`「${profile.name}」的起始路徑（可留空）：`, profile.path ?? '') ?? ''
-  const side = (prompt('放在哪一側？（left / right）：', 'left') ?? 'left').trim().toLowerCase() === 'right'
+  const startDir = await promptDialog({ message: `「${profile.name}」的起始路徑（可留空）：`, defaultValue: profile.path ?? '' }) ?? ''
+  const side = (await promptDialog({ message: '放在哪一側？（left / right）：', defaultValue: 'left' }) ?? 'left').trim().toLowerCase() === 'right'
     ? 'right' : 'left'
 
   await openRemoteCompare(profile, secret, startDir, side)
@@ -3221,6 +3393,7 @@ function navigateDiff(where) {
       table: tableCompare,
       image: imageCompare,
       folder: folderCompare,
+      metadata: metadataCompare,
     }[currentView]
     result = view?.[`${where}Difference`]?.() ?? null
   }
@@ -3361,6 +3534,7 @@ function setupMenuActions() {
     'session.new.table':  () => newSession('table'),
     'session.new.hex':    () => newSession('hex'),
     'session.new.image':  () => newSession('image'),
+    'session.new.metadata': () => newSession('metadata'),
     'session.new.merge3': () => newSession('merge3'),
     'session.home':       () => showHome(),
     'session.settings':   () => openConfigModal(),
@@ -3376,7 +3550,7 @@ function setupMenuActions() {
     'session.swap': () => {
       const view = {
         text: textCompare, folder: folderCompare, hex: hexCompare,
-        table: tableCompare, image: imageCompare,
+        table: tableCompare, image: imageCompare, metadata: metadataCompare,
       }[currentView]
       void view?.swap?.()
     },
@@ -3385,7 +3559,7 @@ function setupMenuActions() {
       if (currentView === 'text') textCompare?.refresh()
       else if (currentView === 'folder') folderCompare?.refresh()
     },
-    'session.saveAs':               () => saveSessionAs(),
+    'session.saveAs':               () => void saveSessionAs(),
     'session.clear':                () => clearSession(),
     'session.locked':               () => toggleSessionLock(),
     'session.compareParentFolders': () => void compareParentFolders(),
@@ -3436,12 +3610,14 @@ function setupMenuActions() {
       if (currentView === 'text') void textCompare?.openLeft()
       else if (currentView === 'hex') void hexCompare?.openLeft()
       else if (currentView === 'image') void imageCompare?.openLeft()
+      else if (currentView === 'metadata') void metadataCompare?.openLeft()
       else if (currentView === 'folder') void folderCompare?.openLeft?.()
     },
     'file.openRight': () => {
       if (currentView === 'text') void textCompare?.openRight()
       else if (currentView === 'hex') void hexCompare?.openRight()
       else if (currentView === 'image') void imageCompare?.openRight()
+      else if (currentView === 'metadata') void metadataCompare?.openRight()
       else if (currentView === 'folder') void folderCompare?.openRight?.()
     },
     'file.saveLeft':  () => { if (currentView === 'text') void textCompare?.saveLeft() },

@@ -132,6 +132,11 @@
             <span class="label">表格比對</span>
             <span class="desc">CSV / Excel 比對</span>
           </button>
+          <button class="session-type-btn" data-type="metadata">
+            <span class="icon">🏷️</span>
+            <span class="label">中繼資料比對</span>
+            <span class="desc">MP3 標籤 / 版本資源</span>
+          </button>
           <button class="session-type-btn" data-type="merge3">
             <span class="icon">🔀</span>
             <span class="label">三向合併</span>
@@ -151,6 +156,9 @@
 
       <!-- Hex Compare View -->
       <div id="view-hex" class="u-flex-col-fill" style="display:none"></div>
+
+      <!-- Metadata Compare View (MP3 tags / PE version resources) -->
+      <div id="view-metadata" class="u-flex-fill" style="display:none"></div>
 
       <!-- 3-Way Merge View -->
       <div id="view-merge3" class="u-flex-fill" style="display:none"></div>

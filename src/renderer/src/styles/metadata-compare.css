@@ -1,0 +1,248 @@
+/* metadata-compare.css — 中繼資料比對視圖（MP3 標籤 / 版本資源）樣式
+ * 所有顏色使用 variables.css 中定義的 CSS 變數，無硬編碼顏色。
+ */
+
+.metadata-compare {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+/* ── Path row ────────────────────────────────────────────────────────────── */
+
+.mc-path-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 4px 8px;
+  min-height: var(--pathbar-height, 32px);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.mc-path-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mc-open-btn {
+  padding: 2px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-toolbar);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mc-open-btn:hover {
+  border-color: var(--accent);
+}
+
+.mc-path-display {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+/* ── Toolbar ─────────────────────────────────────────────────────────────── */
+
+.mc-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  min-height: var(--toolbar-height, 36px);
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.mc-toolbar-label,
+.mc-check-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.mc-check-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+
+.mc-kind {
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.mc-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border-color);
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+
+.mc-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mc-btn:hover {
+  border-color: var(--accent);
+}
+
+/* ── Notes ───────────────────────────────────────────────────────────────── */
+
+.mc-notes {
+  padding: 4px 8px;
+  background: var(--color-warning-bg);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.mc-note {
+  font-size: 12px;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+/* ── Grid ────────────────────────────────────────────────────────────────── */
+
+.mc-grid {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.mc-rows {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.mc-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) 2fr 2fr;
+  gap: 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.mc-row--header {
+  background: var(--bg-secondary);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: var(--z-toolbar);
+  flex-shrink: 0;
+}
+
+.mc-cell {
+  padding: 3px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-right: 1px solid var(--border-color);
+}
+
+.mc-cell:last-child {
+  border-right: none;
+}
+
+.mc-cell-field {
+  color: var(--text-secondary);
+}
+
+.mc-cell-value {
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.mc-cell--absent,
+.mc-cell--empty {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* 音訊屬性不是標籤欄位，稍作區隔 */
+.mc-row--audio .mc-cell-field::before {
+  content: "♪ ";
+  color: var(--text-secondary);
+}
+
+/* ── 色彩語意（CLAUDE.md「UI 色彩語意」）─────────────────────────────────── */
+
+/* 相同 → 預設背景 */
+.mc-row--same {
+  background: var(--bg-primary);
+}
+
+/* 重要差異 → 紅／粉紅 */
+.mc-row--different {
+  background: var(--diff-delete-bg);
+  border-left: 3px solid var(--diff-delete-border);
+}
+
+/* 僅左側 → 綠 */
+.mc-row--left-only {
+  background: var(--diff-insert-bg);
+  border-left: 3px solid var(--diff-insert-border);
+}
+
+/* 僅右側 → 橘紅 */
+.mc-row--right-only {
+  background: var(--color-warning-bg);
+  border-left: 3px solid var(--color-warning-strong);
+}
+
+.mc-row--current {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.mc-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+/* ── Stats ───────────────────────────────────────────────────────────────── */
+
+.mc-stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  min-height: 24px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}

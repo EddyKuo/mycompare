@@ -106,12 +106,14 @@ test('sessions can be filed into folders on the home screen', async () => {
   await win.evaluate(() => document.getElementById('btn-new-session')?.click())
   await expect(win.locator('.recent-sessions .recent-item')).toHaveCount(1)
 
-  // Create a folder without going through prompt(), which cannot be driven.
+  // Naming goes through core/modal.js, so it can be driven for real — the
+  // native prompt() this used to stub throws inside Electron.
   await win.evaluate(() => {
-    window.prompt = () => '專案 A'
     ;[...document.querySelectorAll('.session-action-btn')]
       .find((b) => b.textContent.includes('新增資料夾'))?.click()
   })
+  await win.locator('.mc-modal-overlay .mc-modal-input').fill('專案 A')
+  await win.locator('.mc-modal-overlay .mc-modal-btn--primary').click()
   await expect(win.locator('.recent-sessions .recent-group')).toHaveCount(1)
 
   // File the session into it.
@@ -150,9 +152,14 @@ test('deleting a folder keeps the sessions filed under it', async () => {
   await win.evaluate(() => document.getElementById('btn-new-session')?.click())
 
   await win.evaluate(() => {
-    window.prompt = () => '待刪除'
     ;[...document.querySelectorAll('.session-action-btn')]
       .find((b) => b.textContent.includes('新增資料夾'))?.click()
+  })
+  await win.locator('.mc-modal-overlay .mc-modal-input').fill('待刪除')
+  await win.locator('.mc-modal-overlay .mc-modal-btn--primary').click()
+  await expect(win.locator('.recent-sessions .recent-group')).toHaveCount(1)
+
+  await win.evaluate(() => {
     const sel = document.querySelector('.recent-item .ri-group')
     const opt = [...sel.options].find((o) => o.textContent.includes('待刪除'))
     sel.value = opt.value

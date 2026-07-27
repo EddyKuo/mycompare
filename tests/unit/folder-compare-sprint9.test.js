@@ -88,6 +88,25 @@ function openContextMenuForRow(fc, { name, leftPath = '', rightPath = '', status
   return capturedMenu.items ?? []
 }
 
+/**
+ * Answer the promise-based prompt modal that core/modal.js just opened.
+ *
+ * The modal is built synchronously by `prompt()`, so the overlay already
+ * exists by the time the (async) menu action has yielded at its first await.
+ *
+ * @param {string} value text to type; pass nothing to cancel
+ */
+function answerPromptModal(value) {
+  const input = document.querySelector('.mc-modal-overlay .mc-modal-input')
+  if (!(input instanceof HTMLInputElement)) throw new Error('prompt modal did not open')
+  if (value === undefined) {
+    document.querySelector('.mc-modal-overlay .mc-modal-btn:not(.mc-modal-btn--primary)').click()
+    return
+  }
+  input.value = value
+  document.querySelector('.mc-modal-overlay .mc-modal-btn--primary').click()
+}
+
 beforeEach(() => {
   document.body.innerHTML = ''
   capturedMenu.items = null
@@ -129,8 +148,8 @@ describe('T52: rename IPC rejection', () => {
     const fc = buildFC()
     fc.refresh = vi.fn().mockResolvedValue(undefined)
     window.electronAPI.renameFile = vi.fn().mockRejectedValue(new Error('EACCES'))
-    // Provide alert + prompt stubs (jsdom does not implement them)
-    window.prompt = vi.fn().mockReturnValue('new.txt')
+    // Naming goes through core/modal.js now: Electron throws on window.prompt,
+    // so stubbing the global would test a code path that cannot run.
     window.alert = vi.fn()
 
     const items = openContextMenuForRow(fc, {
@@ -142,7 +161,9 @@ describe('T52: rename IPC rejection', () => {
     expect(renameItem).toBeDefined()
 
     // Action should not bubble despite electronAPI rejecting
-    await expect(renameItem.action()).resolves.toBeUndefined()
+    const done = renameItem.action()
+    answerPromptModal('new.txt')
+    await expect(done).resolves.toBeUndefined()
 
     expect(window.electronAPI.renameFile).toHaveBeenCalledOnce()
     expect(fc.refresh).not.toHaveBeenCalled()
@@ -158,7 +179,6 @@ describe('T53: mkdirFolder IPC rejection', () => {
     const fc = buildFC()
     fc.refresh = vi.fn().mockResolvedValue(undefined)
     window.electronAPI.mkdirFolder = vi.fn().mockRejectedValue(new Error('EEXIST'))
-    window.prompt = vi.fn().mockReturnValue('newdir')
     window.alert = vi.fn()
 
     const items = openContextMenuForRow(fc, {
@@ -169,7 +189,9 @@ describe('T53: mkdirFolder IPC rejection', () => {
     const mkdirItem = items.find((it) => it.label === '新建資料夾（左側）…')
     expect(mkdirItem).toBeDefined()
 
-    await expect(mkdirItem.action()).resolves.toBeUndefined()
+    const done = mkdirItem.action()
+    answerPromptModal('newdir')
+    await expect(done).resolves.toBeUndefined()
 
     expect(window.electronAPI.mkdirFolder).toHaveBeenCalledOnce()
     expect(fc.refresh).not.toHaveBeenCalled()

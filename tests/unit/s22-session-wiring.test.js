@@ -38,8 +38,23 @@ describe('Smart Routing — .html is not unambiguously text', () => {
     expect(isAmbiguousPath('index.html')).toBe(true)
   })
 
+  it('offers both readings for a PE image, defaulting to hex as before', () => {
+    // An .exe is honestly both a binary blob and a versioned resource, so the
+    // metadata view has to be offered rather than silently skipped — but the
+    // default must not change under anyone who was relying on hex.
+    expect(getViewChoicesForPath('a.exe')).toEqual(['hex', 'metadata'])
+    expect(getViewChoicesForPath('C:\win\a.DLL')).toEqual(['hex', 'metadata'])
+    expect(isAmbiguousPath('a.exe')).toBe(true)
+    expect(getViewTypeForPath('a.exe')).toBe('hex')
+  })
+
+  it('routes an MP3 to the metadata view, which is its only useful reading', () => {
+    expect(getViewTypeForPath('song.mp3')).toBe('metadata')
+    expect(isAmbiguousPath('song.mp3')).toBe(false)
+  })
+
   it('leaves every unambiguous extension alone', () => {
-    for (const p of ['a.txt', 'a.csv', 'a.png', 'a.exe', 'noext', '', null]) {
+    for (const p of ['a.txt', 'a.csv', 'a.png', 'a.zip', 'noext', '', null]) {
       expect(getViewChoicesForPath(p)).toEqual([])
       expect(isAmbiguousPath(p)).toBe(false)
     }
@@ -287,12 +302,12 @@ describe('three-way merge hand-offs the view cannot service itself', () => {
   })
 })
 
-describe('table, image and hex tabs record their paths', () => {
-  it('all three sync the active tab', () => {
-    // Only text and folder did, so a saved workspace restored the other three
+describe('table, image, hex and metadata tabs record their paths', () => {
+  it('all four sync the active tab', () => {
+    // Only text and folder did, so a saved workspace restored the others
     // blank and nothing could ask "which files is this tab showing?".
     // Call sites only — the declaration line starts with `function`.
     const occurrences = [...APP.matchAll(/^\s+_syncActiveTabPaths\(left, right\)$/gm)]
-    expect(occurrences.length).toBe(3)
+    expect(occurrences.length).toBe(4)
   })
 })

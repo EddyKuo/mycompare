@@ -17,16 +17,31 @@ const HEX_EXTS = new Set([
 ])
 
 /**
+ * 檔案本身只有中繼資料值得逐欄比對的副檔名。
+ *
+ * MP3 的音訊內容逐 byte 比對幾乎不會給出有用的答案——重新編碼一次就整份不同，
+ * 而使用者想知道的是標籤欄位哪裡不一樣，這正是 BC 的 MP3 Compare。
+ */
+const METADATA_EXTS = new Set(['mp3'])
+
+/**
  * 副檔名 → 一個以上同樣合理的視圖類型，第一個為預設。
  *
  * HTML 既是文字也是表格容器：表格比對能解析其中的 `<table>`，但一份手寫的
  * 網頁多半該逐行看。單靠副檔名無法判斷使用者想要哪一種，所以這裡不替他決定，
  * 由呼叫端詢問。
- * @type {Map<string, Array<'text'|'image'|'table'|'hex'>>}
+ *
+ * 同理，一個 .exe 既是二進位檔（hex）也帶有版本資源（metadata）：兩種讀法都
+ * 誠實，所以照樣問，而不是替使用者選一個。預設維持 hex，與過去一致。
+ * @type {Map<string, Array<'text'|'image'|'table'|'hex'|'metadata'>>}
  */
 const AMBIGUOUS_EXTS = new Map([
   ['html', ['text', 'table']],
   ['htm',  ['text', 'table']],
+  ['exe',  ['hex', 'metadata']],
+  ['dll',  ['hex', 'metadata']],
+  ['ocx',  ['hex', 'metadata']],
+  ['sys',  ['hex', 'metadata']],
 ])
 
 /**
@@ -51,16 +66,19 @@ function extensionOf(path) {
  * 應先用 {@link getViewChoicesForPath} 判斷。
  *
  * @param {string|null|undefined} path - 檔案路徑
- * @returns {'text'|'image'|'table'|'hex'} 視圖類型
+ * @returns {'text'|'image'|'table'|'hex'|'metadata'} 視圖類型
  */
 export function getViewTypeForPath(path) {
   const ext = extensionOf(path)
   if (!ext) return 'text'
-  if (IMAGE_EXTS.has(ext)) return 'image'
-  if (TABLE_EXTS.has(ext)) return 'table'
-  if (HEX_EXTS.has(ext))   return 'hex'
+  // 先問「有沒有多種讀法」：.exe 同時列在 HEX_EXTS 裡，若照舊順序就永遠不會
+  // 走到多選，使用者也就永遠看不到版本比對這個選項。
   const ambiguous = AMBIGUOUS_EXTS.get(ext)
   if (ambiguous) return ambiguous[0]
+  if (IMAGE_EXTS.has(ext)) return 'image'
+  if (TABLE_EXTS.has(ext)) return 'table'
+  if (METADATA_EXTS.has(ext)) return 'metadata'
+  if (HEX_EXTS.has(ext))   return 'hex'
   return 'text'
 }
 
@@ -68,7 +86,7 @@ export function getViewTypeForPath(path) {
  * 這個路徑有哪些同樣合理的視圖類型（第一個為預設）。
  *
  * @param {string|null|undefined} path
- * @returns {Array<'text'|'image'|'table'|'hex'>} 只有單一解讀時回傳空陣列
+ * @returns {Array<'text'|'image'|'table'|'hex'|'metadata'>} 只有單一解讀時回傳空陣列
  */
 export function getViewChoicesForPath(path) {
   const choices = AMBIGUOUS_EXTS.get(extensionOf(path))

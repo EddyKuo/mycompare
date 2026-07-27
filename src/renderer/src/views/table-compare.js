@@ -29,6 +29,9 @@
 import { isActive } from '../core/active-view.js'
 import { renderTextTable, reportHeader, reportSummary } from '../core/report.js'
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
+// Electron has no window.prompt — calling it THROWS. Aliased on import so the
+// call sites never look like the (broken) global.
+import { prompt as promptDialog } from '../core/modal.js'
 import { el, formatSize } from '../core/utils.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
@@ -6045,10 +6048,16 @@ export class TableCompare {
       if (col >= 0) {
         items.push({
           label: '重新命名這一欄（顯示用）…',
-          action: () => {
+          action: async () => {
             const current = this._columnNames[col]
               ?? (this._displayHeaders?.[side]?.[col] ?? '')
-            const next = window.prompt(`第 ${col} 欄的顯示名稱`, current)
+            const next = await promptDialog({
+              title: '重新命名欄位',
+              message: `第 ${col} 欄的顯示名稱`,
+              defaultValue: current,
+            })
+            // null = cancelled. '' stays meaningful here: it clears the
+            // override and falls back to the file's own header.
             if (next != null) this.setColumnDisplayName(col, next)
           },
         })

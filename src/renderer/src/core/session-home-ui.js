@@ -16,6 +16,9 @@ import {
   flattenGroups,
 } from './session-groups.js'
 import { SessionStore } from './session-store.js'
+// Electron has no window.prompt — calling it THROWS. Aliased on import so the
+// call sites never look like the (broken) global.
+import { prompt as promptDialog } from './modal.js'
 
 /** Shared store instance — also exported for use in app.js */
 export const store = new SessionStore()
@@ -307,8 +310,9 @@ export function renderRecentSessions(onOpen, onRemove) {
   const btnNewGroup = document.createElement('button')
   btnNewGroup.className = 'session-action-btn'
   btnNewGroup.textContent = '＋ 新增資料夾'
-  btnNewGroup.addEventListener('click', () => {
-    const name = prompt('資料夾名稱：')
+  btnNewGroup.addEventListener('click', async () => {
+    const name = await promptDialog({ title: '新增資料夾', message: '資料夾名稱：' })
+    // null = cancelled, '' = empty name; neither creates a group.
     if (!name) return
     saveGroups(addGroup(loadGroups(), name).state)
     rerender()

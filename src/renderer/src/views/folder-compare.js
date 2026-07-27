@@ -4,6 +4,9 @@
  */
 
 import { showContextMenu } from '../core/context-menu.js'
+// Electron has no window.prompt — calling it THROWS. Aliased on import so the
+// call sites never look like the (broken) global.
+import { prompt as promptDialog } from '../core/modal.js'
 import { el, debounce, formatSize } from '../core/utils.js'
 import { isActive } from '../core/active-view.js'
 import { parseMasks, matchesMasks } from '../core/file-mask.js'
@@ -11434,7 +11437,12 @@ ${rows}
       items.push({
         label: '重新命名…',
         action: async () => {
-          const newName = prompt(`重新命名「${name}」：`, name)
+          const newName = await promptDialog({
+            title: '重新命名',
+            message: `重新命名「${name}」：`,
+            defaultValue: name,
+          })
+          // null = cancelled, '' = cleared the box; neither may rename.
           if (!newName || newName === name) return
           const dir = renamePath.slice(0, renamePath.length - name.length)
           const newPath = dir + newName
@@ -11454,7 +11462,7 @@ ${rows}
         label: '新建資料夾（左側）…',
         action: async () => {
           if (!this._leftPath) { alert('請先選擇左側資料夾'); return }
-          const folderName = prompt('新資料夾名稱：')
+          const folderName = await promptDialog({ title: '新建資料夾（左側）', message: '新資料夾名稱：' })
           if (!folderName) return
           try {
             await window.electronAPI.mkdirFolder(this._leftPath + '/' + folderName)
@@ -11468,7 +11476,7 @@ ${rows}
         label: '新建資料夾（右側）…',
         action: async () => {
           if (!this._rightPath) { alert('請先選擇右側資料夾'); return }
-          const folderName = prompt('新資料夾名稱：')
+          const folderName = await promptDialog({ title: '新建資料夾（右側）', message: '新資料夾名稱：' })
           if (!folderName) return
           try {
             await window.electronAPI.mkdirFolder(this._rightPath + '/' + folderName)

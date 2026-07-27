@@ -13,7 +13,7 @@ const KEY_NAMED_CONFIGS = 'mycompare:namedConfigs'
 const SCHEMA_VERSION = 1   // S15-U10
 
 /**
- * @typedef {'text' | 'folder' | 'table' | 'image' | 'hex' | 'merge3'} NamedConfigViewType
+ * @typedef {'text' | 'folder' | 'table' | 'image' | 'hex' | 'metadata' | 'merge3'} NamedConfigViewType
  */
 
 /**
