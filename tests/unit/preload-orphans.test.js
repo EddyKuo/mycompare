@@ -88,3 +88,35 @@ describe('preload surface', () => {
     expect(stale, 'listed as uncalled but now called').toEqual([])
   })
 })
+
+/**
+ * The mirror defect: a renderer call to a method preload never exposed.
+ *
+ * The orphan check above runs preload → renderer and catches a capability with
+ * no caller. It says nothing about the other direction, and that is the one
+ * that actually breaks at runtime: `window.electronAPI.vcsStatus(...)` on an
+ * object with no such key is a TypeError, raised only when the feature is
+ * first exercised. The version control and owner columns shipped that way —
+ * two complete main-process modules, thirty-five passing unit tests, and no
+ * handler or preload entry anywhere behind them.
+ *
+ * Only the qualified `electronAPI.name` form is collected. Call sites that
+ * alias the object first are missed, which is a false negative — the same
+ * trade the orphan check makes above, and the cheap direction to be wrong in.
+ */
+function calledMethods() {
+  return new Set(
+    [...RENDERER.matchAll(/\belectronAPI\??\.([a-zA-Z]\w*)\b/g)].map((m) => m[1]))
+}
+
+describe('renderer calls land somewhere', () => {
+  it('finds the qualified call sites at all', () => {
+    expect(calledMethods().size).toBeGreaterThan(20)
+  })
+
+  it('every electronAPI method the renderer calls is exposed by preload', () => {
+    const exposed = new Set(exposedMethods())
+    const missing = [...calledMethods()].filter((n) => !exposed.has(n))
+    expect(missing, 'called in the renderer but not exposed by preload').toEqual([])
+  })
+})

@@ -923,6 +923,9 @@ export const FOLDER_COLUMN_DEFS = [
   { id: 'attrs',   label: '屬性',     width: '72px' },
   { id: 'version', label: '版本',     width: '120px' },
   { id: 'crc',     label: '檢查碼',   width: '120px' },
+  { id: 'vcs',     label: '版本控制', width: '96px' },
+  { id: 'owner',   label: '擁有者',   width: '150px' },
+  { id: 'group',   label: '群組',     width: '130px' },
 ]
 
 /** @type {string[]} */
@@ -1605,6 +1608,150 @@ const VERSION_CANDIDATE_EXTS = new Set([
   'exe', 'dll', 'sys', 'ocx', 'scr', 'cpl', 'drv', 'efi', 'mun', 'mui', 'mp3',
 ])
 
+// ── VCS column ──────────────────────────────────────────────────────────────
+//
+// Unlike the version and checksum columns, this one is *not* lazy per row. The
+// whole repository's status arrives in one `git status` call per base folder
+// and every row is answered from that table. Asking git per row is the mistake
+// those two columns already had to be rescued from, and here it would also be
+// wrong: git's answer for a file depends on the index, which one call reads
+// once and 50,000 calls would read 50,000 times.
+
+/**
+ * @typedef {'untracked'|'modified'|'staged'|'deleted'|'conflict'|'ignored'|'clean'} VcsState
+ *
+ * @typedef {object} VcsRepo
+ * @property {string} root absolute repository top level
+ * @property {Record<string, VcsState>} files repo-relative path -> state
+ * @property {Record<string, VcsState>} dirs repo-relative prefix (trailing '/')
+ */
+
+/** Short cell text per state; the tooltip carries the full wording. */
+export const VCS_STATE_BADGES = Object.freeze({
+  conflict: '衝突',
+  staged: '已暫存',
+  modified: '已修改',
+  deleted: '已刪除',
+  untracked: '未追蹤',
+  ignored: '已忽略',
+  clean: '乾淨',
+})
+
+/** @type {Readonly<Record<string, string>>} */
+export const VCS_STATE_TITLES = Object.freeze({
+  conflict: '合併衝突尚未解決（git unmerged）',
+  staged: '變更已加入索引，尚未提交（git staged）',
+  modified: '工作區內容與索引不同（git modified）',
+  deleted: '檔案已被刪除',
+  untracked: '未納入版本控制（git untracked）',
+  ignored: '被 .gitignore 排除',
+  clean: '與 HEAD 相同，沒有本機變更',
+})
+
+/**
+ * The state git reports for one absolute path, or null when the path is not
+ * inside the repository at all.
+ *
+ * Untracked and ignored *directories* are reported by git as a single entry
+ * with a trailing slash rather than as one entry per file inside them. Matching
+ * those by prefix is what lets a `node_modules` of 40,000 files be answered
+ * without git ever having enumerated it.
+ *
+ * @param {VcsRepo|null|undefined} repo
+ * @param {string} absPath
+ * @returns {VcsState|null}
+ */
+export function lookupVcsState(repo, absPath) {
+  if (!repo?.root) return null
+  const root = String(repo.root).replace(/[\\/]+$/, '').replace(/\\/g, '/')
+  const p = String(absPath ?? '').replace(/\\/g, '/')
+  if (p.length <= root.length || !p.startsWith(root + '/')) return null
+  const rel = p.slice(root.length + 1)
+
+  const exact = repo.files?.[rel]
+  if (exact) return exact
+
+  // Longest prefix wins, so an ignored file inside an untracked directory
+  // still reads as ignored rather than inheriting the shallower answer.
+  let best = null
+  let bestLen = -1
+  for (const prefix of Object.keys(repo.dirs ?? {})) {
+    if (rel.startsWith(prefix) && prefix.length > bestLen) {
+      best = repo.dirs[prefix]
+      bestLen = prefix.length
+    }
+  }
+  if (best) return best
+  // Not listed by `git status` and inside the repo means tracked and unchanged.
+  return 'clean'
+}
+
+/**
+ * @typedef {object} VcsOpResult
+ * @property {string} path
+ * @property {'done'|'skipped'|'failed'} state
+ * @property {string} message
+ */
+
+/**
+ * Summary text for a batch of source-control writes.
+ *
+ * Modelled on {@link formatMoveSummary}: a batch that half-succeeded has to
+ * name which paths did not, because the user's next action depends on it.
+ *
+ * @param {string} label operation name shown in the first line
+ * @param {VcsOpResult[]} results
+ * @returns {string}
+ */
+export function formatVcsOpSummary(label, results) {
+  const list = results ?? []
+  const done = list.filter((r) => r.state === 'done')
+  const skipped = list.filter((r) => r.state === 'skipped')
+  const failed = list.filter((r) => r.state === 'failed')
+
+  const lines = [`${label}：${done.length} 項成功`]
+  if (skipped.length) lines[0] += `，${skipped.length} 項略過`
+  if (failed.length) lines[0] += `，${failed.length} 項失敗`
+
+  if (skipped.length) {
+    lines.push('', '略過（未執行任何操作）：')
+    for (const r of skipped) lines.push(`• ${r.path}\n　${r.message}`)
+  }
+  if (failed.length) {
+    lines.push('', '失敗：')
+    for (const r of failed) lines.push(`• ${r.path}\n　${r.message}`)
+  }
+  return lines.join('\n')
+}
+
+// ── Owner / Group columns ───────────────────────────────────────────────────
+
+/**
+ * Paths per `file-owners` IPC call. Must not exceed the main process's own
+ * `MAX_OWNER_BATCH`, which refuses the excess rather than silently dropping it.
+ */
+const OWNER_BATCH_SIZE = 200
+
+/**
+ * Ceiling on how many files one "sort by owner" is allowed to look up, for the
+ * same reason as {@link MAX_VERSION_PREFETCH}. Higher than the checksum cap
+ * because a lookup reads a security descriptor, not a whole file.
+ */
+const MAX_OWNER_PREFETCH = 2000
+
+/**
+ * Cell text for an owner/group value.
+ *
+ * An unknown value shows an em dash rather than an empty cell: a blank column
+ * reads as "this file has no owner", which is never true.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+export function ownerCellText(value) {
+  return value ? value : '—'
+}
+
 /**
  * @param {string} name
  * @returns {boolean}
@@ -1876,6 +2023,12 @@ export function columnSortValue(row, key) {
     // Rows whose version has not been read yet sort as empty rather than being
     // guessed at; the view fills the visible set in before sorting on it.
     case 'version': return String(entry?.version ?? '')
+    // Owner, group and VCS sort as empty until they have been read, on the
+    // same principle: an unknown value is never guessed at, and the view fills
+    // the set in before sorting on it.
+    case 'owner':   return String(entry?.owner ?? '')
+    case 'group':   return String(entry?.group ?? '')
+    case 'vcs':     return String(entry?.vcsState ?? '')
     case 'status':  return String(row?.status ?? '')
     default:        return String(row?.name ?? '')
   }
@@ -3189,6 +3342,28 @@ export class FolderCompare {
     this._crcQueue = []
     this._crcTimer = 0
 
+    // VCS column. One entry per repository root, filled by a single
+    // `git status` per base folder rather than by anything per row.
+    /** @type {Map<string, VcsRepo>} */
+    this._vcsRepos = new Map()
+    /** @type {Set<string>} base folders already asked about */
+    this._vcsAsked = new Set()
+    /** @type {string} why the column is blank, when it is */
+    this._vcsUnavailable = ''
+    /** @type {boolean} the status read has settled (successfully or not) */
+    this._vcsLoaded = false
+    /** @type {Promise<void>|null} in-flight status read, so it runs once */
+    this._vcsPending = null
+
+    // Owner / group columns, lazy per drawn row and batched per IPC.
+    /** @type {Map<string, { owner: string, group: string, error: string }>} */
+    this._ownerCache = new Map()
+    /** @type {Set<string>} */
+    this._ownerInFlight = new Set()
+    /** @type {Array<{ entry: FileEntry, path: string }>} */
+    this._ownerQueue = []
+    this._ownerTimer = 0
+
     // BC's timezone / daylight-saving tolerance. Orthogonal to the ±n-second
     // tolerance above: that one forgives rounding, this one forgives whole
     // hours, and widening the first to cover the second would hide real edits.
@@ -3725,6 +3900,12 @@ export class FolderCompare {
     }
     if (key === 'crc') {
       void this.prefetchCrcForSort().then(() => this._applyFilterAndRender())
+    }
+    if (key === 'owner' || key === 'group') {
+      void this.prefetchOwnersForSort().then(() => this._applyFilterAndRender())
+    }
+    if (key === 'vcs') {
+      void this.prefetchVcsForSort().then(() => this._applyFilterAndRender())
     }
   }
 
@@ -7301,6 +7482,11 @@ ${rows}
       this._crcTimer = 0
     }
     this._crcQueue = []
+    if (this._ownerTimer) {
+      clearTimeout(this._ownerTimer)
+      this._ownerTimer = 0
+    }
+    this._ownerQueue = []
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
@@ -8723,6 +8909,15 @@ ${rows}
       return
     }
 
+    // A rescan is exactly when the working copy may have moved on, so the
+    // status table is dropped rather than reused. Owner and version caches are
+    // keyed by path and stay valid, so they survive.
+    this._vcsAsked.clear()
+    this._vcsRepos.clear()
+    this._vcsUnavailable = ''
+    this._vcsLoaded = false
+    this._vcsPending = null
+
     this._renderLoading()
     const ctrl = this._beginScan()
 
@@ -9643,6 +9838,11 @@ ${rows}
         }, entryAttrText(entry))
       case 'version':
         return this._buildVersionCell(entry, isDir)
+      case 'vcs':
+        return this._buildVcsCell(entry)
+      case 'owner':
+      case 'group':
+        return this._buildOwnerCell(entry, def.id)
       default: {
         const nameCell = el('div', { className: 'fc-name-cell' })
         if (depth > 0) {
@@ -10046,6 +10246,516 @@ ${rows}
     })
     this._setScanStatus(skipped
       ? `檢查碼排序：僅計算前 ${pending.length} 個檔案，另有 ${skipped} 個未計算`
+      : '')
+  }
+
+  // ── VCS column ──────────────────────────────────────────────────────────────
+
+  /**
+   * The base folders whose repository status is worth asking about.
+   *
+   * Archive, snapshot and remote paths have no working copy behind them, so
+   * they are excluded here rather than being sent to git and refused there.
+   *
+   * @returns {string[]}
+   */
+  _vcsBaseFolders() {
+    return [this._leftPath, this._rightPath, this._mergeMode ? this._basePath : null]
+      .filter((p) => typeof p === 'string' && p && sourceKindOf(p) === 'fs')
+  }
+
+  /**
+   * Read every base folder's repository status, once.
+   *
+   * Deliberately a single call per *base folder*, not per row and not per
+   * directory: `git status` answers for the whole working copy, and the row
+   * lookup is then a table read with no IPC in it at all.
+   *
+   * @param {boolean} [force] re-read even if the folders were already asked
+   * @returns {Promise<void>}
+   */
+  async _ensureVcsStatus(force = false) {
+    if (force) {
+      this._vcsAsked.clear()
+      this._vcsRepos.clear()
+      this._vcsUnavailable = ''
+      this._vcsLoaded = false
+      this._vcsPending = null
+    }
+    if (this._vcsLoaded) return
+    // Concurrent callers (several cells in one render pass, plus the context
+    // menu) share the one in-flight read rather than each starting a git.
+    if (this._vcsPending) return this._vcsPending
+
+    const folders = this._vcsBaseFolders().filter((p) => !this._vcsAsked.has(p))
+    if (!folders.length) {
+      // No local base folder to ask about — settle the cells rather than
+      // leaving them pending on a call that will never be made.
+      this._vcsLoaded = true
+      this._resolveVcsCells()
+      return
+    }
+    if (typeof window.electronAPI?.vcsStatus !== 'function') {
+      this._vcsUnavailable = '此版本未提供版本控制查詢。'
+      for (const p of folders) this._vcsAsked.add(p)
+      this._vcsLoaded = true
+      this._resolveVcsCells()
+      return
+    }
+
+    for (const p of folders) this._vcsAsked.add(p)
+    const run = (async () => {
+      for (const folder of folders) {
+        let res = null
+        try {
+          res = await window.electronAPI.vcsStatus(folder)
+        } catch (err) {
+          // A failed status read is shown, not swallowed: the alternative is a
+          // column of "乾淨" for a tree full of edits.
+          this._vcsUnavailable = `版本控制狀態讀取失敗：${errText(err)}`
+          this._setScanStatus(this._vcsUnavailable)
+          continue
+        }
+        if (res?.available && res.root) {
+          this._vcsRepos.set(res.root, {
+            root: res.root, files: res.files ?? {}, dirs: res.dirs ?? {},
+          })
+          continue
+        }
+        // 'not-a-repo' is the ordinary case for any folder outside a working
+        // copy and must stay silent; everything else is something the user has
+        // to be told, or the empty column looks like "no changes".
+        if (res?.reason && res.reason !== 'not-a-repo') {
+          this._vcsUnavailable = res.message || '無法取得版本控制狀態。'
+          this._setScanStatus(this._vcsUnavailable)
+        }
+      }
+      this._vcsLoaded = true
+      this._resolveVcsCells()
+    })()
+    this._vcsPending = run
+    try {
+      await run
+    } finally {
+      this._vcsPending = null
+    }
+  }
+
+  /**
+   * The state for one path across all loaded repositories.
+   * @param {string} absPath
+   * @returns {VcsState|null}
+   */
+  _vcsStateFor(absPath) {
+    for (const repo of this._vcsRepos.values()) {
+      const state = lookupVcsState(repo, absPath)
+      if (state) return state
+    }
+    return null
+  }
+
+  /**
+   * A VCS cell. Answered from the in-memory table when it is loaded, and left
+   * pending otherwise — the one status read is kicked off here rather than at
+   * scan time so a user who never shows the column never pays for it.
+   *
+   * @param {FileEntry} entry
+   * @returns {HTMLElement}
+   */
+  _buildVcsCell(entry) {
+    const cell = el('span', { className: 'fc-vcs' })
+    if (!entry?.path) return cell
+
+    if (sourceKindOf(entry.path) !== 'fs') {
+      cell.textContent = '—'
+      cell.title = '此來源（壓縮檔／快照／遠端）沒有本機工作區，無法判讀版本控制狀態。'
+      return cell
+    }
+
+    if (!this._vcsLoaded) {
+      void this._ensureVcsStatus()
+      cell.classList.add('fc-vcs--pending')
+      cell.dataset.vcsPath = entry.path
+      cell.textContent = '…'
+      return cell
+    }
+
+    const state = this._vcsStateFor(entry.path)
+    if (!state) {
+      cell.textContent = '—'
+      cell.title = this._vcsUnavailable
+        || '不在 git 工作區內（其他版本控制系統尚未支援）。'
+      return cell
+    }
+    entry.vcsState = state
+    cell.classList.add(`fc-vcs--${state}`)
+    cell.textContent = VCS_STATE_BADGES[state] ?? state
+    cell.title = VCS_STATE_TITLES[state] ?? ''
+    return cell
+  }
+
+  /**
+   * Patch the pending VCS cells in place once the status table arrives.
+   *
+   * Patching rather than re-rendering, for the same reason the version column
+   * does it: a re-render would fight the virtual scroller for the frame, and
+   * the only thing that changed is one span.
+   */
+  _resolveVcsCells() {
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    for (const cell of vlist.querySelectorAll('.fc-vcs--pending')) {
+      const path = cell.dataset.vcsPath ?? ''
+      cell.classList.remove('fc-vcs--pending')
+      const state = path ? this._vcsStateFor(path) : null
+      if (!state) {
+        cell.textContent = '—'
+        cell.title = this._vcsUnavailable
+          || '不在 git 工作區內（其他版本控制系統尚未支援）。'
+        continue
+      }
+      cell.classList.add(`fc-vcs--${state}`)
+      cell.textContent = VCS_STATE_BADGES[state] ?? state
+      cell.title = VCS_STATE_TITLES[state] ?? ''
+    }
+  }
+
+  /**
+   * The repository root that owns a path, or null.
+   * @param {string} absPath
+   * @returns {string|null}
+   */
+  _vcsRootFor(absPath) {
+    for (const repo of this._vcsRepos.values()) {
+      if (lookupVcsState(repo, absPath)) return repo.root
+    }
+    return null
+  }
+
+  /**
+   * Run a source-control write over a set of absolute paths.
+   *
+   * Confirmed first, because `revert` destroys the working copy and `add`
+   * changes what a later commit will contain. Reported per path afterwards,
+   * because a batch can stop halfway.
+   *
+   * @param {'add'|'revert'|'unstage'} action
+   * @param {string[]} paths already inside a known repository
+   * @returns {Promise<void>}
+   */
+  async runVcsAction(action, paths) {
+    const labels = { add: '加入索引（git add）', revert: '還原（git checkout --）', unstage: '取消暫存（git reset）' }
+    const label = labels[action] ?? action
+    const list = (paths ?? []).filter((p) => typeof p === 'string' && p)
+    if (!list.length) { alert('沒有可執行版本控制操作的檔案'); return }
+    if (typeof window.electronAPI?.vcsRun !== 'function') {
+      alert('此版本未提供版本控制操作。')
+      return
+    }
+
+    // The menu is offered before the probe lands, on purpose. That makes the
+    // wait land here instead: _vcsRootFor reads an in-memory table, so acting
+    // while `git status` is still running put every path in `outside` and told
+    // the user their tracked files were not in a working copy.
+    await this._ensureVcsStatus()
+
+    // Grouped by repository: a selection can span the left and right base
+    // folders, and each git call has to run inside the tree it belongs to.
+    /** @type {Map<string, string[]>} */
+    const byRoot = new Map()
+    /** @type {string[]} */
+    const outside = []
+    for (const p of list) {
+      const root = this._vcsRootFor(p)
+      if (!root) { outside.push(p); continue }
+      if (!byRoot.has(root)) byRoot.set(root, [])
+      byRoot.get(root).push(p)
+    }
+    if (!byRoot.size) {
+      alert(`選取的檔案都不在 git 工作區內，無法執行「${label}」。`)
+      return
+    }
+
+    const inRepo = [...byRoot.values()].reduce((n, arr) => n + arr.length, 0)
+    const warn = action === 'revert'
+      ? '\n\n還原會丟棄工作區的變更，沒有復原按鈕。'
+      : ''
+    const skippedNote = outside.length ? `\n（另有 ${outside.length} 個檔案不在版本庫內，將略過）` : ''
+    if (!confirm(`確定要對 ${inRepo} 個檔案執行「${label}」嗎？${skippedNote}${warn}`)) return
+
+    /** @type {VcsOpResult[]} */
+    const results = outside.map((path) => ({
+      path, state: 'skipped', message: '不在任何已載入的 git 工作區內。',
+    }))
+    for (const [root, group] of byRoot) {
+      try {
+        const res = await window.electronAPI.vcsRun({ action, root, paths: group })
+        results.push(...(res?.results ?? []))
+      } catch (err) {
+        const message = errText(err)
+        for (const path of group) results.push({ path, state: 'failed', message })
+      }
+    }
+    alert(formatVcsOpSummary(label, results))
+    await this._ensureVcsStatus(true)
+    await this.refresh()
+  }
+
+  /**
+   * Show `git diff` or `git log` for one file.
+   * @param {'diff'|'log'} action
+   * @param {string} absPath
+   * @returns {Promise<void>}
+   */
+  async showVcsText(action, absPath) {
+    if (typeof window.electronAPI?.vcsText !== 'function') {
+      alert('此版本未提供版本控制查詢。')
+      return
+    }
+    // As in runVcsAction: the table may still be loading when the menu item is
+    // clicked, and reading it early reports a tracked file as untracked.
+    await this._ensureVcsStatus()
+    const root = this._vcsRootFor(absPath)
+    if (!root) { alert(`「${absPath}」不在 git 工作區內。`); return }
+    const title = action === 'diff' ? `git diff — ${absPath}` : `git log — ${absPath}`
+    try {
+      const res = await window.electronAPI.vcsText({ action, root, path: absPath })
+      const text = res?.truncated
+        ? '（輸出過長，已中止顯示。請改用命令列查看。）'
+        : (res?.text || '（沒有輸出：此檔案沒有相對於 HEAD 的變更，或尚未納入版本控制。）')
+      this._showTextDialog(title, text)
+    } catch (err) {
+      alert(`${title} 失敗：${errText(err)}`)
+    }
+  }
+
+  /**
+   * A read-only scrolling text dialog, used by the Source Control queries.
+   *
+   * Reuses the attribute dialog's modal shell so Escape, the backdrop and the
+   * styling behave the same way everywhere in this view.
+   *
+   * @param {string} title
+   * @param {string} text
+   * @returns {HTMLElement} the backdrop, so tests can read and dismiss it
+   */
+  _showTextDialog(title, text) {
+    const host = this._dom.root ?? document.body
+    const backdrop = el('div', { className: 'fc-modal-backdrop fc-text-backdrop' })
+    const modal = el('div', { className: 'fc-modal fc-text-modal', role: 'dialog', 'aria-modal': 'true' })
+    modal.appendChild(el('div', { className: 'fc-modal-title' }, title))
+    modal.appendChild(el('pre', { className: 'fc-text-body' }, text))
+
+    const actions = el('div', { className: 'fc-modal-actions' })
+    const btnClose = el('button', { className: 'fc-modal-ok fc-text-close' }, '關閉')
+    actions.appendChild(btnClose)
+    modal.appendChild(actions)
+    backdrop.appendChild(modal)
+    host.appendChild(backdrop)
+
+    const close = () => {
+      backdrop.remove()
+      document.removeEventListener('keydown', onKey, true)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); close() } }
+    btnClose.addEventListener('click', close)
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close() })
+    document.addEventListener('keydown', onKey, true)
+    return backdrop
+  }
+
+  // ── Owner / Group columns ───────────────────────────────────────────────────
+
+  /**
+   * An owner or group cell, filled from cache when possible and queued
+   * otherwise. Nothing here awaits: the row has to reach the DOM before the
+   * scroller's next frame.
+   *
+   * @param {FileEntry} entry
+   * @param {'owner'|'group'} field
+   * @returns {HTMLElement}
+   */
+  _buildOwnerCell(entry, field) {
+    const cell = el('span', { className: `fc-owner fc-${field}` })
+    if (!entry?.path) return cell
+
+    const cached = this._ownerCache.get(entry.path)
+    if (cached) {
+      entry.owner = cached.owner
+      entry.group = cached.group
+      cell.textContent = ownerCellText(cached[field])
+      // The tooltip is where "why is this an em dash" is answered; without it
+      // the blank looks like a bug rather than a permission or platform limit.
+      cell.title = cached[field]
+        ? cached[field]
+        : (cached.error || '此來源未提供擁有者資訊。')
+      return cell
+    }
+
+    if (sourceKindOf(entry.path) !== 'fs') {
+      this._ownerCache.set(entry.path, {
+        owner: '', group: '',
+        error: '此來源（壓縮檔／快照／遠端）沒有本機擁有者資訊。',
+      })
+      cell.textContent = '—'
+      cell.title = '此來源（壓縮檔／快照／遠端）沒有本機擁有者資訊。'
+      return cell
+    }
+
+    cell.classList.add('fc-owner--pending')
+    cell.dataset.ownerPath = entry.path
+    cell.dataset.ownerField = field
+    cell.textContent = '…'
+    this._queueOwner(entry)
+    return cell
+  }
+
+  /**
+   * @param {FileEntry} entry
+   */
+  _queueOwner(entry) {
+    if (this._ownerInFlight.has(entry.path)) return
+    if (this._ownerQueue.some((job) => job.path === entry.path)) return
+    this._ownerQueue.push({ entry, path: entry.path })
+    if (this._ownerTimer) return
+    // One drain per render pass, for the same reason the version column
+    // coalesces: a wheel tick must not put a burst of IPC behind it.
+    this._ownerTimer = setTimeout(() => {
+      this._ownerTimer = 0
+      void this._drainOwnerQueue()
+    }, 0)
+  }
+
+  /**
+   * @returns {Promise<void>}
+   */
+  async _drainOwnerQueue() {
+    const jobs = this._ownerQueue
+    this._ownerQueue = []
+    if (!jobs.length) return
+    if (typeof window.electronAPI?.fileOwners !== 'function') {
+      for (const job of jobs) {
+        this._resolveOwner(job.entry, { owner: '', group: '', error: '此版本未提供擁有者查詢。' })
+      }
+      return
+    }
+
+    for (const job of jobs) this._ownerInFlight.add(job.path)
+    // Batched, not one call per row: the main process answers a whole batch
+    // with one OS call on Windows and none at all on Unix.
+    for (let i = 0; i < jobs.length; i += OWNER_BATCH_SIZE) {
+      const slice = jobs.slice(i, i + OWNER_BATCH_SIZE)
+      /** @type {Array<{ path: string, owner: string, group: string, error: string }>} */
+      let infos = []
+      try {
+        infos = await window.electronAPI.fileOwners(slice.map((j) => j.path)) ?? []
+      } catch (err) {
+        const message = errText(err)
+        console.warn('FolderCompare: owner lookup failed:', message)
+        infos = slice.map((j) => ({ path: j.path, owner: '', group: '', error: message }))
+      }
+      const byPath = new Map(infos.map((info) => [info.path, info]))
+      for (const job of slice) {
+        this._ownerInFlight.delete(job.path)
+        this._resolveOwner(job.entry, byPath.get(job.path)
+          ?? { owner: '', group: '', error: '未取得擁有者資訊。' })
+      }
+    }
+  }
+
+  /**
+   * @param {FileEntry} entry
+   * @param {{ owner?: string, group?: string, error?: string }} info
+   */
+  _resolveOwner(entry, info) {
+    const value = { owner: info.owner ?? '', group: info.group ?? '', error: info.error ?? '' }
+    this._ownerCache.set(entry.path, value)
+    entry.owner = value.owner
+    entry.group = value.group
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    for (const cell of vlist.querySelectorAll('.fc-owner--pending')) {
+      if (cell.dataset.ownerPath !== entry.path) continue
+      const field = cell.dataset.ownerField === 'group' ? 'group' : 'owner'
+      cell.classList.remove('fc-owner--pending')
+      cell.textContent = ownerCellText(value[field])
+      cell.title = value[field] || value.error || '此來源未提供擁有者資訊。'
+    }
+  }
+
+  /**
+   * Look owners up for the rows in the filtered tree, so sorting on the column
+   * has something to sort.
+   *
+   * Bounded by {@link MAX_OWNER_PREFETCH} for the same reason the version and
+   * checksum sorts are: a sort must not be the back door that turns a lazy
+   * column into a full-tree walk.
+   *
+   * @returns {Promise<void>}
+   */
+  /**
+   * Give every row a VCS sort key, not just the drawn ones.
+   *
+   * One `git status` covers the whole tree, so there is no per-row IPC to
+   * bound here — but the lookup table is not the sort key. `columnSortValue`
+   * reads `entry.vcsState`, and the only thing that ever wrote that field was
+   * the cell builder, which runs for the virtual window alone. Sorting on the
+   * column therefore ordered the handful of rows the user had scrolled past
+   * and left every other row tied on '', which reads as "the sort did
+   * nothing" on any tree bigger than the viewport.
+   *
+   * @returns {Promise<void>}
+   */
+  async prefetchVcsForSort() {
+    await this._ensureVcsStatus()
+    for (const flat of this._visibleRows ?? []) {
+      for (const entry of [flat.row.left, flat.row.right]) {
+        if (!entry?.path || sourceKindOf(entry.path) !== 'fs') continue
+        const state = this._vcsStateFor(entry.path)
+        if (state) entry.vcsState = state
+      }
+    }
+  }
+
+  async prefetchOwnersForSort() {
+    if (typeof window.electronAPI?.fileOwners !== 'function') return
+    /** @type {FileEntry[]} */
+    const pending = []
+    let skipped = 0
+    for (const flat of this._visibleRows ?? []) {
+      for (const entry of [flat.row.left, flat.row.right]) {
+        if (!entry?.path) continue
+        const cached = this._ownerCache.get(entry.path)
+        if (cached) { entry.owner = cached.owner; entry.group = cached.group; continue }
+        if (sourceKindOf(entry.path) !== 'fs') continue
+        if (pending.length >= MAX_OWNER_PREFETCH) { skipped++; continue }
+        pending.push(entry)
+      }
+    }
+    if (!pending.length) {
+      if (skipped) this._setScanStatus(`擁有者排序：超過 ${MAX_OWNER_PREFETCH} 個檔案，其餘未查詢`)
+      return
+    }
+
+    this._setScanStatus(`讀取擁有者… 0/${pending.length}`)
+    for (let i = 0; i < pending.length; i += OWNER_BATCH_SIZE) {
+      const slice = pending.slice(i, i + OWNER_BATCH_SIZE)
+      let infos = []
+      try {
+        infos = await window.electronAPI.fileOwners(slice.map((e) => e.path)) ?? []
+      } catch (err) {
+        this._setScanStatus(`讀取擁有者失敗：${errText(err)}`)
+        return
+      }
+      const byPath = new Map(infos.map((info) => [info.path, info]))
+      for (const entry of slice) {
+        this._resolveOwner(entry, byPath.get(entry.path)
+          ?? { owner: '', group: '', error: '未取得擁有者資訊。' })
+      }
+      this._setScanStatus(`讀取擁有者… ${Math.min(i + OWNER_BATCH_SIZE, pending.length)}/${pending.length}`)
+    }
+    this._setScanStatus(skipped
+      ? `擁有者排序：僅查詢前 ${pending.length} 個檔案，另有 ${skipped} 個未查詢`
       : '')
   }
 
@@ -10496,6 +11206,55 @@ ${rows}
         label: '屬性…',
         action: () => void this.openAttributesDialog(modelRow),
       })
+    }
+
+    // ── Source Control ──
+    // Rendered as a labelled group rather than a real submenu: the shared
+    // context-menu component is one level deep, and a flat group with a header
+    // is closer to BC's wording than silently dropping the commands would be.
+    if (!isDir && (leftPath || rightPath)) {
+      // Kicked off here so a user who never shows the VCS column still gets a
+      // populated menu the second time they open it.
+      void this._ensureVcsStatus()
+      const scPaths = [leftPath, rightPath]
+        .filter((p) => p && sourceKindOf(p) === 'fs')
+      // Quiet outside a working copy: once the status read has happened and
+      // found no repository, these commands are noise on every row.
+      const known = this._vcsLoaded
+      const inRepo = scPaths.filter((p) => this._vcsRootFor(p))
+      if (scPaths.length && (!known || inRepo.length)) {
+        const targets = known ? inRepo : scPaths
+        items.push({ separator: true })
+        items.push({ label: '版本控制（Source Control）— git', disabled: true })
+        // Diff and log answer about one file, so when both sides qualify the
+        // side is named instead of picking one and hoping it was the one meant.
+        for (const [action, text] of [['diff', '比較差異（git diff）'], ['log', '歷史記錄（git log）']]) {
+          for (const p of targets) {
+            const side = targets.length > 1 ? (p === leftPath ? '左側 ' : '右側 ') : ''
+            items.push({
+              label: `　${side}${text}…`,
+              action: () => void this.showVcsText(
+                /** @type {'diff'|'log'} */ (action), p),
+            })
+          }
+        }
+        items.push({
+          label: '　加入索引（git add）',
+          action: () => void this.runVcsAction('add', targets),
+        })
+        items.push({
+          label: '　取消暫存（git reset）',
+          action: () => void this.runVcsAction('unstage', targets),
+        })
+        items.push({
+          label: '　還原（git checkout --，會丟棄變更）',
+          action: () => void this.runVcsAction('revert', targets),
+        })
+        items.push({
+          label: '　重新讀取版本控制狀態',
+          action: () => void this._ensureVcsStatus(true).then(() => this._applyFilterAndRender()),
+        })
+      }
     }
 
     // Algorithm shortcuts for differing files

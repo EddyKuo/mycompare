@@ -519,6 +519,12 @@
           <button class="options-tab" id="options-tab-shortcuts" role="tab" data-pane="shortcuts" aria-controls="options-pane-shortcuts" aria-selected="false">快捷鍵</button>
           <button class="options-tab" id="options-tab-commands" role="tab" data-pane="commands" aria-controls="options-pane-commands" aria-selected="false">選單與工具列</button>
           <button class="options-tab" id="options-tab-appearance" role="tab" data-pane="appearance" aria-controls="options-pane-appearance" aria-selected="false">色彩與字型</button>
+          <button class="options-tab" id="options-tab-folderViews" role="tab" data-pane="folderViews" aria-controls="options-pane-folderViews" aria-selected="false">資料夾檢視</button>
+          <button class="options-tab" id="options-tab-picture" role="tab" data-pane="picture" aria-controls="options-pane-picture" aria-selected="false">圖片比對</button>
+          <button class="options-tab" id="options-tab-textEditing" role="tab" data-pane="textEditing" aria-controls="options-pane-textEditing" aria-selected="false">文字編輯</button>
+          <button class="options-tab" id="options-tab-archives" role="tab" data-pane="archives" aria-controls="options-pane-archives" aria-selected="false">封存檔類型</button>
+          <button class="options-tab" id="options-tab-openWith" role="tab" data-pane="openWith" aria-controls="options-pane-openWith" aria-selected="false">開啟方式</button>
+          <button class="options-tab" id="options-tab-tweaks" role="tab" data-pane="tweaks" aria-controls="options-pane-tweaks" aria-selected="false">進階調整</button>
         </div>
 
         <div class="modal-body options-body">
@@ -675,6 +681,135 @@
                 <input type="number" id="inp-font-ui-size" min="10" max="22" step="1" class="u-size-input" />
                 <span>px</span>
               </label>
+            </div>
+          </section>
+
+          <section class="options-pane" id="options-pane-folderViews" role="tabpanel" aria-labelledby="options-tab-folderViews" hidden>
+            <h4 class="settings-section-title">開啟資料夾比對時</h4>
+            <div class="settings-prefs">
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-folder-expand-on-open" />
+                <span>自動展開整棵樹</span>
+              </label>
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-folder-folders-first" />
+                <span>資料夾排在檔案之前</span>
+              </label>
+            </div>
+            <h4 class="settings-section-title">刪除</h4>
+            <div class="settings-prefs">
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-folder-confirm-delete" />
+                <span>刪除前先確認</span>
+              </label>
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-folder-recycle-bin" />
+                <span>刪除到資源回收筒，而不是直接刪除</span>
+              </label>
+              <p class="settings-hint">關閉後檔案無法復原，只有備份能救。</p>
+            </div>
+          </section>
+
+          <section class="options-pane" id="options-pane-picture" role="tabpanel" aria-labelledby="options-tab-picture" hidden>
+            <h4 class="settings-section-title">預設值</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>混合模式：</span>
+                <select id="sel-picture-blend" class="u-config-input">
+                  <option value="normal">一般</option>
+                  <option value="difference">差異</option>
+                  <option value="blend">混合</option>
+                </select>
+              </label>
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-picture-auto-scale" />
+                <span>自動縮放以符合視窗</span>
+              </label>
+              <label class="settings-field">
+                <span>容差：</span>
+                <input type="number" id="inp-picture-tolerance" min="0" max="255" step="1" class="u-size-input" />
+                <span>／255</span>
+              </label>
+              <p class="settings-hint">容差是每個色板允許的差距；0 代表完全相同才算相同。</p>
+            </div>
+          </section>
+
+          <section class="options-pane" id="options-pane-textEditing" role="tabpanel" aria-labelledby="options-tab-textEditing" hidden>
+            <h4 class="settings-section-title">縮排</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>Tab 寬度：</span>
+                <input type="number" id="inp-edit-tab-width" min="1" max="16" step="1" class="u-size-input" />
+              </label>
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-edit-insert-spaces" />
+                <span>按 Tab 時插入空白，而不是 Tab 字元</span>
+              </label>
+            </div>
+            <h4 class="settings-section-title">儲存時</h4>
+            <div class="settings-prefs">
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-edit-trim-on-save" />
+                <span>移除行尾多餘空白</span>
+              </label>
+              <label class="settings-field settings-field--check">
+                <input type="checkbox" id="chk-edit-final-newline" />
+                <span>確保檔案以換行結尾</span>
+              </label>
+              <p class="settings-hint">這兩項會改動檔案內容，因此預設關閉。</p>
+            </div>
+          </section>
+
+          <section class="options-pane" id="options-pane-archives" role="tabpanel" aria-labelledby="options-tab-archives" hidden>
+            <h4 class="settings-section-title">要當成資料夾展開的封存檔</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>副檔名：</span>
+                <input type="text" id="inp-archive-enabled" class="u-config-input" placeholder="zip,tar,gz,bz2,xz,7z,cab" />
+              </label>
+              <label class="settings-field">
+                <span>單一項目大小上限：</span>
+                <input type="number" id="inp-archive-max-mb" min="1" max="4096" step="1" class="u-size-input" />
+                <span>MB</span>
+              </label>
+              <p class="settings-hint" id="archive-support-hint"></p>
+            </div>
+          </section>
+
+          <section class="options-pane" id="options-pane-openWith" role="tabpanel" aria-labelledby="options-tab-openWith" hidden>
+            <h4 class="settings-section-title">外部程式</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>程式路徑：</span>
+                <input type="text" id="inp-openwith-command" class="u-config-input" placeholder="（空白代表使用系統預設程式）" />
+              </label>
+              <label class="settings-field">
+                <span>引數：</span>
+                <input type="text" id="inp-openwith-args" class="u-config-input" placeholder="&quot;%1&quot;" />
+              </label>
+              <p class="settings-hint">%1 會換成檔案路徑。引數以陣列傳給程式，不經過命令列解譯。</p>
+            </div>
+          </section>
+
+          <section class="options-pane" id="options-pane-tweaks" role="tabpanel" aria-labelledby="options-tab-tweaks" hidden>
+            <h4 class="settings-section-title">效能上限</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>排序預取檔案數上限：</span>
+                <input type="number" id="inp-tweak-prefetch" min="50" max="20000" step="50" class="u-size-input" />
+              </label>
+              <label class="settings-field">
+                <span>同時進行的檔案讀取數：</span>
+                <input type="number" id="inp-tweak-concurrency" min="1" max="32" step="1" class="u-size-input" />
+              </label>
+              <label class="settings-field">
+                <span>虛擬捲動預繪列數：</span>
+                <input type="number" id="inp-tweak-overscan" min="0" max="200" step="1" class="u-size-input" />
+              </label>
+              <p class="settings-hint">
+                調高會用掉更多記憶體與 IPC；調低會讓排序只涵蓋一部分檔案，
+                而被略過的部分會在狀態列說明，不會靜默截斷。
+              </p>
             </div>
           </section>
         </div>

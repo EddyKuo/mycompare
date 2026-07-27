@@ -92,6 +92,49 @@ export const DEFAULT_PREFS = {
   confirmOnCloseTab: false,
   showToolbar: true,
   showStatusBar: true,
+
+  // Folder Views
+  folderExpandOnOpen: false,
+  folderShowFoldersFirst: true,
+  folderConfirmDelete: true,
+  folderUseRecycleBin: true,
+
+  // Picture Compare
+  // 'difference' because that is what the view itself starts at, and it is the
+  // overlay the picture comparison exists to show. Defaulting to 'normal' here
+  // silently disabled it — and with it the blend slider — for every user who
+  // never opened the dialog.
+  pictureDefaultBlend: 'difference',
+  // Off, because on is not a display preference — it resamples one image to
+  // the other's dimensions before a single pixel is compared. A 16x4 against
+  // an 8x8 stops being a union and becomes an 8x8 rescale, which both hides
+  // real differences and invents ones the resampler introduced. The user who
+  // never opens this dialog has to get the honest comparison.
+  pictureAutoScale: false,
+  pictureTolerance: 0,
+
+  // Text Editing
+  editTabWidth: 4,
+  editInsertSpaces: true,
+  editTrimOnSave: false,
+  editEnsureFinalNewline: false,
+
+  // Archive Types — which containers the folder view will descend into.
+  // Off by default for none of them; a container this build cannot read is
+  // simply absent from the list rather than present and failing.
+  archiveEnabled: 'zip,tar,gz,bz2,xz,7z,cab',
+  archiveMaxEntryMB: 256,
+
+  // Open With
+  openWithCommand: '',
+  openWithArgs: '"%1"',
+
+  // Tweaks — the ceilings that used to be module constants only. Exposed
+  // because the right value depends on the machine and the tree being
+  // compared, and the failure mode of a too-low one is silent truncation.
+  tweakPrefetchLimit: 500,
+  tweakConcurrency: 4,
+  tweakVirtualOverscan: 10,
 }
 
 /**
@@ -110,6 +153,19 @@ export const PREF_PAGES = Object.freeze({
     'navWrapAround', 'navFirstDiffOnLoad', 'navNextAfterCopy', 'navShowNoDiffMessage',
   ]),
   backup: Object.freeze(['backupOnSave', 'backupNaming', 'backupFolder']),
+  folderViews: Object.freeze([
+    'folderExpandOnOpen', 'folderShowFoldersFirst', 'folderConfirmDelete',
+    'folderUseRecycleBin',
+  ]),
+  picture: Object.freeze(['pictureDefaultBlend', 'pictureAutoScale', 'pictureTolerance']),
+  textEditing: Object.freeze([
+    'editTabWidth', 'editInsertSpaces', 'editTrimOnSave', 'editEnsureFinalNewline',
+  ]),
+  archives: Object.freeze(['archiveEnabled', 'archiveMaxEntryMB']),
+  openWith: Object.freeze(['openWithCommand', 'openWithArgs']),
+  tweaks: Object.freeze([
+    'tweakPrefetchLimit', 'tweakConcurrency', 'tweakVirtualOverscan',
+  ]),
 })
 
 // ---------------------------------------------------------------------------

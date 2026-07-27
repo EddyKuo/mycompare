@@ -88,8 +88,10 @@
   vertical-align: middle;
 }
 
-/* T59: Blend mode selector */
-.ic-overlay-select {
+/* Shared toolbar select appearance (blend mode, highlight colour). The two
+   must not share an identifying class: a selector matching both is ambiguous,
+   which is how the blend-mode tests started resolving to two elements. */
+.ic-toolbar-select {
   padding: 2px 6px;
   background-color: var(--bg-secondary);
   color: var(--text-primary);
@@ -100,7 +102,7 @@
   font-family: inherit;
 }
 
-.ic-overlay-select:hover {
+.ic-toolbar-select:hover {
   background-color: var(--bg-toolbar);
 }
 
@@ -464,3 +466,98 @@
 }
 
 .ic-info-table td { font-variant-numeric: tabular-nums; }
+
+/* ── Custom highlight swatch ─────────────────────────────────────────────── */
+
+.ic-highlight-swatch {
+  width: 28px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: none;
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.ic-highlight-swatch:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+/* ── Difference offset ───────────────────────────────────────────────────── */
+
+.ic-offset-input {
+  width: 52px;
+  padding: 1px 4px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+}
+
+/* ── Replacements panel ──────────────────────────────────────────────────── */
+
+.ic-replacements-panel {
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-secondary);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.ic-replacements-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.ic-replacements-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-right: auto;
+}
+
+.ic-replacements-hint,
+.ic-replacements-empty {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+
+.ic-replacements-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ic-replacement-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ic-replacement-index {
+  color: var(--text-secondary);
+  min-width: 22px;
+}
+
+.ic-replacement-color {
+  width: 34px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: none;
+  cursor: pointer;
+}
+
+.ic-replacement-arrow,
+.ic-replacement-hex {
+  color: var(--text-secondary);
+  font-family: var(--font-mono, monospace);
+}

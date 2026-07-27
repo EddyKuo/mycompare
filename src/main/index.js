@@ -862,6 +862,39 @@ ipcMain.handle('crc32-file', async (_event, filePath) => {
   return computeCrc32(buffer)
 })
 
+// IPC: 版本控制狀態欄與 Source Control 子選單（僅 git）。
+//
+// 每一條路徑都要經過 validatePath——vcs.js 的介面註明它收到的是「已驗證的
+// 絕對路徑」，驗證是這一層的責任。批次操作特別容易漏：驗證了 root 卻讓
+// paths 陣列裡的元素直接進去，等於開了一個以 root 為幌子的任意路徑通道。
+ipcMain.handle('vcs-status', async (_event, dirPath) => {
+  const safe = validatePath(dirPath)
+  const { readVcsStatus } = await import('./vcs.js')
+  return readVcsStatus(safe)
+})
+
+ipcMain.handle('vcs-run', async (_event, req) => {
+  const root = validatePath(req?.root)
+  const paths = (Array.isArray(req?.paths) ? req.paths : []).map((p) => validatePath(p))
+  const { runVcsCommand } = await import('./vcs.js')
+  return runVcsCommand({ action: req?.action, root, paths })
+})
+
+ipcMain.handle('vcs-text', async (_event, req) => {
+  const root = validatePath(req?.root)
+  const filePath = validatePath(req?.path)
+  const { readVcsText } = await import('./vcs.js')
+  return readVcsText({ action: req?.action, root, path: filePath })
+})
+
+// IPC: 擁有者 / 群組欄。批次上限由 file-owner.js 明確拒絕超出的部分，
+// 不靜默截斷——被丟掉的列會顯示為「擁有者不明」而看不出原因。
+ipcMain.handle('file-owners', async (_event, paths) => {
+  const safe = (Array.isArray(paths) ? paths : []).map((p) => validatePath(p))
+  const { readOwners } = await import('./file-owner.js')
+  return readOwners(safe)
+})
+
 // IPC: T33 — 監視檔案變更（fs.watch，callback-based，非 promises）
 ipcMain.handle('watch-file', (event, filePath) => {
   const safe = validatePath(filePath)

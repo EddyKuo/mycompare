@@ -101,6 +101,72 @@ export const HIGHLIGHT_COLORS = {
 /** @type {HighlightColorKey} */
 export const DEFAULT_HIGHLIGHT_COLOR = 'red'
 
+/** The swatch a freshly-opened custom colour picker starts on. */
+export const DEFAULT_CUSTOM_HIGHLIGHT = '#ff8800'
+
+/**
+ * Parse `#rgb` / `#rrggbb` into channel values.
+ *
+ * @param {unknown} value
+ * @returns {[number, number, number] | null} null when the input is not a hex colour
+ */
+export function parseHexColor(value) {
+  if (typeof value !== 'string') return null
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value.trim())
+  if (!m) return null
+  const hex = m[1]
+  if (hex.length === 3) {
+    return [
+      parseInt(hex[0] + hex[0], 16),
+      parseInt(hex[1] + hex[1], 16),
+      parseInt(hex[2] + hex[2], 16),
+    ]
+  }
+  return [
+    parseInt(hex.slice(0, 2), 16),
+    parseInt(hex.slice(2, 4), 16),
+    parseInt(hex.slice(4, 6), 16),
+  ]
+}
+
+/**
+ * `#rrggbb` for a colour input, or null when the value is not a colour.
+ * @param {unknown} value
+ * @returns {string | null}
+ */
+export function normalizeHexColor(value) {
+  const rgb = parseHexColor(value)
+  if (!rgb) return null
+  return `#${rgb.map((n) => n.toString(16).padStart(2, '0')).join('')}`
+}
+
+/**
+ * Resolve a highlight selection to RGB.
+ *
+ * Accepts either a named key or a hex colour, so the custom swatch needs no
+ * separate code path anywhere downstream.
+ *
+ * @param {unknown} key
+ * @returns {[number, number, number]} the default colour when unrecognised
+ */
+export function resolveHighlightRGB(key) {
+  const named = HIGHLIGHT_COLORS[/** @type {HighlightColorKey} */ (key)]
+  if (named) return named.rgb
+  return parseHexColor(key) ?? HIGHLIGHT_COLORS[DEFAULT_HIGHLIGHT_COLOR].rgb
+}
+
+/**
+ * Human label for a highlight selection, for reports and tooltips.
+ * @param {unknown} key
+ * @returns {string}
+ */
+export function highlightColorLabel(key) {
+  const named = HIGHLIGHT_COLORS[/** @type {HighlightColorKey} */ (key)]
+  if (named) return named.label
+  const hex = normalizeHexColor(key)
+  return hex ? `自訂 ${hex}` : String(key)
+}
+
 /** Number of severity buckets used by mismatch-range mode. */
 export const MISMATCH_LEVELS = 4
 
@@ -186,17 +252,106 @@ export function mismatchLevel(magnitude, threshold, algorithm = 'exact') {
  * @returns {[number, number, number, number]}
  */
 export function highlightRGBA(colorKey, level = MISMATCH_LEVELS) {
-  const entry = HIGHLIGHT_COLORS[/** @type {HighlightColorKey} */ (colorKey)]
-    ?? HIGHLIGHT_COLORS[DEFAULT_HIGHLIGHT_COLOR]
+  const rgb = resolveHighlightRGB(colorKey)
   const lv = Math.min(MISMATCH_LEVELS, Math.max(1, Math.round(level)))
   const t = lv / MISMATCH_LEVELS
   const k = MIN_HIGHLIGHT_INTENSITY + (1 - MIN_HIGHLIGHT_INTENSITY) * t
   return [
-    Math.round(entry.rgb[0] * k),
-    Math.round(entry.rgb[1] * k),
-    Math.round(entry.rgb[2] * k),
+    Math.round(rgb[0] * k),
+    Math.round(rgb[1] * k),
+    Math.round(rgb[2] * k),
     Math.round(MIN_HIGHLIGHT_ALPHA + (MAX_HIGHLIGHT_ALPHA - MIN_HIGHLIGHT_ALPHA) * t),
   ]
+}
+
+// ── Replacements (BC "unimportant colour differences") ────────────────────────
+
+/**
+ * Upper bound on replacement rules.
+ *
+ * Every rule is one Map entry consulted only for pixels that already differ,
+ * so the cost is bounded regardless; the cap exists so the dialog stays a list
+ * a person can read rather than an unbounded table.
+ */
+export const MAX_REPLACEMENT_RULES = 64
+
+/**
+ * Colour used for differences that a replacement rule declared unimportant.
+ * Blue, per the project's fixed colour semantics for unimportant differences.
+ * @type {[number, number, number, number]}
+ */
+export const UNIMPORTANT_RGBA = [80, 140, 255, 170]
+
+/**
+ * @typedef {object} ReplacementRule
+ * @property {string} from  colour seen in a file, `#rrggbb`
+ * @property {string} to    colour it should be treated as, `#rrggbb`
+ */
+
+/** @param {number} r @param {number} g @param {number} b @returns {number} */
+function packRGB(r, g, b) {
+  return (r << 16) | (g << 8) | b
+}
+
+/**
+ * Turn replacement rules into the packed-RGB lookup the diff loop uses.
+ *
+ * Chains are resolved eagerly (a→b, b→c means a→c) so the inner loop never
+ * has to follow more than one link; a cycle stops at its entry point rather
+ * than looping forever.
+ *
+ * @param {ReplacementRule[] | null | undefined} rules
+ * @returns {Map<number, number> | null} null when there is nothing to apply
+ */
+export function buildReplacementMap(rules) {
+  if (!Array.isArray(rules) || rules.length === 0) return null
+  /** @type {Map<number, number>} */
+  const direct = new Map()
+  for (const rule of rules.slice(0, MAX_REPLACEMENT_RULES)) {
+    const from = parseHexColor(rule?.from)
+    const to = parseHexColor(rule?.to)
+    if (!from || !to) continue
+    const key = packRGB(from[0], from[1], from[2])
+    const val = packRGB(to[0], to[1], to[2])
+    if (key === val) continue
+    // First rule wins, so an accidental duplicate cannot silently override an
+    // earlier one the user still sees listed above it.
+    if (!direct.has(key)) direct.set(key, val)
+  }
+  if (direct.size === 0) return null
+
+  /** @type {Map<number, number>} */
+  const resolved = new Map()
+  for (const key of direct.keys()) {
+    let cur = /** @type {number} */ (direct.get(key))
+    const seen = new Set([key])
+    while (direct.has(cur) && !seen.has(cur)) {
+      seen.add(cur)
+      cur = /** @type {number} */ (direct.get(cur))
+    }
+    resolved.set(key, cur)
+  }
+  return resolved
+}
+
+/**
+ * Validate/normalise rules coming from a stored config or the dialog.
+ *
+ * @param {unknown} rules
+ * @returns {ReplacementRule[]}
+ */
+export function normalizeReplacements(rules) {
+  if (!Array.isArray(rules)) return []
+  /** @type {ReplacementRule[]} */
+  const out = []
+  for (const rule of rules) {
+    const from = normalizeHexColor(rule?.from)
+    const to = normalizeHexColor(rule?.to)
+    if (!from || !to) continue
+    out.push({ from, to })
+    if (out.length >= MAX_REPLACEMENT_RULES) break
+  }
+  return out
 }
 
 /**
@@ -217,6 +372,10 @@ export function highlightRGBA(colorKey, level = MISMATCH_LEVELS) {
  * @property {Uint32Array} [tileCounts] - 選用；每個 tile 累計的差異像素數
  * @property {number} [tileSize] - tile 邊長（px），搭配 tileCounts 使用
  * @property {number} [tileCols] - tileCounts 的每列 tile 數
+ * @property {Map<number, number> | null} [replacements] - packed-RGB 取代表
+ * @property {number} [offsetX] - 右圖相對左圖的水平位移（px）
+ * @property {number} [offsetY] - 右圖相對左圖的垂直位移（px）
+ * @property {{ unimportant: number }} [counters] - 就地寫回「不重要差異」像素數
  */
 
 /**
@@ -234,9 +393,17 @@ export function computeDiffBuffer(opts) {
     tileCounts = null,
     tileSize = 0,
     tileCols = 0,
+    replacements = null,
+    offsetX = 0,
+    offsetY = 0,
+    counters = null,
   } = opts
 
   const tally = tileCounts && tileSize > 0 && tileCols > 0 ? tileCounts : null
+  const remap = replacements instanceof Map && replacements.size > 0 ? replacements : null
+  const ox = Number.isFinite(offsetX) ? Math.trunc(offsetX) : 0
+  const oy = Number.isFinite(offsetY) ? Math.trunc(offsetY) : 0
+  let unimportantCount = 0
 
   // The inner loop runs once per pixel, so the per-level colours are resolved
   // up-front rather than recomputed millions of times.
@@ -253,8 +420,12 @@ export function computeDiffBuffer(opts) {
     for (let x = 0; x < width; x++) {
       const outIdx = (y * width + x) * 4
 
+      // The right image can be displaced, so its sample coordinate is the
+      // canvas coordinate minus the offset.
+      const rx = x - ox
+      const ry = y - oy
       const inLeft  = x < lw && y < lh
-      const inRight = x < rw && y < rh
+      const inRight = rx >= 0 && ry >= 0 && rx < rw && ry < rh
 
       if (!inLeft || !inRight) {
         // 超出其中一張圖的範圍 → 視為最嚴重的差異
@@ -268,19 +439,47 @@ export function computeDiffBuffer(opts) {
       }
 
       const lIdx = (y * lw + x) * 4
-      const rIdx = (y * rw + x) * 4
+      const rIdx = (ry * rw + rx) * 4
 
       const lR = leftData[lIdx]
       const lG = leftData[lIdx + 1]
       const lB = leftData[lIdx + 2]
+      const rR = rightData[rIdx]
+      const rG = rightData[rIdx + 1]
+      const rB = rightData[rIdx + 2]
 
-      const magnitude = pixelDiffMagnitude(
-        lR, lG, lB,
-        rightData[rIdx], rightData[rIdx + 1], rightData[rIdx + 2],
-        algorithm,
-      )
+      const magnitude = pixelDiffMagnitude(lR, lG, lB, rR, rG, rB, algorithm)
 
       if (isPixelDiff(magnitude, threshold, algorithm)) {
+        // Replacements are consulted only for pixels that already differ, so
+        // an identical image pays nothing for having rules configured.
+        let unimportant = false
+        if (remap) {
+          const lKey = packRGB(lR, lG, lB)
+          const rKey = packRGB(rR, rG, rB)
+          const lCanon = remap.get(lKey) ?? lKey
+          const rCanon = remap.get(rKey) ?? rKey
+          if (lCanon === rCanon) {
+            unimportant = true
+          } else {
+            const after = pixelDiffMagnitude(
+              (lCanon >> 16) & 0xff, (lCanon >> 8) & 0xff, lCanon & 0xff,
+              (rCanon >> 16) & 0xff, (rCanon >> 8) & 0xff, rCanon & 0xff,
+              algorithm,
+            )
+            unimportant = !isPixelDiff(after, threshold, algorithm)
+          }
+        }
+
+        if (unimportant) {
+          out[outIdx]     = UNIMPORTANT_RGBA[0]
+          out[outIdx + 1] = UNIMPORTANT_RGBA[1]
+          out[outIdx + 2] = UNIMPORTANT_RGBA[2]
+          out[outIdx + 3] = UNIMPORTANT_RGBA[3]
+          unimportantCount++
+          continue
+        }
+
         const rgba = mismatchRange
           ? palette[mismatchLevel(magnitude, threshold, algorithm) - 1]
           : flat
@@ -299,6 +498,7 @@ export function computeDiffBuffer(opts) {
     }
   }
 
+  if (counters) counters.unimportant = unimportantCount
   return diffCount
 }
 
@@ -475,6 +675,12 @@ export function formatDiffStats(diffCount, totalPixels, approximate = false) {
  * @property {string} highlightColor
  * @property {ImageMetadata|null} [leftMeta]
  * @property {ImageMetadata|null} [rightMeta]
+ * @property {boolean} [compareMetadata]
+ * @property {MetadataFieldDiff[]} [metadataDiffs]
+ * @property {ReplacementRule[]} [replacements]
+ * @property {boolean} [ignoreUnimportant]
+ * @property {number} [unimportantCount]
+ * @property {{ x: number, y: number }} [diffOffset]
  */
 
 const ALGORITHM_LABELS = {
@@ -505,8 +711,15 @@ export function imageReportParameters(info) {
     ['差異分級', info.mismatchRange ? '開' : '關'],
     ['疊加模式', BLEND_LABELS[info.blendMode] ?? String(info.blendMode)],
     ['混合比例', `${Math.round((info.blendRatio ?? 1) * 100)}%`],
-    ['標示色', HIGHLIGHT_COLORS[info.highlightColor]?.label ?? String(info.highlightColor)],
+    ['標示色', highlightColorLabel(info.highlightColor)],
     ['差異區塊數', String(info.regionCount ?? 0)],
+    ['差異位移', `X ${info.diffOffset?.x ?? 0}, Y ${info.diffOffset?.y ?? 0}`],
+    ['中繼資料比對', info.compareMetadata
+      ? `開（差異 ${info.metadataDiffs?.length ?? 0} 項）`
+      : '關'],
+    ['取代規則', `${info.replacements?.length ?? 0} 條${
+      info.ignoreUnimportant ? '（已套用，忽略不重要差異）' : '（未套用）'}`],
+    ['不重要差異像素', String(info.unimportantCount ?? 0)],
   ]
 }
 
@@ -536,8 +749,11 @@ export function buildImageTextReport(info, opts = {}) {
    */
   const meta = (label, m) => `${label}檔頭中繼資料\n${
     renderTextTable([{ title: '項目' }, { title: '值' }], imageMetadataRows(m))}`
+  const metaDiff = `中繼資料差異\n${renderTextTable(
+    [{ title: '項目' }, { title: '值' }],
+    metadataDiffRows(info.metadataDiffs ?? [], !!info.compareMetadata))}`
   return `${header}${summary}\n\n${table}\n\n${
-    meta('左側', info.leftMeta)}\n${meta('右側', info.rightMeta)}\n`
+    meta('左側', info.leftMeta)}\n${meta('右側', info.rightMeta)}\n${metaDiff}\n`
 }
 
 // ── Image info panel ─────────────────────────────────────────────────────────
@@ -936,6 +1152,71 @@ export function imageMetadataRows(meta) {
 }
 
 /**
+ * @typedef {object} MetadataFieldDiff
+ * @property {string} label
+ * @property {string} left   '（無此欄位）' when the side does not carry it
+ * @property {string} right
+ */
+
+/** Shown when one side has no such field at all, as opposed to an empty one. */
+const META_ABSENT = '（無此欄位）'
+
+/**
+ * Header fields that differ between the two files.
+ *
+ * Only fields either side actually carries are considered — a format whose
+ * header this reader cannot decode yields no diffs rather than being reported
+ * as "different from" a format it can, which would be an artefact of the
+ * reader, not of the files.
+ *
+ * @param {ImageMetadata|null|undefined} left
+ * @param {ImageMetadata|null|undefined} right
+ * @returns {MetadataFieldDiff[]}
+ */
+export function metadataFieldDiffs(left, right) {
+  /** @param {ImageMetadata|null|undefined} m @returns {Map<string, string>} */
+  const toMap = (m) => {
+    /** @type {Map<string, string>} */
+    const map = new Map()
+    if (!m || !m.supported || !Array.isArray(m.fields)) return map
+    for (const row of m.fields) {
+      if (!Array.isArray(row) || row.length < 2) continue
+      // A repeated label keeps its first value: EXIF can name the same tag in
+      // both IFD0 and the Exif sub-IFD, and IFD0 is the authoritative one.
+      if (!map.has(String(row[0]))) map.set(String(row[0]), String(row[1]))
+    }
+    return map
+  }
+  const l = toMap(left)
+  const r = toMap(right)
+  if (l.size === 0 && r.size === 0) return []
+
+  /** @type {MetadataFieldDiff[]} */
+  const out = []
+  const labels = [...l.keys()]
+  for (const label of r.keys()) if (!l.has(label)) labels.push(label)
+  for (const label of labels) {
+    const lv = l.has(label) ? /** @type {string} */ (l.get(label)) : META_ABSENT
+    const rv = r.has(label) ? /** @type {string} */ (r.get(label)) : META_ABSENT
+    if (lv !== rv) out.push({ label, left: lv, right: rv })
+  }
+  return out
+}
+
+/**
+ * Metadata-difference rows for the info panel and reports.
+ *
+ * @param {MetadataFieldDiff[]} diffs
+ * @param {boolean} enabled  whether metadata comparison is switched on
+ * @returns {string[][]}
+ */
+export function metadataDiffRows(diffs, enabled) {
+  if (!enabled) return [['中繼資料比對', '關閉（中繼資料僅顯示，不計入比對結果）']]
+  if (!diffs || diffs.length === 0) return [['中繼資料比對', '開啟：兩側中繼資料相同']]
+  return diffs.map((d) => [d.label, `左：${d.left}　右：${d.right}`])
+}
+
+/**
  * @typedef {object} ImageSideInfo
  * @property {string} path
  * @property {string} format     file extension as loaded
@@ -1046,6 +1327,10 @@ ${rows}
 </tbody></table>
 ${metaTable('左側', info.leftMeta)}
 ${metaTable('右側', info.rightMeta)}
+<h3>中繼資料差異</h3>
+<table><thead><tr><th>項目</th><th>值</th></tr></thead><tbody>
+${toRows(metadataDiffRows(info.metadataDiffs ?? [], !!info.compareMetadata))}
+</tbody></table>
 </body></html>`
 }
 
@@ -1274,18 +1559,55 @@ export class ImageCompare {
     /**
      * Last computed statistics, kept so a report states the same numbers the
      * status bar shows rather than re-running the diff to find out.
-     * @type {{ diffCount: number|null, totalPixels: number|null, approximate: boolean }}
+     * @type {{ diffCount: number|null, totalPixels: number|null, approximate: boolean,
+     *          unimportant: number }}
      */
-    this._stats = { diffCount: null, totalPixels: null, approximate: false }
+    this._stats = { diffCount: null, totalPixels: null, approximate: false, unimportant: 0 }
 
     /** @type {(() => void) | null} removes the drag/drop listeners on destroy */
     this._dropCleanup = null
 
     /**
-     * S16: user-selectable highlight colour key (see HIGHLIGHT_COLORS).
+     * S16: user-selectable highlight colour — a HIGHLIGHT_COLORS key or, when
+     * the custom swatch is in use, a `#rrggbb` literal.
      * @type {string}
      */
     this._highlightColor = DEFAULT_HIGHLIGHT_COLOR
+
+    /**
+     * Last colour the custom swatch held, kept separately so switching to a
+     * named colour and back does not lose the user's pick.
+     * @type {string}
+     */
+    this._customHighlight = DEFAULT_CUSTOM_HIGHLIGHT
+
+    /**
+     * BC's View > Compare Metadata: when on, header metadata differences count
+     * as part of the comparison result rather than being display-only.
+     * @type {boolean}
+     */
+    this._compareMetadata = false
+
+    /** @type {MetadataFieldDiff[]} result of the last metadata comparison */
+    this._metaDiffs = []
+
+    /**
+     * BC Session Settings > Replacements: colours declared equivalent, so a
+     * palette shift is not reported as a difference on every pixel.
+     * @type {ReplacementRule[]}
+     */
+    this._replacements = []
+
+    /** Whether the replacement rules are applied at all. @type {boolean} */
+    this._ignoreUnimportant = true
+
+    /**
+     * BC's difference offset: how far the right image is displaced relative to
+     * the left before the pixel diff. Two screenshots that differ only by a
+     * few pixels of scroll otherwise compare as entirely different.
+     * @type {{ x: number, y: number }}
+     */
+    this._diffOffset = { x: 0, y: 0 }
 
     /**
      * Panel layout, matching the other views' Side-by-side / Over-under toggle.
@@ -1373,6 +1695,12 @@ export class ImageCompare {
       autoScale: this._autoScale,
       mismatchRange: this._mismatchRange,
       highlightColor: this._highlightColor,
+      customHighlight: this._customHighlight,
+      compareMetadata: this._compareMetadata,
+      replacements: this._replacements.map((r) => ({ from: r.from, to: r.to })),
+      ignoreUnimportant: this._ignoreUnimportant,
+      offsetX: this._diffOffset.x,
+      offsetY: this._diffOffset.y,
       layout: this._layout,
     })
   }
@@ -1394,9 +1722,17 @@ export class ImageCompare {
     if (typeof s.autoScale === 'boolean') this._autoScale = s.autoScale
     if (typeof s.mismatchRange === 'boolean') this._mismatchRange = s.mismatchRange
     if (typeof s.highlightColor === 'string'
-        && Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, s.highlightColor)) {
-      this._highlightColor = s.highlightColor
+        && (Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, s.highlightColor)
+            || normalizeHexColor(s.highlightColor))) {
+      this._highlightColor = normalizeHexColor(s.highlightColor) ?? s.highlightColor
     }
+    const custom = normalizeHexColor(s.customHighlight)
+    if (custom) this._customHighlight = custom
+    if (typeof s.compareMetadata === 'boolean') this._compareMetadata = s.compareMetadata
+    if (Array.isArray(s.replacements)) this._replacements = normalizeReplacements(s.replacements)
+    if (typeof s.ignoreUnimportant === 'boolean') this._ignoreUnimportant = s.ignoreUnimportant
+    if (Number.isFinite(s.offsetX)) this._diffOffset.x = Math.trunc(s.offsetX)
+    if (Number.isFinite(s.offsetY)) this._diffOffset.y = Math.trunc(s.offsetY)
     if (s.layout === 'side' || s.layout === 'over') this._layout = s.layout
     this._syncConfigControls()
     this.refresh()
@@ -1410,10 +1746,30 @@ export class ImageCompare {
     if (dom.overlaySelect) dom.overlaySelect.value = this._blendMode
     if (dom.blendRatioSlider) dom.blendRatioSlider.value = String(this._blendRatio)
     this._updateBlendRatioLabel()
-    if (dom.highlightSelect) dom.highlightSelect.value = this._highlightColor
+    this._syncHighlightControls()
+    if (dom.compareMetaCheck) dom.compareMetaCheck.checked = this._compareMetadata
+    if (dom.ignoreUnimportantCheck) dom.ignoreUnimportantCheck.checked = this._ignoreUnimportant
+    if (dom.offsetXInput) dom.offsetXInput.value = String(this._diffOffset.x)
+    if (dom.offsetYInput) dom.offsetYInput.value = String(this._diffOffset.y)
     if (dom.thresholdSlider) dom.thresholdSlider.value = String(this._threshold)
     if (dom.thresholdVal) dom.thresholdVal.textContent = this._threshold.toFixed(2)
+    this._updateReplacementsButton()
+    this._updateLegend()
     this._applyLayout()
+  }
+
+  /** Keep the named-colour select and the custom swatch consistent. */
+  _syncHighlightControls() {
+    const sel = /** @type {HTMLSelectElement | undefined} */ (this._dom.highlightSelect)
+    const swatch = /** @type {HTMLInputElement | undefined} */ (this._dom.highlightSwatch)
+    const isNamed = Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, this._highlightColor)
+    if (sel) sel.value = isNamed ? this._highlightColor : 'custom'
+    if (swatch) {
+      swatch.value = isNamed ? this._customHighlight : this._highlightColor
+      // Disabled rather than hidden: a control that vanishes reads as a bug,
+      // and the greyed swatch still shows which colour custom mode would use.
+      swatch.disabled = isNamed
+    }
   }
 
   // ── Public: layout ──────────────────────────────────────────────────────────
@@ -1816,21 +2172,210 @@ export class ImageCompare {
   }
 
   /**
-   * @param {string} key - HIGHLIGHT_COLORS 的鍵；未知值視為 no-op
+   * @param {string} key - HIGHLIGHT_COLORS 的鍵，或 `#rrggbb` 自訂色；
+   *   兩者皆不符時視為 no-op
+   * @returns {string} 目前生效的標示色
    */
   setHighlightColor(key) {
-    if (!Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, key)) return
-    if (key === this._highlightColor) return
-    this._highlightColor = key
-    const sel = /** @type {HTMLSelectElement | undefined} */ (this._dom.highlightSelect)
-    if (sel && sel.value !== key) sel.value = key
+    const named = Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, key)
+    const hex = named ? null : normalizeHexColor(key)
+    if (!named && !hex) return this._highlightColor
+    const next = named ? String(key) : /** @type {string} */ (hex)
+    if (hex) this._customHighlight = hex
+    if (next === this._highlightColor) {
+      this._syncHighlightControls()
+      return this._highlightColor
+    }
+    this._highlightColor = next
+    this._syncHighlightControls()
     this._updateLegend()
     void this._runDiff()
+    return this._highlightColor
   }
 
   /** @returns {string} */
   getHighlightColor() {
     return this._highlightColor
+  }
+
+  /** @returns {string} the `#rrggbb` the custom swatch currently holds */
+  getCustomHighlight() {
+    return this._customHighlight
+  }
+
+  // ── Public API: Blend toggle ────────────────────────────────────────────────
+
+  /**
+   * BC's Blend Toggle — one key steps through the overlay modes, because
+   * flicking between them per image pair is the common case and opening a
+   * drop-down each time is not.
+   *
+   * @returns {'normal'|'difference'|'blend'} the mode now in force
+   */
+  cycleBlendMode() {
+    /** @type {Array<'normal'|'difference'|'blend'>} */
+    const order = ['normal', 'difference', 'blend']
+    const idx = order.indexOf(this._blendMode)
+    this.setBlendMode(order[(idx + 1) % order.length])
+    return this._blendMode
+  }
+
+  // ── Public API: Compare Metadata ────────────────────────────────────────────
+
+  /**
+   * BC's View > Compare Metadata.
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setCompareMetadata(on) {
+    const next = !!on
+    if (next !== this._compareMetadata) {
+      this._compareMetadata = next
+      const box = /** @type {HTMLInputElement | undefined} */ (this._dom.compareMetaCheck)
+      if (box && box.checked !== next) box.checked = next
+      this._refreshMetadataDiffs()
+      this._updateStats(
+        this._stats.diffCount, this._stats.totalPixels,
+        this._stats.approximate, this._stats.unimportant)
+      this._renderInfoPanel()
+    }
+    return this._compareMetadata
+  }
+
+  /** @returns {boolean} */
+  getCompareMetadata() {
+    return this._compareMetadata
+  }
+
+  /** @returns {MetadataFieldDiff[]} differing header fields from the last compare */
+  getMetadataDiffs() {
+    return this._metaDiffs.slice()
+  }
+
+  /** Recompute the metadata comparison from the loaded files. */
+  _refreshMetadataDiffs() {
+    this._metaDiffs = this._compareMetadata
+      ? metadataFieldDiffs(this._left?.meta ?? null, this._right?.meta ?? null)
+      : []
+  }
+
+  // ── Public API: Replacements ────────────────────────────────────────────────
+
+  /**
+   * Replace the whole rule list. Invalid entries are dropped rather than
+   * silently treated as a colour, and the caller is told how many survived.
+   *
+   * @param {ReplacementRule[]} rules
+   * @returns {ReplacementRule[]} the rules now in force
+   */
+  setReplacements(rules) {
+    this._replacements = normalizeReplacements(rules)
+    this._updateReplacementsButton()
+    this._renderReplacementRows()
+    void this._runDiff()
+    return this.getReplacements()
+  }
+
+  /** @returns {ReplacementRule[]} */
+  getReplacements() {
+    return this._replacements.map((r) => ({ from: r.from, to: r.to }))
+  }
+
+  /**
+   * @param {string} from
+   * @param {string} to
+   * @returns {boolean} false when the colours are unusable or the list is full
+   */
+  addReplacement(from, to) {
+    if (this._replacements.length >= MAX_REPLACEMENT_RULES) {
+      this._emit('status', {
+        message: `取代規則已達上限 ${MAX_REPLACEMENT_RULES} 條`, level: 'warn',
+      })
+      return false
+    }
+    const f = normalizeHexColor(from)
+    const t = normalizeHexColor(to)
+    if (!f || !t) {
+      this._emit('status', { message: '取代規則需要兩個有效的色碼', level: 'warn' })
+      return false
+    }
+    this._replacements.push({ from: f, to: t })
+    this._updateReplacementsButton()
+    this._renderReplacementRows()
+    void this._runDiff()
+    return true
+  }
+
+  /**
+   * @param {number} index
+   * @returns {boolean} false when there is no such rule
+   */
+  removeReplacement(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this._replacements.length) return false
+    this._replacements.splice(index, 1)
+    this._updateReplacementsButton()
+    this._renderReplacementRows()
+    void this._runDiff()
+    return true
+  }
+
+  /**
+   * BC's View > Ignore Unimportant Differences: gates whether the replacement
+   * rules are applied at all.
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setIgnoreUnimportant(on) {
+    const next = !!on
+    if (next === this._ignoreUnimportant) return this._ignoreUnimportant
+    this._ignoreUnimportant = next
+    const box = /** @type {HTMLInputElement | undefined} */ (this._dom.ignoreUnimportantCheck)
+    if (box && box.checked !== next) box.checked = next
+    void this._runDiff()
+    return this._ignoreUnimportant
+  }
+
+  /** @returns {boolean} */
+  getIgnoreUnimportant() {
+    return this._ignoreUnimportant
+  }
+
+  /** The rule map the diff actually uses, or null when nothing applies. */
+  _activeReplacementMap() {
+    if (!this._ignoreUnimportant) return null
+    return buildReplacementMap(this._replacements)
+  }
+
+  // ── Public API: Difference offset ───────────────────────────────────────────
+
+  /**
+   * Displace the right image relative to the left before the pixel diff.
+   *
+   * @param {number} x
+   * @param {number} y
+   * @returns {{ x: number, y: number }} the offset now in force
+   */
+  setDiffOffset(x, y) {
+    const nx = Number.isFinite(x) ? Math.trunc(x) : this._diffOffset.x
+    const ny = Number.isFinite(y) ? Math.trunc(y) : this._diffOffset.y
+    if (nx === this._diffOffset.x && ny === this._diffOffset.y) return this.getDiffOffset()
+    this._diffOffset = { x: nx, y: ny }
+    const xi = /** @type {HTMLInputElement | undefined} */ (this._dom.offsetXInput)
+    const yi = /** @type {HTMLInputElement | undefined} */ (this._dom.offsetYInput)
+    if (xi && xi.value !== String(nx)) xi.value = String(nx)
+    if (yi && yi.value !== String(ny)) yi.value = String(ny)
+    void this._runDiff()
+    return this.getDiffOffset()
+  }
+
+  /** @returns {{ x: number, y: number }} */
+  getDiffOffset() {
+    return { x: this._diffOffset.x, y: this._diffOffset.y }
+  }
+
+  /** BC's Reset Difference Offset — realign the two images' top-left corners. */
+  resetDiffOffset() {
+    return this.setDiffOffset(0, 0)
   }
 
   /**
@@ -2015,6 +2560,12 @@ export class ImageCompare {
       highlightColor: this._highlightColor,
       leftMeta: this._left?.meta ?? null,
       rightMeta: this._right?.meta ?? null,
+      compareMetadata: this._compareMetadata,
+      metadataDiffs: this.getMetadataDiffs(),
+      replacements: this.getReplacements(),
+      ignoreUnimportant: this._ignoreUnimportant,
+      unimportantCount: this._stats.unimportant,
+      diffOffset: this.getDiffOffset(),
     }
   }
 
@@ -2157,12 +2708,14 @@ export class ImageCompare {
     root.appendChild(this._buildPathRow())
     root.appendChild(this._buildToolbar())
     root.appendChild(this._buildInfoPanel())
+    root.appendChild(this._buildReplacementsDialog())
     root.appendChild(this._buildBody())
     root.appendChild(this._buildRegionList())
     root.appendChild(this._buildStats())
 
     this._container.appendChild(root)
     this._dom.root = root
+    this._updateReplacementsButton()
 
     // 建立同步縮放/平移控制器
     this._setupSyncTransform()
@@ -2237,7 +2790,7 @@ export class ImageCompare {
     const blendLabel = el('label', { className: 'ic-toolbar-label', textContent: '疊加模式：' })
     toolbar.appendChild(blendLabel)
     const overlaySelect = /** @type {HTMLSelectElement} */ (el('select', {
-      className: 'ic-overlay-select',
+      className: 'ic-toolbar-select ic-overlay-select',
       title: '差異疊加顯示模式',
     }))
     for (const [val, text] of /** @type {Array<['normal'|'difference'|'blend', string]>} */ ([
@@ -2253,6 +2806,15 @@ export class ImageCompare {
     overlaySelect.value = this._blendMode
     this._dom.overlaySelect = overlaySelect
     toolbar.appendChild(overlaySelect)
+
+    // BC's Blend Toggle: stepping the mode without opening the drop-down.
+    const btnBlendToggle = el('button', {
+      className: 'ic-btn-refresh ic-btn-blend-toggle',
+      title: '循環切換疊加模式：無 → 差異 → 混合 (Ctrl+B)',
+      textContent: '⇋',
+    })
+    this._dom.btnBlendToggle = btnBlendToggle
+    toolbar.appendChild(btnBlendToggle)
 
     // Blend percentage — BC's blend is a slider, not a switch.
     toolbar.appendChild(el('label', { className: 'ic-toolbar-label', textContent: '混合比例：' }))
@@ -2309,7 +2871,10 @@ export class ImageCompare {
     // S16-3: Highlight colour
     toolbar.appendChild(el('label', { className: 'ic-toolbar-label', textContent: '標示色：' }))
     const highlightSelect = /** @type {HTMLSelectElement} */ (el('select', {
-      className: 'ic-overlay-select ic-highlight-select',
+      // Shares the appearance class, not the identifying one: carrying
+      // ic-overlay-select here made every selector for the blend-mode control
+      // match two elements.
+      className: 'ic-toolbar-select ic-highlight-select',
       title: '差異像素的高亮顏色',
     }))
     for (const [key, entry] of Object.entries(HIGHLIGHT_COLORS)) {
@@ -2318,9 +2883,91 @@ export class ImageCompare {
       opt.textContent = entry.label
       highlightSelect.appendChild(opt)
     }
-    highlightSelect.value = this._highlightColor
+    const customOpt = document.createElement('option')
+    customOpt.value = 'custom'
+    customOpt.textContent = '自訂…'
+    highlightSelect.appendChild(customOpt)
     this._dom.highlightSelect = highlightSelect
     toolbar.appendChild(highlightSelect)
+
+    const highlightSwatch = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'color',
+      className: 'ic-highlight-swatch',
+      title: '自訂差異標示色（先在左側下拉選「自訂…」）',
+    }))
+    this._dom.highlightSwatch = highlightSwatch
+    toolbar.appendChild(highlightSwatch)
+    this._syncHighlightControls()
+
+    // Separator
+    toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
+
+    // BC View > Compare Metadata
+    const compareMetaCheck = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'checkbox',
+      className: 'ic-toolbar-check ic-compare-meta-check',
+      id: 'ic-compare-meta',
+      title: '把檔頭中繼資料（EXIF 等）的差異一併計入比對結果，而非僅顯示',
+    }))
+    compareMetaCheck.checked = this._compareMetadata
+    this._dom.compareMetaCheck = compareMetaCheck
+    toolbar.appendChild(compareMetaCheck)
+    toolbar.appendChild(el('label', {
+      className: 'ic-toolbar-label', for: 'ic-compare-meta', textContent: '比對中繼資料',
+    }))
+
+    // BC View > Ignore Unimportant Differences (gates the replacement rules)
+    const ignoreUnimportantCheck = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'checkbox',
+      className: 'ic-toolbar-check ic-ignore-unimportant-check',
+      id: 'ic-ignore-unimportant',
+      title: '套用取代規則：符合規則的色彩差異標為藍色，且不計入差異像素數',
+    }))
+    ignoreUnimportantCheck.checked = this._ignoreUnimportant
+    this._dom.ignoreUnimportantCheck = ignoreUnimportantCheck
+    toolbar.appendChild(ignoreUnimportantCheck)
+    toolbar.appendChild(el('label', {
+      className: 'ic-toolbar-label', for: 'ic-ignore-unimportant', textContent: '忽略不重要差異',
+    }))
+
+    const btnReplacements = el('button', {
+      className: 'ic-btn-refresh ic-btn-replacements',
+      title: '取代規則：指定某個色彩視為與另一個色彩相同',
+      textContent: '🎨 取代規則',
+    })
+    this._dom.btnReplacements = btnReplacements
+    toolbar.appendChild(btnReplacements)
+
+    // Separator
+    toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
+
+    // BC difference offset / Reset Difference Offset
+    toolbar.appendChild(el('label', { className: 'ic-toolbar-label', textContent: '位移 X/Y：' }))
+    const offsetXInput = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'number',
+      className: 'ic-offset-input',
+      step: '1',
+      value: String(this._diffOffset.x),
+      title: '右圖相對左圖的水平位移（像素）',
+    }))
+    this._dom.offsetXInput = offsetXInput
+    toolbar.appendChild(offsetXInput)
+    const offsetYInput = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'number',
+      className: 'ic-offset-input',
+      step: '1',
+      value: String(this._diffOffset.y),
+      title: '右圖相對左圖的垂直位移（像素）',
+    }))
+    this._dom.offsetYInput = offsetYInput
+    toolbar.appendChild(offsetYInput)
+    const btnResetOffset = el('button', {
+      className: 'ic-btn-refresh ic-btn-reset-offset',
+      title: '重設差異位移：兩張圖左上角重新對齊',
+      textContent: '⌖ 重設位移',
+    })
+    this._dom.btnResetOffset = btnResetOffset
+    toolbar.appendChild(btnResetOffset)
 
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
@@ -2504,6 +3151,138 @@ export class ImageCompare {
     return panel
   }
 
+  // ── Private: Replacements dialog ────────────────────────────────────────────
+
+  _buildReplacementsDialog() {
+    const panel = el('div', { className: 'ic-replacements-panel' })
+    panel.style.display = 'none'
+
+    const head = el('div', { className: 'ic-replacements-head' })
+    head.appendChild(el('span', {
+      className: 'ic-replacements-title', textContent: '取代規則（色彩視為相同）',
+    }))
+    const btnAdd = el('button', {
+      className: 'ic-btn-refresh ic-btn-add-replacement',
+      textContent: '＋ 新增規則',
+      title: `新增一條取代規則（上限 ${MAX_REPLACEMENT_RULES} 條）`,
+    })
+    this._dom.btnAddReplacement = btnAdd
+    head.appendChild(btnAdd)
+    const btnClose = el('button', {
+      className: 'ic-btn-refresh ic-btn-close-replacements',
+      textContent: '✕ 關閉',
+      title: '關閉取代規則面板',
+    })
+    this._dom.btnCloseReplacements = btnClose
+    head.appendChild(btnClose)
+    panel.appendChild(head)
+
+    panel.appendChild(el('div', {
+      className: 'ic-replacements-hint',
+      textContent: '左欄色彩會被當成右欄色彩來比對。'
+        + '需勾選工具列的「忽略不重要差異」才會套用；符合規則的差異以藍色標示，不計入差異像素數。',
+    }))
+
+    const list = el('div', { className: 'ic-replacements-list' })
+    this._dom.replacementsList = list
+    panel.appendChild(list)
+
+    this._dom.replacementsPanel = panel
+    this._renderReplacementRows()
+    return panel
+  }
+
+  /** Repaint the rule rows from `_replacements`. */
+  _renderReplacementRows() {
+    const list = /** @type {HTMLElement | undefined} */ (this._dom.replacementsList)
+    if (!list) return
+    list.replaceChildren()
+
+    if (this._replacements.length === 0) {
+      list.appendChild(el('div', {
+        className: 'ic-replacements-empty', textContent: '尚無規則。',
+      }))
+      return
+    }
+
+    this._replacements.forEach((rule, idx) => {
+      const row = el('div', { className: 'ic-replacement-row' })
+      row.appendChild(el('span', {
+        className: 'ic-replacement-index', textContent: `${idx + 1}.`,
+      }))
+
+      const from = /** @type {HTMLInputElement} */ (el('input', {
+        type: 'color', className: 'ic-replacement-color', title: '檔案中出現的色彩',
+      }))
+      from.value = rule.from
+      from.addEventListener('change', () => {
+        const hex = normalizeHexColor(from.value)
+        if (!hex) {
+          this._emit('status', { message: `色碼無法解讀：${from.value}`, level: 'warn' })
+          from.value = rule.from
+          return
+        }
+        rule.from = hex
+        void this._runDiff()
+      })
+      row.appendChild(from)
+
+      row.appendChild(el('span', { className: 'ic-replacement-arrow', textContent: '→' }))
+
+      const to = /** @type {HTMLInputElement} */ (el('input', {
+        type: 'color', className: 'ic-replacement-color', title: '視為相同的目標色彩',
+      }))
+      to.value = rule.to
+      to.addEventListener('change', () => {
+        const hex = normalizeHexColor(to.value)
+        if (!hex) {
+          this._emit('status', { message: `色碼無法解讀：${to.value}`, level: 'warn' })
+          to.value = rule.to
+          return
+        }
+        rule.to = hex
+        void this._runDiff()
+      })
+      row.appendChild(to)
+
+      row.appendChild(el('span', {
+        className: 'ic-replacement-hex', textContent: `${rule.from} → ${rule.to}`,
+      }))
+
+      const del = el('button', {
+        className: 'ic-btn-refresh ic-btn-del-replacement',
+        textContent: '✕',
+        title: '刪除這條規則',
+      })
+      del.addEventListener('click', () => { this.removeReplacement(idx) })
+      row.appendChild(del)
+
+      list.appendChild(row)
+    })
+  }
+
+  /** Show the rule count on the toolbar button, so it is visible when closed. */
+  _updateReplacementsButton() {
+    const btn = /** @type {HTMLElement | undefined} */ (this._dom.btnReplacements)
+    if (!btn) return
+    const n = this._replacements.length
+    btn.textContent = n > 0 ? `🎨 取代規則 (${n})` : '🎨 取代規則'
+    btn.classList.toggle('ic-btn--active', n > 0 && this._ignoreUnimportant)
+  }
+
+  /**
+   * @param {boolean} [show] omit to toggle
+   * @returns {boolean} whether the panel is now on screen
+   */
+  toggleReplacementsPanel(show) {
+    const panel = /** @type {HTMLElement | undefined} */ (this._dom.replacementsPanel)
+    if (!panel) return false
+    const next = show === undefined ? panel.style.display === 'none' : !!show
+    panel.style.display = next ? '' : 'none'
+    if (next) this._renderReplacementRows()
+    return next
+  }
+
   /** Repaint the info panel from the loaded images and the last diff. */
   _renderInfoPanel() {
     const panel = /** @type {HTMLElement | undefined} */ (this._dom.infoPanel)
@@ -2560,7 +3339,10 @@ export class ImageCompare {
       ['差異像素', diffCount == null ? '（尚未比對）' : `${mark}${diffCount.toLocaleString()}`],
       ['差異百分比', pct == null ? '（尚未比對）' : `${mark}${pct}%`],
       ['差異區塊數', String(this._diffRegions.length)],
+      ['不重要差異像素', `${mark}${(this._stats.unimportant ?? 0).toLocaleString()}`],
+      ['差異位移', `X ${this._diffOffset.x}, Y ${this._diffOffset.y}`],
       ['數值來源', approximate ? '大圖縮圖後比對，為估計值' : '全解析度實測'],
+      ...metadataDiffRows(this._metaDiffs, this._compareMetadata),
     ]) {
       const tr = el('tr')
       tr.appendChild(el('th', {}, k))
@@ -2747,8 +3529,50 @@ export class ImageCompare {
     })
 
     highlightSelect?.addEventListener('change', () => {
-      this.setHighlightColor(highlightSelect.value)
+      // 'custom' is not a colour — it hands control to the swatch, which keeps
+      // whatever the user last picked.
+      this.setHighlightColor(
+        highlightSelect.value === 'custom' ? this._customHighlight : highlightSelect.value)
     })
+
+    const highlightSwatch = dom.highlightSwatch
+    highlightSwatch?.addEventListener('input', () => {
+      this.setHighlightColor(highlightSwatch.value)
+    })
+
+    dom.btnBlendToggle?.addEventListener('click', () => { this.cycleBlendMode() })
+
+    const compareMetaCheck = dom.compareMetaCheck
+    compareMetaCheck?.addEventListener('change', () => {
+      this.setCompareMetadata(compareMetaCheck.checked)
+    })
+
+    const ignoreUnimportantCheck = dom.ignoreUnimportantCheck
+    ignoreUnimportantCheck?.addEventListener('change', () => {
+      this.setIgnoreUnimportant(ignoreUnimportantCheck.checked)
+      this._updateReplacementsButton()
+    })
+
+    dom.btnReplacements?.addEventListener('click', () => { this.toggleReplacementsPanel() })
+    dom.btnCloseReplacements?.addEventListener('click', () => {
+      this.toggleReplacementsPanel(false)
+    })
+    dom.btnAddReplacement?.addEventListener('click', () => {
+      // A rule that changes nothing would be invisible; seeding two different
+      // colours makes the new row demonstrably a rule.
+      this.addReplacement('#ffffff', '#000000')
+    })
+
+    const offsetXInput = dom.offsetXInput
+    const offsetYInput = dom.offsetYInput
+    const readOffset = () => {
+      const x = parseInt(offsetXInput?.value ?? '', 10)
+      const y = parseInt(offsetYInput?.value ?? '', 10)
+      this.setDiffOffset(Number.isFinite(x) ? x : 0, Number.isFinite(y) ? y : 0)
+    }
+    offsetXInput?.addEventListener('change', readOffset)
+    offsetYInput?.addEventListener('change', readOffset)
+    dom.btnResetOffset?.addEventListener('click', () => { this.resetDiffOffset() })
 
     btnZoomIn?.addEventListener('click', () => this.zoomIn())
     btnZoomOut?.addEventListener('click', () => this.zoomOut())
@@ -3029,6 +3853,7 @@ export class ImageCompare {
    * 執行 pixel diff，更新 diff canvas 與統計列
    */
   async _runDiff() {
+    this._refreshMetadataDiffs()
     if (!this._left || !this._right) {
       this._updateStats(null, null)
       this._diffRegions = []
@@ -3075,6 +3900,12 @@ export class ImageCompare {
     const tileCols = Math.max(1, Math.ceil(geo.width / tileSize))
     const tileRows = Math.max(1, Math.ceil(geo.height / tileSize))
     const tileCounts = new Uint32Array(tileCols * tileRows)
+    const counters = { unimportant: 0 }
+    // The offset is expressed in full-resolution pixels, so it has to travel
+    // through the same downscale the geometry did or it would mean something
+    // different on a large image than on a small one.
+    const offsetX = Math.round(this._diffOffset.x * geo.scale)
+    const offsetY = Math.round(this._diffOffset.y * geo.scale)
     const diffCount = computeDiffBuffer({
       leftData: leftCtx.getImageData(0, 0, geo.leftW, geo.leftH).data,
       rightData: rightCtx.getImageData(0, 0, geo.rightW, geo.rightH).data,
@@ -3088,6 +3919,9 @@ export class ImageCompare {
       mismatchRange: this._mismatchRange,
       highlightColor: this._highlightColor,
       tileCounts, tileSize, tileCols,
+      replacements: this._activeReplacementMap(),
+      offsetX, offsetY,
+      counters,
     })
     this._diffCtx.putImageData(diffImgData, 0, 0)
 
@@ -3105,7 +3939,10 @@ export class ImageCompare {
     const reportedDiffCount = approximate
       ? Math.round(diffCount / (geo.scale * geo.scale))
       : diffCount
-    this._updateStats(reportedDiffCount, totalPixels, approximate)
+    const reportedUnimportant = approximate
+      ? Math.round(counters.unimportant / (geo.scale * geo.scale))
+      : counters.unimportant
+    this._updateStats(reportedDiffCount, totalPixels, approximate, reportedUnimportant)
     this._renderRegionList()
     this._renderInfoPanel()
 
@@ -3132,9 +3969,10 @@ export class ImageCompare {
    * @param {number | null} diffCount
    * @param {number | null} totalPixels
    * @param {boolean} [approximate] - 數字由縮圖比對外推而來
+   * @param {number} [unimportant] - 被取代規則判為不重要的差異像素數
    */
-  _updateStats(diffCount, totalPixels, approximate = false) {
-    this._stats = { diffCount, totalPixels, approximate }
+  _updateStats(diffCount, totalPixels, approximate = false, unimportant = 0) {
+    this._stats = { diffCount, totalPixels, approximate, unimportant }
     const stats = this._dom.stats
     if (!stats) return
 
@@ -3144,7 +3982,19 @@ export class ImageCompare {
       return
     }
 
-    stats.textContent = formatDiffStats(diffCount, totalPixels, approximate)
+    const mark = approximate ? '≈' : ''
+    let text = formatDiffStats(diffCount, totalPixels, approximate)
+    if (unimportant > 0) {
+      text += `　不重要差異 ${mark}${unimportant.toLocaleString()}`
+    }
+    // With metadata comparison on, "0 differing pixels" is no longer the whole
+    // verdict, so the status line must not read as if it were.
+    if (this._compareMetadata) {
+      text += this._metaDiffs.length > 0
+        ? `　中繼資料差異 ${this._metaDiffs.length} 項`
+        : '　中繼資料相同'
+    }
+    stats.textContent = text
     stats.classList?.toggle('ic-stats-text--approx', approximate)
   }
 
@@ -3201,6 +4051,15 @@ export class ImageCompare {
       if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
         e.preventDefault()
         this.fitToWindow()
+        return
+      }
+      // Ctrl+B → BC's Blend Toggle
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'b' || e.key === 'B')) {
+        e.preventDefault()
+        const mode = this.cycleBlendMode()
+        this._emit('status', {
+          message: `疊加模式：${BLEND_LABELS[mode] ?? mode}`, level: 'info',
+        })
         return
       }
     }

@@ -194,7 +194,8 @@ test('工具列每個控制項都留在視窗內', async () => {
   await goToImageCompare(win)
   const offscreen = await win.evaluate(() => {
     const bad = []
-    for (const ctl of document.querySelectorAll('#view-image button, #view-image select')) {
+    for (const ctl of document.querySelectorAll(
+      '#view-image button, #view-image select, #view-image input')) {
       const r = ctl.getBoundingClientRect()
       if (r.width === 0 && r.height === 0) continue
       if (r.bottom > window.innerHeight || r.right > window.innerWidth || r.top < 0) {
@@ -204,4 +205,189 @@ test('工具列每個控制項都留在視窗內', async () => {
     return bad
   })
   expect(offscreen).toEqual([])
+})
+
+// ── S25: the BC picture-compare gaps ─────────────────────────────────────────
+//
+// Driven through the real controls rather than the view's methods: this file's
+// history includes a slider wired to a branch that could never run, which a
+// unit test on the method behind it would have happily passed.
+
+test('Blend Toggle 按鈕循環三種疊加模式', async () => {
+  await goToImageCompare(win)
+  const select = win.locator('#view-image .ic-overlay-select')
+  const toggle = win.locator('#view-image .ic-btn-blend-toggle')
+
+  const seen = []
+  for (let i = 0; i < 4; i++) {
+    seen.push(await select.inputValue())
+    await toggle.click()
+  }
+  expect(new Set(seen).size).toBe(3)
+  // 循環而非停在端點：第 4 次應回到起點
+  expect(seen[3]).toBe(seen[0])
+})
+
+test('自訂色票真的改變 diff canvas 的標示顏色', async () => {
+  await goToImageCompare(win)
+  const black = await makePng(win, 16, 16, '#000000')
+  const white = await makePng(win, 16, 16, '#ffffff')
+  await inject(win, black, white)
+  await win.waitForFunction(() => {
+    const s = window.__testAPI?.imageGetDiffCanvasSize()
+    return s && s.w === 16
+  }, { timeout: 5000 })
+
+  /** 讀 diff canvas 左上角像素。 */
+  const pixel = () => win.evaluate(() => {
+    const c = document.querySelector('#view-image .ic-canvas-diff canvas')
+    const d = c.getContext('2d').getImageData(0, 0, 1, 1).data
+    return [d[0], d[1], d[2]]
+  })
+
+  const before = await pixel()
+
+  await win.locator('#view-image .ic-highlight-select').selectOption('custom')
+  const swatch = win.locator('#view-image .ic-highlight-swatch')
+  await expect(swatch).toBeEnabled()
+  await win.evaluate(() => {
+    const s = document.querySelector('#view-image .ic-highlight-swatch')
+    s.value = '#00ff00'
+    s.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+
+  await win.waitForFunction((prev) => {
+    const c = document.querySelector('#view-image .ic-canvas-diff canvas')
+    const d = c.getContext('2d').getImageData(0, 0, 1, 1).data
+    return d[0] !== prev[0] || d[1] !== prev[1] || d[2] !== prev[2]
+  }, before, { timeout: 5000 })
+
+  const after = await pixel()
+  expect(after[1]).toBeGreaterThan(after[0])
+  expect(after[1]).toBeGreaterThan(after[2])
+
+  // 還原，避免影響後續測試
+  await win.locator('#view-image .ic-highlight-select').selectOption('red')
+})
+
+test('比對中繼資料開關會改變狀態列的結論', async () => {
+  await goToImageCompare(win)
+  // 尺寸不同 → PNG 檔頭的寬/高欄位必定不同，是真實的中繼資料差異
+  const left = await makePng(win, 8, 8, '#123456')
+  const right = await makePng(win, 16, 4, '#123456')
+  await inject(win, left, right)
+  await win.waitForFunction(() => (window.__testAPI?.imageGetStats() ?? '').length > 0,
+    { timeout: 5000 })
+
+  const off = await win.evaluate(() => window.__testAPI?.imageGetStats())
+  expect(off).not.toContain('中繼資料')
+
+  await win.locator('#view-image .ic-compare-meta-check').check()
+  await win.waitForFunction(
+    () => (window.__testAPI?.imageGetStats() ?? '').includes('中繼資料'),
+    { timeout: 5000 })
+  const on = await win.evaluate(() => window.__testAPI?.imageGetStats())
+  expect(on).toMatch(/中繼資料差異\s*\d+\s*項/)
+
+  await win.locator('#view-image .ic-compare-meta-check').uncheck()
+})
+
+test('取代規則讓被宣告等價的色彩差異不計入差異像素數', async () => {
+  await goToImageCompare(win)
+  const red = await makePng(win, 16, 16, '#ff0000')
+  const green = await makePng(win, 16, 16, '#00ff00')
+  await inject(win, red, green)
+  await win.waitForFunction(() => /差異像素\s*256\b/.test(window.__testAPI?.imageGetStats() ?? ''),
+    { timeout: 5000 })
+
+  await win.locator('#view-image .ic-btn-replacements').click()
+  await expect(win.locator('#view-image .ic-replacements-panel')).toBeVisible()
+  await win.locator('#view-image .ic-btn-add-replacement').click()
+  await expect(win.locator('#view-image .ic-replacement-row')).toHaveCount(1)
+
+  await win.evaluate(() => {
+    const [from, to] = document.querySelectorAll('#view-image .ic-replacement-color')
+    from.value = '#ff0000'
+    from.dispatchEvent(new Event('change', { bubbles: true }))
+    to.value = '#00ff00'
+    to.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+
+  await win.waitForFunction(() => /差異像素\s*0\b/.test(window.__testAPI?.imageGetStats() ?? ''),
+    { timeout: 5000 })
+  const applied = await win.evaluate(() => window.__testAPI?.imageGetStats())
+  expect(applied).toMatch(/不重要差異\s*256\b/)
+
+  // 取消「忽略不重要差異」後，同樣的規則不再套用
+  await win.locator('#view-image .ic-ignore-unimportant-check').uncheck()
+  await win.waitForFunction(() => /差異像素\s*256\b/.test(window.__testAPI?.imageGetStats() ?? ''),
+    { timeout: 5000 })
+
+  // 面板開啟時工具列與規則列都仍在視窗內
+  const offscreen = await win.evaluate(() => {
+    const bad = []
+    for (const ctl of document.querySelectorAll(
+      '#view-image button, #view-image select, #view-image input')) {
+      const r = ctl.getBoundingClientRect()
+      if (r.width === 0 && r.height === 0) continue
+      if (r.bottom > window.innerHeight || r.right > window.innerWidth || r.top < 0) {
+        bad.push(ctl.textContent?.trim() || ctl.className)
+      }
+    }
+    return bad
+  })
+  expect(offscreen).toEqual([])
+
+  await win.locator('#view-image .ic-ignore-unimportant-check').check()
+  await win.locator('#view-image .ic-btn-del-replacement').click()
+  await expect(win.locator('#view-image .ic-replacement-row')).toHaveCount(0)
+  await win.locator('#view-image .ic-btn-close-replacements').click()
+  await expect(win.locator('#view-image .ic-replacements-panel')).toBeHidden()
+})
+
+test('差異位移把錯開的兩張圖對回來，重設位移還原', async () => {
+  await goToImageCompare(win)
+  // 左圖：左半白右半黑；右圖：同樣的圖案往右移 4px
+  const shifted = await win.evaluate(() => {
+    const draw = (offset) => {
+      const c = document.createElement('canvas')
+      c.width = 16; c.height = 16
+      const ctx = c.getContext('2d')
+      ctx.fillStyle = '#000000'
+      ctx.fillRect(0, 0, 16, 16)
+      ctx.fillStyle = '#ffffff'
+      ctx.fillRect(offset, 0, 8, 16)
+      return c.toDataURL('image/png').split(',')[1]
+    }
+    return [draw(0), draw(4)]
+  })
+  await inject(win, shifted[0], shifted[1])
+  await win.waitForFunction(() => (window.__testAPI?.imageGetStats() ?? '').length > 0,
+    { timeout: 5000 })
+
+  const parseDiff = (s) => Number((/差異像素\s*≈?([\d,]+)/.exec(s ?? '')?.[1] ?? '-1')
+    .replace(/,/g, ''))
+  const before = parseDiff(await win.evaluate(() => window.__testAPI?.imageGetStats()))
+  expect(before).toBeGreaterThan(0)
+
+  await win.evaluate(() => {
+    const [x] = document.querySelectorAll('#view-image .ic-offset-input')
+    x.value = '-4'
+    x.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await win.waitForFunction((prev) => {
+    const m = /差異像素\s*≈?([\d,]+)/.exec(window.__testAPI?.imageGetStats() ?? '')
+    return m && Number(m[1].replace(/,/g, '')) < prev
+  }, before, { timeout: 5000 })
+
+  const after = parseDiff(await win.evaluate(() => window.__testAPI?.imageGetStats()))
+  expect(after).toBeLessThan(before)
+
+  await win.locator('#view-image .ic-btn-reset-offset').click()
+  await win.waitForFunction(() => {
+    const [x, y] = document.querySelectorAll('#view-image .ic-offset-input')
+    return x.value === '0' && y.value === '0'
+  }, { timeout: 5000 })
+  const restored = parseDiff(await win.evaluate(() => window.__testAPI?.imageGetStats()))
+  expect(restored).toBe(before)
 })

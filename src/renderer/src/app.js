@@ -477,6 +477,7 @@ function showTextCompare() {
 
   if (!textCompare) {
     textCompare = new TextCompare({ container: el('view-text') })
+    applyBcDefaults('text', textCompare)
     textCompare.mount()
 
     textCompare.on('diff-count', ({ total, currentIndex }) => {
@@ -614,6 +615,7 @@ function showImageCompare() {
 
   if (!imageCompare) {
     imageCompare = new ImageCompare({})
+    applyBcDefaults('image', imageCompare)
     imageCompare.mount(el('view-image'))
     imageCompare.on('paths-changed', ({ left, right }) => {
       recordSession('image', { leftPath: left ?? '', rightPath: right ?? '' })
@@ -2540,6 +2542,45 @@ function setupKeyboardShortcuts() {
 }
 
 /**
+ * Push the Options defaults into a view that has just been created.
+ *
+ * Without this the six BC pages would store preferences nothing reads — a
+ * dialog that accepts every change and alters nothing, which is the failure
+ * this project keeps finding. Applied at construction rather than on every
+ * render so a value the user changes inside a session is not overwritten by
+ * the default on the next repaint.
+ *
+ * Only settings with a real setter on the view are pushed; the rest are read
+ * at their point of use.
+ *
+ * @param {'text'|'image'} kind
+ * @param {object|null} view
+ */
+function applyBcDefaults(kind, view) {
+  if (!view) return
+  try {
+    if (kind === 'text' && typeof view.setTabWidth === 'function') {
+      view.setTabWidth(
+        Number(settings.getPref('editTabWidth')) || 4,
+        !settings.getPref('editInsertSpaces'))
+    }
+    if (kind === 'image') {
+      if (typeof view.setBlendMode === 'function') {
+        view.setBlendMode(String(settings.getPref('pictureDefaultBlend') || 'normal'))
+      }
+      if (typeof view.setAutoScale === 'function') {
+        view.setAutoScale(Boolean(settings.getPref('pictureAutoScale')))
+      }
+    }
+  } catch (err) {
+    // A bad stored value must not stop the view from opening, but it should
+    // not vanish either — the user changed a setting and needs to know it
+    // did not take.
+    showError(`套用預設選項失敗：${err instanceof Error ? err.message : String(err)}`, err)
+  }
+}
+
+/**
  * Re-read the active view's files from disk.
  *
  * The menu advertised Ctrl+Shift+R next to the hex reload command, but nothing
@@ -4218,6 +4259,36 @@ function setupPreferenceControls(setStatus) {
     ['chk-confirm-close-tab',    'confirmOnCloseTab',    '關閉分頁前確認'],
     ['chk-show-toolbar',         'showToolbar',          '顯示工具列'],
     ['chk-show-statusbar',       'showStatusBar',        '顯示狀態列'],
+    ['chk-folder-expand-on-open',  'folderExpandOnOpen',      '開啟時展開整棵樹'],
+    ['chk-folder-folders-first',   'folderShowFoldersFirst',  '資料夾排在前'],
+    ['chk-folder-confirm-delete',  'folderConfirmDelete',     '刪除前確認'],
+    ['chk-folder-recycle-bin',     'folderUseRecycleBin',     '刪除到資源回收筒'],
+    ['chk-picture-auto-scale',     'pictureAutoScale',        '圖片自動縮放'],
+    ['chk-edit-insert-spaces',     'editInsertSpaces',        'Tab 插入空白'],
+    ['chk-edit-trim-on-save',      'editTrimOnSave',          '儲存時移除行尾空白'],
+    ['chk-edit-final-newline',     'editEnsureFinalNewline',  '儲存時確保結尾換行'],
+  ]
+
+  /**
+   * The text and number fields of the six BC pages.
+   *
+   * Kept as a table for the same reason the checkboxes are: the page-scoped
+   * "restore defaults" button reads PREF_PAGES, so a control wired by hand
+   * would be reset by the store and never re-read into the input.
+   *
+   * @type {Array<[string, string, string, 'text'|'number']>}
+   */
+  const FIELDS = [
+    ['sel-picture-blend',      'pictureDefaultBlend',   '圖片預設混合模式', 'text'],
+    ['inp-picture-tolerance',  'pictureTolerance',      '圖片容差',         'number'],
+    ['inp-edit-tab-width',     'editTabWidth',          'Tab 寬度',         'number'],
+    ['inp-archive-enabled',    'archiveEnabled',        '封存檔副檔名',     'text'],
+    ['inp-archive-max-mb',     'archiveMaxEntryMB',     '封存項目上限',     'number'],
+    ['inp-openwith-command',   'openWithCommand',       '外部程式',         'text'],
+    ['inp-openwith-args',      'openWithArgs',          '外部程式引數',     'text'],
+    ['inp-tweak-prefetch',     'tweakPrefetchLimit',    '預取上限',         'number'],
+    ['inp-tweak-concurrency',  'tweakConcurrency',      '並行讀取數',       'number'],
+    ['inp-tweak-overscan',     'tweakVirtualOverscan',  '預繪列數',         'number'],
   ]
 
   const themeSel = el('sel-theme-mode')
@@ -4246,6 +4317,19 @@ function setupPreferenceControls(setStatus) {
     }
     if (folderEl) folderEl.textContent = backup.folder || '（與原檔同一資料夾）'
     if (themeSel instanceof HTMLSelectElement) themeSel.value = getThemeMode()
+    for (const [id, pref] of FIELDS) {
+      const node = el(id)
+      if (node instanceof HTMLInputElement || node instanceof HTMLSelectElement) {
+        node.value = String(settings.getPref(pref) ?? '')
+      }
+    }
+    const archiveHint = el('archive-support-hint')
+    if (archiveHint) {
+      // Naming what this build can actually read, rather than letting someone
+      // type "rar" and wait for a folder that never opens.
+      archiveHint.textContent = '本版本可讀取：zip、tar、gz、bz2、xz、7z、cab。'
+        + '未列出的格式會明確報錯，不會誤判為空資料夾。'
+    }
   }
 
   for (const [id, pref, label] of CHECKS) {
@@ -4256,6 +4340,37 @@ function setupPreferenceControls(setStatus) {
       applyDisplayPrefs()
       refresh()
       setStatus(`${label}：${node.checked ? '開啟' : '關閉'}`)
+    })
+  }
+
+  for (const [id, pref, label, kind] of FIELDS) {
+    const node = el(id)
+    if (!(node instanceof HTMLInputElement || node instanceof HTMLSelectElement)) continue
+    node.addEventListener('change', () => {
+      if (kind === 'number') {
+        // `Number('')` is 0, and 0 is finite — so a cleared field would have
+        // stored a concurrency of zero and stalled every queued read. The
+        // emptiness check has to come before the numeric one.
+        const raw = node.value.trim()
+        const n = Number(raw)
+        const min = Number(node.getAttribute('min'))
+        const max = Number(node.getAttribute('max'))
+        const bad = raw === '' || !Number.isFinite(n)
+          || (Number.isFinite(min) && n < min) || (Number.isFinite(max) && n > max)
+        if (bad) {
+          // Refused and put back, rather than stored and silently clamped
+          // somewhere far from the control that set it.
+          refresh()
+          setStatus(`${label}：請填 ${min}–${max} 之間的數字`)
+          return
+        }
+        settings.setPref(pref, n)
+      } else {
+        settings.setPref(pref, node.value)
+      }
+      applyDisplayPrefs()
+      refresh()
+      setStatus(`${label}：已更新`)
     })
   }
 

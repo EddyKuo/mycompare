@@ -1283,6 +1283,91 @@
   font-style: italic;
 }
 
+/* ── VCS status column ────────────────────────────────────────────────────── */
+
+.fc-vcs {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  padding-right: 6px;
+}
+
+.fc-vcs--pending {
+  opacity: 0.45;
+  font-style: italic;
+}
+
+/* The palette follows the view's fixed semantics: red for a real problem,
+   green for "only on one side" (here: not yet in the repository), and a muted
+   default for the states that need no attention. */
+.fc-vcs--conflict {
+  color: #c62828;
+  font-weight: 600;
+}
+
+.fc-vcs--modified {
+  color: #b26a00;
+}
+
+.fc-vcs--staged {
+  color: #1565c0;
+}
+
+.fc-vcs--deleted {
+  color: #c62828;
+}
+
+.fc-vcs--untracked {
+  color: #2e7d32;
+}
+
+.fc-vcs--ignored,
+.fc-vcs--clean {
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+/* ── Owner / Group columns ────────────────────────────────────────────────── */
+
+.fc-owner {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  padding-right: 6px;
+}
+
+.fc-owner--pending {
+  opacity: 0.45;
+  font-style: italic;
+}
+
+/* ── Read-only text dialog (git diff / git log) ───────────────────────────── */
+
+.fc-text-modal {
+  width: min(880px, 90vw);
+}
+
+.fc-text-body {
+  margin: 8px 0;
+  padding: 8px;
+  max-height: 60vh;
+  overflow: auto;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+}
+
 /* ── Comparison criteria controls in the rules panel ──────────────────────── */
 
 .fc-rules-time-shift,
