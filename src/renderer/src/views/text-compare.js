@@ -579,8 +579,15 @@ const _settings = new SettingsStore();
  *   ignoreCase?: boolean,
  *   ignoreLineEndings?: boolean,
  *   contextLines?: number,
+ *   alignByGrammar?: boolean,
  * }} TextCompareOptions
  */
+
+/**
+ * Combined size of both sides above which grammar line weights are skipped.
+ * See `_weightAlignEligible`.
+ */
+const MAX_WEIGHT_ALIGN_CHARS = 1_000_000;
 
 /**
  * @typedef {{
@@ -618,6 +625,7 @@ export class TextCompare {
       ignorePatterns: options.ignorePatterns ?? [],
       unimportantPatterns: options.unimportantPatterns ?? [],
       ignoreUnimportant: options.ignoreUnimportant ?? false,
+      alignByGrammar: options.alignByGrammar ?? true,
     };
 
     // Content state
@@ -2353,6 +2361,10 @@ ${rows}
   _runDiff({ resetScroll = false } = {}) {
     if (!this._leftContent && !this._rightContent) return;
 
+    // P2-29: grammar tokens feed both the alignment weights below and the
+    // importance decision further down, so they have to exist first.
+    this._computeGrammarTokens();
+
     if (!this._leftContent || !this._rightContent) {
       // Single-side view: show content without diff coloring
       const content = this._leftContent || this._rightContent;
@@ -2365,6 +2377,7 @@ ${rows}
         rightText: isLeft ? ''    : text,
       }));
     } else {
+      const weights = this._alignmentWeights();
       this._diffResult = diffLines(this._leftContent, this._rightContent, {
         algorithm: this._opts.algorithm,
         ignoreWhitespace: this._opts.ignoreWhitespace,
@@ -2372,11 +2385,10 @@ ${rows}
         ignoreLineEndings: this._opts.ignoreLineEndings,
         ignoreIndent: this._opts.ignoreIndent,
         ignoreCrlf: this._opts.ignoreCrlf,
+        leftWeights: weights?.left,
+        rightWeights: weights?.right,
       });
     }
-
-    // P2-29: grammar tokens must exist before importance is decided.
-    this._computeGrammarTokens();
 
     // Apply ignore / unimportant patterns
     this._applyIgnorePatterns();
@@ -2803,6 +2815,7 @@ ${rows}
       ignoreLineEndings:  this._opts.ignoreLineEndings,
       contextLines:       this._opts.contextLines,
       ignoreUnimportant:  this._opts.ignoreUnimportant,
+      alignByGrammar:     this._opts.alignByGrammar,
       ignorePatterns:     Array.isArray(this._opts.ignorePatterns) ? [...this._opts.ignorePatterns] : [],
       unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
       manualIgnoreLeft:   [...this._manualIgnore.left].sort((a, b) => a - b),
@@ -2829,7 +2842,7 @@ ${rows}
   applyConfig(cfg) {
     const settings = readConfig('text', cfg)
     if (!settings) return
-    const known = ['algorithm','ignoreWhitespace','ignoreCase','ignoreLineEndings','contextLines','ignorePatterns','unimportantPatterns','ignoreUnimportant']
+    const known = ['algorithm','ignoreWhitespace','ignoreCase','ignoreLineEndings','contextLines','ignorePatterns','unimportantPatterns','ignoreUnimportant','alignByGrammar']
     for (const key of known) {
       if (Object.prototype.hasOwnProperty.call(settings, key)) {
         const value = settings[key]
@@ -3871,6 +3884,14 @@ ${rows}
     }
     if (elements.length === 0) {
       items.push({ label: '（此檔案格式沒有可用的文法）', disabled: true, action: () => {} });
+    } else {
+      items.push({
+        label: (this._opts.alignByGrammar ? '✓ ' : '　') + '以文法權重輔助對齊',
+        action: () => {
+          const on = this.setAlignByGrammar(!this._opts.alignByGrammar);
+          toast(on ? '對齊已納入文法行權重' : '對齊已改為純文字比對', { type: 'success' });
+        },
+      });
     }
 
     // P3: view panels
@@ -4296,7 +4317,50 @@ ${rows}
 
   /** Whether anything currently needs grammar tokens. */
   _grammarNeeded() {
-    return this._grammarIgnored.size > 0 || this._detailsMode === 'alignment';
+    return this._grammarIgnored.size > 0 || this._detailsMode === 'alignment'
+      || this._weightAlignEligible();
+  }
+
+  /**
+   * Whether line weights should be handed to the diff for this pair.
+   *
+   * Tokenizing costs roughly 2.6 µs per line, which is affordable once but not
+   * on every keystroke of the 300 ms edit debounce for an arbitrarily large
+   * file — hence the size ceiling. Above it the diff simply runs unweighted;
+   * alignment stays correct, it just loses the grammar's opinion about which
+   * of several equally short edit scripts to prefer.
+   */
+  _weightAlignEligible() {
+    if (!this._opts.alignByGrammar) return false;
+    if (!this._grammarLeft && !this._grammarRight) return false;
+    if (!this._leftContent || !this._rightContent) return false;
+    return this._leftContent.length + this._rightContent.length <= MAX_WEIGHT_ALIGN_CHARS;
+  }
+
+  /**
+   * Per-line alignment weights for both sides, or null when not applicable.
+   *
+   * Derived from the tokens `_computeGrammarTokens` has already produced, so
+   * enabling this costs one tokenize pass rather than two.
+   *
+   * @returns {{ left: number[], right: number[] }|null}
+   */
+  _alignmentWeights() {
+    if (!this._weightAlignEligible()) return null;
+    /**
+     * @param {'left'|'right'} side
+     * @param {string} content
+     * @param {import('../core/grammar.js').CompiledGrammar|null} grammar
+     * @returns {number[]}
+     */
+    const build = (side, content, grammar) => {
+      if (!grammar) return content.split('\n').map(() => 1);
+      return content.split('\n').map((line, i) => lineWeight(line, this._tokensForLine(side, i + 1), grammar));
+    };
+    return {
+      left: build('left', this._leftContent, this._grammarLeft),
+      right: build('right', this._rightContent, this._grammarRight),
+    };
   }
 
   /**
@@ -4421,6 +4485,17 @@ ${rows}
     else this._grammarIgnored.add(element);
     this._runDiff();
     return this._grammarIgnored.has(element);
+  }
+
+  /**
+   * Turn grammar line weights on or off as an alignment input.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} the resulting state
+   */
+  setAlignByGrammar(on) {
+    this._opts.alignByGrammar = on === undefined ? !this._opts.alignByGrammar : !!on;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return this._opts.alignByGrammar;
   }
 
   /**

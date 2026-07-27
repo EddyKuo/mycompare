@@ -36,6 +36,7 @@ beforeEach(() => {
  * Kept here so the round-trip assertions stay exhaustive rather than partial.
  */
 const TEXT_CONFIG_DEFAULTS = {
+  alignByGrammar: true,
   grammarIgnore: [],
   userGrammars: [],
   description: '',

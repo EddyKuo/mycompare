@@ -529,6 +529,7 @@ describe('S16 merge3 — getConfig / applyConfig', () => {
       ignoreWhitespace: true, ignoreCase: true,
       // S22: Show Context and Favor Left/Right travel with the snapshot too.
       contextLines: 2, favor: 'none',
+      alignByGrammar: true,
     })
   })
 

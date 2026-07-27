@@ -135,12 +135,25 @@ describe('grammar importance', () => {
   })
 
   it('does not tokenize when nothing needs the tokens', () => {
+    // Line-weight alignment consumes the same tokens, so "nothing needs them"
+    // now means: no ignored element, no alignment panel, and either no grammar
+    // or a pair too large for weighting to be worth its cost.
     const tc = makeTC()
+    tc.setAlignByGrammar(false)
     tc.setLeft('a.c', 'int x = 1; // a\n')
     tc.setRight('b.c', 'int x = 1; // b\n')
     expect(tc._tokensLeft).toEqual([])
     tc.setGrammarIgnore(['Comment'])
     expect(tc._tokensLeft.length).toBeGreaterThan(0)
+  })
+
+  it('a recognised format tokenizes on its own, for the alignment weights', () => {
+    const tc = makeTC()
+    tc.setLeft('a.c', 'int x = 1; // a\n')
+    tc.setRight('b.c', 'int x = 1; // b\n')
+    expect(tc._tokensLeft.length).toBeGreaterThan(0)
+    tc.setAlignByGrammar(false)
+    expect(tc._tokensLeft).toEqual([])
   })
 
   it('reports grammar compile errors instead of hiding them', () => {
@@ -243,6 +256,7 @@ describe('details panels', () => {
 
   it('alignment details turns tokenizing on by itself', () => {
     const tc = makeTC()
+    tc.setAlignByGrammar(false)
     tc.setLeft('a.c', 'int x;\n')
     tc.setRight('b.c', 'int y;\n')
     expect(tc._tokensLeft).toEqual([])

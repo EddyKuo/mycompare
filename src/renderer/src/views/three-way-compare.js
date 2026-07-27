@@ -8,9 +8,16 @@ import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, getNavOptions } from '../core/diff-nav.js'
 import { renderTextTable, reportHeader } from '../core/report.js'
 import { toast } from '../core/toast.js'
+import { getGrammarForPath, computeLineWeights } from '../core/grammar.js'
 // Imported here rather than from the renderer entry so the view stays
 // self-contained; the bundler emits it once no matter how many tabs mount.
 import '../styles/merge-compare.css'
+
+/**
+ * Size above which one pane is compared without grammar line weights.
+ * Tokenizing is linear but not free, and three panes pay it.
+ */
+const MAX_WEIGHT_ALIGN_CHARS = 1_000_000
 
 // ---------------------------------------------------------------------------
 // S13-C01: 3-way merge helpers (module-private)
@@ -591,6 +598,8 @@ export class ThreeWayCompare {
 
     /** @type {'myers'|'patience'|'histogram'} */
     this._algorithm = 'myers'
+    /** Whether grammar line weights feed the alignment (BC line weights). */
+    this._alignByGrammar = true
     this._ignoreWhitespace = false
     this._ignoreCase = false
 
@@ -1183,6 +1192,7 @@ ${body}
       ignoreCase: this._ignoreCase,
       contextLines: this._contextLines,
       favor: this._favor,
+      alignByGrammar: this._alignByGrammar,
     })
   }
 
@@ -1203,6 +1213,7 @@ ${body}
     if (typeof c.ignoreCase === 'boolean') this._ignoreCase = c.ignoreCase
     if (c.contextLines != null) this._contextLines = normalizeContextLines(c.contextLines)
     if (c.favor === 'none' || c.favor === 'left' || c.favor === 'right') this._favor = c.favor
+    if (typeof c.alignByGrammar === 'boolean') this._alignByGrammar = c.alignByGrammar
 
     this._runMerge()
   }
@@ -1881,6 +1892,25 @@ ${body}
   }
 
   /**
+   * Grammar line weights for one pane, or undefined when they do not apply.
+   *
+   * Returning undefined for any one pane switches the whole merge back to
+   * unweighted alignment, because comparing a weighted side against an
+   * unweighted one would mean two different objectives in one DP.
+   *
+   * @param {string} path
+   * @param {string} content
+   * @returns {number[]|undefined}
+   */
+  _alignmentWeights(path, content) {
+    if (!this._alignByGrammar || !path || !content) return undefined
+    if (content.length > MAX_WEIGHT_ALIGN_CHARS) return undefined
+    const grammar = getGrammarForPath(path)
+    if (!grammar) return undefined
+    return computeLineWeights(grammar, content.split('\n')).weights
+  }
+
+  /**
    * Simple line-by-line 3-way merge.
    * Returns segment array and diffs base→left, base→right.
    *
@@ -1900,8 +1930,18 @@ ${body}
       ignoreWhitespace: this._ignoreWhitespace,
       ignoreCase: this._ignoreCase,
     }
-    const leftDiff = diffLines(base || '', left || '', diffOpts)
-    const rightDiff = diffLines(base || '', right || '', diffOpts)
+    // Grammar line weights steer which of several equally short edit scripts
+    // wins. Both diffs share the base, so its weights are computed once.
+    const baseW = this._alignmentWeights(this._basePath || this._leftPath || this._rightPath, base)
+    const leftW = this._alignmentWeights(this._leftPath || this._basePath, left)
+    const rightW = this._alignmentWeights(this._rightPath || this._basePath, right)
+
+    const leftDiff = diffLines(base || '', left || '', {
+      ...diffOpts, leftWeights: baseW, rightWeights: leftW,
+    })
+    const rightDiff = diffLines(base || '', right || '', {
+      ...diffOpts, leftWeights: baseW, rightWeights: rightW,
+    })
     const baseLines = (base || '').split('\n')
 
     // S13-C01: build hunks from each diff, then walk base lines in order,
