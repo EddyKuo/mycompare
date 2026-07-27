@@ -32,14 +32,15 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 其他功能：
 
 - 完整選單列（Session / File / Edit / Search / View / Tools / Help）
-- 命令列開關（`/fv` `/filters` `/qc` `/iu` `/expandall` `/script` 等，`/?` 顯示說明）
+- 命令列開關（`/fv` `/filters` `/qc` `/iu` `/expandall` `/?` 等）
+- 腳本執行（`/script=<檔案>` 預設為預演，加 `/execute` 才實際寫檔）
 - 資料夾快照（記錄結構與時間戳供日後比對，可選內容雜湊）
 - Session 資料夾分類
 - 多分頁（tab）工作區與工作區儲存
 - 深色 / 淺色主題（跟隨系統或手動切換）
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
-- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz
+- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz
 - MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對
 - 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
@@ -49,10 +50,10 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ### 尚未實作
 
-- **遠端與雲端**：FTP / SFTP / S3 / Dropbox / OneDrive 連線設定檔
-- **腳本執行**：腳本語法檢查已實作（`/script=<file>` 會解析並回報錯誤與是否會寫檔），
-  但實際執行未實作——會寫檔的指令在未經真實輸入驗證前不適合無人值守執行
-- **壓縮格式**：bzip2 / xz / 7z / RAR 需要外部解碼器，會明確回報不支援而非模糊失敗
+- **SFTP**：需要完整的 SSH 傳輸層（金鑰交換、加密、MAC），無法只用 Node 內建模組實作
+- **Dropbox / OneDrive**：需要 OAuth 流程與各自的 API
+- **7z / RAR**：7z 需要額外的容器與 filter chain；RAR 為專有格式且無可自由重新實作的規格
+- **遠端 UI**：FTP / FTPS / S3 的傳輸層與連線設定檔已實作並測試，但尚未接上介面
 
 ---
 
@@ -190,7 +191,7 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**1268 / 1268 unit tests passing**、**106 / 106 e2e tests passing**。
+目前覆蓋：**1523 / 1523 unit tests passing**、**107 / 107 e2e tests passing**。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、
