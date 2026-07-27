@@ -35,14 +35,24 @@
  *   the published empty-input vector `dd0e8917…` and against 7-Zip's own
  *   `7z h -scrcBLAKE2SP`, and end-to-end by `7z t` accepting the record.
  *
- *   What none of that establishes, and it matters: **no archive written by
- *   WinRAR has ever been read here**, because none exists on this machine and
- *   nothing here can create one. 7-Zip proves the fixtures are well-formed
- *   RAR that a real reader accepts; it does not prove that every construct a
- *   real packer emits is handled. Deliberately not implemented, and refused by
- *   name rather than guessed at: all compressed methods, encrypted archives at
- *   both the header and per-file level, solid blocks, split volumes, and
- *   entries of unknown size.
+ *   This comment used to end by saying no archive written by a real packer had
+ *   ever been read here, because none existed on this machine and nothing here
+ *   could create one. That was the sixth inherited refusal in this codebase
+ *   and, like the other five, it was false: RARLAB publishes `Rar.exe` inside
+ *   the winrar distribution, and 7-Zip extracts that installer without running
+ *   it. `tests/unit/rar-genuine.test.js` now reads four archives written by
+ *   RARLAB's own packer — RAR 5 from 7.13 and RAR 4 from 6.24, the last
+ *   version that still creates the older generation — each holding a
+ *   subdirectory and a non-ASCII filename, so entry-name handling is checked
+ *   against a real packer's encoding rather than against our own idea of it.
+ *   The stored entries come out byte-for-byte; the compressed ones list
+ *   correctly and refuse by name.
+ *
+ *   Deliberately not implemented, and refused by name rather than guessed at:
+ *   all compressed methods, encrypted archives at both the header and per-file
+ *   level, solid blocks, split volumes, and entries of unknown size. Those
+ *   refusals are now exercised against genuinely compressed archives from the
+ *   real packer, not only against fixtures written here.
  *
  *   Read `cab.js`'s note on Quantum before extending any of this. Five
  *   refusals in this codebase's history were inherited rather than checked and
