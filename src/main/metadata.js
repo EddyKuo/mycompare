@@ -23,7 +23,12 @@ const SNIFF_BYTES = 4096
 const MAX_ID3_BYTES = 1 << 20        // 1 MiB — huge even for embedded artwork
 const AUDIO_SCAN_BYTES = 64 * 1024   // window after the tag to find a frame sync
 const MAX_PE_HEADER_BYTES = 64 * 1024
+// Window used to walk the resource *tree*. The tree sits at the start of the
+// section, so a prefix is enough; the leaf it points at is read separately
+// (see `_readPeMetadata`) because it can live anywhere in the section.
 const MAX_RSRC_BYTES = 8 * 1024 * 1024
+// A VS_VERSIONINFO block is a kilobyte or two even with 24 translations.
+const MAX_VERSION_BYTES = 1 << 20
 const ID3V1_SIZE = 128
 
 /**
@@ -560,6 +565,17 @@ const RT_VERSION = 16
 const VS_FIXEDFILEINFO_SIGNATURE = 0xfeef04bd
 /** Data-directory slot holding the resource table. */
 const RESOURCE_DIR_INDEX = 2
+/**
+ * The resource *name* Windows looks for under RT_VERSION. `GetFileVersionInfo`
+ * does the equivalent of `FindResource(hMod, MAKEINTRESOURCE(1), RT_VERSION)`,
+ * so a block filed under any other name is not the file's version information
+ * and must not be read as if it were.
+ */
+const VS_VERSION_INFO_ID = 1
+/** en-US, the language Microsoft's own toolchain files version resources under. */
+const LANG_EN_US = 0x0409
+/** LANG_NEUTRAL / SUBLANG_NEUTRAL. */
+const LANG_NEUTRAL = 0x0000
 
 /**
  * @typedef {object} PeSection
@@ -642,8 +658,108 @@ export function sectionForRva(sections, rva) {
 }
 
 /**
+ * @typedef {object} ResourceEntry
+ * @property {number} id      numeric id, or -1 for a named (string) entry
+ * @property {number} target  offset of the entry's target within the buffer
+ * @property {boolean} isSubdir
+ */
+
+/**
+ * List the entries of one resource directory.
+ *
+ * @param {Buffer} buf
+ * @param {number} root base of the resource directory
+ * @param {number} dir offset of the directory to scan
+ * @returns {ResourceEntry[]}
+ */
+function _dirEntries(buf, root, dir) {
+  /** @type {ResourceEntry[]} */
+  const out = []
+  if (dir < 0 || dir + 16 > buf.length) return out
+  const total = buf.readUInt16LE(dir + 12) + buf.readUInt16LE(dir + 14)
+  for (let i = 0; i < total; i++) {
+    const e = dir + 16 + i * 8
+    if (e + 8 > buf.length) break
+    const nameField = buf.readUInt32LE(e)
+    const offsetField = buf.readUInt32LE(e + 4)
+    const target = root + (offsetField & 0x7fffffff)
+    if (target < 0 || target >= buf.length) continue
+    out.push({
+      // Named entries have the high bit set; they can never match a numeric id.
+      id: (nameField & 0x80000000) !== 0 ? -1 : nameField,
+      target,
+      isSubdir: (offsetField & 0x80000000) !== 0
+    })
+  }
+  return out
+}
+
+/**
+ * Choose which translation of a resource to read.
+ *
+ * A binary may file the same resource under many languages — MRT.exe carries 24
+ * — and picking whichever the tree happens to list first is picking by build
+ * order. Windows resolves this against the calling thread's UI language, but a
+ * comparison tool must not: two machines diffing the same pair of files have to
+ * reach the same verdict, so the choice here is fixed rather than ambient.
+ *
+ * Order: en-US, then language-neutral, then the numerically lowest id present.
+ * en-US comes first because that is what Microsoft's toolchain files version
+ * resources under, and because every field this module reports except
+ * FileDescription is language-invariant in practice.
+ *
+ * @param {number[]} langs available language ids
+ * @returns {number} the chosen id; -1 when `langs` is empty
+ */
+export function pickResourceLanguage(langs) {
+  if (!Array.isArray(langs) || langs.length === 0) return -1
+  if (langs.includes(LANG_EN_US)) return LANG_EN_US
+  if (langs.includes(LANG_NEUTRAL)) return LANG_NEUTRAL
+  return langs.reduce((a, b) => (b < a ? b : a))
+}
+
+/**
+ * Locate the VS_VERSIONINFO leaf without reading it.
+ *
+ * Returns the leaf's own RVA rather than a slice of `rsrc`, because the leaf can
+ * sit hundreds of megabytes past the directory that names it: the caller maps
+ * that RVA through the section table itself and reads only those bytes.
+ *
+ * @param {Buffer} rsrc bytes of the resource section from its PointerToRawData
+ *   (a prefix is enough — the directory tree lives at the start)
+ * @param {number} sectionVa the section's VirtualAddress
+ * @param {number} rootRva RVA of the resource directory itself
+ * @returns {{ rva: number, size: number, lang: number }|null}
+ */
+export function findVersionResourceEntry(rsrc, sectionVa, rootRva) {
+  if (!Buffer.isBuffer(rsrc)) return null
+  const root = rootRva - sectionVa
+  if (root < 0 || root + 16 > rsrc.length) return null
+
+  const type = _dirEntries(rsrc, root, root).find((e) => e.isSubdir && e.id === RT_VERSION)
+  if (!type) return null
+
+  // Name must be 1: RT_VERSION can also hold vendor blobs under other names,
+  // and Windows would not read those as version information either.
+  const names = _dirEntries(rsrc, root, type.target).filter((e) => e.isSubdir)
+  const name = names.find((e) => e.id === VS_VERSION_INFO_ID)
+  if (!name) return null
+
+  const leaves = _dirEntries(rsrc, root, name.target).filter((e) => !e.isSubdir)
+  if (leaves.length === 0) return null
+  const lang = pickResourceLanguage(leaves.map((e) => e.id))
+  const leaf = leaves.find((e) => e.id === lang) ?? leaves[0]
+  if (leaf.target + 16 > rsrc.length) return null
+
+  const rva = rsrc.readUInt32LE(leaf.target)
+  const size = rsrc.readUInt32LE(leaf.target + 4)
+  if (size <= 0 || size > MAX_VERSION_BYTES) return null
+  return { rva, size, lang: leaf.id }
+}
+
+/**
  * Walk the resource tree (type -> name -> language) and return the bytes of the
- * first RT_VERSION leaf.
+ * VS_VERSIONINFO leaf, when it falls inside `rsrc`.
  *
  * @param {Buffer} rsrc raw bytes of the resource section, starting at its
  *   PointerToRawData
@@ -653,51 +769,11 @@ export function sectionForRva(sections, rva) {
  * @returns {Buffer|null}
  */
 export function findVersionResource(rsrc, sectionVa, rootRva) {
-  if (!Buffer.isBuffer(rsrc)) return null
-  const root = rootRva - sectionVa
-  if (root < 0 || root + 16 > rsrc.length) return null
-
-  const typeEntry = _findDirEntry(rsrc, root, root, RT_VERSION, true)
-  if (typeEntry === null) return null
-  const nameEntry = _findDirEntry(rsrc, root, typeEntry, null, true)
-  if (nameEntry === null) return null
-  const langEntry = _findDirEntry(rsrc, root, nameEntry, null, false)
-  if (langEntry === null || langEntry + 16 > rsrc.length) return null
-
-  const dataRva = rsrc.readUInt32LE(langEntry)
-  const dataSize = rsrc.readUInt32LE(langEntry + 4)
-  const start = dataRva - sectionVa
-  if (start < 0 || dataSize <= 0 || start + dataSize > rsrc.length) return null
-  return rsrc.subarray(start, start + dataSize)
-}
-
-/**
- * @param {Buffer} buf
- * @param {number} root base of the resource directory
- * @param {number} dir offset of the directory to scan
- * @param {number|null} wantId id to match, or null to take the first entry
- * @param {boolean} wantSubdir true when the entry must point at a subdirectory
- * @returns {number|null} offset of the matched entry's target
- */
-function _findDirEntry(buf, root, dir, wantId, wantSubdir) {
-  if (dir + 16 > buf.length) return null
-  const named = buf.readUInt16LE(dir + 12)
-  const ids = buf.readUInt16LE(dir + 14)
-  const total = named + ids
-  for (let i = 0; i < total; i++) {
-    const e = dir + 16 + i * 8
-    if (e + 8 > buf.length) return null
-    const nameField = buf.readUInt32LE(e)
-    const offsetField = buf.readUInt32LE(e + 4)
-    const isSubdir = (offsetField & 0x80000000) !== 0
-    if (isSubdir !== wantSubdir) continue
-    // Named entries have the high bit set; they can never match a numeric id.
-    if (wantId !== null && ((nameField & 0x80000000) !== 0 || nameField !== wantId)) continue
-    const target = root + (offsetField & 0x7fffffff)
-    if (target < 0 || target >= buf.length) return null
-    return target
-  }
-  return null
+  const entry = findVersionResourceEntry(rsrc, sectionVa, rootRva)
+  if (!entry) return null
+  const start = entry.rva - sectionVa
+  if (start < 0 || start + entry.size > rsrc.length) return null
+  return rsrc.subarray(start, start + entry.size)
 }
 
 /**
@@ -737,9 +813,11 @@ function _readVersionNode(buf, off) {
  * Parse a VS_VERSIONINFO block into flat fields.
  *
  * @param {Buffer} buf the version resource bytes
+ * @param {number} [preferredLang] language id of the resource leaf this block
+ *   came from, used to pick between several StringFileInfo tables
  * @returns {MetadataFields|null} null when the block is not VS_VERSION_INFO
  */
-export function parseVersionBlock(buf) {
+export function parseVersionBlock(buf, preferredLang = LANG_EN_US) {
   const root = _readVersionNode(buf, 0)
   if (!root || root.key !== 'VS_VERSION_INFO') return null
 
@@ -755,7 +833,7 @@ export function parseVersionBlock(buf) {
   for (let c = root.childOffset; c + 6 <= root.end;) {
     const child = _readVersionNode(buf, c)
     if (!child || child.end <= c) break
-    if (child.key === 'StringFileInfo') _collectStringTables(buf, child, fields)
+    if (child.key === 'StringFileInfo') _collectStringTables(buf, child, fields, preferredLang)
     c = _align4(child.end)
   }
 
@@ -774,25 +852,62 @@ function _version32(buf, off) {
 }
 
 /**
+ * Read the string values out of a StringFileInfo block.
+ *
+ * A StringFileInfo may hold several StringTable children, each keyed by eight
+ * hex digits: four for the language id and four for a codepage (oleaut32.dll
+ * ships `040904B0` and `0c0904E4`). Tables are visited in the order the chosen
+ * language prefers, and the first value seen for a key wins, so a secondary
+ * table only fills gaps.
+ *
+ * The codepage half of the key is *not* honoured when decoding, and that is
+ * deliberate: in a 32-bit PE every string in VS_VERSIONINFO is UTF-16LE
+ * regardless of what the key claims. The codepage is a leftover from 16-bit
+ * VER resources and today only records which codepage the strings can be
+ * round-tripped through — `04B0` is 1200 (UTF-16) and `04E4` is 1252, but both
+ * are stored as UTF-16. Decoding `040904E4` as 1252 would corrupt every value.
+ *
  * @param {Buffer} buf
  * @param {{ end: number, childOffset: number }} sfi
  * @param {MetadataFields} out
+ * @param {number} preferredLang
  */
-function _collectStringTables(buf, sfi, out) {
+function _collectStringTables(buf, sfi, out, preferredLang) {
+  /** @type {{ node: ReturnType<typeof _readVersionNode>, lang: number }[]} */
+  const tables = []
   for (let t = sfi.childOffset; t + 6 <= sfi.end;) {
     const table = _readVersionNode(buf, t)
     if (!table || table.end <= t) break
+    // A malformed key parses to NaN; Number('') would be 0, which is a real
+    // language id (neutral), so parse the digits explicitly.
+    const lang = /^[0-9A-Fa-f]{8}$/.test(table.key) ? parseInt(table.key.slice(0, 4), 16) : -1
+    tables.push({ node: table, lang })
+    t = _align4(table.end)
+  }
+
+  const rank = (lang) => (lang === preferredLang ? 0 : lang === LANG_EN_US ? 1 : lang === LANG_NEUTRAL ? 2 : 3)
+  const ordered = tables
+    .map((entry, i) => ({ ...entry, i }))
+    .sort((a, b) => rank(a.lang) - rank(b.lang) || a.i - b.i)
+
+  for (const { node: table } of ordered) {
     for (let s = table.childOffset; s + 6 <= table.end;) {
       const str = _readVersionNode(buf, s)
       if (!str || str.end <= s) break
       if (str.isText && str.valueBytes > 0 && out[str.key] === undefined) {
-        const raw = buf.toString('utf16le', str.valueOffset,
-          Math.min(str.valueOffset + str.valueBytes, buf.length))
-        out[str.key] = raw.replace(/\0+$/, '')
+        // wValueLength is specified in characters for a text value, but
+        // non-Microsoft resource compilers write it in bytes — nvspcap64.dll
+        // does — and doubling it then walks into the next node's key. The
+        // node's own wLength is the hard bound, and the value is a single
+        // NUL-terminated string, so honour whichever ends first. That is also
+        // what the Windows API returns, which is why it is unaffected.
+        const stop = Math.min(str.valueOffset + str.valueBytes, str.end, buf.length)
+        const raw = buf.toString('utf16le', str.valueOffset, Math.max(str.valueOffset, stop))
+        const nul = raw.indexOf('\0')
+        out[str.key] = nul >= 0 ? raw.slice(0, nul) : raw
       }
       s = _align4(str.end)
     }
-    t = _align4(table.end)
   }
 }
 
@@ -814,11 +929,33 @@ export function parsePeMetadata(buf) {
   const end = Math.min(section.rawPointer + section.rawSize, buf.length)
   if (section.rawPointer >= end) return { kind: 'pe', fields: {} }
 
-  const block = findVersionResource(
+  const entry = findVersionResourceEntry(
     buf.subarray(section.rawPointer, end), section.virtualAddress, headers.resource.rva
   )
+  if (!entry) return { kind: 'pe', fields: {} }
+
+  // The leaf's RVA is mapped through the whole section table rather than
+  // assumed to land in the directory's own section.
+  const block = _sliceRva(buf, headers.sections, entry.rva, entry.size)
   if (!block) return { kind: 'pe', fields: {} }
-  return { kind: 'pe', fields: parseVersionBlock(block) ?? {} }
+  return { kind: 'pe', fields: parseVersionBlock(block, entry.lang) ?? {} }
+}
+
+/**
+ * Map an RVA to file bytes through the section table.
+ *
+ * @param {Buffer} buf whole image
+ * @param {PeSection[]} sections
+ * @param {number} rva
+ * @param {number} size
+ * @returns {Buffer|null}
+ */
+function _sliceRva(buf, sections, rva, size) {
+  const section = sectionForRva(sections, rva)
+  if (!section) return null
+  const start = section.rawPointer + (rva - section.virtualAddress)
+  if (start < 0 || size <= 0 || start + size > buf.length) return null
+  return buf.subarray(start, start + size)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -969,12 +1106,25 @@ async function _readPeMetadata(fh, size, sniff) {
     return { kind: 'pe', fields: {} }
   }
 
-  // Only the resource section is pulled in, and even that is capped — .rsrc can
-  // legitimately hold tens of megabytes of icons and manifests.
+  // Only a prefix of the resource section is pulled in — .rsrc can legitimately
+  // hold hundreds of megabytes (MRT.exe's is 226 MB of signature data) and the
+  // directory tree we need to walk sits at the front of it.
   const rsrcLen = Math.min(section.rawSize, size - section.rawPointer, MAX_RSRC_BYTES)
   const rsrc = await _readAt(fh, section.rawPointer, rsrcLen)
 
-  const block = findVersionResource(rsrc, section.virtualAddress, headers.resource.rva)
-  if (!block) return { kind: 'pe', fields: {} }
-  return { kind: 'pe', fields: parseVersionBlock(block) ?? {} }
+  const entry = findVersionResourceEntry(rsrc, section.virtualAddress, headers.resource.rva)
+  if (!entry) return { kind: 'pe', fields: {} }
+
+  // The leaf itself is read at its own file offset. Slicing it out of the
+  // prefix above was the bug: a version resource that happens to be laid out
+  // past the cap — which is where a linker puts it when the icons and
+  // manifests come first — silently produced "this file has no version".
+  const leafSection = sectionForRva(headers.sections, entry.rva)
+  if (!leafSection) return { kind: 'pe', fields: {} }
+  const leafAt = leafSection.rawPointer + (entry.rva - leafSection.virtualAddress)
+  if (leafAt < 0 || leafAt + entry.size > size) return { kind: 'pe', fields: {} }
+  const block = await _readAt(fh, leafAt, entry.size)
+  if (block.length < entry.size) return { kind: 'pe', fields: {} }
+
+  return { kind: 'pe', fields: parseVersionBlock(block, entry.lang) ?? {} }
 }
