@@ -112,10 +112,19 @@ export function buildAppMenu(win) {
             item('右側', 'session.merge.compareOutput.right')
           ]
         },
+        item('文字比對資訊…', 'text.info'),
+        item('不重要文字規則…', 'text.unimportantText'),
+        item('對齊選項…', 'text.alignmentOptions'),
+        item('單側獨有的行一律視為重要', 'text.orphansImportant'),
         item('資料夾比對資訊', 'session.folder.info'),
         { type: 'separator' },
         item('交換兩側', 'session.swap'),
         item('重新比對', 'session.recompare', 'F5'),
+        { type: 'separator' },
+        item('快速比對選取項目', 'folder.quickCompare'),
+        item('快速比對全部', 'folder.quickCompareAll'),
+        item('左側比對至…', 'folder.compareToLeft'),
+        item('右側比對至…', 'folder.compareToRight'),
         { type: 'separator' },
         item('移動選取到其他資料夾…', 'session.folder.moveToFolder'),
         item('封存檔比對設定…', 'session.folder.archiveOptions'),
@@ -288,6 +297,21 @@ export function buildAppMenu(win) {
         item('下一個行內差異', 'text.nextInlineDiff', 'CmdOrCtrl+F8'),
         item('上一個行內差異', 'text.prevInlineDiff', 'CmdOrCtrl+F7'),
         item('下一個編輯位置', 'text.nextEdit', 'Alt+F8'),
+        { type: 'separator' },
+        {
+          label: '跳至書籤',
+          submenu: [
+            item('書籤 1', 'search.gotoBookmark1'),
+            item('書籤 2', 'search.gotoBookmark2'),
+            item('書籤 3', 'search.gotoBookmark3'),
+            item('書籤 4', 'search.gotoBookmark4'),
+            item('書籤 5', 'search.gotoBookmark5'),
+            item('書籤 6', 'search.gotoBookmark6'),
+            item('書籤 7', 'search.gotoBookmark7'),
+            item('書籤 8', 'search.gotoBookmark8'),
+            item('書籤 9', 'search.gotoBookmark9')
+          ]
+        },
         item('上一個編輯位置', 'text.prevEdit', 'Alt+F7'),
         item('上一個差異', 'search.prevDiff', 'F7'),
         item('第一個差異', 'search.firstDiff', 'Alt+Home'),
@@ -309,6 +333,18 @@ export function buildAppMenu(win) {
             item('詳細資料：對齊', 'view.text.details.alignment'),
             item('關閉詳細資料', 'view.text.details.off'),
             { type: 'separator' },
+            item('語法高亮', 'text.toggleSyntax'),
+            item('檔案格式…', 'text.fileFormat'),
+            {
+              label: '空白比對方式',
+              submenu: [
+                item('不忽略', 'text.whitespaceMode.none'),
+                item('忽略全部空白', 'text.whitespaceMode.all'),
+                item('忽略行首空白', 'text.whitespaceMode.leading'),
+                item('忽略行尾空白', 'text.whitespaceMode.trailing'),
+                item('忽略空白數量差異', 'text.whitespaceMode.amount')
+              ]
+            },
             item('標尺', 'view.text.ruler'),
             item('檔案資訊', 'view.text.fileInfo'),
             item('說明欄', 'view.text.description'),
@@ -397,6 +433,7 @@ export function buildAppMenu(win) {
       label: '工具(&T)',
       submenu: [
         item('選項…', 'tools.options'),
+        item('自訂指令…', 'tools.customizeCommands'),
         { type: 'separator' },
         item('比對規則（忽略設定）…', 'tools.ignoreRules'),
         item('文法定義…', 'tools.grammar'),

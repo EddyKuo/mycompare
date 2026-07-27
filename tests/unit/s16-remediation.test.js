@@ -17,6 +17,7 @@ import {
   statusVisibleUnder,
   VIEW_PRESETS,
   VIEW_PRESET_LABELS,
+  CUSTOM_VIEW_PRESET,
 } from '../../src/renderer/src/views/folder-compare.js'
 
 // ── Folder compare tree model ───────────────────────────────────────────────
@@ -195,10 +196,14 @@ describe('folder view presets', () => {
     ALL_STATUSES.filter((s) => statusVisibleUnder(s, VIEW_PRESETS[preset]))
 
   it('covers every display filter Beyond Compare offers', () => {
-    for (const [name] of VIEW_PRESET_LABELS) {
+    // `custom` is a read-out for a hand-tuned switch combination, not a preset,
+    // so it is the one label with no entry in VIEW_PRESETS.
+    const named = VIEW_PRESET_LABELS.filter(([name]) => name !== CUSTOM_VIEW_PRESET)
+    for (const [name] of named) {
       expect(VIEW_PRESETS[name], `missing preset ${name}`).toBeDefined()
     }
-    expect(VIEW_PRESET_LABELS).toHaveLength(Object.keys(VIEW_PRESETS).length)
+    expect(named).toHaveLength(Object.keys(VIEW_PRESETS).length)
+    expect(VIEW_PRESETS[CUSTOM_VIEW_PRESET]).toBeUndefined()
   })
 
   it('shows everything under "all"', () => {

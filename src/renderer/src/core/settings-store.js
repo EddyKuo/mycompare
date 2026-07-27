@@ -23,6 +23,7 @@ const KEY_SETTINGS = 'mycompare:settings'
  * @property {Record<string, string>} shortcuts  action → combo string, e.g. 'Ctrl+Z'
  * @property {AppPreferences} prefs
  * @property {AppearanceSettings} appearance
+ * @property {Record<string, boolean>} commandVisibility  command id → shown
  */
 
 /**
@@ -110,6 +111,77 @@ export const PREF_PAGES = Object.freeze({
   ]),
   backup: Object.freeze(['backupOnSave', 'backupNaming', 'backupFolder']),
 })
+
+// ---------------------------------------------------------------------------
+// Per-command visibility (BC's Tools ▸ Customize Commands)
+// ---------------------------------------------------------------------------
+
+/**
+ * The commands a user may hide from the main toolbar.
+ *
+ * `element` is the id of the button in index.html rather than a lookup by
+ * label: a translated or re-worded caption must not silently detach a
+ * preference from the control it governs.
+ *
+ * `menuId` names the native menu item that issues the same command, for the
+ * rows whose command also exists in the menu bar. The renderer cannot hide a
+ * native menu item — that has to happen in the main process — so the field is
+ * carried here as the single list both sides can agree on, and the dialog
+ * marks those rows as menu-side-not-yet-supported instead of pretending.
+ *
+ * @type {ReadonlyArray<{ id: string, element: string, label: string, menuId?: string }>}
+ */
+export const TOOLBAR_COMMANDS = Object.freeze([
+  { id: 'newSession',   element: 'btn-new-session',    label: '新增比對',        menuId: 'session.new' },
+  { id: 'firstDiff',    element: 'btn-first-diff',     label: '第一個差異',      menuId: 'search.firstDiff' },
+  { id: 'prevDiff',     element: 'btn-prev-diff',      label: '上一個差異',      menuId: 'search.prevDiff' },
+  { id: 'nextDiff',     element: 'btn-next-diff',      label: '下一個差異',      menuId: 'search.nextDiff' },
+  { id: 'lastDiff',     element: 'btn-last-diff',      label: '最後一個差異',    menuId: 'search.lastDiff' },
+  { id: 'copyLeft',     element: 'btn-copy-left',      label: '複製到左側' },
+  { id: 'copyRight',    element: 'btn-copy-right',     label: '複製到右側' },
+  { id: 'copyAllLeft',  element: 'btn-copy-all-left',  label: '複製全部差異到左側' },
+  { id: 'copyAllRight', element: 'btn-copy-all-right', label: '複製全部差異到右側' },
+  { id: 'editMode',     element: 'btn-edit-mode',      label: '切換編輯模式' },
+  { id: 'swap',         element: 'btn-swap',           label: '交換左右' },
+  { id: 'refresh',      element: 'btn-refresh',        label: '重新整理' },
+  { id: 'showAll',      element: 'btn-show-all',       label: '顯示：全部' },
+  { id: 'showDiff',     element: 'btn-show-diff',      label: '顯示：只有差異' },
+  { id: 'showSame',     element: 'btn-show-same',      label: '顯示：只有相同' },
+  { id: 'showNone',     element: 'btn-show-none',      label: '顯示：都不顯示' },
+  { id: 'whitespace',   element: 'btn-whitespace',     label: '顯示空白字元' },
+  { id: 'lineNumbers',  element: 'btn-line-numbers',   label: '顯示行號' },
+  { id: 'layout',       element: 'btn-layout-toggle',  label: '切換版面配置' },
+  { id: 'export',       element: 'btn-export',         label: '匯出報告' },
+  { id: 'print',        element: 'btn-print-report',   label: '列印 / 匯出 PDF', menuId: 'file.print' },
+  { id: 'ignoreRules',  element: 'btn-ignore-rules',   label: '忽略規則設定' },
+  { id: 'namedConfig',  element: 'btn-config-modal',   label: '設定管理（命名儲存）' },
+  { id: 'workspaces',   element: 'btn-workspaces',     label: '工作區' },
+  { id: 'options',      element: 'btn-settings-modal', label: '選項' },
+  { id: 'theme',        element: 'btn-theme',          label: '切換主題' },
+])
+
+/** @type {ReadonlyArray<string>} */
+const TOOLBAR_COMMAND_IDS = Object.freeze(TOOLBAR_COMMANDS.map((c) => c.id))
+
+/**
+ * Coerce stored visibility into a map holding only known commands.
+ *
+ * Only `false` is kept. A command absent from the map is shown, so a build
+ * that adds a toolbar button does not need a storage migration to make it
+ * appear.
+ *
+ * @param {unknown} raw
+ * @returns {Record<string, boolean>}
+ */
+export function normaliseCommandVisibility(raw) {
+  /** @type {Record<string, boolean>} */
+  const out = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(/** @type {Record<string, unknown>} */ (raw))) {
+    if (TOOLBAR_COMMAND_IDS.includes(k) && v === false) out[k] = false
+  }
+  return out
+}
 
 // ---------------------------------------------------------------------------
 // Appearance — colours and fonts (BC's Tools ▸ Options ▸ Colors, Fonts)
@@ -352,6 +424,7 @@ function readSettings() {
     shortcuts: { ...DEFAULT_SHORTCUTS },
     prefs: { ...DEFAULT_PREFS },
     appearance: normaliseAppearance(null),
+    commandVisibility: {},
   })
   try {
     const raw = localStorage.getItem(KEY_SETTINGS)
@@ -368,6 +441,7 @@ function readSettings() {
       shortcuts: { ...DEFAULT_SHORTCUTS, ...stored },
       prefs: { ...DEFAULT_PREFS, ...storedPrefs },
       appearance: normaliseAppearance(parsed.appearance),
+      commandVisibility: normaliseCommandVisibility(parsed.commandVisibility),
     }
   } catch {
     return fallback()
@@ -557,6 +631,44 @@ export class SettingsStore {
     return clamped
   }
 
+  // -------------------------------------------------------------------------
+  // Per-command visibility
+  // -------------------------------------------------------------------------
+
+  /** @returns {Record<string, boolean>} only the hidden commands, as `id: false` */
+  getCommandVisibility() {
+    return readSettings().commandVisibility
+  }
+
+  /**
+   * @param {string} id  one of {@link TOOLBAR_COMMANDS}
+   * @returns {boolean}
+   */
+  isCommandVisible(id) {
+    return readSettings().commandVisibility[id] !== false
+  }
+
+  /**
+   * @param {string} id
+   * @param {boolean} visible
+   * @returns {boolean} whether the id was known and the change stored
+   */
+  setCommandVisible(id, visible) {
+    if (!TOOLBAR_COMMAND_IDS.includes(id)) return false
+    const s = readSettings()
+    if (visible) delete s.commandVisibility[id]
+    else s.commandVisibility[id] = false
+    writeSettings(s)
+    return true
+  }
+
+  /** Show every command again. */
+  resetCommandVisibility() {
+    const s = readSettings()
+    s.commandVisibility = {}
+    writeSettings(s)
+  }
+
   /** Restore every colour and font to the shipped defaults. */
   resetAppearance() {
     const s = readSettings()
@@ -606,7 +718,50 @@ export const BUNDLE_SECTIONS = Object.freeze({
   sessions:      'mycompare:sessions',
   recent:        'mycompare:recent',
   folderColumns: 'mycompare:folderColumns',
+  grammars:      'mycompare:grammars',
 })
+
+/** Where user-defined grammars live; see {@link loadUserGrammarDefs}. */
+const KEY_GRAMMARS = 'mycompare:grammars'
+
+/**
+ * User-defined grammars, as last stored.
+ *
+ * The grammar registry itself keeps them in memory only, so before this every
+ * grammar a user wrote was gone at the next launch and none of them could be
+ * exported. Validation stays in the registry: this reads and writes the raw
+ * definitions and lets `setUserGrammars` reject what it cannot compile, so a
+ * definition rejected by a newer build is still reported rather than dropped
+ * here without a word.
+ *
+ * @returns {unknown[]} an empty array when nothing is stored or it is unreadable
+ */
+export function loadUserGrammarDefs() {
+  try {
+    const raw = localStorage.getItem(KEY_GRAMMARS)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * @param {unknown[]} defs
+ * @returns {string} '' on success, otherwise the reason to show the user
+ */
+export function saveUserGrammarDefs(defs) {
+  try {
+    localStorage.setItem(KEY_GRAMMARS, JSON.stringify(Array.isArray(defs) ? defs : []))
+    return ''
+  } catch (err) {
+    const name = err instanceof Error ? err.name : ''
+    return name === 'QuotaExceededError'
+      ? 'localStorage 空間不足，自訂文法未能存檔'
+      : `自訂文法存檔失敗：${err instanceof Error ? err.message : String(err)}`
+  }
+}
 
 /**
  * Property names that must never appear in an exported file.

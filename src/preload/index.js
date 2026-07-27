@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setHidden: (path, hidden) => ipcRenderer.invoke('set-hidden', path, hidden),
   setMtime: (path, mtime) => ipcRenderer.invoke('set-mtime', path, mtime),
   statFile: (path) => ipcRenderer.invoke('stat-file', path),
+  getPortableInfo: () => ipcRenderer.invoke('get-portable-info'),
   saveFile: (defaultPath, content, filters, encoding, backup) =>
     ipcRenderer.invoke('save-file', { defaultPath, content, filters, encoding, backup }),
   readArchive: (archivePath) => ipcRenderer.invoke('read-archive', archivePath),

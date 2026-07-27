@@ -258,3 +258,83 @@ test('S21: 欄位選單可切換「版本」欄', async () => {
   await win.locator('.fc-btn-columns').click()
   await win.locator('.ctx-item', { hasText: '版本' }).first().click()
 })
+
+// ---------------------------------------------------------------------------
+// S26: the P2 gaps — extra columns, composable display switches, comparison
+// criteria, Quick Compare and Compare To.
+//
+// Same reasoning as the S21 block above: the unit tests know the modules work,
+// only the built app answers whether a user can reach them.
+// ---------------------------------------------------------------------------
+
+test('S26: 欄位選單列出建立時間 / 完整路徑 / 檢查碼', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-columns').click()
+  for (const label of ['建立時間', '完整路徑', '檢查碼']) {
+    await expect(win.locator('.ctx-item', { hasText: label }).first())
+      .toBeVisible({ timeout: 2000 })
+  }
+  await win.keyboard.press('Escape')
+})
+
+test('S26: 欄位選單可切換「檢查碼」欄並顯示在表頭', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-columns').click()
+  await win.locator('.ctx-item', { hasText: '檢查碼' }).first().click()
+  await expect(win.locator('.fc-header')).toContainText('檢查碼', { timeout: 2000 })
+  // Restore, so later tests see the default column set.
+  await win.locator('.fc-btn-columns').click()
+  await win.locator('.ctx-item', { hasText: '檢查碼' }).first().click()
+})
+
+test('S26: 工具列有左孤兒 / 右孤兒獨立開關，且下拉會標成「自訂組合」', async () => {
+  await goToFolderCompare(win)
+  const leftOrphan = win.locator('[data-filter="left-orphan"]')
+  const rightOrphan = win.locator('[data-filter="right-orphan"]')
+  await expect(leftOrphan).toBeVisible()
+  await expect(rightOrphan).toBeVisible()
+
+  const preset = win.locator('.fc-view-preset')
+  await preset.selectOption('left-newer')
+  await leftOrphan.click()
+  await expect(preset).toHaveValue('custom')
+
+  // Restore the default view for later tests.
+  await preset.selectOption('all')
+})
+
+test('S26: 規則面板有時間位移、檔名大小寫與檔名對齊三項條件', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-rules').click()
+  const panel = win.locator('.fc-rules-panel')
+  await expect(panel).toBeVisible({ timeout: 2000 })
+  await expect(panel.locator('.fc-rules-time-shift')).toBeAttached()
+  await expect(panel.locator('.fc-rules-name-case')).toBeAttached()
+  await expect(panel.locator('.fc-compare-name-case')).toBeAttached()
+  await expect(panel.locator('.fc-rules-align')).toBeAttached()
+
+  // The select really drives the setting: apply and read it back.
+  await panel.locator('.fc-rules-time-shift').selectOption('dst')
+  await panel.locator('.fc-rules-apply').click()
+  await expect(panel.locator('.fc-rules-time-shift')).toHaveValue('dst')
+  await panel.locator('.fc-rules-time-shift').selectOption('none')
+  await panel.locator('.fc-rules-apply').click()
+  await win.locator('.fc-btn-rules').click()
+})
+
+test('S26: 「比對 ▾」下拉含 Compare To 與 Quick Compare 四項', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-compare-menu').click()
+  const menu = win.locator('.fc-compare-menu')
+  await expect(menu).toBeVisible({ timeout: 2000 })
+  for (const action of ['compare-to-left', 'compare-to-right',
+    'quick-compare-selected', 'quick-compare-all']) {
+    await expect(menu.locator(`[data-action="${action}"]`)).toBeAttached()
+  }
+  await win.locator('.fc-btn-compare-menu').click()
+})
+
+test('S26: 批次選單含「快速比對選取」', async () => {
+  await goToFolderCompare(win)
+  await expect(win.locator('.fc-batch-menu [data-action="quick-compare"]')).toBeAttached()
+})

@@ -24,11 +24,14 @@ import {
   BACKUP_NAMING_OPTIONS,
   COLOR_TOKENS,
   PREF_PAGES,
+  TOOLBAR_COMMANDS,
   applySettingsBundle,
   eventToCombo,
   exportSettingsJSON,
   findShortcutConflicts,
   keyComboMatches,
+  loadUserGrammarDefs,
+  saveUserGrammarDefs,
 } from './core/settings-store.js'
 
 // ---------------------------------------------------------------------------
@@ -204,6 +207,13 @@ const tabMgr = new TabManager()
 /** User settings: keyboard bindings and preferences. */
 const settings = new SettingsStore()
 
+/**
+ * Opens the Options dialog on a named page. Replaced by setupSettingsModal;
+ * until then a command that needs a page has to say so rather than do nothing.
+ * @type {(pane: string) => void}
+ */
+let _openOptionsPane = () => showStatus('選項對話框尚未初始化')
+
 // ---------------------------------------------------------------------------
 // 視圖狀態
 // ---------------------------------------------------------------------------
@@ -255,6 +265,9 @@ export function initApp() {
   setupTheme()
   applyAppearance()
   applyDisplayPrefs()
+  applyCommandVisibility()
+  restoreUserGrammars()
+  void refreshPortableState()
   setupViewSwitching()
   setupToolbarButtons()
   setupPathBarButtons()
@@ -1215,6 +1228,24 @@ function _viewStatus({ message, level }) {
 }
 
 /**
+ * Run something on the text view, or say why it did nothing.
+ *
+ * @param {(v: any) => void} fn
+ * @param {string} label named in the message when the view is not active
+ */
+function _textView(fn, label) {
+  if (currentView !== 'text' || !textCompare) {
+    showStatus(`${label}僅適用於文字比對`)
+    return
+  }
+  try {
+    fn(textCompare)
+  } catch (err) {
+    showError(`${label}失敗：${err?.message ?? err}`, err)
+  }
+}
+
+/**
  * Run a folder-view command from the menu.
  *
  * @param {string} method
@@ -1272,6 +1303,28 @@ function _mergeCompareOutput(side) {
  * matches the view's own table, so adding a command without a menu entry — or
  * the reverse — fails rather than going unnoticed.
  */
+/**
+ * Whitespace comparison modes, as menu ids.
+ *
+ * Spelled out rather than built from a template so the wiring test can see
+ * them: it reads ids out of the source, and a generated string is invisible to
+ * it — which is precisely how a menu item ends up dispatching to nothing.
+ */
+const WHITESPACE_MODE_IDS = Object.freeze([
+  'text.whitespaceMode.none',
+  'text.whitespaceMode.all',
+  'text.whitespaceMode.leading',
+  'text.whitespaceMode.trailing',
+  'text.whitespaceMode.amount',
+])
+
+/** Numbered bookmark jumps, as menu ids. Same reasoning as above. */
+const BOOKMARK_GOTO_IDS = Object.freeze([
+  'search.gotoBookmark1', 'search.gotoBookmark2', 'search.gotoBookmark3',
+  'search.gotoBookmark4', 'search.gotoBookmark5', 'search.gotoBookmark6',
+  'search.gotoBookmark7', 'search.gotoBookmark8', 'search.gotoBookmark9',
+])
+
 const TEXT_EDIT_COMMAND_IDS = Object.freeze([
   'text.copyLineRight', 'text.copyLineLeft', 'text.copyLineOther', 'text.copyOtherSide',
   'text.insertLineBefore', 'text.insertLineAfter',
@@ -1315,6 +1368,106 @@ async function printActiveReport() {
   } catch (err) {
     showError(`列印報告失敗：${err?.message ?? err}`, err)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Print pagination — how a report breaks across printed pages
+// ---------------------------------------------------------------------------
+
+/** Marks the injected block so a second pass cannot add it twice. */
+export const PRINT_PAGINATION_STYLE_ID = 'mc-print-pagination'
+
+/**
+ * Page-break rules applied to every report on its way to the printer.
+ *
+ * Each view builds its own report and its own `@media print` block, so before
+ * this a line could be cut in half by a page break in one view and not in
+ * another. The rules live here, applied to the finished document, so the
+ * behaviour is one decision rather than six.
+ *
+ * `display: table-header-group` is what makes a `<thead>` repeat on every
+ * page; the promotion pass below exists because most of the reports write
+ * their header row straight into the table with no `<thead>` around it, and
+ * the rule has nothing to act on until they do.
+ */
+export const PRINT_PAGINATION_CSS = `
+@page { margin: 14mm 12mm; }
+@media print {
+  thead { display: table-header-group; }
+  tfoot { display: table-footer-group; }
+  tr, img, figure, pre, blockquote, li, .row, .diff-row, .fc-row {
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  h1, h2, h3, h4 {
+    break-inside: avoid; page-break-inside: avoid;
+    break-after: avoid; page-break-after: avoid;
+  }
+  p { orphans: 3; widows: 3; }
+  table { break-inside: auto; }
+}
+`.trim()
+
+/**
+ * Move a table's leading all-`<th>` row into a `<thead>`.
+ *
+ * @param {Document} doc
+ * @returns {number} how many tables were changed
+ */
+function _promoteTableHeaders(doc) {
+  let changed = 0
+  for (const table of doc.querySelectorAll('table')) {
+    if (table.tHead) continue
+    const first = table.querySelector('tr')
+    if (!first) continue
+    const cells = [...first.children]
+    if (cells.length === 0) continue
+    if (!cells.every((c) => c.tagName === 'TH')) continue
+    const thead = doc.createElement('thead')
+    thead.appendChild(first)
+    table.insertBefore(thead, table.firstChild)
+    changed += 1
+  }
+  return changed
+}
+
+/**
+ * Add the shared pagination rules to a finished report document.
+ *
+ * Returns the input unchanged if it cannot be parsed rather than throwing:
+ * printing an un-paginated report is a worse result than an error only in the
+ * sense that it still prints, which is what the user asked for.
+ *
+ * Page *numbers* are deliberately absent. Chromium implements neither `@page`
+ * margin boxes nor `counter(page)` outside them, and the frame that renders
+ * the preview runs no scripts, so anything this printed as a page number would
+ * be a guess at where the breaks landed. The number the user gets comes from
+ * the print dialog's own header/footer option, which is stated in the preview.
+ *
+ * @param {string} html
+ * @returns {string}
+ */
+export function withPrintPagination(html) {
+  const source = String(html ?? '')
+  if (!source.trim()) return source
+  let doc
+  try {
+    doc = new DOMParser().parseFromString(source, 'text/html')
+  } catch (err) {
+    console.error('[print] pagination rules not applied:', err)
+    return source
+  }
+  const head = doc.head
+  if (!head || !doc.documentElement) return source
+  if (doc.getElementById(PRINT_PAGINATION_STYLE_ID)) return source
+
+  _promoteTableHeaders(doc)
+
+  const style = doc.createElement('style')
+  style.id = PRINT_PAGINATION_STYLE_ID
+  style.textContent = PRINT_PAGINATION_CSS
+  head.appendChild(style)
+
+  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,7 +1526,7 @@ function openPrintPreview() {
 
   let html
   try {
-    html = src.view.buildHtmlReport()
+    html = withPrintPagination(src.view.buildHtmlReport())
   } catch (err) {
     showError(`建立列印預覽失敗：${err instanceof Error ? err.message : String(err)}`, err)
     return
@@ -1473,7 +1626,7 @@ async function runReportAction(action) {
         if (src.html) {
           await window.electronAPI.saveFile(
             'compare-report.html',
-            src.view.buildHtmlReport(),
+            withPrintPagination(src.view.buildHtmlReport()),
             [{ name: 'HTML', extensions: ['html'] }, { name: '所有檔案', extensions: ['*'] }])
         } else {
           await src.view.exportHtml()
@@ -1492,7 +1645,7 @@ async function runReportAction(action) {
         _setReportStatus('純文字報告已處理')
         return
       case 'copy-html':
-        await copyTextToClipboard(src.view.buildHtmlReport())
+        await copyTextToClipboard(withPrintPagination(src.view.buildHtmlReport()))
         _setReportStatus('HTML 報告已複製到剪貼簿')
         return
       case 'copy-text':
@@ -3183,6 +3336,7 @@ function setupMenuActions() {
     // and the two settings-transfer items without a second round trip.
     'file.printPreview': () => openPrintPreview(),
     'tools.options': () => el('btn-settings-modal')?.click(),
+    'tools.customizeCommands': () => _openOptionsPane('commands'),
     'tools.settings.export': () => el('btn-settings-export')?.click(),
     'tools.settings.import': () => el('btn-settings-import')?.click(),
     'view.toggleToolbar': () => _toggleChromePref('showToolbar', '工具列'),
@@ -3260,6 +3414,17 @@ function setupMenuActions() {
     'edit.folder.selectOrphansBoth': () => void _folderNav('selectOrphansBoth', '選取兩側孤兒'),
     'session.folder.moveToFolder': () => void _folderNav('moveSelectedToFolder', '移動到其他資料夾'),
     'session.folder.archiveOptions': () => void _folderNav('openArchiveOptionsDialog', '封存檔比對設定'),
+    'folder.quickCompare': () => void _folderNav('quickCompareSelected', '快速比對'),
+    'folder.quickCompareAll': () => void _folderNav('quickCompareAll', '快速比對全部'),
+    'folder.compareToLeft': () => {
+      if (currentView !== 'folder' || !folderCompare) { showStatus('比對至…僅適用於資料夾比對'); return }
+      void folderCompare.compareTo('left')
+    },
+    'folder.compareToRight': () => {
+      if (currentView !== 'folder' || !folderCompare) { showStatus('比對至…僅適用於資料夾比對'); return }
+      void folderCompare.compareTo('right')
+    },
+
     'view.folder.filesOnly': () => void _folderNav('toggleFilesOnly', '只比對檔案'),
     'view.folder.flatten': () => void _folderNav('toggleFlatMode', '攤平比對'),
     'view.folder.ignoreUnimportant': () => void _folderNav('toggleIgnoreUnimportant', '忽略不重要差異'),
@@ -3299,6 +3464,24 @@ function setupMenuActions() {
     'view.text.details.hex':       () => _textPanel((v) => v.setDetailsMode('hex'), '詳細資料：Hex'),
     'view.text.details.alignment': () => _textPanel((v) => v.setDetailsMode('alignment'), '詳細資料：對齊決策'),
     'view.text.details.off':       () => _textPanel((v) => v.setDetailsMode(null), '關閉詳細資料'),
+    'text.info': () => _textView((v) => v.openInfoDialog(), '文字比對資訊'),
+    'text.fileFormat': () => _textView((v) => v.openFileFormatDialog(), '檔案格式'),
+    'text.unimportantText': () => _textView((v) => v.openUnimportantTextDialog(), '不重要文字規則'),
+    'text.alignmentOptions': () => _textView((v) => v.openAlignmentDialog(), '對齊選項'),
+    'text.toggleSyntax': () => _textView(
+      (v) => showStatus(v.setSyntaxHighlighting() ? '已開啟語法高亮' : '已關閉語法高亮'), '語法高亮'),
+    'text.orphansImportant': () => _textView(
+      (v) => showStatus(v.setOrphansAlwaysImportant() ? '單側獨有的行一律視為重要' : '單側獨有的行可被規則降級'),
+      '此設定'),
+    ...Object.fromEntries(WHITESPACE_MODE_IDS.map((id) => [
+      id,
+      () => _textView((v) => v.setWhitespaceMode(id.split('.').pop()), '空白比對方式'),
+    ])),
+    ...Object.fromEntries(BOOKMARK_GOTO_IDS.map((id, i) => [
+      id,
+      () => _textView((v) => v.gotoBookmark(i + 1), '書籤'),
+    ])),
+
     'view.text.ruler':       () => _textPanel((v) => showStatus(v.toggleRuler() ? '已顯示欄位標尺' : '已隱藏欄位標尺')),
     'view.text.fileInfo':    () => _textPanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
     'view.text.description': () => _textPanel((v) => showStatus(v.toggleDescription() ? '已顯示說明欄' : '已隱藏說明欄')),
@@ -3412,7 +3595,8 @@ function setupSettingsModal() {
 
   const renderPrefs = setupPreferenceControls(setStatus)
   const renderAppearance = setupAppearanceControls(setStatus)
-  const selectPane = setupOptionsTabs()
+  const renderCommands = setupCommandControls(setStatus)
+  const { current: selectPane, show: showPane } = setupOptionsTabs()
 
   function render() {
     list.replaceChildren()
@@ -3497,9 +3681,16 @@ function setupSettingsModal() {
     }
   }
 
-  const refreshAll = () => { render(); renderPrefs(); renderAppearance() }
+  const refreshAll = () => {
+    render(); renderPrefs(); renderAppearance(); renderCommands(); void refreshPortableState()
+  }
   const open = () => { refreshAll(); setStatus(''); modal.style.display = 'flex' }
   const close = () => { stopRecording(); modal.style.display = 'none' }
+
+  // Menu commands that want a specific page have to go through here; opening
+  // the dialog and leaving the user to find the page is how "Customize
+  // Commands…" would end up meaning "Options…".
+  _openOptionsPane = (pane) => { open(); showPane(pane) }
 
   el('btn-settings-modal')?.addEventListener('click', open)
   el('btn-settings-modal-close')?.addEventListener('click', close)
@@ -3520,6 +3711,10 @@ function setupSettingsModal() {
       settings.resetPrefs(PREF_PAGES.general)
       setThemeMode('system')
       setStatus('一般設定已恢復預設')
+    } else if (pane === 'commands') {
+      settings.resetCommandVisibility()
+      applyCommandVisibility()
+      setStatus('所有指令已恢復顯示')
     } else {
       settings.resetPrefs(PREF_PAGES[pane] ?? [])
       applyDisplayPrefs()
@@ -3534,12 +3729,12 @@ function setupSettingsModal() {
 /**
  * Wire the Options tab strip.
  *
- * @returns {() => string} the id of the page currently shown
+ * @returns {{ current: () => string, show: (pane: string) => void }}
  */
 function setupOptionsTabs() {
   const strip = el('options-tabs')
   let current = 'general'
-  if (!strip) return () => current
+  if (!strip) return { current: () => current, show: () => {} }
 
   /** @type {HTMLButtonElement[]} */
   const tabs = [...strip.querySelectorAll('.options-tab')]
@@ -3561,7 +3756,98 @@ function setupOptionsTabs() {
     tab.addEventListener('click', () => show(tab.dataset.pane ?? 'general'))
   }
   show(current)
-  return () => current
+  return { current: () => current, show }
+}
+
+/**
+ * Wire the "Menu and toolbar" page.
+ *
+ * Rows are generated from TOOLBAR_COMMANDS rather than from the toolbar's DOM:
+ * a button that is currently hidden is not in the document to be scanned, so
+ * building the list from what is on screen would make the checkbox that hid it
+ * disappear along with it.
+ *
+ * @param {(msg: string) => void} setStatus
+ * @returns {() => void} re-reads the store into the controls
+ */
+function setupCommandControls(setStatus) {
+  const list = el('settings-commands-list')
+  const filterInput = el('inp-command-filter')
+  if (!list) return () => {}
+
+  let filter = ''
+
+  const render = () => {
+    list.replaceChildren()
+    const needle = filter.trim().toLowerCase()
+    let shown = 0
+    for (const cmd of TOOLBAR_COMMANDS) {
+      if (needle && !cmd.label.toLowerCase().includes(needle)
+          && !cmd.id.toLowerCase().includes(needle)) continue
+      shown += 1
+
+      const row = document.createElement('label')
+      row.className = 'settings-check'
+
+      const box = document.createElement('input')
+      box.type = 'checkbox'
+      box.checked = settings.isCommandVisible(cmd.id)
+      box.dataset.commandId = cmd.id
+      box.addEventListener('change', () => {
+        if (!settings.setCommandVisible(cmd.id, box.checked)) {
+          setStatus(`無法設定「${cmd.label}」：不是已知的指令`)
+          box.checked = settings.isCommandVisible(cmd.id)
+          return
+        }
+        applyCommandVisibility()
+        setStatus(box.checked ? `已顯示「${cmd.label}」` : `已從工具列隱藏「${cmd.label}」`)
+      })
+
+      const name = document.createElement('span')
+      name.textContent = cmd.label
+      row.append(box, name)
+
+      if (cmd.menuId) {
+        const note = document.createElement('span')
+        note.className = 'settings-row-conflict'
+        note.textContent = `選單（${cmd.menuId}）：尚未支援`
+        row.appendChild(note)
+      }
+      list.appendChild(row)
+    }
+
+    if (shown === 0) {
+      const empty = document.createElement('p')
+      empty.className = 'settings-hint'
+      empty.textContent = '沒有符合的指令'
+      list.appendChild(empty)
+    }
+  }
+
+  filterInput?.addEventListener('input', () => {
+    filter = /** @type {HTMLInputElement} */ (filterInput).value
+    render()
+  })
+
+  return () => {
+    if (filterInput instanceof HTMLInputElement) filter = filterInput.value
+    render()
+  }
+}
+
+/**
+ * Hide the toolbar buttons the user switched off.
+ *
+ * Separators are left alone: a run of them with nothing between is untidy, but
+ * collapsing them would need to know which separator belongs to which group,
+ * and guessing that wrongly removes a divider the user still needs.
+ */
+function applyCommandVisibility() {
+  for (const cmd of TOOLBAR_COMMANDS) {
+    const node = el(cmd.element)
+    if (!node) continue
+    node.style.display = settings.isCommandVisible(cmd.id) ? '' : 'none'
+  }
 }
 
 /**
@@ -3720,6 +4006,8 @@ function setupSettingsTransfer(setStatus, refreshAll) {
 
       applyAppearance()
       applyDisplayPrefs()
+      applyCommandVisibility()
+      restoreUserGrammars()
       refreshAll()
       renderRecentSessions(openSession, removeSession)
       setStatus(`已匯入 ${result.applied.length} 個設定區段；部分設定需重新開啟分頁才會生效`)
@@ -4325,6 +4613,22 @@ function renderGrammarErrors(extra) {
   box.append(title, ul)
 }
 
+/**
+ * Load the user's grammars back into the registry at startup.
+ *
+ * The registry is memory-only, so without this every grammar a user wrote was
+ * gone at the next launch — the dialog re-opened listing the built-ins alone
+ * and never said why.
+ */
+function restoreUserGrammars() {
+  const stored = loadUserGrammarDefs()
+  if (stored.length === 0) return
+  const rejected = setUserGrammars(stored)
+  if (rejected.length > 0) {
+    showError(`有 ${rejected.length} 個已儲存的自訂文法無法載入：${rejected.join('；')}`)
+  }
+}
+
 function applyGrammarChanges() {
   const userDefs = _grammarEdit.defs
     .filter((d) => !d.builtin)
@@ -4339,6 +4643,11 @@ function applyGrammarChanges() {
   // those that merely lost an item still register, and compileGrammar reports
   // the loss below.
   const rejected = setUserGrammars(userDefs)
+
+  // Store what the registry accepted, so a definition rejected here is not
+  // reloaded as a failure on every launch.
+  const saveError = saveUserGrammarDefs(getUserGrammars())
+  if (saveError) showError(saveError)
 
   if (textCompare) {
     textCompare.applyConfig({ ...textCompare.getConfig(), grammarIgnore: [..._grammarEdit.ignored] })
@@ -4585,6 +4894,43 @@ function _toggleChromePref(pref, label) {
 }
 
 /** Show or hide the chrome the Display page controls. */
+/**
+ * Report whether the app is running as a portable install.
+ *
+ * Everything the renderer persists goes to localStorage, which Chromium keeps
+ * inside `userData`; relocating that has to happen in the main process before
+ * the app is ready, so the renderer can only ask and report. When the main
+ * process does not answer, this says so plainly — showing "可攜式" because a
+ * check could not run is exactly how a user would come to believe their
+ * settings travel with the folder when they do not.
+ */
+async function refreshPortableState() {
+  const state = el('txt-portable-state')
+  const hint = el('portable-hint')
+  if (!state || !hint) return
+
+  const api = /** @type {Record<string, unknown> | undefined} */ (window.electronAPI)
+  if (typeof api?.getPortableInfo !== 'function') {
+    state.textContent = '不支援（一般安裝）'
+    hint.textContent = '主程序尚未提供可攜式模式，設定仍存放在使用者資料夾。'
+      + '在此之前，把設定帶到另一台機器的方式是上面的「匯出全部設定…」與「匯入設定…」。'
+    return
+  }
+
+  try {
+    const info = /** @type {{ portable?: boolean, dataDir?: string }} */ (
+      await /** @type {() => Promise<unknown>} */ (api.getPortableInfo)())
+    state.textContent = info?.portable ? '可攜式（設定隨程式目錄）' : '一般安裝'
+    hint.textContent = info?.dataDir
+      ? `設定存放位置：${info.dataDir}`
+      : '主程序未回報設定存放位置。'
+  } catch (err) {
+    state.textContent = '（無法取得）'
+    hint.textContent = ''
+    showError(`無法讀取可攜式模式狀態：${err instanceof Error ? err.message : String(err)}`, err)
+  }
+}
+
 function applyDisplayPrefs() {
   const toolbar = el('toolbar')
   if (toolbar) toolbar.style.display = settings.getPref('showToolbar') === false ? 'none' : ''

@@ -64,6 +64,33 @@ test('read-dir reports the hidden attribute when asked', async () => {
   expect(after.find((r) => r.name === 'secret.txt').hidden).toBe(false)
 })
 
+test('read-dir reports the system and archive bits alongside hidden', async () => {
+  test.skip(!isWindows, 'no such attributes on this platform')
+
+  // attrib already prints all three on the same line; only H was being read,
+  // so the folder view's System and Archive columns had nothing to show even
+  // though the answer was right there.
+  const p = join(dir, 'flagged.txt')
+  await writeFile(p, 'x', 'utf-8')
+  await win.evaluate((f) => window.electronAPI.setHidden(f, true), p)
+
+  const rows = await win.evaluate(
+    (d) => window.electronAPI.readDir(d, { attributes: true }), dir)
+  const row = rows.find((r) => r.name === 'flagged.txt')
+
+  expect(row.hidden).toBe(true)
+  expect(typeof row.system).toBe('boolean')
+  expect(typeof row.archive).toBe('boolean')
+
+  // A plain file must read false rather than true for everything, or the
+  // columns would be decorative.
+  const plain = rows.find((r) => r.name === 'plain.txt')
+  expect(plain.hidden).toBe(false)
+  expect(plain.system).toBe(false)
+
+  await win.evaluate((f) => window.electronAPI.setHidden(f, false), p)
+})
+
 test('read-only can be set and cleared without discarding other permissions', async () => {
   const p = join(dir, 'plain.txt')
   const before = (await stat(p)).mode

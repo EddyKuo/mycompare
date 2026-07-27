@@ -178,6 +178,8 @@ function seedEverything() {
   localStorage.setItem('mycompare:sessions', JSON.stringify({ s1: { id: 's1', type: 'text' } }))
   localStorage.setItem('mycompare:recent', JSON.stringify(['s1']))
   localStorage.setItem('mycompare:folderColumns', JSON.stringify(['name', 'size']))
+  localStorage.setItem('mycompare:grammars', JSON.stringify(
+    [{ name: 'INI', masks: ['*.ini'], caseSensitive: false, items: [] }]))
 }
 
 /** @returns {Record<string,string|null>} every bundled key's raw value */

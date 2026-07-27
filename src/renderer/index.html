@@ -517,6 +517,7 @@
           <button class="options-tab" id="options-tab-nav" role="tab" data-pane="nav" aria-controls="options-pane-nav" aria-selected="false">下一個差異</button>
           <button class="options-tab" id="options-tab-backup" role="tab" data-pane="backup" aria-controls="options-pane-backup" aria-selected="false">備份</button>
           <button class="options-tab" id="options-tab-shortcuts" role="tab" data-pane="shortcuts" aria-controls="options-pane-shortcuts" aria-selected="false">快捷鍵</button>
+          <button class="options-tab" id="options-tab-commands" role="tab" data-pane="commands" aria-controls="options-pane-commands" aria-selected="false">選單與工具列</button>
           <button class="options-tab" id="options-tab-appearance" role="tab" data-pane="appearance" aria-controls="options-pane-appearance" aria-selected="false">色彩與字型</button>
         </div>
 
@@ -550,9 +551,19 @@
                 <button id="btn-settings-import">匯入設定…</button>
               </div>
               <p class="settings-hint">
-                涵蓋快捷鍵、所有偏好、色彩與字型、已命名設定、工作區、Session 與 Session 群組、
-                資料夾欄位。遠端連線設定檔不在其中：密碼由作業系統金鑰庫保管，連密文也不會寫進檔案。
+                涵蓋快捷鍵、所有偏好、色彩與字型、指令顯示設定、自訂文法、已命名設定、工作區、
+                Session 與 Session 群組、資料夾欄位。遠端連線設定檔不在其中：密碼由作業系統金鑰庫保管，
+                連密文也不會寫進檔案。
               </p>
+            </div>
+
+            <h4 class="settings-section-title">可攜式安裝</h4>
+            <div class="settings-prefs">
+              <div class="settings-field">
+                <span>目前狀態：</span>
+                <code id="txt-portable-state" class="settings-path">（檢查中…）</code>
+              </div>
+              <p class="settings-hint" id="portable-hint"></p>
             </div>
           </section>
 
@@ -628,6 +639,21 @@
             <div id="settings-shortcuts-list"></div>
           </section>
 
+          <!-- 選單與工具列 -->
+          <section class="options-pane" id="options-pane-commands" role="tabpanel" aria-labelledby="options-tab-commands" hidden>
+            <h4 class="settings-section-title">顯示哪些指令</h4>
+            <label class="settings-field">
+              <span>搜尋指令：</span>
+              <input type="search" id="inp-command-filter" class="u-config-input" placeholder="輸入指令名稱" />
+            </label>
+            <p class="settings-hint">
+              取消勾選會把該指令從主工具列移除；指令本身仍可由選單與快捷鍵使用。
+              標示「選單：尚未支援」的列表示同一個指令也在原生選單列中，
+              而隱藏原生選單項必須由主程序執行，目前尚未提供。
+            </p>
+            <div id="settings-commands-list"></div>
+          </section>
+
           <!-- 色彩與字型 -->
           <section class="options-pane" id="options-pane-appearance" role="tabpanel" aria-labelledby="options-tab-appearance" hidden>
             <h4 class="settings-section-title">差異色彩</h4>
@@ -671,6 +697,11 @@
       </div>
       <div class="modal-body print-preview-body">
         <div id="print-preview-view" class="settings-hint"></div>
+        <p class="settings-hint" id="print-preview-pagination-hint">
+          列印時已避免把單行或單列從中間切斷，表頭會在每一頁重複。
+          頁碼由列印對話框的「頁首及頁尾」選項產生：瀏覽器引擎不提供可由報告本身
+          印出頁碼的方式，因此這裡不會自行標上頁碼。
+        </p>
         <!-- sandbox without allow-scripts: the report is static markup, and the
              frame must not be able to run anything even if that changes. -->
         <iframe id="print-preview-frame" class="print-preview-frame" title="列印預覽內容"

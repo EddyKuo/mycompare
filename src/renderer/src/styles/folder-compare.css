@@ -384,8 +384,10 @@
 
 .fc-size,
 .fc-mtime,
+.fc-created,
 .fc-ext,
 .fc-relpath,
+.fc-abspath,
 .fc-attrs {
   font-size: 11px;
   color: var(--text-secondary);
@@ -402,11 +404,13 @@
 }
 
 .fc-mtime,
+.fc-created,
 .fc-attrs {
   padding-right: 4px;
 }
 
-.fc-relpath {
+.fc-relpath,
+.fc-abspath {
   padding-right: 6px;
 }
 
@@ -741,7 +745,8 @@
   border-color: var(--accent);
 }
 
-.fc-select-menu {
+.fc-select-menu,
+.fc-compare-menu {
   position: absolute;
   top: calc(100% + 2px);
   left: 0;
@@ -754,7 +759,8 @@
   padding: 4px 0;
 }
 
-.fc-select-item {
+.fc-select-item,
+.fc-compare-item {
   display: block;
   width: 100%;
   text-align: left;
@@ -767,7 +773,8 @@
   white-space: nowrap;
 }
 
-.fc-select-item:hover {
+.fc-select-item:hover,
+.fc-compare-item:hover {
   background: var(--bg-toolbar);
 }
 
@@ -1256,6 +1263,73 @@
 .fc-version--pending {
   opacity: 0.45;
   font-style: italic;
+}
+
+/* ── Checksum column ──────────────────────────────────────────────────────── */
+
+.fc-crc {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  padding-right: 6px;
+  font-family: monospace;
+}
+
+.fc-crc--pending {
+  opacity: 0.45;
+  font-style: italic;
+}
+
+/* ── Comparison criteria controls in the rules panel ──────────────────────── */
+
+.fc-rules-time-shift,
+.fc-rules-name-case {
+  font-size: 12px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  outline: none;
+}
+
+.fc-rules-align {
+  font-size: 12px;
+  padding: 2px 6px;
+  height: 24px;
+  width: 220px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  outline: none;
+}
+
+/* ── Compare To / Quick Compare dropdown ──────────────────────────────────── */
+
+.fc-btn-compare-menu {
+  font-size: 12px;
+  padding: 2px 8px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fc-btn-compare-menu:hover {
+  background: var(--bg-toolbar);
+}
+
+/* Wider than the selection dropdown: these labels are full sentences. */
+.fc-compare-menu {
+  min-width: 240px;
 }
 
 /* ── P2-37: settings scope dialog ─────────────────────────────────────────── */

@@ -44,9 +44,15 @@ function dispatchIds() {
  * are read from the id list instead.
  */
 function generatedIds() {
-  const block = /TEXT_EDIT_COMMAND_IDS = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(APP)
-  if (!block) return []
-  return [...block[1].matchAll(/'([\w.]+)'/g)].map((m) => m[1])
+  // Any frozen array of dotted ids counts: several command groups are spread
+  // into the dispatch table from such a list, so no literal key exists for the
+  // scan above to find. Reading every one of them keeps a new group from
+  // silently looking unhandled.
+  const out = []
+  for (const block of APP.matchAll(/Object\.freeze\(\[([\s\S]*?)\]\)/g)) {
+    for (const id of block[1].matchAll(/'([a-z][\w]*(?:\.[\w]+)+)'/g)) out.push(id[1])
+  }
+  return out
 }
 
 describe('menu wiring', () => {

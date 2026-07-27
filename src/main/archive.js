@@ -20,6 +20,7 @@ import { gunzipSync } from 'zlib'
 import { bunzip2, isBzip2, Bzip2Error } from './bzip2.js'
 import { decodeXz, isXz, LzmaError } from './lzma.js'
 import { is7z, parse7z, extract7zEntry, SevenZipError } from './sevenzip.js'
+import { isCab, parseCab, extractCabEntry, CabError } from './cab.js'
 
 /**
  * @typedef {Object} ArchiveEntry
@@ -38,7 +39,7 @@ import { is7z, parse7z, extract7zEntry, SevenZipError } from './sevenzip.js'
  */
 
 /**
- * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'|'7z'} ArchiveFormat
+ * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'|'7z'|'cab'} ArchiveFormat
  */
 
 /**
@@ -410,6 +411,20 @@ export function unxz(buf, maxBytes = DEFAULT_LIMITS.maxTotalBytes) {
  * @param {() => T} fn
  * @returns {T}
  */
+/**
+ * Re-throw a cabinet failure as an archive failure, keeping its reason.
+ *
+ * @template T @param {() => T} fn @returns {T}
+ */
+function withCabErrors(fn) {
+  try {
+    return fn()
+  } catch (err) {
+    if (err instanceof CabError) throw new ArchiveError(err.message, err.code)
+    throw new ArchiveError(`Corrupt cab archive: ${err instanceof Error ? err.message : err}`, 'corrupt')
+  }
+}
+
 function with7zErrors(fn) {
   try {
     return fn()
@@ -443,6 +458,7 @@ export function detectFormat(filePath, buf) {
   if (isBzip2(buf)) return /\.(tbz|tbz2|tar\.bz2)$/i.test(filePath) ? 'tar.bz2' : 'bzip2'
   if (isXz(buf)) return /\.(txz|tar\.xz)$/i.test(filePath) ? 'tar.xz' : 'xz'
   if (is7z(buf)) return '7z'
+  if (isCab(buf)) return 'cab'
   if (buf.length >= 4 && buf.toString('ascii', 0, 4) === 'Rar!') {
     throw new ArchiveError('RAR archives are not supported (no built-in decoder)', 'unsupported')
   }
@@ -565,6 +581,19 @@ export async function readArchive(archivePath, limits = {}) {
     entries = parseTar(bunzip(buf, lim.maxTotalBytes), lim).map(stripOffset)
   } else if (format === 'tar.xz') {
     entries = parseTar(unxz(buf, lim.maxTotalBytes), lim).map(stripOffset)
+  } else if (format === 'cab') {
+    const parsed = withCabErrors(() => parseCab(buf))
+    let total = 0
+    entries = parsed.entries.map((e) => {
+      total += e.size
+      if (e.size > lim.maxEntryBytes) {
+        throw new ArchiveError(`Entry "${e.path}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
+      }
+      if (total > lim.maxTotalBytes) {
+        throw new ArchiveError(`Archive expands past the ${lim.maxTotalBytes} byte limit`, 'limit')
+      }
+      return { path: sanitizeEntryPath(e.path), size: e.size, mtime: e.mtime, isDirectory: false }
+    })
   } else if (format === '7z') {
     const parsed = with7zErrors(() => parse7z(buf, { maxBytes: lim.maxTotalBytes }))
     let total = 0
@@ -703,6 +732,17 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
       throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
     }
     return readZipEntryBounded(file, wanted, lim.maxEntryBytes)
+  }
+
+  if (format === 'cab') {
+    const parsed = withCabErrors(() => parseCab(buf))
+    const hit = parsed.entries.find((e) => safeName(e.path) === wanted)
+    if (!hit) throw new ArchiveError(`No such entry: ${wanted}`, 'notfound')
+    if (hit.size > lim.maxEntryBytes) {
+      throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
+    }
+    return Buffer.from(withCabErrors(() =>
+      extractCabEntry(buf, parsed, hit.path, { maxBytes: lim.maxTotalBytes })))
   }
 
   if (format === '7z') {

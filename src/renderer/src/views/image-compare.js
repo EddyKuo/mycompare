@@ -471,7 +471,10 @@ export function formatDiffStats(diffCount, totalPixels, approximate = false) {
  * @property {boolean} autoScale
  * @property {boolean} mismatchRange
  * @property {'normal'|'difference'|'blend'} blendMode
+ * @property {number} [blendRatio]
  * @property {string} highlightColor
+ * @property {ImageMetadata|null} [leftMeta]
+ * @property {ImageMetadata|null} [rightMeta]
  */
 
 const ALGORITHM_LABELS = {
@@ -501,6 +504,7 @@ export function imageReportParameters(info) {
     ['自動縮放對齊', info.autoScale ? '開' : '關'],
     ['差異分級', info.mismatchRange ? '開' : '關'],
     ['疊加模式', BLEND_LABELS[info.blendMode] ?? String(info.blendMode)],
+    ['混合比例', `${Math.round((info.blendRatio ?? 1) * 100)}%`],
     ['標示色', HIGHLIGHT_COLORS[info.highlightColor]?.label ?? String(info.highlightColor)],
     ['差異區塊數', String(info.regionCount ?? 0)],
   ]
@@ -526,7 +530,14 @@ export function buildImageTextReport(info, opts = {}) {
   const table = renderTextTable(
     [{ title: '項目' }, { title: '值' }],
     imageReportParameters(info))
-  return `${header}${summary}\n\n${table}\n`
+  /**
+   * @param {string} label
+   * @param {ImageMetadata|null|undefined} m
+   */
+  const meta = (label, m) => `${label}檔頭中繼資料\n${
+    renderTextTable([{ title: '項目' }, { title: '值' }], imageMetadataRows(m))}`
+  return `${header}${summary}\n\n${table}\n\n${
+    meta('左側', info.leftMeta)}\n${meta('右側', info.rightMeta)}\n`
 }
 
 // ── Image info panel ─────────────────────────────────────────────────────────
@@ -558,6 +569,372 @@ export function formatBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+// ── File-header metadata ─────────────────────────────────────────────────────
+
+/**
+ * How much of the file is kept for header parsing.
+ *
+ * Everything read below lives in the first few kilobytes of every format
+ * handled here; EXIF thumbnails can push an APP1 segment to 64 KB, and PNG
+ * writers occasionally place `pHYs` after a large `iCCP`. 256 KB covers both
+ * without keeping a second copy of a large image alive.
+ */
+export const METADATA_SCAN_BYTES = 256 * 1024
+
+/**
+ * @typedef {object} ImageMetadata
+ * @property {string} container  container as identified from its signature
+ * @property {boolean} supported whether this reader can decode that container
+ * @property {string[][]} fields label/value rows read from the file itself
+ * @property {string} [note]     why something is absent, when it is
+ */
+
+/**
+ * Decode a base64 payload's leading bytes.
+ *
+ * @param {string} b64
+ * @param {number} [limit]
+ * @returns {Uint8Array} empty when the input is not decodable base64
+ */
+export function base64HeadBytes(b64, limit = METADATA_SCAN_BYTES) {
+  const clean = String(b64 ?? '').replace(/[\r\n]/g, '')
+  if (!clean) return new Uint8Array(0)
+  // 4 base64 chars per 3 bytes; slicing on a multiple of 4 keeps atob happy.
+  const chars = Math.min(clean.length, Math.ceil(limit / 3) * 4)
+  const head = clean.slice(0, chars - (chars % 4))
+  try {
+    const bin = atob(head)
+    const out = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+    return out
+  } catch {
+    // Not base64 (a data: URL prefix, or a truncated payload). The caller
+    // reports "unreadable" rather than inventing values.
+    return new Uint8Array(0)
+  }
+}
+
+/** @param {Uint8Array} b @param {number} at @returns {number} */
+const u16be = (b, at) => (b[at] << 8) | b[at + 1]
+/** @param {Uint8Array} b @param {number} at @returns {number} */
+const u32be = (b, at) => ((b[at] << 24) >>> 0) + (b[at + 1] << 16) + (b[at + 2] << 8) + b[at + 3]
+/** @param {Uint8Array} b @param {number} at @returns {number} */
+const u16le = (b, at) => b[at] | (b[at + 1] << 8)
+/** @param {Uint8Array} b @param {number} at @returns {number} */
+const u32le = (b, at) => (b[at] + (b[at + 1] << 8) + (b[at + 2] << 16) + (b[at + 3] * 0x1000000))
+
+/** @param {Uint8Array} b @param {number} at @param {string} sig @returns {boolean} */
+function matches(b, at, sig) {
+  if (b.length < at + sig.length) return false
+  for (let i = 0; i < sig.length; i++) if (b[at + i] !== sig.charCodeAt(i)) return false
+  return true
+}
+
+const PNG_COLOR_TYPES = {
+  0: '灰階', 2: 'RGB（真彩色）', 3: '索引色（調色盤）', 4: '灰階＋Alpha', 6: 'RGBA（真彩色＋Alpha）',
+}
+
+/** EXIF tags this reader names. Anything else is skipped, not guessed at. */
+const EXIF_TAGS = {
+  0x010e: '影像描述', 0x010f: '相機製造商', 0x0110: '相機型號',
+  0x0112: '方向', 0x011a: '水平解析度', 0x011b: '垂直解析度',
+  0x0128: '解析度單位', 0x0131: '軟體', 0x0132: '檔案修改時間',
+  0x9003: '拍攝時間', 0x829a: '曝光時間', 0x829d: '光圈值',
+  0x8827: 'ISO', 0x920a: '焦距', 0xa002: 'EXIF 影像寬', 0xa003: 'EXIF 影像高',
+  0xa001: '色彩空間',
+}
+
+const EXIF_ORIENTATION = {
+  1: '正常', 2: '水平翻轉', 3: '旋轉 180°', 4: '垂直翻轉',
+  5: '轉置（順時針 90° ＋翻轉）', 6: '順時針 90°', 7: '轉置（逆時針 90° ＋翻轉）', 8: '逆時針 90°',
+}
+
+/**
+ * Read the TIFF structure an EXIF segment carries.
+ *
+ * Only IFD0 and the Exif sub-IFD are walked, and only the tags in EXIF_TAGS
+ * are reported: a dump of every private maker-note tag would be noise, and a
+ * tag whose type this does not understand is skipped rather than rendered as
+ * whatever its bytes happen to spell.
+ *
+ * @param {Uint8Array} b
+ * @param {number} start  offset of the "II"/"MM" byte-order mark
+ * @returns {string[][]}
+ */
+export function parseExif(b, start) {
+  /** @type {string[][]} */
+  const out = []
+  if (b.length < start + 8) return out
+  const le = matches(b, start, 'II')
+  if (!le && !matches(b, start, 'MM')) return out
+  const u16 = (at) => (le ? u16le(b, at) : u16be(b, at))
+  const u32 = (at) => (le ? u32le(b, at) : u32be(b, at))
+  if (u16(start + 2) !== 42) return out
+
+  /** @type {number|null} */
+  let resolutionUnit = null
+  /** @type {Array<[string, string]>} */
+  const rows = []
+
+  /** @param {number} ifd @param {number} depth */
+  const walk = (ifd, depth) => {
+    if (depth > 1) return // IFD0 → Exif IFD; deeper is maker-note territory
+    const base = start + ifd
+    if (base + 2 > b.length) return
+    const count = u16(base)
+    for (let i = 0; i < count; i++) {
+      const e = base + 2 + i * 12
+      if (e + 12 > b.length) return
+      const tag = u16(e)
+      const type = u16(e + 2)
+      const num = u32(e + 4)
+      const sizes = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 }
+      const unit = sizes[type]
+      if (!unit) continue
+      const bytes = unit * num
+      const at = bytes <= 4 ? e + 8 : start + u32(e + 8)
+      if (at < 0 || at + bytes > b.length) continue
+
+      if (tag === 0x8769) { walk(u32(e + 8), depth + 1); continue }
+
+      const label = EXIF_TAGS[tag]
+      if (!label) continue
+
+      /** @type {string|null} */
+      let value = null
+      if (type === 2) {
+        let s = ''
+        for (let k = 0; k < bytes && b[at + k] !== 0; k++) s += String.fromCharCode(b[at + k])
+        value = s.trim() || null
+      } else if (type === 3) {
+        value = String(u16(at))
+      } else if (type === 4) {
+        value = String(u32(at))
+      } else if (type === 5 || type === 10) {
+        const den = u32(at + 4)
+        value = den === 0 ? null : String(Number((u32(at) / den).toFixed(4)))
+      }
+      if (value === null) continue
+
+      if (tag === 0x0112) value = EXIF_ORIENTATION[Number(value)] ?? value
+      if (tag === 0x0128) resolutionUnit = Number(value)
+      if (tag === 0xa001) value = value === '1' ? 'sRGB' : `未校正（${value}）`
+      rows.push([label, value])
+    }
+  }
+
+  walk(u32(start + 4), 0)
+
+  // The resolution numbers mean nothing without their unit, so it is folded in
+  // rather than listed as a bare enum the user has to look up.
+  const unitName = resolutionUnit === 3 ? ' 點/公分' : resolutionUnit === 2 ? ' DPI' : ''
+  for (const [k, v] of rows) {
+    if (k === '解析度單位') continue
+    out.push([k, (k === '水平解析度' || k === '垂直解析度') ? `${v}${unitName}` : v])
+  }
+  return out
+}
+
+/** @param {Uint8Array} b @returns {ImageMetadata} */
+function parsePngMetadata(b) {
+  /** @type {string[][]} */
+  const fields = []
+  let at = 8
+  let sawIhdr = false
+  while (at + 8 <= b.length) {
+    const len = u32be(b, at)
+    const type = String.fromCharCode(b[at + 4], b[at + 5], b[at + 6], b[at + 7])
+    const data = at + 8
+    if (len < 0 || data + len > b.length) break
+
+    if (type === 'IHDR' && len >= 13) {
+      sawIhdr = true
+      fields.push(['尺寸（檔頭）', `${u32be(b, data)} × ${u32be(b, data + 4)}`])
+      fields.push(['位元深度', `${b[data + 8]} 位元/通道`])
+      fields.push(['色彩型別', PNG_COLOR_TYPES[b[data + 9]] ?? `未知（${b[data + 9]}）`])
+      fields.push(['交錯', b[data + 12] === 1 ? 'Adam7' : '無'])
+    } else if (type === 'pHYs' && len >= 9) {
+      const x = u32be(b, data)
+      const y = u32be(b, data + 4)
+      fields.push(b[data + 8] === 1
+        ? ['解析度', `${(x * 0.0254).toFixed(1)} × ${(y * 0.0254).toFixed(1)} DPI`]
+        : ['像素比例', `${x} : ${y}（未指定單位，無法換算成 DPI）`])
+    } else if (type === 'eXIf') {
+      for (const row of parseExif(b, data)) fields.push(row)
+    } else if (type === 'IDAT' || type === 'IEND') {
+      break // metadata after the pixel data is legal but rare; stop scanning
+    }
+    at = data + len + 4
+  }
+  return sawIhdr
+    ? { container: 'PNG', supported: true, fields }
+    : { container: 'PNG', supported: true, fields, note: '檔頭不完整，無法讀取 IHDR' }
+}
+
+/** @param {Uint8Array} b @returns {ImageMetadata} */
+function parseJpegMetadata(b) {
+  /** @type {string[][]} */
+  const fields = []
+  let at = 2
+  let sawSof = false
+  let truncated = false
+  while (at + 4 <= b.length) {
+    if (b[at] !== 0xff) { truncated = true; break }
+    const marker = b[at + 1]
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { at += 2; continue }
+    if (marker === 0xda || marker === 0xd9) break // start of scan: pixels from here
+    const len = u16be(b, at + 2)
+    const data = at + 4
+    if (len < 2 || data + len - 2 > b.length) { truncated = true; break }
+
+    if (marker === 0xe0 && matches(b, data, 'JFIF\0') && len >= 14) {
+      const units = b[data + 7]
+      const x = u16be(b, data + 8)
+      const y = u16be(b, data + 10)
+      fields.push(units === 1 ? ['解析度', `${x} × ${y} DPI`]
+        : units === 2 ? ['解析度', `${x} × ${y} 點/公分`]
+          : ['像素比例', `${x} : ${y}（未指定單位，無法換算成 DPI）`])
+    } else if (marker === 0xe1 && matches(b, data, 'Exif\0')) {
+      for (const row of parseExif(b, data + 6)) fields.push(row)
+    } else if (marker >= 0xc0 && marker <= 0xcf
+               && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc && len >= 8) {
+      sawSof = true
+      const comps = b[data + 5]
+      fields.unshift(
+        ['尺寸（檔頭）', `${u16be(b, data + 3)} × ${u16be(b, data + 1)}`],
+        ['取樣精度', `${b[data]} 位元/通道`],
+        ['分量數', comps === 1 ? '1（灰階）' : comps === 3 ? '3（YCbCr）'
+          : comps === 4 ? '4（CMYK / YCCK）' : String(comps)],
+        ['編碼方式', (marker === 0xc2 || marker === 0xc6 || marker === 0xca)
+          ? '漸進式' : '基線'],
+      )
+    }
+    at = data + len - 2
+  }
+  const meta = { container: 'JPEG', supported: true, fields }
+  if (!sawSof) {
+    meta.note = truncated
+      ? '檔頭不完整或超出可讀取的範圍，未找到影格標頭'
+      : '未找到影格標頭'
+  }
+  return meta
+}
+
+/** @param {Uint8Array} b @returns {ImageMetadata} */
+function parseGifMetadata(b) {
+  if (b.length < 13) return { container: 'GIF', supported: true, fields: [], note: '檔頭不完整' }
+  const packed = b[10]
+  const hasGct = (packed & 0x80) !== 0
+  return {
+    container: 'GIF',
+    supported: true,
+    fields: [
+      ['版本', String.fromCharCode(b[3], b[4], b[5])],
+      ['尺寸（檔頭）', `${u16le(b, 6)} × ${u16le(b, 8)}`],
+      ['色彩解析度', `${((packed >> 4) & 0x07) + 1} 位元/通道`],
+      ['全域調色盤', hasGct ? `${2 ** ((packed & 0x07) + 1)} 色` : '無'],
+    ],
+  }
+}
+
+/** @param {Uint8Array} b @returns {ImageMetadata} */
+function parseBmpMetadata(b) {
+  if (b.length < 54) return { container: 'BMP', supported: true, fields: [], note: '檔頭不完整' }
+  const dib = u32le(b, 14)
+  /** @type {string[][]} */
+  const fields = [
+    ['尺寸（檔頭）', `${u32le(b, 18)} × ${Math.abs(u32le(b, 22) | 0)}`],
+    ['位元深度', `${u16le(b, 28)} 位元/像素`],
+    ['壓縮', u32le(b, 30) === 0 ? '無（BI_RGB）' : `代碼 ${u32le(b, 30)}`],
+  ]
+  if (dib >= 40) {
+    const xppm = u32le(b, 38)
+    const yppm = u32le(b, 42)
+    fields.push(xppm > 0 && yppm > 0
+      ? ['解析度', `${(xppm * 0.0254).toFixed(1)} × ${(yppm * 0.0254).toFixed(1)} DPI`]
+      : ['解析度', '檔頭未記錄'])
+  }
+  return { container: 'BMP', supported: true, fields }
+}
+
+/** @param {Uint8Array} b @returns {ImageMetadata} */
+function parseWebpMetadata(b) {
+  /** @type {string[][]} */
+  const fields = []
+  let at = 12
+  while (at + 8 <= b.length) {
+    const fourcc = String.fromCharCode(b[at], b[at + 1], b[at + 2], b[at + 3])
+    const len = u32le(b, at + 4)
+    const data = at + 8
+    if (len < 0 || data + len > b.length) break
+    if (fourcc === 'VP8X' && len >= 10) {
+      const flags = b[data]
+      fields.push(['尺寸（檔頭）',
+        `${1 + (b[data + 4] | (b[data + 5] << 8) | (b[data + 6] << 16))} × ${
+          1 + (b[data + 7] | (b[data + 8] << 8) | (b[data + 9] << 16))}`])
+      fields.push(['Alpha 通道', (flags & 0x10) ? '有' : '無'])
+      fields.push(['動畫', (flags & 0x02) ? '有' : '無'])
+    } else if (fourcc === 'VP8 ' && len >= 10) {
+      fields.push(['編碼', '有損（VP8）'])
+      fields.push(['尺寸（檔頭）',
+        `${u16le(b, data + 6) & 0x3fff} × ${u16le(b, data + 8) & 0x3fff}`])
+    } else if (fourcc === 'VP8L') {
+      fields.push(['編碼', '無損（VP8L）'])
+    } else if (fourcc === 'EXIF') {
+      for (const row of parseExif(b, data)) fields.push(row)
+    }
+    at = data + len + (len % 2)
+  }
+  return fields.length
+    ? { container: 'WebP', supported: true, fields }
+    : { container: 'WebP', supported: true, fields, note: '未找到可讀取的區塊' }
+}
+
+/**
+ * Read what the image file itself records about the image.
+ *
+ * Signature-driven, never extension-driven: a `.png` holding a JPEG is read as
+ * a JPEG, and a container this cannot parse is reported as unsupported rather
+ * than filled in from the decoded canvas. That distinction is the whole point
+ * of the panel — dimensions are already known from the decode, so the only
+ * value here is in stating what the *file* says, or admitting it cannot.
+ *
+ * @param {Uint8Array} bytes  leading bytes of the file
+ * @param {string} [ext]  the extension it was loaded under, for the message only
+ * @returns {ImageMetadata}
+ */
+export function parseImageMetadata(bytes, ext = '') {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(0)
+  const label = ext ? String(ext).replace(/^\./, '').toUpperCase() : '未知'
+  if (b.length < 12) {
+    return { container: label, supported: false, fields: [], note: '無法讀取檔案內容' }
+  }
+  if (b[0] === 0x89 && matches(b, 1, 'PNG')) return parsePngMetadata(b)
+  if (b[0] === 0xff && b[1] === 0xd8) return parseJpegMetadata(b)
+  if (matches(b, 0, 'GIF8')) return parseGifMetadata(b)
+  if (matches(b, 0, 'BM')) return parseBmpMetadata(b)
+  if (matches(b, 0, 'RIFF') && matches(b, 8, 'WEBP')) return parseWebpMetadata(b)
+  return {
+    container: label,
+    supported: false,
+    fields: [],
+    note: '此格式的檔頭尚未支援讀取，因此不顯示任何中繼資料',
+  }
+}
+
+/**
+ * Metadata rows for the info panel, including the reason there are none.
+ *
+ * @param {ImageMetadata|null|undefined} meta
+ * @returns {string[][]}
+ */
+export function imageMetadataRows(meta) {
+  if (!meta) return [['中繼資料', '（未載入）']]
+  if (!meta.supported) return [['中繼資料', meta.note ?? '此格式不支援讀取檔頭']]
+  if (meta.fields.length === 0) return [['中繼資料', meta.note ?? '檔頭中沒有可顯示的欄位']]
+  return meta.note ? [...meta.fields, ['備註', meta.note]] : meta.fields
+}
+
 /**
  * @typedef {object} ImageSideInfo
  * @property {string} path
@@ -566,6 +943,7 @@ export function formatBytes(n) {
  * @property {number} width
  * @property {number} height
  * @property {'rgba'|'rgb'|'unknown'} depth  see {@link imageInfoRows}
+ * @property {ImageMetadata|null} [meta]  what the file header says, if readable
  */
 
 /**
@@ -629,9 +1007,14 @@ export function buildImageHtmlReport(info, images = {}, opts = {}) {
     : '<p class="missing">（無法擷取影像）</p>'}
 </figure>`
 
-  const rows = imageReportParameters(info)
+  const toRows = (pairs) => pairs
     .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`)
     .join('\n')
+  const rows = toRows(imageReportParameters(info))
+  const metaTable = (label, m) => `<h3>${escapeHtml(label)}檔頭中繼資料</h3>
+<table><thead><tr><th>項目</th><th>值</th></tr></thead><tbody>
+${toRows(imageMetadataRows(m))}
+</tbody></table>`
 
   return `<!DOCTYPE html><html lang="zh-TW"><head><meta charset="utf-8">
 <title>圖片比對報告</title>
@@ -658,9 +1041,11 @@ ${pane('左側', images.left ?? '')}
 ${pane('右側', images.right ?? '')}
 ${pane('差異', images.diff ?? '')}
 </div>
-<table><tbody>
+<table><thead><tr><th>項目</th><th>值</th></tr></thead><tbody>
 ${rows}
 </tbody></table>
+${metaTable('左側', info.leftMeta)}
+${metaTable('右側', info.rightMeta)}
 </body></html>`
 }
 
@@ -860,6 +1245,15 @@ export class ImageCompare {
     this._blendMode = 'difference'
 
     /**
+     * How strongly the difference layer is mixed into the difference pane,
+     * 0 = not at all, 1 = fully. Beyond Compare exposes the blend as a
+     * percentage rather than only on/off, so a faint difference can be dialled
+     * up and a loud one dialled back without switching modes.
+     * @type {number}
+     */
+    this._blendRatio = 1
+
+    /**
      * S16: align differently-sized images before the pixel diff.
      * @type {boolean}
      */
@@ -912,7 +1306,7 @@ export class ImageCompare {
     this._mounted = false
 
     // 圖片資料
-    /** @typedef {{ path: string, ext: string, img: HTMLImageElement, bytes: number, depth: 'rgba'|'rgb'|'unknown'|null }} LoadedImage */
+    /** @typedef {{ path: string, ext: string, img: HTMLImageElement, bytes: number, depth: 'rgba'|'rgb'|'unknown'|null, meta: ImageMetadata|null }} LoadedImage */
     /** @type {LoadedImage | null} */
     this._left = null
     /** @type {LoadedImage | null} */
@@ -975,6 +1369,7 @@ export class ImageCompare {
       threshold: this._threshold,
       algorithm: this._algorithm,
       blendMode: this._blendMode,
+      blendRatio: this._blendRatio,
       autoScale: this._autoScale,
       mismatchRange: this._mismatchRange,
       highlightColor: this._highlightColor,
@@ -993,6 +1388,9 @@ export class ImageCompare {
     }
     if (['exact', 'tolerance', 'grayscale'].includes(s.algorithm)) this._algorithm = s.algorithm
     if (['normal', 'difference', 'blend'].includes(s.blendMode)) this._blendMode = s.blendMode
+    if (typeof s.blendRatio === 'number' && s.blendRatio >= 0 && s.blendRatio <= 1) {
+      this._blendRatio = s.blendRatio
+    }
     if (typeof s.autoScale === 'boolean') this._autoScale = s.autoScale
     if (typeof s.mismatchRange === 'boolean') this._mismatchRange = s.mismatchRange
     if (typeof s.highlightColor === 'string'
@@ -1010,6 +1408,8 @@ export class ImageCompare {
     if (dom.autoScaleCheck) dom.autoScaleCheck.checked = this._autoScale
     if (dom.mismatchRangeCheck) dom.mismatchRangeCheck.checked = this._mismatchRange
     if (dom.overlaySelect) dom.overlaySelect.value = this._blendMode
+    if (dom.blendRatioSlider) dom.blendRatioSlider.value = String(this._blendRatio)
+    this._updateBlendRatioLabel()
     if (dom.highlightSelect) dom.highlightSelect.value = this._highlightColor
     if (dom.thresholdSlider) dom.thresholdSlider.value = String(this._threshold)
     if (dom.thresholdVal) dom.thresholdVal.textContent = this._threshold.toFixed(2)
@@ -1108,6 +1508,7 @@ export class ImageCompare {
       width: side.img?.naturalWidth ?? 0,
       height: side.img?.naturalHeight ?? 0,
       depth: side.depth ?? this._detectDepth(which),
+      meta: side.meta ?? null,
     }
   }
 
@@ -1332,6 +1733,42 @@ export class ImageCompare {
     const sel = /** @type {HTMLSelectElement | undefined} */ (this._dom.overlaySelect)
     if (sel && sel.value !== mode) sel.value = mode
     this._toggleDiffOverlay()
+    this._updateBlendRatioLabel()
+  }
+
+  /**
+   * Set the blend percentage of the difference layer.
+   *
+   * @param {number} ratio  0–1; values outside are clamped rather than refused,
+   *   because the slider is the only producer and clamping is what it means
+   * @returns {number} the ratio now in effect
+   */
+  setBlendRatio(ratio) {
+    const n = Number(ratio)
+    if (!Number.isFinite(n)) return this._blendRatio
+    this._blendRatio = Math.min(1, Math.max(0, n))
+    const slider = /** @type {HTMLInputElement | undefined} */ (this._dom.blendRatioSlider)
+    if (slider && slider.value !== String(this._blendRatio)) {
+      slider.value = String(this._blendRatio)
+    }
+    this._toggleDiffOverlay()
+    this._updateBlendRatioLabel()
+    return this._blendRatio
+  }
+
+  /** @returns {number} */
+  getBlendRatio() {
+    return this._blendRatio
+  }
+
+  /** Keep the percentage readout and the slider's enabled state in step. */
+  _updateBlendRatioLabel() {
+    const label = this._dom.blendRatioVal
+    if (label) label.textContent = `${Math.round(this._blendRatio * 100)}%`
+    const slider = /** @type {HTMLInputElement | undefined} */ (this._dom.blendRatioSlider)
+    // With no overlay on screen there is nothing to blend, so the control says
+    // so instead of moving and appearing to do nothing.
+    if (slider) slider.disabled = this._blendMode === 'normal'
   }
 
   /** @returns {'normal'|'difference'|'blend'} */
@@ -1447,7 +1884,12 @@ export class ImageCompare {
     // S14-M06: drop the base64 string after decode — nothing reads it later
     // and it can double image memory for large files. Its length is the only
     // record of the file size, so it is measured before being dropped.
-    this._left = { path, ext, img, bytes: base64ByteLength(base64), depth: null }
+    this._left = {
+      path, ext, img,
+      bytes: base64ByteLength(base64),
+      depth: null,
+      meta: parseImageMetadata(base64HeadBytes(base64), ext),
+    }
     this._pendingFirstDiff = true
     this._drawImage('left', img)
     this._updatePathDisplay('left', path, img.naturalWidth, img.naturalHeight)
@@ -1467,7 +1909,12 @@ export class ImageCompare {
   async setRight(path, base64, ext) {
     const img = await this._loadImage(base64, ext)
     // S14-M06: drop base64 after decode.
-    this._right = { path, ext, img, bytes: base64ByteLength(base64), depth: null }
+    this._right = {
+      path, ext, img,
+      bytes: base64ByteLength(base64),
+      depth: null,
+      meta: parseImageMetadata(base64HeadBytes(base64), ext),
+    }
     this._pendingFirstDiff = true
     this._drawImage('right', img)
     this._updatePathDisplay('right', path, img.naturalWidth, img.naturalHeight)
@@ -1564,7 +2011,10 @@ export class ImageCompare {
       autoScale: this._autoScale,
       mismatchRange: this._mismatchRange,
       blendMode: this._blendMode,
+      blendRatio: this._blendRatio,
       highlightColor: this._highlightColor,
+      leftMeta: this._left?.meta ?? null,
+      rightMeta: this._right?.meta ?? null,
     }
   }
 
@@ -1803,6 +2253,27 @@ export class ImageCompare {
     overlaySelect.value = this._blendMode
     this._dom.overlaySelect = overlaySelect
     toolbar.appendChild(overlaySelect)
+
+    // Blend percentage — BC's blend is a slider, not a switch.
+    toolbar.appendChild(el('label', { className: 'ic-toolbar-label', textContent: '混合比例：' }))
+    const blendRatioSlider = /** @type {HTMLInputElement} */ (el('input', {
+      type: 'range',
+      className: 'ic-blend-slider',
+      min: '0',
+      max: '1',
+      step: '0.05',
+      value: String(this._blendRatio),
+      title: '差異疊加層混合的百分比',
+    }))
+    blendRatioSlider.disabled = this._blendMode === 'normal'
+    this._dom.blendRatioSlider = blendRatioSlider
+    toolbar.appendChild(blendRatioSlider)
+    const blendRatioVal = el('span', {
+      className: 'ic-blend-value',
+      textContent: `${Math.round(this._blendRatio * 100)}%`,
+    })
+    this._dom.blendRatioVal = blendRatioVal
+    toolbar.appendChild(blendRatioVal)
 
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
@@ -2047,9 +2518,10 @@ export class ImageCompare {
     ])) {
       const block = el('div', { className: 'ic-info-side' })
       block.appendChild(el('div', { className: 'ic-info-title', textContent: label }))
+      const info = this.getSideInfo(which)
       const table = el('table', { className: 'ic-info-table' })
       const tbody = el('tbody')
-      for (const [k, v] of imageInfoRows(this.getSideInfo(which))) {
+      for (const [k, v] of imageInfoRows(info)) {
         const tr = el('tr')
         tr.appendChild(el('th', {}, k))
         tr.appendChild(el('td', {}, v))
@@ -2057,6 +2529,23 @@ export class ImageCompare {
       }
       table.appendChild(tbody)
       block.appendChild(table)
+
+      // Kept in its own table under its own heading: everything above is
+      // measured from the decoded image, everything here is quoted from the
+      // file, and the two must not read as one list of equally-sourced facts.
+      block.appendChild(el('div', {
+        className: 'ic-info-subtitle', textContent: '檔頭中繼資料',
+      }))
+      const metaTable = el('table', { className: 'ic-info-table' })
+      const metaBody = el('tbody')
+      for (const [k, v] of imageMetadataRows(info?.meta ?? null)) {
+        const tr = el('tr')
+        tr.appendChild(el('th', {}, k))
+        tr.appendChild(el('td', {}, v))
+        metaBody.appendChild(tr)
+      }
+      metaTable.appendChild(metaBody)
+      block.appendChild(metaTable)
       panel.appendChild(block)
     }
 
@@ -2205,6 +2694,7 @@ export class ImageCompare {
     const thresholdSlider    = dom.thresholdSlider
     const thresholdVal       = dom.thresholdVal
     const overlaySelect      = dom.overlaySelect
+    const blendRatioSlider   = dom.blendRatioSlider
     const autoScaleCheck     = dom.autoScaleCheck
     const mismatchRangeCheck = dom.mismatchRangeCheck
     const highlightSelect    = dom.highlightSelect
@@ -2242,6 +2732,10 @@ export class ImageCompare {
       if (v === 'normal' || v === 'difference' || v === 'blend') {
         this.setBlendMode(v)
       }
+    })
+
+    blendRatioSlider?.addEventListener('input', () => {
+      this.setBlendRatio(parseFloat(blendRatioSlider.value))
     })
 
     autoScaleCheck?.addEventListener('change', () => {
@@ -2670,6 +3164,9 @@ export class ImageCompare {
       wrapDiff.style.visibility = ''
       wrapDiff.style.mixBlendMode = ''
     }
+    // Left at '' rather than '1' when fully mixed, so nothing inherits an
+    // opacity that would defeat the panel's own styling.
+    wrapDiff.style.opacity = this._blendRatio >= 1 ? '' : String(this._blendRatio)
   }
 
   // ── Private: T57 Keyboard shortcuts ─────────────────────────────────────────

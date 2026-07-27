@@ -27,6 +27,7 @@ import { toast } from '../core/toast.js';
 import {
   getGrammarForPath, tokenizeLines, maskLine, linesEqualIgnoringElements,
   lineWeight, elementsOf, getUserGrammars, setUserGrammars, isRiskyRegexSource,
+  listGrammars, compileGrammar,
 } from '../core/grammar.js';
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
@@ -1226,6 +1227,239 @@ export function restoreOriginalDiffText(diff, leftLines, rightLines) {
 }
 
 // ---------------------------------------------------------------------------
+// P2-53 — whitespace comparison modes
+// ---------------------------------------------------------------------------
+
+/**
+ * BC splits whitespace handling into four mutually exclusive choices rather
+ * than one checkbox. Two of them (`all`, `trailing`) have no equivalent in the
+ * diff engine's `normalise`, so they are expressed here as a comparison-only
+ * rewrite and undone afterwards by `restoreOriginalDiffText` — the same route
+ * the replacement rules already take.
+ *
+ * @typedef {'none'|'all'|'leading'|'trailing'|'amount'} WhitespaceMode
+ */
+
+/** Modes the diff engine cannot express, so they need a rewrite pass. */
+const REWRITE_WS_MODES = new Set(['all', 'trailing']);
+
+/**
+ * Rewrite text for comparison under a whitespace mode.
+ *
+ * Line count is preserved (each line keeps its own terminator) so the original
+ * text can be restored by line number afterwards.
+ *
+ * @param {string} text
+ * @param {WhitespaceMode} mode
+ * @returns {string}
+ */
+export function applyWhitespaceMode(text, mode) {
+  const src = String(text ?? '');
+  if (!REWRITE_WS_MODES.has(mode)) return src;
+  return splitLinesKeepEol(src).map((line) => {
+    const { body, eol } = splitEol(line);
+    const out = mode === 'all'
+      ? body.replace(/[ \t]+/g, '')
+      : body.replace(/[ \t]+$/, '');
+    return out + eol;
+  }).join('');
+}
+
+// ---------------------------------------------------------------------------
+// P2-59 / P2-60 — alignment options
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs longer than this are left alone: the pairing below is O(n·m) in the run
+ * length, and a thousand-line block of pure insertions has no useful pairing
+ * to find anyway.
+ */
+const MAX_REALIGN_RUN = 300;
+
+/**
+ * Dice coefficient over character bigrams — 1 for identical, 0 for nothing in
+ * common. Cheap enough to run on every candidate pair inside a run.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} 0..1
+ */
+export function lineSimilarity(a, b) {
+  const x = String(a ?? '').trim();
+  const y = String(b ?? '').trim();
+  if (x === y) return 1;
+  if (x.length === 0 || y.length === 0) return 0;
+  if (x.length === 1 || y.length === 1) return x === y ? 1 : 0;
+  /** @type {Map<string, number>} */
+  const bag = new Map();
+  for (let i = 0; i < x.length - 1; i++) {
+    const g = x.slice(i, i + 2);
+    bag.set(g, (bag.get(g) ?? 0) + 1);
+  }
+  let hits = 0;
+  for (let i = 0; i < y.length - 1; i++) {
+    const g = y.slice(i, i + 2);
+    const n = bag.get(g) ?? 0;
+    if (n > 0) { bag.set(g, n - 1); hits++; }
+  }
+  return (2 * hits) / (x.length - 1 + y.length - 1);
+}
+
+/**
+ * @typedef {{
+ *   neverAlign?: RegExp[],
+ *   skewTolerance?: number,
+ *   useCloseness?: boolean,
+ *   closenessThreshold?: number,
+ * }} AlignmentOptions
+ */
+
+/**
+ * Whether any alignment option is actually in effect.
+ *
+ * Used to skip the pass entirely when it is off, so the default diff output —
+ * and every test written against it — is bit-identical to before.
+ *
+ * @param {AlignmentOptions} opts
+ * @returns {boolean}
+ */
+export function alignmentOptionsActive(opts) {
+  return (opts?.neverAlign?.length ?? 0) > 0
+    || (Number(opts?.skewTolerance) || 0) > 0
+    || opts?.useCloseness === true;
+}
+
+/**
+ * Re-pair the lines inside each run of differences.
+ *
+ * The diff engine pairs a deletion with an insertion purely by position within
+ * the run. BC lets the user override that with three controls, all applied
+ * here because the engine takes no such options:
+ *
+ *  - never-align patterns: a matching line is emitted as an orphan, never as
+ *    half of a `replace` row;
+ *  - skew tolerance: refuses a pairing whose two lines sit more than N apart
+ *    within the run, which is what stops a stray match dragging the alignment;
+ *  - closeness matching: pairs by similarity rather than by position, so a
+ *    moved-and-edited line lands opposite its counterpart.
+ *
+ * @param {import('../core/diff-engine.js').DiffLine[]} diff
+ * @param {AlignmentOptions} opts
+ * @returns {import('../core/diff-engine.js').DiffLine[]} a new array
+ */
+export function applyAlignmentOptions(diff, opts = {}) {
+  const list = Array.isArray(diff) ? diff : [];
+  if (!alignmentOptionsActive(opts)) return list;
+
+  const neverAlign = opts.neverAlign ?? [];
+  const skew = Number(opts.skewTolerance) || 0;
+  const useCloseness = opts.useCloseness === true;
+  const threshold = Number.isFinite(opts.closenessThreshold)
+    ? Math.max(0, Math.min(1, Number(opts.closenessThreshold))) : 0.5;
+
+  /** @param {string} text */
+  const excluded = (text) => neverAlign.some((re) => { re.lastIndex = 0; return re.test(text ?? ''); });
+
+  /** @type {import('../core/diff-engine.js').DiffLine[]} */
+  const out = [];
+  let i = 0;
+  while (i < list.length) {
+    if (list[i].type === 'equal') { out.push(list[i]); i++; continue; }
+    let j = i;
+    while (j < list.length && list[j].type !== 'equal') j++;
+    out.push(...realignRun(list.slice(i, j), { excluded, skew, useCloseness, threshold }));
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * Re-pair one maximal run of non-equal DiffLines.
+ *
+ * @param {import('../core/diff-engine.js').DiffLine[]} run
+ * @param {{ excluded: (text: string) => boolean, skew: number,
+ *           useCloseness: boolean, threshold: number }} cfg
+ * @returns {import('../core/diff-engine.js').DiffLine[]}
+ */
+function realignRun(run, cfg) {
+  /** @type {Array<{ line: number, text: string, src: import('../core/diff-engine.js').DiffLine }>} */
+  const lefts = [];
+  /** @type {Array<{ line: number, text: string, src: import('../core/diff-engine.js').DiffLine }>} */
+  const rights = [];
+  for (const dl of run) {
+    if (dl.leftLine != null) lefts.push({ line: dl.leftLine, text: dl.leftText ?? '', src: dl });
+    if (dl.rightLine != null) rights.push({ line: dl.rightLine, text: dl.rightText ?? '', src: dl });
+  }
+  if (lefts.length === 0 || rights.length === 0) return run;
+  if (lefts.length > MAX_REALIGN_RUN || rights.length > MAX_REALIGN_RUN) return run;
+
+  /**
+   * Whether l[a] may be paired with r[b] at all.
+   * @param {number} a @param {number} b
+   */
+  const allowed = (a, b) => {
+    if (cfg.excluded(lefts[a].text) || cfg.excluded(rights[b].text)) return false;
+    if (cfg.skew > 0 && Math.abs(a - b) > cfg.skew) return false;
+    return true;
+  };
+
+  /**
+   * Pair score. Without closeness matching every allowed pair scores the same,
+   * which reproduces the engine's positional pairing minus the exclusions.
+   * @param {number} a @param {number} b
+   */
+  const score = (a, b) => {
+    if (!allowed(a, b)) return -1;
+    if (!cfg.useCloseness) return 1;
+    const s = lineSimilarity(lefts[a].text, rights[b].text);
+    return s >= cfg.threshold ? s : -1;
+  };
+
+  // Order-preserving maximum-weight matching: the same recurrence as LCS, with
+  // similarity in place of equality. Order must hold or the panes would show
+  // lines out of file order.
+  const n = lefts.length, m = rights.length;
+  const dp = Array.from({ length: n + 1 }, () => new Float64Array(m + 1));
+  for (let a = n - 1; a >= 0; a--) {
+    for (let b = m - 1; b >= 0; b--) {
+      const s = score(a, b);
+      const pair = s < 0 ? -Infinity : s + dp[a + 1][b + 1];
+      dp[a][b] = Math.max(pair, dp[a + 1][b], dp[a][b + 1]);
+    }
+  }
+
+  /** @type {import('../core/diff-engine.js').DiffLine[]} */
+  const out = [];
+  let a = 0, b = 0;
+  while (a < n && b < m) {
+    const s = score(a, b);
+    const pair = s < 0 ? -Infinity : s + dp[a + 1][b + 1];
+    if (pair === dp[a][b]) {
+      out.push({ type: 'replace', leftLine: lefts[a].line, rightLine: rights[b].line,
+        leftText: lefts[a].text, rightText: rights[b].text });
+      a++; b++;
+    } else if (dp[a + 1][b] >= dp[a][b + 1]) {
+      out.push({ type: 'delete', leftLine: lefts[a].line, rightLine: null,
+        leftText: lefts[a].text, rightText: '' });
+      a++;
+    } else {
+      out.push({ type: 'insert', leftLine: null, rightLine: rights[b].line,
+        leftText: '', rightText: rights[b].text });
+      b++;
+    }
+  }
+  for (; a < n; a++) {
+    out.push({ type: 'delete', leftLine: lefts[a].line, rightLine: null,
+      leftText: lefts[a].text, rightText: '' });
+  }
+  for (; b < m; b++) {
+    out.push({ type: 'insert', leftLine: null, rightLine: rights[b].line,
+      leftText: '', rightText: rights[b].text });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // TextCompare class
 // ---------------------------------------------------------------------------
 
@@ -1283,7 +1517,32 @@ export class TextCompare {
       unimportantPatterns: options.unimportantPatterns ?? [],
       ignoreUnimportant: options.ignoreUnimportant ?? false,
       alignByGrammar: options.alignByGrammar ?? true,
+      // P2-54: BC treats a line that exists on one side only as a difference
+      // no ignore rule may downgrade, because "the file gained a line" is not
+      // a cosmetic change however the line reads.
+      orphansAlwaysImportant: options.orphansAlwaysImportant ?? false,
+      // P2-59 / P2-60
+      neverAlignPatterns: options.neverAlignPatterns ?? [],
+      skewTolerance: options.skewTolerance ?? 0,
+      useClosenessMatching: options.useClosenessMatching ?? false,
+      closenessThreshold: options.closenessThreshold ?? 0.5,
     };
+
+    /** P2-53: whitespace mode, derived from / synced with the legacy flags. */
+    this._whitespaceMode = /** @type {WhitespaceMode} */ (
+      REWRITE_WS_MODES.has(options.whitespaceMode) ? options.whitespaceMode : 'none');
+
+    /** P2-52: BC has syntax highlighting as an explicit toggle, not only a
+     *  consequence of the extension. @type {boolean} */
+    this._syntaxHighlight = options.syntaxHighlight ?? true;
+
+    /** P2-58: manual file-format override per side; right may be 'same-as-left'.
+     *  @type {{ left: string|null, right: string|null }} */
+    this._formatOverride = { left: null, right: null };
+
+    /** Compiled never-align patterns, rebuilt whenever the list changes.
+     *  @type {RegExp[]} */
+    this._neverAlignCompiled = [];
 
     // Content state
     this._leftPath = '';
@@ -1549,8 +1808,19 @@ export class TextCompare {
     this._redoStack.push({ left: this._leftContent, right: this._rightContent });
     this._leftContent = snap.left;
     this._rightContent = snap.right;
+    this._syncEditTextareas();
     this._runDiff();
     return true;
+  }
+
+  /**
+   * P2-49: an undo taken while the edit overlays are visible has to be
+   * reflected in them, or the next keystroke would re-commit the old text.
+   */
+  _syncEditTextareas() {
+    if (!this._editMode) return;
+    if (this._textareaLeft) this._textareaLeft.value = this._leftContent;
+    if (this._textareaRight) this._textareaRight.value = this._rightContent;
   }
 
   /**
@@ -1563,6 +1833,7 @@ export class TextCompare {
     this._undoStack.push({ left: this._leftContent, right: this._rightContent });
     this._leftContent = snap.left;
     this._rightContent = snap.right;
+    this._syncEditTextareas();
     this._runDiff();
     return true;
   }
@@ -1736,18 +2007,7 @@ export class TextCompare {
     // T43: Bookmark shortcuts
     this._onKeyDownBookmark = (e) => {
       if (!this._mounted || !isActive('text')) return;
-      if (e.ctrlKey && e.key === 'F2') {
-        e.preventDefault();
-        this._toggleBookmarkAtCursor();
-      }
-      if (e.key === 'F2' && !e.ctrlKey && !e.shiftKey) {
-        e.preventDefault();
-        this._navigateBookmark(1);
-      }
-      if (e.key === 'F2' && e.shiftKey && !e.ctrlKey) {
-        e.preventDefault();
-        this._navigateBookmark(-1);
-      }
+      this._handleBookmarkKey(e);
     };
     document.addEventListener('keydown', this._onKeyDownBookmark);
 
@@ -1756,25 +2016,7 @@ export class TextCompare {
     // need the live DOM selection, which only this view can resolve.
     this._onKeyDownTextGaps = (e) => {
       if (!this._mounted || !isActive('text')) return;
-      if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
-        e.preventDefault();
-        void this.compareSelectionToClipboard();
-      } else if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
-        e.preventDefault();
-        void this.openPatchFile();
-      } else if (e.ctrlKey && e.shiftKey && (e.key === 'R' || e.key === 'r')) {
-        e.preventDefault();
-        this.openReplacementsDialog();
-      } else if (e.ctrlKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) {
-        e.preventDefault();
-        void this.mergeFilesWithBase();
-      } else if (e.ctrlKey && e.shiftKey && (e.key === 'A' || e.key === 'a')) {
-        e.preventDefault();
-        void this.openFromArchive(this.activeSide());
-      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'i' || e.key === 'I')) {
-        e.preventDefault();
-        this.toggleIgnoreSelection();
-      }
+      this._handleTextGapKey(e);
     };
     document.addEventListener('keydown', this._onKeyDownTextGaps);
 
@@ -2417,6 +2659,10 @@ export class TextCompare {
         return;
       }
       const timerKey = side === 'left' ? '_editTimerLeft' : '_editTimerRight';
+      // P2-49: typing has to enter the undo stack too, otherwise Ctrl+Z after
+      // an edit jumps back past it to the last copy. One snapshot per burst —
+      // per keystroke would fill the 50-entry cap with single characters.
+      if (this[timerKey] == null) this._pushUndoSnapshot();
       clearTimeout(this[timerKey]);
       this[timerKey] = setTimeout(() => {
         if (side === 'left') {
@@ -2426,6 +2672,7 @@ export class TextCompare {
           this._rightContent = ta.value;
           this._modified.right = true;
         }
+        this[timerKey] = null;
         this._updateModifiedIndicator();
         this._runDiff();
       }, 300);
@@ -2752,6 +2999,29 @@ export class TextCompare {
 
   /** Scroll to the previous bookmark, wrapping around. */
   prevBookmark() { this._navigateBookmark(-1); }
+
+  /**
+   * P2-51: jump to the Nth bookmark in line order (BC's numbered Go To
+   * Bookmark). Out of range says so rather than silently doing nothing —
+   * "nothing happened" is indistinguishable from a broken shortcut.
+   *
+   * @param {number} n 1-based
+   * @returns {boolean} whether a bookmark was reached
+   */
+  gotoBookmark(n) {
+    const sorted = [...this._bookmarks].sort((a, b) => a - b);
+    const idx = Math.trunc(Number(n)) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= sorted.length) {
+      toast(sorted.length === 0 ? '尚未設定任何書籤' : `只有 ${sorted.length} 個書籤`,
+        { type: 'error' });
+      return false;
+    }
+    const target = sorted[idx];
+    if (this._contentLeft) this._contentLeft.scrollTop = target * this._rowHeight;
+    if (this._contentRight) this._contentRight.scrollTop = target * this._rowHeight;
+    this._renderVisibleRows();
+    return true;
+  }
 
   /** Toggle soft wrapping of long lines. */
   toggleWordWrap() {
@@ -3140,13 +3410,18 @@ ${rows}
       // 1.7 Replacements rewrite both sides *for the comparison only*; the
       // original text is put back below so nothing downstream ever sees the
       // rewritten form.
-      const active = this._replacementsCompiled.length > 0;
-      const leftForDiff = active
-        ? applyReplacements(this._leftContent, this._replacementsCompiled)
-        : this._leftContent;
-      const rightForDiff = active
-        ? applyReplacements(this._rightContent, this._replacementsCompiled)
-        : this._rightContent;
+      // P2-53: the two whitespace modes the engine cannot express ride the
+      // same rewrite-then-restore path.
+      const wsMode = this._whitespaceMode;
+      const active = this._replacementsCompiled.length > 0 || REWRITE_WS_MODES.has(wsMode);
+      /** @param {string} text */
+      const forDiff = (text) => applyWhitespaceMode(
+        this._replacementsCompiled.length > 0
+          ? applyReplacements(text, this._replacementsCompiled)
+          : text,
+        wsMode);
+      const leftForDiff = forDiff(this._leftContent);
+      const rightForDiff = forDiff(this._rightContent);
 
       // 1.4 Align With: anchors cut the files into regions that are diffed
       // independently, which is what forces the pinned lines onto one row.
@@ -3160,6 +3435,10 @@ ${rows}
           splitLinesKeepEol(this._leftContent),
           splitLinesKeepEol(this._rightContent));
       }
+
+      // P2-59 / P2-60: never-align, skew tolerance and closeness matching all
+      // re-pair lines the engine already decided on, so they run after it.
+      this._diffResult = applyAlignmentOptions(this._diffResult, this._alignmentOptions());
     }
 
     // Apply ignore / unimportant patterns
@@ -3225,15 +3504,196 @@ ${rows}
         (dl.leftLine != null && manualLeft.has(dl.leftLine)) ||
         (dl.rightLine != null && manualRight.has(dl.rightLine))
       )
+      // P2-54: an orphan is a line one side simply does not have. A manual
+      // mark still wins — that is the user saying it about this exact line —
+      // but no pattern rule may quietly demote it.
+      const orphan = dl.leftLine == null || dl.rightLine == null
+      const protectedOrphan = this._opts.orphansAlwaysImportant && orphan && !manual
       dl.manualIgnored = manual
-      dl.grammarIgnored = !manual && this._grammarUnimportant(dl)
-      dl.unimportant = manual || dl.grammarIgnored ||
-        (unimportantRe.length > 0 && unimportantRe.some(re => re.test(text)))
+      dl.grammarIgnored = !manual && !protectedOrphan && this._grammarUnimportant(dl)
+      dl.unimportant = manual || (!protectedOrphan && (dl.grammarIgnored ||
+        (unimportantRe.length > 0 && unimportantRe.some(re => re.test(text)))))
       // BC's "Ignore Unimportant Differences" downgrades these to equal rather
       // than merely tinting them blue, which is what makes a file with only
       // cosmetic changes read as identical.
       if (dl.unimportant && this._opts.ignoreUnimportant) dl.type = 'equal'
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-53 — whitespace comparison mode
+  // -------------------------------------------------------------------------
+
+  /**
+   * The whitespace rule currently in effect.
+   *
+   * Derived rather than stored so the two legacy checkboxes in the toolbar
+   * stay the single source of truth for the modes they already express.
+   *
+   * @returns {WhitespaceMode}
+   */
+  getWhitespaceMode() {
+    if (REWRITE_WS_MODES.has(this._whitespaceMode)) return this._whitespaceMode;
+    if (this._opts.ignoreWhitespace) return 'amount';
+    if (this._opts.ignoreIndent) return 'leading';
+    return 'none';
+  }
+
+  /**
+   * BC's four whitespace choices are mutually exclusive, so setting one clears
+   * the others rather than adding to them.
+   *
+   * @param {WhitespaceMode} mode
+   * @returns {WhitespaceMode} the mode actually in effect
+   */
+  setWhitespaceMode(mode) {
+    const valid = ['none', 'all', 'leading', 'trailing', 'amount'];
+    const next = /** @type {WhitespaceMode} */ (valid.includes(mode) ? mode : 'none');
+    this._opts.ignoreWhitespace = next === 'amount';
+    this._opts.ignoreIndent = next === 'leading';
+    this._whitespaceMode = REWRITE_WS_MODES.has(next) ? next : 'none';
+    const chkWs = document.getElementById('chk-ignore-whitespace');
+    if (chkWs instanceof HTMLInputElement) chkWs.checked = this._opts.ignoreWhitespace;
+    const chkIndent = document.getElementById('chk-ignore-indent');
+    if (chkIndent instanceof HTMLInputElement) chkIndent.checked = this._opts.ignoreIndent;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return next;
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-59 / P2-60 — alignment options
+  // -------------------------------------------------------------------------
+
+  /**
+   * Compiled options for `applyAlignmentOptions`.
+   * @returns {AlignmentOptions}
+   */
+  _alignmentOptions() {
+    return {
+      neverAlign: this._neverAlignCompiled,
+      skewTolerance: this._opts.skewTolerance,
+      useCloseness: this._opts.useClosenessMatching,
+      closenessThreshold: this._opts.closenessThreshold,
+    };
+  }
+
+  /**
+   * Lines matching any of these patterns never become half of a paired
+   * `replace` row — BC's "Never align these lines".
+   *
+   * @param {string[]} patterns
+   * @returns {string[]} patterns that failed to compile; the rest still apply
+   */
+  setNeverAlignPatterns(patterns) {
+    const list = (Array.isArray(patterns) ? patterns : [])
+      .filter((p) => typeof p === 'string' && p.length > 0 && p.length <= 200);
+    /** @type {RegExp[]} */
+    const compiled = [];
+    /** @type {string[]} */
+    const bad = [];
+    for (const p of list) {
+      try { compiled.push(new RegExp(p)); } catch { bad.push(p); }
+    }
+    this._opts.neverAlignPatterns = list;
+    this._neverAlignCompiled = compiled;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return bad;
+  }
+
+  /** @returns {string[]} */
+  getNeverAlignPatterns() {
+    return [...this._opts.neverAlignPatterns];
+  }
+
+  /**
+   * How far apart two lines may sit inside a run and still be paired.
+   * Zero means no limit, which is the engine's own behaviour.
+   * @param {number} n
+   * @returns {number}
+   */
+  setSkewTolerance(n) {
+    const v = Number(n);
+    this._opts.skewTolerance = Number.isFinite(v) ? Math.max(0, Math.min(1000, Math.round(v))) : 0;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return this._opts.skewTolerance;
+  }
+
+  /** @returns {number} */
+  getSkewTolerance() { return this._opts.skewTolerance; }
+
+  /**
+   * Pair lines by similarity instead of by position within the run.
+   * @param {boolean} [on] omit to toggle
+   * @param {number} [threshold] 0..1, minimum similarity for a pair
+   * @returns {boolean}
+   */
+  setClosenessMatching(on, threshold) {
+    this._opts.useClosenessMatching = on ?? !this._opts.useClosenessMatching;
+    if (Number.isFinite(threshold)) {
+      this._opts.closenessThreshold = Math.max(0, Math.min(1, Number(threshold)));
+    }
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return this._opts.useClosenessMatching;
+  }
+
+  /**
+   * How many lines the never-align patterns are keeping out of the pairing.
+   * Reported in the Alignment dialog so a pattern that matches nothing is
+   * visible as such rather than looking like it worked.
+   * @returns {{ left: number, right: number }}
+   */
+  getUnalignedLineCounts() {
+    /** @param {string} text */
+    const hit = (text) => this._neverAlignCompiled.some((re) => { re.lastIndex = 0; return re.test(text); });
+    let left = 0, right = 0;
+    if (this._neverAlignCompiled.length > 0) {
+      for (const line of splitLinesKeepEol(this._leftContent)) if (hit(line)) left++;
+      for (const line of splitLinesKeepEol(this._rightContent)) if (hit(line)) right++;
+    }
+    return { left, right };
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-54 — orphan importance
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether a line present on one side only is always an important difference.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean}
+   */
+  setOrphansAlwaysImportant(on) {
+    this._opts.orphansAlwaysImportant = on ?? !this._opts.orphansAlwaysImportant;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return this._opts.orphansAlwaysImportant;
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-52 — syntax highlighting toggle
+  // -------------------------------------------------------------------------
+
+  /**
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean}
+   */
+  setSyntaxHighlighting(on) {
+    this._syntaxHighlight = on ?? !this._syntaxHighlight;
+    this._render();
+    return this._syntaxHighlight;
+  }
+
+  /** @returns {boolean} */
+  get syntaxHighlighting() { return this._syntaxHighlight; }
+
+  /**
+   * The highlighter a side should render with, or null when highlighting is
+   * off. Every render path goes through here so the toggle cannot be missed
+   * by one of them.
+   * @param {'left'|'right'} side
+   */
+  _hl(side) {
+    if (!this._syntaxHighlight) return null;
+    return side === 'left' ? this._hlLeft : this._hlRight;
   }
 
   /**
@@ -3724,6 +4184,327 @@ ${rows}
   }
 
   // -------------------------------------------------------------------------
+  // Public: P2-48 — Text Compare Info
+  // -------------------------------------------------------------------------
+
+  /**
+   * Everything BC's "Text Compare Info" dialog reports, as data.
+   *
+   * Split from the dialog so the numbers can be asserted without a DOM, and
+   * so the report writer can reuse them later.
+   *
+   * @returns {{
+   *   left: { path: string, bytes: number, chars: number, lines: number,
+   *           encoding: string, eol: string, format: string, readOnly: boolean },
+   *   right: { path: string, bytes: number, chars: number, lines: number,
+   *            encoding: string, eol: string, format: string, readOnly: boolean },
+   *   diff: { equal: number, insert: number, delete: number, replace: number,
+   *           unimportant: number, blocks: number },
+   * }}
+   */
+  getCompareInfo() {
+    const enc = new TextEncoder();
+    /** @param {'left'|'right'} side */
+    const describe = (side) => {
+      const content = (side === 'left' ? this._leftContent : this._rightContent) ?? '';
+      return {
+        path: (side === 'left' ? this._leftPath : this._rightPath) || '',
+        bytes: enc.encode(content).length,
+        chars: content.length,
+        lines: content ? splitLinesKeepEol(content).length : 0,
+        encoding: side === 'left' ? this._encodingLeft : this._encodingRight,
+        eol: side === 'left' ? this._eolLeft : this._eolRight,
+        format: (side === 'left' ? this._grammarLeft : this._grammarRight)?.name ?? '—',
+        readOnly: this.isSideReadOnly(side),
+      };
+    };
+    const diff = { equal: 0, insert: 0, delete: 0, replace: 0, unimportant: 0,
+      blocks: this._diffBlocks.length };
+    for (const dl of this._diffResult) {
+      if (dl.type in diff) diff[dl.type]++;
+      if (dl.unimportant) diff.unimportant++;
+    }
+    return { left: describe('left'), right: describe('right'), diff };
+  }
+
+  /** Show the statistics dialog. */
+  openInfoDialog() {
+    const info = this.getCompareInfo();
+    this._openDialog({
+      title: '文字比對資訊',
+      confirmLabel: '關閉',
+      build: (body) => {
+        const table = document.createElement('table');
+        table.style.borderCollapse = 'collapse';
+        table.style.width = '100%';
+        /**
+         * @param {string} label
+         * @param {string} a
+         * @param {string} b
+         * @param {boolean} [head]
+         */
+        const row = (label, a, b, head = false) => {
+          const tr = document.createElement('tr');
+          for (const [text, align] of /** @type {Array<[string, string]>} */ (
+            [[label, 'left'], [a, 'right'], [b, 'right']])) {
+            const cell = document.createElement(head ? 'th' : 'td');
+            cell.textContent = text;
+            cell.style.textAlign = head ? 'center' : align;
+            cell.style.padding = '2px 8px';
+            cell.style.borderBottom = '1px solid var(--border-color, #ddd)';
+            tr.appendChild(cell);
+          }
+          table.appendChild(tr);
+        };
+        row('', '左', '右', true);
+        row('路徑', info.left.path || '（貼上）', info.right.path || '（貼上）');
+        row('行數', String(info.left.lines), String(info.right.lines));
+        row('字元數', String(info.left.chars), String(info.right.chars));
+        row('位元組', formatBytes(info.left.bytes), formatBytes(info.right.bytes));
+        row('編碼', info.left.encoding, info.right.encoding);
+        row('行尾符號', info.left.eol, info.right.eol);
+        row('檔案格式', info.left.format, info.right.format);
+        row('唯讀', info.left.readOnly ? '是' : '否', info.right.readOnly ? '是' : '否');
+        body.appendChild(table);
+
+        const stats = document.createElement('div');
+        stats.style.marginTop = '8px';
+        stats.textContent = `差異區塊 ${info.diff.blocks}　`
+          + `相同 ${info.diff.equal} 行　變更 ${info.diff.replace} 行　`
+          + `僅左側 ${info.diff.delete} 行　僅右側 ${info.diff.insert} 行　`
+          + `不重要 ${info.diff.unimportant} 行`;
+        body.appendChild(stats);
+      },
+      onConfirm: () => true,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-58 — file format selection
+  // -------------------------------------------------------------------------
+
+  /** Pick the file format for each side by hand. */
+  openFileFormatDialog() {
+    const names = this.listFileFormats();
+    /** @type {HTMLSelectElement|null} */ let selLeft = null;
+    /** @type {HTMLSelectElement|null} */ let selRight = null;
+    /**
+     * @param {'left'|'right'} side
+     * @param {HTMLElement} body
+     */
+    const buildSelect = (side, body) => {
+      const label = document.createElement('label');
+      label.textContent = side === 'left' ? '左側格式：' : '右側格式：';
+      const sel = document.createElement('select');
+      const auto = document.createElement('option');
+      auto.value = '';
+      auto.textContent = '（依副檔名自動判斷）';
+      sel.appendChild(auto);
+      if (side === 'right') {
+        const same = document.createElement('option');
+        same.value = 'same-as-left';
+        same.textContent = '同左側';
+        sel.appendChild(same);
+      }
+      for (const name of names) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      }
+      sel.value = this._formatOverride[side] ?? '';
+      label.appendChild(sel);
+      body.appendChild(label);
+      return sel;
+    };
+    this._openDialog({
+      title: '檔案格式',
+      hint: '格式決定文法著色、可忽略的元素與對齊權重。留在「自動判斷」時以副檔名決定。',
+      build: (body) => {
+        selLeft = buildSelect('left', body);
+        selRight = buildSelect('right', body);
+      },
+      onConfirm: () => {
+        this.setFileFormat('left', selLeft?.value || null);
+        this.setFileFormat('right', selRight?.value || null);
+        const info = this.getGrammarInfo();
+        toast(`格式：${info.left ?? '（無）'} / ${info.right ?? '（無）'}`, { type: 'success' });
+        return true;
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-55 — unimportant text list
+  // -------------------------------------------------------------------------
+
+  /**
+   * BC manages unimportant text as a list of rules that can be added and
+   * removed one at a time, not as a free-text blob — a single malformed line
+   * in a blob silently takes the whole set with it.
+   */
+  openUnimportantTextDialog() {
+    /** @type {HTMLElement|null} */ let listEl = null;
+    /** @type {string[]} */ const draft = [...this._opts.unimportantPatterns];
+    /** @type {HTMLElement|null} */ let errorBox = null;
+
+    const redraw = () => {
+      if (!listEl) return;
+      listEl.replaceChildren();
+      if (draft.length === 0) {
+        const empty = document.createElement('div');
+        empty.textContent = '（尚無規則：所有差異都算重要）';
+        empty.style.opacity = '0.7';
+        listEl.appendChild(empty);
+        return;
+      }
+      draft.forEach((pattern, idx) => {
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '6px';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = pattern;
+        input.style.flex = '1';
+        input.spellcheck = false;
+        input.addEventListener('input', () => { draft[idx] = input.value; });
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.textContent = '刪除';
+        del.addEventListener('click', () => { draft.splice(idx, 1); redraw(); });
+        row.append(input, del);
+        listEl.appendChild(row);
+      });
+    };
+
+    this._openDialog({
+      title: '不重要文字規則',
+      hint: '每條為一個正規表示式。符合的差異行以藍色標示；搭配「忽略不重要差異」可完全視為相同。',
+      build: (body) => {
+        listEl = document.createElement('div');
+        listEl.style.display = 'flex';
+        listEl.style.flexDirection = 'column';
+        listEl.style.gap = '4px';
+        body.appendChild(listEl);
+        const add = document.createElement('button');
+        add.type = 'button';
+        add.textContent = '新增規則';
+        add.style.alignSelf = 'flex-start';
+        add.addEventListener('click', () => { draft.push(''); redraw(); });
+        body.appendChild(add);
+        errorBox = document.createElement('div');
+        errorBox.style.whiteSpace = 'pre-wrap';
+        errorBox.style.color = 'var(--diff-delete-fg, #b91c1c)';
+        body.appendChild(errorBox);
+        redraw();
+      },
+      onConfirm: () => {
+        const kept = draft.map((p) => p.trim()).filter((p) => p.length > 0);
+        /** @type {string[]} */
+        const bad = [];
+        for (const p of kept) {
+          try { new RegExp(p); } catch (err) {
+            bad.push(`${p} — ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        if (bad.length > 0) {
+          // Left open with the reasons on screen: a rule the user believes is
+          // running but which never compiled is the worst outcome here.
+          if (errorBox) errorBox.textContent = bad.join('\n');
+          toast(`有 ${bad.length} 條規則無法編譯`, { type: 'error', durationMs: 6000 });
+          return false;
+        }
+        this.setIgnorePatterns(this._opts.ignorePatterns, kept);
+        toast(kept.length > 0 ? `已套用 ${kept.length} 條不重要文字規則` : '已清除不重要文字規則',
+          { type: 'success' });
+        return true;
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-59 / P2-60 — alignment dialog
+  // -------------------------------------------------------------------------
+
+  /** BC's Alignment tab: never-align patterns, skew tolerance, closeness. */
+  openAlignmentDialog() {
+    /** @type {HTMLTextAreaElement|null} */ let patternsEl = null;
+    /** @type {HTMLInputElement|null} */ let skewEl = null;
+    /** @type {HTMLInputElement|null} */ let closeEl = null;
+    /** @type {HTMLInputElement|null} */ let thresholdEl = null;
+    /** @type {HTMLElement|null} */ let errorBox = null;
+
+    this._openDialog({
+      title: '對齊選項',
+      hint: '「永不對齊」的行只會以單側形式出現，不會與另一側配成一列。'
+        + '偏移上限為 0 時不限制。相似度配對以相似度而非位置決定配對對象。',
+      build: (body) => {
+        const counts = this.getUnalignedLineCounts();
+        const summary = document.createElement('div');
+        summary.textContent = `目前有 ${counts.left} 行（左）／${counts.right} 行（右）被排除在對齊之外。`;
+        body.appendChild(summary);
+
+        const lbl = document.createElement('label');
+        lbl.textContent = '永不對齊這些行（每行一個正規表示式）：';
+        body.appendChild(lbl);
+        patternsEl = document.createElement('textarea');
+        patternsEl.rows = 5;
+        patternsEl.spellcheck = false;
+        patternsEl.style.fontFamily = 'var(--font-mono, monospace)';
+        patternsEl.value = this._opts.neverAlignPatterns.join('\n');
+        body.appendChild(patternsEl);
+
+        const skewLabel = document.createElement('label');
+        skewLabel.textContent = '偏移上限（0 = 不限制）：';
+        skewEl = document.createElement('input');
+        skewEl.type = 'number';
+        skewEl.min = '0';
+        skewEl.max = '1000';
+        skewEl.value = String(this._opts.skewTolerance);
+        skewLabel.appendChild(skewEl);
+        body.appendChild(skewLabel);
+
+        const closeLabel = document.createElement('label');
+        closeEl = document.createElement('input');
+        closeEl.type = 'checkbox';
+        closeEl.checked = this._opts.useClosenessMatching;
+        closeLabel.append(closeEl, document.createTextNode(' 以相似度配對（closeness matching）'));
+        body.appendChild(closeLabel);
+
+        const thLabel = document.createElement('label');
+        thLabel.textContent = '相似度門檻（0–1）：';
+        thresholdEl = document.createElement('input');
+        thresholdEl.type = 'number';
+        thresholdEl.min = '0';
+        thresholdEl.max = '1';
+        thresholdEl.step = '0.05';
+        thresholdEl.value = String(this._opts.closenessThreshold);
+        thLabel.appendChild(thresholdEl);
+        body.appendChild(thLabel);
+
+        errorBox = document.createElement('div');
+        errorBox.style.whiteSpace = 'pre-wrap';
+        errorBox.style.color = 'var(--diff-delete-fg, #b91c1c)';
+        body.appendChild(errorBox);
+      },
+      onConfirm: () => {
+        const patterns = (patternsEl?.value ?? '').split('\n')
+          .map((s) => s.trim()).filter((s) => s.length > 0);
+        this.setSkewTolerance(Number(skewEl?.value ?? 0));
+        this.setClosenessMatching(closeEl?.checked === true, Number(thresholdEl?.value));
+        const bad = this.setNeverAlignPatterns(patterns);
+        if (bad.length > 0) {
+          if (errorBox) errorBox.textContent = `無法編譯：\n${bad.join('\n')}`;
+          toast(`有 ${bad.length} 條樣式無法編譯，其餘已套用`, { type: 'error', durationMs: 6000 });
+          return false;
+        }
+        toast('已套用對齊選項', { type: 'success' });
+        return true;
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Public: 1.2 — Merge Files (hand off to a 3-way merge session)
   // -------------------------------------------------------------------------
 
@@ -3907,6 +4688,16 @@ ${rows}
       contextLines:       this._opts.contextLines,
       ignoreUnimportant:  this._opts.ignoreUnimportant,
       alignByGrammar:     this._opts.alignByGrammar,
+      // P2-52…P2-60
+      whitespaceMode:      this.getWhitespaceMode(),
+      syntaxHighlight:     this._syntaxHighlight,
+      orphansAlwaysImportant: this._opts.orphansAlwaysImportant,
+      neverAlignPatterns:  [...this._opts.neverAlignPatterns],
+      skewTolerance:       this._opts.skewTolerance,
+      useClosenessMatching:this._opts.useClosenessMatching,
+      closenessThreshold:  this._opts.closenessThreshold,
+      fileFormatLeft:      this._formatOverride.left,
+      fileFormatRight:     this._formatOverride.right,
       ignorePatterns:     Array.isArray(this._opts.ignorePatterns) ? [...this._opts.ignorePatterns] : [],
       unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
       manualIgnoreLeft:   [...this._manualIgnore.left].sort((a, b) => a - b),
@@ -3980,6 +4771,34 @@ ${rows}
       this._replacementsCompiled = compileReplacementRules(this._replacements).compiled
       if (errs.length > 0) toast(`部分取代規則無法載入：${errs.join('；')}`, { type: 'error', durationMs: 6000 })
     }
+    // P2-52…P2-60. Assigned rather than routed through the setters so a
+    // snapshot costs one re-diff at the end, not one per option.
+    if (typeof settings.syntaxHighlight === 'boolean') this._syntaxHighlight = settings.syntaxHighlight
+    if (typeof settings.orphansAlwaysImportant === 'boolean') {
+      this._opts.orphansAlwaysImportant = settings.orphansAlwaysImportant
+    }
+    if (Number.isFinite(settings.skewTolerance)) {
+      this._opts.skewTolerance = Math.max(0, Math.min(1000, Math.round(Number(settings.skewTolerance))))
+    }
+    if (typeof settings.useClosenessMatching === 'boolean') {
+      this._opts.useClosenessMatching = settings.useClosenessMatching
+    }
+    if (Number.isFinite(settings.closenessThreshold)) {
+      this._opts.closenessThreshold = Math.max(0, Math.min(1, Number(settings.closenessThreshold)))
+    }
+    if (Array.isArray(settings.neverAlignPatterns)) {
+      const bad = this.setNeverAlignPatterns(settings.neverAlignPatterns)
+      if (bad.length > 0) toast(`部分「永不對齊」樣式無法載入：${bad.join('；')}`, { type: 'error', durationMs: 6000 })
+    }
+    if (typeof settings.whitespaceMode === 'string') this.setWhitespaceMode(settings.whitespaceMode)
+    for (const side of /** @type {Array<'left'|'right'>} */ (['left', 'right'])) {
+      const key = side === 'left' ? 'fileFormatLeft' : 'fileFormatRight'
+      if (!Object.prototype.hasOwnProperty.call(settings, key)) continue
+      const name = settings[key]
+      this._formatOverride[side] = typeof name === 'string' && name ? name : null
+    }
+    this._resolveGrammars()
+
     if (Number.isInteger(settings.tabWidth)) this.setTabWidth(settings.tabWidth)
     if (typeof settings.indentWithTabs === 'boolean') this._indentWithTabs = settings.indentWithTabs
 
@@ -4331,7 +5150,7 @@ ${rows}
 
     switch (dl.type) {
       case 'equal': {
-        const html = buildLineHTML(dl.leftText, 'equal', 'left', null, this._hlLeft, ws);
+        const html = buildLineHTML(dl.leftText, 'equal', 'left', null, this._hl('left'), ws);
         const equalCls = dl.alignAnchor ? 'align-anchor' : '';
         const leftEl = createLineEl({
           cssClass: equalCls,
@@ -4343,7 +5162,7 @@ ${rows}
         const rightEl = createLineEl({
           cssClass: equalCls,
           lineNum: dl.rightLine,
-          innerHtml: buildLineHTML(dl.rightText, 'equal', 'right', null, this._hlRight, ws),
+          innerHtml: buildLineHTML(dl.rightText, 'equal', 'right', null, this._hl('right'), ws),
           dataLeft: dl.leftLine,
           dataRight: dl.rightLine,
         });
@@ -4361,7 +5180,7 @@ ${rows}
         const rightEl = createLineEl({
           cssClass: uiClass('insert'),
           lineNum: dl.rightLine,
-          innerHtml: buildLineHTML(dl.rightText, 'insert', 'right', null, this._hlRight, ws),
+          innerHtml: buildLineHTML(dl.rightText, 'insert', 'right', null, this._hl('right'), ws),
           dataRight: dl.rightLine,
         });
         return { leftEl, rightEl };
@@ -4371,7 +5190,7 @@ ${rows}
         const leftEl = createLineEl({
           cssClass: uiClass('delete'),
           lineNum: dl.leftLine,
-          innerHtml: buildLineHTML(dl.leftText, 'delete', 'left', null, this._hlLeft, ws),
+          innerHtml: buildLineHTML(dl.leftText, 'delete', 'left', null, this._hl('left'), ws),
           dataLeft: dl.leftLine,
         });
         // Right: empty placeholder
@@ -4388,14 +5207,14 @@ ${rows}
         const leftEl = createLineEl({
           cssClass: uiClass('replace'),
           lineNum: dl.leftLine,
-          innerHtml: buildLineHTML(dl.leftText, 'replace', 'left', charDiffs, this._hlLeft, ws),
+          innerHtml: buildLineHTML(dl.leftText, 'replace', 'left', charDiffs, this._hl('left'), ws),
           dataLeft: dl.leftLine,
           dataRight: dl.rightLine,
         });
         const rightEl = createLineEl({
           cssClass: uiClass('replace'),
           lineNum: dl.rightLine,
-          innerHtml: buildLineHTML(dl.rightText, 'replace', 'right', charDiffs, this._hlRight, ws),
+          innerHtml: buildLineHTML(dl.rightText, 'replace', 'right', charDiffs, this._hl('right'), ws),
           dataLeft: dl.leftLine,
           dataRight: dl.rightLine,
         });
@@ -5010,10 +5829,49 @@ ${rows}
       action: () => { this.mergeFiles(); },
     });
 
-    // T43: Bookmark items
+    // T43 / P2-51: Bookmark items
     items.push({ separator: true });
     items.push({ label: '切換書籤 (Ctrl+F2)', action: () => this._toggleBookmark(this._lastClickedRow ?? 0) });
+    items.push({
+      label: `跳至編號書籤（Ctrl+1…9，共 ${this._bookmarks.size} 個）`,
+      disabled: this._bookmarks.size === 0,
+      action: () => this.gotoBookmark(1),
+    });
     items.push({ label: '清除所有書籤', action: () => { this._bookmarks.clear(); this._renderVisibleRows(); } });
+
+    // P2-48 / P2-52 / P2-53 / P2-54 / P2-55 / P2-58 / P2-59 / P2-60
+    items.push({ separator: true });
+    items.push({ label: '文字比對資訊… (Ctrl+Shift+I)', action: () => this.openInfoDialog() });
+    items.push({ label: '檔案格式… (Ctrl+Shift+F)', action: () => this.openFileFormatDialog() });
+    items.push({ label: '不重要文字規則…', action: () => this.openUnimportantTextDialog() });
+    items.push({ label: '對齊選項… (Ctrl+Shift+L)', action: () => this.openAlignmentDialog() });
+    items.push({
+      label: (this._syntaxHighlight ? '✓ ' : '　') + '語法高亮',
+      action: () => {
+        const on = this.setSyntaxHighlighting();
+        toast(on ? '語法高亮已開啟' : '語法高亮已關閉');
+      },
+    });
+    items.push({
+      label: (this._opts.orphansAlwaysImportant ? '✓ ' : '　') + '單側獨有的行一律視為重要',
+      action: () => {
+        const on = this.setOrphansAlwaysImportant();
+        toast(on ? '單側獨有的行不再被忽略規則降級' : '單側獨有的行可被忽略規則降級');
+      },
+    });
+    const wsMode = this.getWhitespaceMode();
+    for (const [mode, label] of /** @type {Array<[WhitespaceMode, string]>} */ ([
+      ['none', '空白：完全比對'],
+      ['all', '空白：忽略全部'],
+      ['leading', '空白：忽略行首'],
+      ['trailing', '空白：忽略行尾'],
+      ['amount', '空白：忽略數量變化'],
+    ])) {
+      items.push({
+        label: (wsMode === mode ? '✓ ' : '　') + label,
+        action: () => this.setWhitespaceMode(mode),
+      });
+    }
 
     // P2-29: Grammar — the elements the active file format defines, each of
     // which can be excused from the comparison.
@@ -5235,6 +6093,68 @@ ${rows}
   // -------------------------------------------------------------------------
   // Private: T43 — Bookmarks
   // -------------------------------------------------------------------------
+
+  /**
+   * The view-local shortcut map, split out of the mount-time listener so the
+   * bindings can be exercised without index.html.
+   * @param {KeyboardEvent} e
+   */
+  _handleTextGapKey(e) {
+    if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
+      e.preventDefault();
+      void this.compareSelectionToClipboard();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
+      e.preventDefault();
+      void this.openPatchFile();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'R' || e.key === 'r')) {
+      e.preventDefault();
+      this.openReplacementsDialog();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) {
+      e.preventDefault();
+      void this.mergeFilesWithBase();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'A' || e.key === 'a')) {
+      e.preventDefault();
+      void this.openFromArchive(this.activeSide());
+    } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'i' || e.key === 'I')) {
+      e.preventDefault();
+      this.toggleIgnoreSelection();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) {
+      e.preventDefault();
+      this.openInfoDialog();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+      e.preventDefault();
+      this.openFileFormatDialog();
+    } else if (e.ctrlKey && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+      e.preventDefault();
+      this.openAlignmentDialog();
+    }
+  }
+
+  /**
+   * The bookmark key map, split out of the mount-time listener so the bindings
+   * can be exercised without index.html.
+   * @param {KeyboardEvent} e
+   */
+  _handleBookmarkKey(e) {
+    if (e.ctrlKey && e.key === 'F2') {
+      e.preventDefault();
+      this._toggleBookmarkAtCursor();
+    }
+    if (e.key === 'F2' && !e.ctrlKey && !e.shiftKey) {
+      e.preventDefault();
+      this._navigateBookmark(1);
+    }
+    if (e.key === 'F2' && e.shiftKey && !e.ctrlKey) {
+      e.preventDefault();
+      this._navigateBookmark(-1);
+    }
+    // P2-51: Ctrl+1..9 → Nth bookmark. Guarded on Alt/Shift so it cannot
+    // shadow a modifier combination the host might bind later.
+    if (e.ctrlKey && !e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
+      e.preventDefault();
+      this.gotoBookmark(Number(e.key));
+    }
+  }
 
   /**
    * Toggle bookmark at the last clicked row (or current scroll midpoint).
@@ -5517,10 +6437,95 @@ ${rows}
    * clipboard text or a patch pane, neither of which has a real extension.
    */
   _resolveGrammars() {
-    const left = this._leftPath ? getGrammarForPath(this._leftPath) : null;
-    const right = this._rightPath ? getGrammarForPath(this._rightPath) : null;
+    const auto = (path) => (path ? getGrammarForPath(path) : null);
+    // P2-58: an explicit choice wins over the filename. 'same-as-left' is
+    // BC's default for the right pane and is stored, not resolved, so that
+    // changing the left side later carries over.
+    const pick = (/** @type {'left'|'right'} */ side) => {
+      const name = this._formatOverride[side];
+      if (name === 'same-as-left') return null;
+      if (name) return TextCompare._grammarByName(name);
+      return auto(side === 'left' ? this._leftPath : this._rightPath);
+    };
+    const left = pick('left');
+    const right = this._formatOverride.right === 'same-as-left' ? left : pick('right');
     this._grammarLeft = left ?? right;
     this._grammarRight = right ?? left;
+  }
+
+  /**
+   * @param {string} name
+   * @returns {import('../core/grammar.js').CompiledGrammar|null}
+   */
+  static _grammarByName(name) {
+    const def = listGrammars().find((g) => g.name === name);
+    if (!def) return null;
+    const compiled = compileGrammar(def);
+    return compiled.compiled.length > 0 ? compiled : null;
+  }
+
+  /**
+   * P2-58: the formats a side may be forced to.
+   * @returns {string[]}
+   */
+  listFileFormats() {
+    return listGrammars().map((g) => g.name);
+  }
+
+  /**
+   * Force a side's file format, or pass null to go back to detecting it from
+   * the filename. The right side additionally accepts 'same-as-left'.
+   *
+   * @param {'left'|'right'} side
+   * @param {string|null} name
+   * @returns {boolean} whether the name was recognised
+   */
+  setFileFormat(side, name) {
+    if (side !== 'left' && side !== 'right') return false;
+    if (name != null && name !== 'same-as-left' && !this.listFileFormats().includes(name)) {
+      toast(`沒有名為「${name}」的檔案格式`, { type: 'error' });
+      return false;
+    }
+    if (side === 'left' && name === 'same-as-left') return false;
+    this._formatOverride[side] = name;
+    this._resolveGrammars();
+    // BC's file format also drives the colouring, so a forced format that left
+    // the pane highlighted as the old language would read as a no-op.
+    void this._syncHighlighterToFormat(side);
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return true;
+  }
+
+  /**
+   * Re-pick the highlight.js language from the side's effective format.
+   * @param {'left'|'right'} side
+   */
+  async _syncHighlighterToFormat(side) {
+    const name = this._formatOverride[side];
+    if (!name) {
+      // Back to automatic: the filename decides again.
+      const path = side === 'left' ? this._leftPath : this._rightPath;
+      const hl = path ? await loadHighlighter(this._extFrom(path)) : null;
+      if (side === 'left') this._hlLeft = hl; else this._hlRight = hl;
+      this._render();
+      return;
+    }
+    const effective = name === 'same-as-left' ? this._formatOverride.left : name;
+    const def = effective ? listGrammars().find((g) => g.name === effective) : null;
+    // Masks look like "*.py"; the first one that maps to a known language wins.
+    let hl = null;
+    for (const mask of def?.masks ?? []) {
+      const ext = String(mask).split('.').pop()?.toLowerCase() ?? '';
+      hl = await loadHighlighter(ext);
+      if (hl) break;
+    }
+    if (side === 'left') this._hlLeft = hl; else this._hlRight = hl;
+    this._render();
+  }
+
+  /** @returns {{ left: string|null, right: string|null }} */
+  getFileFormats() {
+    return { ...this._formatOverride };
   }
 
   /** Whether anything currently needs grammar tokens. */

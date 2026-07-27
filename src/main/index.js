@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electron'
 import { join, extname, dirname, basename } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod, utimes } from 'fs/promises'
-import { watch } from 'fs'
+import { watch, existsSync, mkdirSync, accessSync, constants as fsConstants } from 'fs'
 import { execFile } from 'child_process'
 import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
@@ -168,7 +168,60 @@ function createWindow() {
   return win
 }
 
+/**
+ * Where settings live, and whether this is a portable install.
+ *
+ * A portable copy keeps its data beside the executable so the whole thing can
+ * live on a stick. That is opt-in via a marker file rather than a build flag,
+ * so one download serves both; and it is decided before `whenReady`, because
+ * everything after that point reads userData.
+ *
+ * Falls back to the normal location when the marker is there but the directory
+ * cannot be written — a portable install on read-only media should still run,
+ * not fail at startup with settings it cannot save.
+ *
+ * @returns {{portable: boolean, dataDir: string, reason: string}}
+ */
+function configurePortableMode() {
+  const beside = dirname(app.getPath('exe'))
+  const marker = join(beside, 'portable.txt')
+  if (!existsSync(marker)) {
+    return { portable: false, dataDir: app.getPath('userData'), reason: '' }
+  }
+  const dataDir = join(beside, 'mycompare-data')
+  try {
+    mkdirSync(dataDir, { recursive: true })
+    accessSync(dataDir, fsConstants.W_OK)
+  } catch (err) {
+    return {
+      portable: false,
+      dataDir: app.getPath('userData'),
+      reason: `找到 portable.txt，但無法寫入 ${dataDir}：${err instanceof Error ? err.message : err}`,
+    }
+  }
+  app.setPath('userData', dataDir)
+  return { portable: true, dataDir, reason: '' }
+}
+
+/**
+ * Resolved once, at startup.
+ *
+ * Deliberately not computed at module load: this file is imported by tests for
+ * its re-exports, where Electron's `app` is not a working object. A top-level
+ * call made the whole module unimportable.
+ *
+ * @type {{portable: boolean, dataDir: string, reason: string}|null}
+ */
+let portableInfo = null
+
+// IPC: 這是不是可攜式安裝，設定存在哪裡
+ipcMain.handle('get-portable-info', () => portableInfo
+  ?? { portable: false, dataDir: '', reason: '尚未初始化' })
+
 app.whenReady().then(async () => {
+  // Before anything reads userData. setPath is legal this early, and every
+  // consumer below resolves the path lazily.
+  portableInfo = configurePortableMode()
   const cli = parseCli(process.argv)
 
   // Help must not open a window: the point of asking for it is usually that
@@ -519,7 +572,7 @@ function fileAttributes(name, s) {
 }
 
 /**
- * Names carrying the Windows hidden attribute in one directory.
+ * Windows file attributes for one directory, keyed by name.
  *
  * Node's Stats has no attribute bits on any platform, so the only way to read
  * this is to ask the OS. `attrib` answers for a whole directory in one process
@@ -534,8 +587,8 @@ function fileAttributes(name, s) {
  * @returns {Promise<Set<string>>} basenames; empty when the platform has no
  *   such attribute or the query fails, since "unknown" must not read as "yes"
  */
-async function hiddenNamesIn(dir) {
-  if (process.platform !== 'win32') return new Set()
+async function attributeNamesIn(dir) {
+  if (process.platform !== 'win32') return new Map()
   /** @type {string} */
   let out
   try {
@@ -544,19 +597,27 @@ async function hiddenNamesIn(dir) {
         (err, stdout) => (err ? reject(err) : resolve(String(stdout))))
     })
   } catch {
-    return new Set()
+    return new Map()
   }
 
-  const hidden = new Set()
+  /** @type {Map<string, {hidden: boolean, system: boolean, archive: boolean}>} */
+  const byName = new Map()
   for (const line of out.split(/\r?\n/)) {
     const at = line.indexOf(dir)
     if (at <= 0) continue
     const flags = line.slice(0, at)
-    if (!/\bH\b/.test(flags)) continue
     const name = basename(line.slice(at).trim())
-    if (name) hidden.add(name)
+    if (!name) continue
+    // All three bits come from the one call that was already being made; only
+    // H was being read, so the folder view's System and Archive columns had
+    // nothing to show even though the answer was already on the line.
+    byName.set(name, {
+      hidden: /\bH\b/.test(flags),
+      system: /\bS\b/.test(flags),
+      archive: /\bA\b/.test(flags),
+    })
   }
-  return hidden
+  return byName
 }
 
 // IPC: 讀取單一檔案的中繼資料
@@ -752,7 +813,7 @@ ipcMain.handle('read-dir', async (_event, dirPath, options) => {
   // Reading the hidden attribute costs a process per directory, so it is only
   // paid for when the caller says it needs it — a recursive scan asking for it
   // everywhere would spawn one per level.
-  const hidden = options?.attributes === true ? await hiddenNamesIn(safe) : null
+  const attrs = options?.attributes === true ? await attributeNamesIn(safe) : null
   const result = await Promise.all(
     entries.map(async (entry) => {
       const fullPath = join(safe, entry.name)
@@ -770,7 +831,9 @@ ipcMain.handle('read-dir', async (_event, dirPath, options) => {
           mtime: s.mtime.toISOString(),
           ctime: s.ctime.toISOString(),
           ...fileAttributes(entry.name, s),
-          ...(hidden ? { hidden: hidden.has(entry.name) } : {})
+          // Present only when actually read; otherwise the tri-state null
+          // stands, so "not asked" never reads as "not set".
+          ...(attrs ? (attrs.get(entry.name) ?? { hidden: false, system: false, archive: false }) : {})
         }
       } catch {
         // Permission denied / broken symlink — skip

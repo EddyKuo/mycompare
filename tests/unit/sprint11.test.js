@@ -53,6 +53,17 @@ const TEXT_CONFIG_DEFAULTS = {
   indentWithTabs: false,
   // 1.7: the match→replacement pairs are a comparison setting like the rest.
   replacements: [],
+  // P2-52…P2-60. whitespaceMode is derived from ignoreWhitespace/ignoreIndent,
+  // and both snapshots below set ignoreWhitespace, hence 'amount'.
+  whitespaceMode: 'amount',
+  syntaxHighlight: true,
+  orphansAlwaysImportant: false,
+  neverAlignPatterns: [],
+  skewTolerance: 0,
+  useClosenessMatching: false,
+  closenessThreshold: 0.5,
+  fileFormatLeft: null,
+  fileFormatRight: null,
 }
 
 // ── T61 NamedConfigStore CRUD ────────────────────────────────────────────────

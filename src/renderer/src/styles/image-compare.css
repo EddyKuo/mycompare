@@ -24,12 +24,16 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 10px;
-  height: var(--toolbar-height);
+  padding: 3px 10px;
+  /* Wrapping inside a fixed height put the wrapped row underneath the canvases,
+     where it was still clickable in theory and covered in practice. The bar
+     grows instead. */
+  min-height: var(--toolbar-height);
   background-color: var(--bg-toolbar);
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
   flex-wrap: wrap;
+  row-gap: 4px;
 }
 
 .ic-toolbar-label {
@@ -47,6 +51,24 @@
 
 .ic-threshold-value {
   min-width: 36px;
+  text-align: right;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.ic-blend-slider {
+  width: 96px;
+  accent-color: var(--bg-statusbar);
+  cursor: pointer;
+}
+
+.ic-blend-slider:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.ic-blend-value {
+  min-width: 34px;
   text-align: right;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
@@ -409,6 +431,13 @@
   font-weight: 600;
   color: var(--text-secondary);
   margin-bottom: 3px;
+}
+
+.ic-info-subtitle {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 6px 0 3px;
 }
 
 .ic-info-table {

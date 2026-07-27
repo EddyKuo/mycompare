@@ -284,7 +284,15 @@ export const VIEW_PRESET_LABELS = [
   ['left-orphans', '僅左側孤兒'],
   ['right-orphans', '僅右側孤兒'],
   ['none', '全部隱藏'],
+  // Not a preset: the entry the dropdown shows once the six switches have been
+  // combined into something no preset names. BC's View menu is four
+  // independent toggles with the presets as shortcuts, not the other way
+  // round, so a combination it cannot name must still be displayable.
+  ['custom', '自訂組合'],
 ]
+
+/** The dropdown value standing for "the switches, whatever they say". */
+export const CUSTOM_VIEW_PRESET = 'custom'
 
 /**
  * Decide whether a row passes a set of view flags.
@@ -502,6 +510,17 @@ export function classifyArchivePair(left, right) {
   return a.every((v, i) => v === b[i]) ? 'same' : 'different'
 }
 
+/**
+ * Everything that decides a pair's status other than the mode itself.
+ *
+ * @typedef {object} CompareOpts
+ * @property {boolean} [compareAttributes]  read-only/hidden/system/archive differ ⇒ different
+ * @property {boolean} [compareFilenameCase] a case-only name difference ⇒ different
+ * @property {boolean} [caseInsensitive]    pair `README` with `readme`
+ * @property {AlignRule[]} [alignRules]     pair `x.bak.txt` with `x.txt`
+ * @property {TimeShift} [timeShift]        forgive whole-hour timestamp shifts
+ */
+
 // ── Flat mode (Ignore Folder Structure) ─────────────────────────────────────
 
 /**
@@ -515,7 +534,7 @@ export function classifyArchivePair(left, right) {
  * @param {FileEntry[]} rightFiles
  * @param {'name'|'size'|'mtime'|'both'} mode
  * @param {number} [mtimeTolerance]
- * @param {{ compareAttributes?: boolean }} [opts]
+ * @param {CompareOpts} [opts]
  * @returns {CompareRow[]}
  */
 export function pairFlatEntries(leftFiles, rightFiles, mode, mtimeTolerance = 0, opts = {}) {
@@ -525,9 +544,10 @@ export function pairFlatEntries(leftFiles, rightFiles, mode, mtimeTolerance = 0,
     const map = new Map()
     for (const entry of files ?? []) {
       if (!entry || entry.isDirectory) continue
-      const list = map.get(entry.name)
+      const key = pairKeyOf(entry.name, opts)
+      const list = map.get(key)
       if (list) list.push(entry)
-      else map.set(entry.name, [entry])
+      else map.set(key, [entry])
     }
     for (const list of map.values()) {
       list.sort((a, b) => String(a.path).localeCompare(String(b.path)))
@@ -537,20 +557,20 @@ export function pairFlatEntries(leftFiles, rightFiles, mode, mtimeTolerance = 0,
 
   const leftMap = group(leftFiles)
   const rightMap = group(rightFiles)
-  const names = [...new Set([...leftMap.keys(), ...rightMap.keys()])]
+  const keys = [...new Set([...leftMap.keys(), ...rightMap.keys()])]
     .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
 
   /** @type {CompareRow[]} */
   const rows = []
-  for (const name of names) {
-    const lefts = leftMap.get(name) ?? []
-    const rights = rightMap.get(name) ?? []
+  for (const key of keys) {
+    const lefts = leftMap.get(key) ?? []
+    const rights = rightMap.get(key) ?? []
     const count = Math.max(lefts.length, rights.length)
     for (let i = 0; i < count; i++) {
       const left = lefts[i] ?? null
       const right = rights[i] ?? null
       rows.push({
-        name,
+        name: left?.name ?? right?.name ?? key,
         status: computeStatus(left, right, mode, mtimeTolerance, opts),
         left,
         right,
@@ -893,10 +913,13 @@ export const FOLDER_COLUMN_DEFS = [
   { id: 'name',    label: '名稱',     width: 'minmax(0, 1fr)', locked: true },
   { id: 'size',    label: '大小',     width: '80px' },
   { id: 'mtime',   label: '修改時間', width: '140px' },
+  { id: 'created', label: '建立時間', width: '140px' },
   { id: 'ext',     label: '副檔名',   width: '72px' },
   { id: 'relpath', label: '相對路徑', width: '160px' },
-  { id: 'attrs',   label: '屬性',     width: '56px' },
+  { id: 'abspath', label: '完整路徑', width: '220px' },
+  { id: 'attrs',   label: '屬性',     width: '72px' },
   { id: 'version', label: '版本',     width: '120px' },
+  { id: 'crc',     label: '檢查碼',   width: '120px' },
 ]
 
 /** @type {string[]} */
@@ -996,7 +1019,10 @@ export function extensionOf(name) {
  * @property {string} [ctime]
  * @property {boolean} [readOnly]
  * @property {boolean|null} [hidden]    null ⇒ the platform cannot tell
+ * @property {boolean|null} [system]    Windows system bit, same caveat as hidden
+ * @property {boolean|null} [archive]   Windows archive bit, same caveat as hidden
  * @property {string} [version]         filled in lazily by the version column
+ * @property {string} [crc]             filled in lazily by the checksum column
  * @property {number} [depth]           archive entries only
  * @property {string} [parentPath]      archive entries only
  * @property {boolean} [isArchiveEntry]
@@ -1019,6 +1045,11 @@ export function entryAttrText(entry) {
     (entry.isSymbolicLink ? 'L' : '') +
     (entry.readOnly ? 'R' : '') +
     (entry.hidden === true ? 'H' : '') +
+    // S and A come out of the same Windows attribute word as H, so they are
+    // shown only where the source actually reported them; the single trailing
+    // `?` below already says the word could not be read at all.
+    (entry.system === true ? 'S' : '') +
+    (entry.archive === true ? 'A' : '') +
     (entry.hidden === null || entry.hidden === undefined ? '?' : '')
 }
 
@@ -1032,6 +1063,10 @@ export function entryAttrTitle(entry) {
   if (entry.hidden === true) parts.push('H＝隱藏')
   else if (entry.hidden === false) parts.push('非隱藏')
   else parts.push('?＝隱藏屬性未知（此平台無法判讀）')
+  if (entry.system === true) parts.push('S＝系統')
+  else if (entry.system === false) parts.push('非系統')
+  if (entry.archive === true) parts.push('A＝封存')
+  else if (entry.archive === false) parts.push('非封存')
   return parts.join('、')
 }
 
@@ -1049,9 +1084,203 @@ export function entryAttrTitle(entry) {
 export function attributesDiffer(left, right) {
   if (!left || !right) return false
   if (!!left.readOnly !== !!right.readOnly) return true
-  if (typeof left.hidden === 'boolean' && typeof right.hidden === 'boolean'
-      && left.hidden !== right.hidden) return true
+  for (const key of ['hidden', 'system', 'archive']) {
+    if (typeof left[key] === 'boolean' && typeof right[key] === 'boolean'
+        && left[key] !== right[key]) return true
+  }
   return false
+}
+
+// ── Timestamp shift tolerance (timezone / DST) ──────────────────────────────
+//
+// Copying between filesystems does not only round timestamps, it shifts them.
+// FAT stores local time with no zone, so the same file read on either side of a
+// DST boundary is an hour out; an archive or a remote host can be a whole
+// timezone out. Both look like "right is newer by exactly 3600s", which is why
+// the plain ±n-second tolerance cannot express them — widening it to an hour
+// would also swallow a real edit made 50 minutes ago.
+
+/** @typedef {'none'|'dst'|'timezone'} TimeShift */
+
+/** Seconds in one hour, the unit both shifts come in. */
+const HOUR_SECONDS = 3600
+/**
+ * Widest shift `timezone` mode forgives, in hours. UTC-12 … UTC+14 is the real
+ * range of civil offsets, so a pair more than 26 hours apart is not a zone
+ * problem whatever else it is.
+ */
+const MAX_TIMEZONE_HOURS = 26
+
+/**
+ * @param {unknown} raw
+ * @returns {TimeShift}
+ */
+export function normalizeTimeShift(raw) {
+  return raw === 'dst' || raw === 'timezone' ? raw : 'none'
+}
+
+/**
+ * Whether two timestamps count as the same instant.
+ *
+ * @param {number} lTime ms since epoch
+ * @param {number} rTime ms since epoch
+ * @param {number} [toleranceSec] the ordinary ±n-second window
+ * @param {TimeShift} [shift]
+ * @returns {boolean}
+ */
+export function timestampsMatch(lTime, rTime, toleranceSec = 0, shift = 'none') {
+  // A source that reports no usable timestamp (some archive and remote
+  // listings) must not therefore have every file marked newer on one side —
+  // "unknown" is not evidence of a difference. This is the behaviour the plain
+  // `Math.abs(NaN - x) > tol` comparison had before the shift modes existed.
+  if (!Number.isFinite(lTime) || !Number.isFinite(rTime)) return true
+  const diff = Math.abs(lTime - rTime) / 1000
+  const tol = Math.max(0, toleranceSec)
+  if (diff <= tol) return true
+  if (shift === 'none') return false
+
+  // Only whole-hour shifts are forgiven. Half-hour zones exist (UTC+05:30) but
+  // forgiving 30-minute offsets would also forgive a half-hour-old edit, and a
+  // half-hour zone difference still lands on a whole hour when both sides sit
+  // in one — which is the case this option is for.
+  const maxHours = shift === 'dst' ? 1 : MAX_TIMEZONE_HOURS
+  for (let h = 1; h <= maxHours; h++) {
+    if (Math.abs(diff - h * HOUR_SECONDS) <= tol) return true
+  }
+  return false
+}
+
+// ── Filename case and filename alignment ────────────────────────────────────
+
+/** @typedef {'system'|'sensitive'|'insensitive'} FilenameCase */
+
+/**
+ * @param {unknown} raw
+ * @returns {FilenameCase}
+ */
+export function normalizeFilenameCase(raw) {
+  return raw === 'sensitive' || raw === 'insensitive' ? raw : 'system'
+}
+
+/**
+ * Resolve `system` against a platform string.
+ *
+ * Taking the platform as an argument rather than reading `navigator` keeps the
+ * decision testable on either kind of host, and the whole point of the setting
+ * is that the user can disagree with the platform default.
+ *
+ * @param {FilenameCase} mode
+ * @param {string} [platform] as in `navigator.platform`
+ * @returns {boolean} whether names pair case-insensitively
+ */
+export function filenamesAreCaseInsensitive(mode, platform = '') {
+  if (mode === 'sensitive') return false
+  if (mode === 'insensitive') return true
+  return /^(win|mac)/i.test(String(platform ?? ''))
+}
+
+/**
+ * @typedef {object} AlignRule
+ * @property {string} from  mask with exactly one `*`
+ * @property {string} to    mask with exactly one `*`
+ */
+
+/**
+ * Parse Beyond Compare-style filename alignment rules.
+ *
+ * One rule per `;`-separated entry, written `from=to`, each side a mask with
+ * exactly one `*` — `*.bak.txt=*.txt` aligns `report.bak.txt` with
+ * `report.txt`. Malformed entries are returned separately rather than dropped,
+ * because a typo that silently stops aligning anything is indistinguishable
+ * from the feature not working.
+ *
+ * @param {unknown} raw
+ * @returns {{ rules: AlignRule[], errors: string[] }}
+ */
+export function parseAlignRules(raw) {
+  /** @type {AlignRule[]} */
+  const rules = []
+  /** @type {string[]} */
+  const errors = []
+  for (const piece of String(raw ?? '').split(';')) {
+    const text = piece.trim()
+    if (!text) continue
+    const eq = text.indexOf('=')
+    if (eq <= 0 || eq === text.length - 1) {
+      errors.push(`「${text}」不是 from=to 格式`)
+      continue
+    }
+    const from = text.slice(0, eq).trim()
+    const to = text.slice(eq + 1).trim()
+    const stars = (s) => (s.match(/\*/g) ?? []).length
+    if (stars(from) !== 1 || stars(to) !== 1) {
+      errors.push(`「${text}」兩側都必須剛好有一個 *`)
+      continue
+    }
+    rules.push({ from, to })
+  }
+  return { rules, errors }
+}
+
+/**
+ * Rewrite a name through the first matching alignment rule.
+ *
+ * First match only, and the result is never fed back in: chaining rules can
+ * cycle (`*.a=*.b` with `*.b=*.a`), and a pairing key that depends on rule
+ * order in a non-obvious way is worse than one that ignores the later rules.
+ *
+ * @param {string} name
+ * @param {AlignRule[]} [rules]
+ * @param {boolean} [caseInsensitive] match the masks the way the filesystem
+ *   matches names — a rule written `*.bak.txt` has to catch `FOO.BAK.TXT` on a
+ *   case-insensitive volume, or alignment silently stops working there
+ * @returns {string}
+ */
+export function alignmentNameOf(name, rules = [], caseInsensitive = false) {
+  const base = String(name ?? '')
+  const probe = caseInsensitive ? base.toLowerCase() : base
+  for (const rule of rules ?? []) {
+    const from = caseInsensitive ? rule.from.toLowerCase() : rule.from
+    const star = from.indexOf('*')
+    const head = from.slice(0, star)
+    const tail = from.slice(star + 1)
+    if (probe.length < head.length + tail.length) continue
+    if (!probe.startsWith(head) || !probe.endsWith(tail)) continue
+    // Captured from the original so a case-sensitive rewrite keeps the name's
+    // own casing; the key is folded by the caller when that is wanted.
+    const captured = base.slice(head.length, base.length - tail.length)
+    return (caseInsensitive ? rule.to.toLowerCase() : rule.to).replace('*', captured)
+  }
+  return base
+}
+
+/**
+ * The key two entries must share to be shown on one row.
+ *
+ * @param {string} name
+ * @param {{ caseInsensitive?: boolean, alignRules?: AlignRule[] }} [opts]
+ * @returns {string}
+ */
+export function pairKeyOf(name, opts = {}) {
+  const aligned = alignmentNameOf(name, opts.alignRules, !!opts.caseInsensitive)
+  return opts.caseInsensitive ? aligned.toLowerCase() : aligned
+}
+
+/**
+ * Whether a pair was matched only because case was ignored.
+ *
+ * BC keeps "align case-insensitively" and "a case difference is a difference"
+ * as two settings, so this answers the second without disturbing the first.
+ *
+ * @param {FileEntry|null|undefined} left
+ * @param {FileEntry|null|undefined} right
+ * @returns {boolean}
+ */
+export function namesDifferOnlyByCase(left, right) {
+  if (!left || !right) return false
+  const l = String(left.name ?? '')
+  const r = String(right.name ?? '')
+  return l !== r && l.toLowerCase() === r.toLowerCase()
 }
 
 // ── Move / Exchange ─────────────────────────────────────────────────────────
@@ -1344,6 +1573,31 @@ const VERSION_CONCURRENCY = 4
  */
 const MAX_VERSION_PREFETCH = 2000
 
+// ── Checksum column ─────────────────────────────────────────────────────────
+//
+// Backed by the existing `hash-file` IPC, which computes MD5. The column is
+// therefore labelled and tooltipped as MD5 rather than as CRC-32: the two are
+// not interchangeable, and a user who checks the value against another tool's
+// CRC has to be able to see why it does not match. A true CRC-32 column needs
+// a `crc32-file` handler in the main process — see the hand-off notes.
+
+/** Concurrent `hash-file` calls; matches the version column's IPC budget. */
+const CRC_CONCURRENCY = 4
+
+/**
+ * Ceiling on how many files one "sort by checksum" is allowed to read, for the
+ * same reason as {@link MAX_VERSION_PREFETCH}. Lower, because each of these
+ * reads a whole file rather than a header.
+ */
+const MAX_CRC_PREFETCH = 500
+
+/**
+ * Largest file the column will hash. `hash-file` buffers the whole file in the
+ * main process, so a multi-gigabyte row would take the app down; the cell says
+ * so instead.
+ */
+const MAX_CRC_FILE_BYTES = 64 * 1024 * 1024
+
 const VERSION_CANDIDATE_EXTS = new Set([
   'exe', 'dll', 'sys', 'ocx', 'scr', 'cpl', 'drv', 'efi', 'mun', 'mui', 'mp3',
 ])
@@ -1605,9 +1859,17 @@ export function columnSortValue(row, key) {
       const t = Date.parse(entry?.mtime ?? '')
       return Number.isNaN(t) ? -1 : t
     }
+    case 'created': {
+      const t = Date.parse(entry?.ctime ?? '')
+      return Number.isNaN(t) ? -1 : t
+    }
     case 'ext':     return extensionOf(row?.name)
     case 'relpath': return entry?.path ?? row?.name ?? ''
+    case 'abspath': return entry?.path ?? ''
     case 'attrs':   return entryAttrText(entry)
+    // Same rule as `version`: an unread checksum sorts as empty rather than
+    // being guessed at, and the view fills the set in before sorting on it.
+    case 'crc':     return String(entry?.crc ?? '')
     // Rows whose version has not been read yet sort as empty rather than being
     // guessed at; the view fills the visible set in before sorting on it.
     case 'version': return String(entry?.version ?? '')
@@ -1724,14 +1986,20 @@ const _caf = globalThis.cancelAnimationFrame ?? clearTimeout
  * }
  */
 function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0, opts = {}) {
-  const leftMap = new Map(leftEntries.map((e) => [e.name, e]))
-  const rightMap = new Map(rightEntries.map((e) => [e.name, e]))
-  const allNames = new Set([...leftMap.keys(), ...rightMap.keys()])
+  // Directories are keyed by their literal name whatever the alignment rules
+  // say: a rule written for `*.bak.txt` must not silently merge two folders
+  // and hide one side's children behind the other's.
+  const keyOf = (e) => (e.isDirectory
+    ? pairKeyOf(e.name, { caseInsensitive: opts.caseInsensitive })
+    : pairKeyOf(e.name, opts))
+  const leftMap = new Map(leftEntries.map((e) => [keyOf(e), e]))
+  const rightMap = new Map(rightEntries.map((e) => [keyOf(e), e]))
+  const allKeys = new Set([...leftMap.keys(), ...rightMap.keys()])
 
   const rows = []
   // Sort: directories first, then files; each group alphabetically.
   // A row counts as a directory if either side is a directory.
-  const sorted = [...allNames].sort((a, b) => {
+  const sorted = [...allKeys].sort((a, b) => {
     const aLeft = leftMap.get(a), aRight = rightMap.get(a)
     const bLeft = leftMap.get(b), bRight = rightMap.get(b)
     const aIsDir = !!(aLeft?.isDirectory || aRight?.isDirectory)
@@ -1739,10 +2007,14 @@ function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0, opt
     if (aIsDir !== bIsDir) return aIsDir ? -1 : 1
     return a.localeCompare(b, undefined, { sensitivity: 'base' })
   })
-  for (const name of sorted) {
-    const left = leftMap.get(name) ?? null
-    const right = rightMap.get(name) ?? null
+  for (const key of sorted) {
+    const left = leftMap.get(key) ?? null
+    const right = rightMap.get(key) ?? null
     const status = computeStatus(left, right, mode, mtimeTolerance, opts)
+    // The row is labelled with a name that exists on disk — the pairing key can
+    // be case-folded or rewritten by an alignment rule and is not either side's
+    // real name.
+    const name = left?.name ?? right?.name ?? key
     // `children` is null until the directory is expanded or a full scan pulls
     // it in; an empty array means "loaded, and it has no entries".
     rows.push({ name, status, left, right, children: null })
@@ -1756,7 +2028,7 @@ function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0, opt
  * @param {FileEntry|null} right
  * @param {'name'|'size'|'mtime'|'both'} mode
  * @param {number} [mtimeTolerance] 秒；時間差在容差內視為相同（跨檔案系統複製常見）
- * @param {{ compareAttributes?: boolean }} [opts]
+ * @param {CompareOpts} [opts]
  * @returns {'same'|'left-only'|'right-only'|'different'|'left-newer'|'right-newer'}
  */
 function computeStatus(left, right, mode, mtimeTolerance = 0, opts = {}) {
@@ -1773,12 +2045,17 @@ function computeStatus(left, right, mode, mtimeTolerance = 0, opts = {}) {
   // 時間相同的一對檔案正是唯一看得出屬性差異的情況。
   if (opts.compareAttributes && attributesDiffer(left, right)) return 'different'
 
+  // A pair that only reached the same row because case was ignored. Checked
+  // before `mode === 'name'` returns, since under "name only" this is the sole
+  // difference there is left to report.
+  if (opts.compareFilenameCase && namesDifferOnlyByCase(left, right)) return 'different'
+
   if (mode === 'name') return 'same'
 
   const sizeDiff = left.size !== right.size
   const lTime = new Date(left.mtime).getTime()
   const rTime = new Date(right.mtime).getTime()
-  const timeDiff = Math.abs(lTime - rTime) > mtimeTolerance * 1000
+  const timeDiff = !timestampsMatch(lTime, rTime, mtimeTolerance, opts.timeShift ?? 'none')
 
   if (mode === 'size') {
     return sizeDiff ? 'different' : 'same'
@@ -2205,6 +2482,34 @@ export class FolderCompare {
     /** Timer coalescing the queue drain into one pass per render. */
     this._versionTimer = 0
 
+    // Checksum column, same lazy shape as the version column above.
+    /** @type {Map<string, string>} */
+    this._crcCache = new Map()
+    /** @type {Set<string>} */
+    this._crcInFlight = new Set()
+    /** @type {Map<string, string>} */
+    this._crcTitles = new Map()
+    /** @type {Array<{ entry: FileEntry, path: string }>} */
+    this._crcQueue = []
+    this._crcTimer = 0
+
+    // BC's timezone / daylight-saving tolerance. Orthogonal to the ±n-second
+    // tolerance above: that one forgives rounding, this one forgives whole
+    // hours, and widening the first to cover the second would hide real edits.
+    /** @type {TimeShift} */
+    this._timeShift = normalizeTimeShift(options.timeShift)
+    // How filenames pair. `system` follows the host filesystem's own rule,
+    // which is what makes a Windows-to-Linux comparison behave.
+    /** @type {FilenameCase} */
+    this._filenameCase = normalizeFilenameCase(options.filenameCase)
+    // Whether a pair that only matched because case was ignored counts as a
+    // difference. Has no effect while pairing is case-sensitive.
+    this._compareFilenameCase = !!options.compareFilenameCase
+    // BC's Filename Alignment: `*.bak.txt=*.txt` puts the two on one row.
+    this._alignRulesText = typeof options.alignRules === 'string' ? options.alignRules : ''
+    /** @type {AlignRule[]} */
+    this._alignRules = parseAlignRules(this._alignRulesText).rules
+
     // P2-37: BC's settings scope. Defaults are stored under a reserved name in
     // the named-config store and read here, before any DOM exists, so a new
     // comparison opens with them already in force.
@@ -2214,9 +2519,208 @@ export class FolderCompare {
     }
   }
 
-  /** Comparison options that are not the mode itself. @returns {{ compareAttributes: boolean }} */
+  /** Comparison options that are not the mode itself. @returns {CompareOpts} */
   _compareOpts() {
-    return { compareAttributes: this._compareAttributes }
+    return {
+      compareAttributes: this._compareAttributes,
+      compareFilenameCase: this._compareFilenameCase,
+      caseInsensitive: filenamesAreCaseInsensitive(
+        this._filenameCase, globalThis.navigator?.platform ?? ''),
+      alignRules: this._alignRules,
+      timeShift: this._timeShift,
+    }
+  }
+
+  // ── Comparison criteria: time shift / filename case / filename alignment ────
+
+  /** @returns {TimeShift} */
+  getTimeShift() { return this._timeShift }
+
+  /**
+   * @param {unknown} mode
+   * @returns {boolean} whether it changed
+   */
+  setTimeShift(mode) {
+    const next = normalizeTimeShift(mode)
+    if (next === this._timeShift) return false
+    this._timeShift = next
+    return true
+  }
+
+  /** @returns {FilenameCase} */
+  getFilenameCase() { return this._filenameCase }
+
+  /**
+   * @param {unknown} mode
+   * @returns {boolean} whether it changed
+   */
+  setFilenameCase(mode) {
+    const next = normalizeFilenameCase(mode)
+    if (next === this._filenameCase) return false
+    this._filenameCase = next
+    return true
+  }
+
+  /** @returns {boolean} */
+  getCompareFilenameCase() { return this._compareFilenameCase }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} whether it changed
+   */
+  setCompareFilenameCase(on) {
+    const next = !!on
+    if (next === this._compareFilenameCase) return false
+    this._compareFilenameCase = next
+    return true
+  }
+
+  /** @returns {string} the rule text as the user typed it */
+  getAlignRulesText() { return this._alignRulesText }
+
+  /** @returns {AlignRule[]} */
+  getAlignRules() { return this._alignRules.map((r) => ({ ...r })) }
+
+  /**
+   * @param {unknown} text `;`-separated `from=to` rules
+   * @returns {{ changed: boolean, errors: string[] }} malformed entries are
+   *   reported rather than dropped, so the caller can put them on screen
+   */
+  setAlignRules(text) {
+    const raw = String(text ?? '')
+    const { rules, errors } = parseAlignRules(raw)
+    const before = JSON.stringify(this._alignRules)
+    this._alignRulesText = raw
+    this._alignRules = rules
+    return { changed: before !== JSON.stringify(rules), errors }
+  }
+
+  // ── Quick Compare ───────────────────────────────────────────────────────────
+
+  /**
+   * Re-grade rows using only the quick tests — size and timestamp — whatever
+   * the session's compare mode is.
+   *
+   * Beyond Compare's Quick Compare exists because the content modes are slow:
+   * having hashed or rule-parsed a tree, you sometimes want a subset re-judged
+   * without paying for it again, or judged at all when a content scan was
+   * cancelled. It is deliberately a one-shot command and not a mode — the mode
+   * dropdown already holds 「名稱+大小+時間」 for when that is what you want
+   * permanently.
+   *
+   * Writes through {@link eachRow}, not `flattenRows`: the latter hands out
+   * copies and the verdict would land on a throwaway object.
+   *
+   * @param {(row: CompareRow) => boolean} predicate
+   * @returns {number} rows re-graded
+   */
+  _quickCompare(predicate) {
+    let graded = 0
+    for (const row of eachRow(this._rows ?? [])) {
+      if (isDirRow(row)) continue
+      if (!predicate(row)) continue
+      row.status = computeStatus(
+        row.left, row.right, 'both', this._mtimeTolerance, this._compareOpts())
+      // A quick verdict replaces whatever the content or rules pass decided,
+      // including its unimportant grading — that grading came from a text
+      // comparison this row no longer claims to have had.
+      row.unimportant = false
+      graded++
+    }
+    if (graded) {
+      this._refreshRollups()
+      this._applyFilterAndRender()
+    }
+    return graded
+  }
+
+  /**
+   * Quick-compare the checked rows, or the focused one when nothing is checked.
+   * @returns {number} rows re-graded
+   */
+  quickCompareSelected() {
+    const keys = this._selectedNames.size
+      ? new Set(this._selectedNames)
+      : new Set(this._focusedKey ? [this._focusedKey] : [])
+    if (!keys.size) {
+      alert('請先勾選或選取要快速比對的項目。')
+      return 0
+    }
+    const graded = this._quickCompare((row) => {
+      const key = row.left?.path || row.right?.path
+      return !!key && keys.has(key)
+    })
+    this._setScanStatus(graded
+      ? `快速比對：已用大小與時間重新判定 ${graded} 列`
+      : '快速比對：選取的項目沒有可比對的檔案列')
+    return graded
+  }
+
+  /**
+   * Quick-compare every loaded row.
+   * @returns {number} rows re-graded
+   */
+  quickCompareAll() {
+    const graded = this._quickCompare(() => true)
+    this._setScanStatus(`快速比對：已用大小與時間重新判定 ${graded} 列`)
+    return graded
+  }
+
+  // ── Compare To ──────────────────────────────────────────────────────────────
+
+  /**
+   * Beyond Compare's Compare To: keep one side where it is, and point the other
+   * at a folder chosen from a dialog.
+   *
+   * @param {'left'|'right'} side the side that stays
+   * @returns {Promise<boolean>} whether a new comparison was started
+   */
+  async compareTo(side) {
+    if (!this._sourceOf(side) && !(side === 'left' ? this._leftPath : this._rightPath)) {
+      alert(`請先開啟${side === 'left' ? '左' : '右'}側資料夾，才能與其他資料夾比對。`)
+      return false
+    }
+    const picked = await window.electronAPI?.openFolder?.()
+    if (!picked?.path) return false
+    await this.setSource(side === 'left' ? 'right' : 'left', { kind: 'fs', root: picked.path })
+    return true
+  }
+
+  /**
+   * Compare one folder row's directory against a folder chosen from a dialog.
+   *
+   * The chosen folder always lands on the opposite side, so the row the user
+   * right-clicked stays where they are looking at it.
+   *
+   * @param {string} basePath the directory to compare *from*
+   * @param {'left'|'right'} side which side that directory belongs to
+   * @returns {Promise<boolean>}
+   */
+  async compareFolderTo(basePath, side) {
+    if (!basePath) return false
+    const picked = await window.electronAPI?.openFolder?.()
+    if (!picked?.path) return false
+    // Both sides are replaced, so the first scan would compare the new base
+    // against the *old* other side. Setting the state directly and scanning
+    // once avoids showing that intermediate comparison at all.
+    const other = side === 'left' ? 'right' : 'left'
+    await this._disconnectRemote('left')
+    await this._disconnectRemote('right')
+    this._leftZipEntries = null
+    this._rightZipEntries = null
+    const roots = { [side]: basePath, [other]: picked.path }
+    this._leftSource = { kind: 'fs', root: roots.left }
+    this._rightSource = { kind: 'fs', root: roots.right }
+    this._leftPath = roots.left
+    this._rightPath = roots.right
+    this._updatePathDisplay('left', this._sourceLabel('left'))
+    this._updatePathDisplay('right', this._sourceLabel('right'))
+    this._syncModeAvailability()
+    this._expanded.clear()
+    this._pendingFirstDiff = true
+    this._recordNav()
+    await this._scan()
+    return true
   }
 
   /**
@@ -2383,6 +2887,9 @@ export class FolderCompare {
     if (key === 'version') {
       void this.prefetchVersionsForSort().then(() => this._applyFilterAndRender())
     }
+    if (key === 'crc') {
+      void this.prefetchCrcForSort().then(() => this._applyFilterAndRender())
+    }
   }
 
   /** @returns {{ key: string, dir: number }} */
@@ -2398,18 +2905,24 @@ export class FolderCompare {
     const flags = this._viewFlags
     const hit = Object.entries(VIEW_PRESETS).find(([, p]) =>
       Object.keys(p).every((k) => p[k] === flags[k]))
-    this._viewPreset = hit ? hit[0] : 'all'
-    if (this._dom.viewPreset && hit) this._dom.viewPreset.value = hit[0]
+    // Previously this fell back to 'all', which both mislabelled the dropdown
+    // and — because getConfig stores the preset — restored a saved session
+    // showing every row instead of the combination the user chose.
+    this._viewPreset = hit ? hit[0] : CUSTOM_VIEW_PRESET
+    if (this._dom.viewPreset) this._dom.viewPreset.value = this._viewPreset
   }
 
   /** Push the current flags back onto the toolbar controls. */
   _syncFilterControls() {
-    const { cbSame, cbDiff, cbOrphan, btnLeftNewer, btnRightNewer, viewPreset } = this._dom
+    const { cbSame, cbDiff, cbOrphan, btnLeftNewer, btnRightNewer,
+      btnLeftOrphan, btnRightOrphan, viewPreset } = this._dom
     if (cbSame) cbSame.checked = this._showSame
     if (cbDiff) cbDiff.checked = this._showDiff
     if (cbOrphan) cbOrphan.checked = this._showOrphan
     btnLeftNewer?.classList.toggle('fc-btn-filter-toggle--active', this._showLeftNewer)
     btnRightNewer?.classList.toggle('fc-btn-filter-toggle--active', this._showRightNewer)
+    btnLeftOrphan?.classList.toggle('fc-btn-filter-toggle--active', this._showLeftOnly)
+    btnRightOrphan?.classList.toggle('fc-btn-filter-toggle--active', this._showRightOnly)
     if (viewPreset) viewPreset.value = this._viewPreset
     if (this._dom.filter) this._dom.filter.value = this._filterStr
   }
@@ -2523,6 +3036,10 @@ export class FolderCompare {
       mode: this._mode,
       viewPreset: this._viewPreset,
       mtimeTolerance: this._mtimeTolerance,
+      timeShift: this._timeShift,
+      filenameCase: this._filenameCase,
+      compareFilenameCase: this._compareFilenameCase,
+      alignRules: this._alignRulesText,
       compareAttributes: this._compareAttributes,
       compareVersion: this._compareVersion,
       filesOnly: this._filesOnly,
@@ -2535,8 +3052,8 @@ export class FolderCompare {
       columns: [...this._columns],
       rulesOptions: this.getRulesOptions(),
       // The six flags are stored alongside the preset because a hand-tuned
-      // combination that matches no preset is reported as 'all', which on its
-      // own would restore the wrong set of rows.
+      // combination is reported as 'custom', which names no flag set of its
+      // own and so cannot restore the rows by itself.
       filters: {
         showSame: this._showSame,
         showDiff: this._showDiff,
@@ -2567,6 +3084,14 @@ export class FolderCompare {
     if (typeof settings.mtimeTolerance === 'number' && settings.mtimeTolerance >= 0) {
       this._mtimeTolerance = settings.mtimeTolerance
     }
+    if (settings.timeShift !== undefined) this._timeShift = normalizeTimeShift(settings.timeShift)
+    if (settings.filenameCase !== undefined) {
+      this._filenameCase = normalizeFilenameCase(settings.filenameCase)
+    }
+    if (typeof settings.compareFilenameCase === 'boolean') {
+      this._compareFilenameCase = settings.compareFilenameCase
+    }
+    if (typeof settings.alignRules === 'string') this.setAlignRules(settings.alignRules)
     if (typeof settings.compareAttributes === 'boolean') {
       this._compareAttributes = settings.compareAttributes
     }
@@ -5281,6 +5806,11 @@ ${rows}
       this._versionTimer = 0
     }
     this._versionQueue = []
+    if (this._crcTimer) {
+      clearTimeout(this._crcTimer)
+      this._crcTimer = 0
+    }
+    this._crcQueue = []
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
@@ -5434,6 +5964,25 @@ ${rows}
     this._dom.btnRightNewer = btnRightNewer
     toolbar.appendChild(btnRightNewer)
 
+    // Per-side orphan switches. The 顯示孤兒 checkbox above drives both at
+    // once, which cannot express BC's "left newer plus left orphans" — a
+    // combination the preset list has no name for either.
+    const btnLeftOrphan = el('button', {
+      className: 'fc-btn-filter-toggle fc-btn-filter-toggle--active',
+      title: '顯示僅左側存在的項目',
+      'data-filter': 'left-orphan',
+    }, '左孤兒')
+    this._dom.btnLeftOrphan = btnLeftOrphan
+    toolbar.appendChild(btnLeftOrphan)
+
+    const btnRightOrphan = el('button', {
+      className: 'fc-btn-filter-toggle fc-btn-filter-toggle--active',
+      title: '顯示僅右側存在的項目',
+      'data-filter': 'right-orphan',
+    }, '右孤兒')
+    this._dom.btnRightOrphan = btnRightOrphan
+    toolbar.appendChild(btnRightOrphan)
+
     // BC's three folder-level display/comparison switches. Checkboxes rather
     // than another preset entry: each is orthogonal to the preset list and to
     // the other two.
@@ -5493,6 +6042,31 @@ ${rows}
     const btnColumns = el('button', { className: 'fc-btn-columns', title: '選擇顯示欄位' }, '▦ 欄位')
     this._dom.btnColumns = btnColumns
     toolbar.appendChild(btnColumns)
+
+    // Compare To / Quick Compare. Grouped in their own dropdown rather than
+    // added as two more bare buttons: the toolbar already carries fifteen.
+    const compareWrap = el('div', { className: 'fc-select-wrap fc-compare-wrap' })
+    const btnCompareMenu = el('button', {
+      className: 'fc-btn-compare-menu',
+      title: 'Compare To（換掉一側）與 Quick Compare（只用大小與時間重判）',
+    }, '比對 ▾')
+    this._dom.btnCompareMenu = btnCompareMenu
+    // Its own classes, not the selection dropdown's: sharing `fc-select-menu`
+    // would make every existing `.fc-select-menu` / `.fc-select-item` selector
+    // — in tests and in the document click handler alike — ambiguous.
+    const compareMenu = el('div', { className: 'fc-compare-menu', style: 'display:none' })
+    for (const item of [
+      { label: '保留左側，與其他資料夾比對…', action: 'compare-to-left' },
+      { label: '保留右側，與其他資料夾比對…', action: 'compare-to-right' },
+      { label: '快速比對選取（僅大小與時間）', action: 'quick-compare-selected' },
+      { label: '快速比對全部（僅大小與時間）', action: 'quick-compare-all' },
+    ]) {
+      compareMenu.appendChild(
+        el('button', { className: 'fc-compare-item', 'data-action': item.action }, item.label))
+    }
+    this._dom.compareMenu = compareMenu
+    compareWrap.append(btnCompareMenu, compareMenu)
+    toolbar.appendChild(compareWrap)
 
     const btnRules = el('button', { className: 'fc-btn-rules', title: '比對規則（忽略選項）' }, '⚖ 規則')
     this._dom.btnRules = btnRules
@@ -5587,6 +6161,7 @@ ${rows}
       { label: '移動選取到其他資料夾…',      action: 'move-to-folder' },
       { label: '同步時間戳（左 → 右）',      action: 'touch-to-right' },
       { label: '同步時間戳（右 → 左）',      action: 'touch-to-left' },
+      { label: '快速比對選取（僅大小與時間）', action: 'quick-compare' },
     ]
     for (const item of batchItems) {
       const btn = el('button', { className: 'fc-batch-item', 'data-action': item.action }, item.label)
@@ -5849,6 +6424,69 @@ ${rows}
     this._dom.cbCompareVersion = cbVersion
     panel.appendChild(versionWrap)
 
+    // BC's timezone / DST tolerance. A select rather than a checkbox because
+    // the two shifts differ in width: DST is always exactly one hour, a
+    // timezone can be any whole hour up to a day apart.
+    const timeShift = el('select', {
+      className: 'fc-rules-time-shift',
+      title: '跨檔案系統的時間戳位移：FAT 沒有時區資訊，日光節約時間切換前後會整整差一小時；'
+        + '封存檔與遠端主機則可能差整個時區。與上方的「秒」容差獨立，'
+        + '因為把秒容差放寬到一小時會連真正的編輯一起吃掉',
+    })
+    for (const [value, label] of [
+      ['none', '時間位移：不容忍'],
+      ['dst', '時間位移：忽略 1 小時（日光節約）'],
+      ['timezone', '忽略整點時區位移'],
+    ]) {
+      const opt = el('option', { value }, label)
+      if (value === this._timeShift) opt.setAttribute('selected', '')
+      timeShift.appendChild(opt)
+    }
+    this._dom.rulesTimeShift = timeShift
+    panel.appendChild(timeShift)
+
+    // BC's filename case handling. `system` is the default because the answer
+    // that matches the host filesystem is right far more often than either
+    // absolute, but a cross-platform comparison needs to override it.
+    const nameCase = el('select', {
+      className: 'fc-rules-name-case',
+      title: '檔名配對是否區分大小寫。「依平台」在 Windows/macOS 不分、在 Linux 區分',
+    })
+    for (const [value, label] of [
+      ['system', '檔名大小寫：依平台'],
+      ['insensitive', '檔名大小寫：不分（配對 README 與 readme）'],
+      ['sensitive', '檔名大小寫：區分'],
+    ]) {
+      const opt = el('option', { value }, label)
+      if (value === this._filenameCase) opt.setAttribute('selected', '')
+      nameCase.appendChild(opt)
+    }
+    this._dom.rulesNameCase = nameCase
+    panel.appendChild(nameCase)
+
+    const cbNameCase = el('input', { type: 'checkbox', className: 'fc-rules-cb fc-compare-name-case' })
+    cbNameCase.checked = this._compareFilenameCase
+    const nameCaseWrap = el('label', {
+      className: 'fc-rules-toggle',
+      title: '大小寫不同的一對檔名視為差異；配對本身區分大小寫時此項無作用（那種情況下兩者本來就是孤兒）',
+    })
+    nameCaseWrap.appendChild(cbNameCase)
+    nameCaseWrap.appendChild(document.createTextNode(' 大小寫算差異'))
+    this._dom.cbCompareNameCase = cbNameCase
+    panel.appendChild(nameCaseWrap)
+
+    // BC's Filename Alignment.
+    const alignInput = el('input', {
+      type: 'text',
+      className: 'fc-rules-align',
+      placeholder: '檔名對齊規則（如 *.bak.txt=*.txt；分號分隔）',
+      title: '把不同檔名的兩個檔案放到同一列。每條寫成 from=to，兩側各剛好一個 *；'
+        + '只套用於檔案，不會合併資料夾',
+    })
+    alignInput.value = this._alignRulesText
+    this._dom.rulesAlign = alignInput
+    panel.appendChild(alignInput)
+
     const btnArchives = el('button', {
       className: 'fc-rules-archives',
       title: '封存檔比對條件：是否展開為資料夾、哪些副檔名算封存檔、是否以內容清單判定差異',
@@ -5873,6 +6511,12 @@ ${rows}
     if (rulesIgnore) rulesIgnore.value = this._rulesOptions.ignorePatterns.join(';')
     if (rulesUnimportant) rulesUnimportant.value = this._rulesOptions.unimportantPatterns.join(';')
     if (rulesSize) rulesSize.value = String(Math.floor(this._rulesOptions.maxBytes / 1024))
+    if (this._dom.rulesTimeShift) this._dom.rulesTimeShift.value = this._timeShift
+    if (this._dom.rulesNameCase) this._dom.rulesNameCase.value = this._filenameCase
+    if (this._dom.cbCompareNameCase) {
+      this._dom.cbCompareNameCase.checked = this._compareFilenameCase
+    }
+    if (this._dom.rulesAlign) this._dom.rulesAlign.value = this._alignRulesText
     this._syncAttributeControl()
   }
 
@@ -5896,9 +6540,25 @@ ${rows}
     const versionBefore = this._compareVersion
     this._compareAttributes = !!this._dom.cbCompareAttrs?.checked
     this._compareVersion = !!this._dom.cbCompareVersion?.checked
+
+    // Pairing and timestamp criteria. A malformed alignment rule is surfaced
+    // rather than dropped: a typo that silently stops aligning anything looks
+    // exactly like the feature not working.
+    let pairingChanged = this.setTimeShift(this._dom.rulesTimeShift?.value)
+    pairingChanged = this.setFilenameCase(this._dom.rulesNameCase?.value) || pairingChanged
+    pairingChanged = this.setCompareFilenameCase(this._dom.cbCompareNameCase?.checked)
+      || pairingChanged
+    const align = this.setAlignRules(this._dom.rulesAlign?.value ?? '')
+    pairingChanged = align.changed || pairingChanged
+    if (align.errors.length) {
+      alert(`檔名對齊規則有 ${align.errors.length} 條無法解析，已略過：\n\n`
+        + align.errors.map((e) => `• ${e}`).join('\n'))
+    }
+
     this.setRulesOptions(next)
     const criteriaChanged = attrsBefore !== this._compareAttributes
       || versionBefore !== this._compareVersion
+      || pairingChanged
     if (criteriaChanged && this._mode !== 'rules' && (this._leftPath || this._rightPath)) {
       void this._compareAndRender()
     }
@@ -6115,18 +6775,23 @@ ${rows}
 
     btnSync.addEventListener('click', () => this.toggleSyncMode())
 
-    // T55: Left Newer / Right Newer toggles
-    btnLeftNewer?.addEventListener('click', () => {
-      this._showLeftNewer = !this._showLeftNewer
-      btnLeftNewer.classList.toggle('fc-btn-filter-toggle--active', this._showLeftNewer)
-      this._applyFilterAndRender()
-    })
-
-    btnRightNewer?.addEventListener('click', () => {
-      this._showRightNewer = !this._showRightNewer
-      btnRightNewer.classList.toggle('fc-btn-filter-toggle--active', this._showRightNewer)
-      this._applyFilterAndRender()
-    })
+    // T55: Left Newer / Right Newer toggles. Each of the four below is one of
+    // BC's independent View switches, so flipping one re-labels the preset
+    // dropdown rather than leaving it claiming a preset that no longer holds.
+    /** @param {'_showLeftNewer'|'_showRightNewer'|'_showLeftOnly'|'_showRightOnly'} flag */
+    const bindFilterToggle = (btn, flag) => {
+      btn?.addEventListener('click', () => {
+        this[flag] = !this[flag]
+        btn.classList.toggle('fc-btn-filter-toggle--active', this[flag])
+        this._markPresetCustom()
+        this._syncFilterControls()
+        this._applyFilterAndRender()
+      })
+    }
+    bindFilterToggle(btnLeftNewer, '_showLeftNewer')
+    bindFilterToggle(btnRightNewer, '_showRightNewer')
+    bindFilterToggle(this._dom.btnLeftOrphan, '_showLeftOnly')
+    bindFilterToggle(this._dom.btnRightOrphan, '_showRightOnly')
 
     // Column chooser — stopPropagation so the document click handler that
     // closes the other toolbar menus does not immediately close this one.
@@ -6196,6 +6861,23 @@ ${rows}
       else if (action === 'invert-selection')    this.invertSelection()
     })
 
+    this._dom.btnCompareMenu?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const menu = this._dom.compareMenu
+      if (menu) menu.style.display = menu.style.display === 'none' ? 'block' : 'none'
+    })
+
+    this._dom.compareMenu?.addEventListener('click', (e) => {
+      const btn = e.target.closest('.fc-compare-item')
+      if (!btn) return
+      this._dom.compareMenu.style.display = 'none'
+      const action = btn.dataset.action
+      if (action === 'compare-to-left') void this.compareTo('left')
+      else if (action === 'compare-to-right') void this.compareTo('right')
+      else if (action === 'quick-compare-selected') this.quickCompareSelected()
+      else if (action === 'quick-compare-all') this.quickCompareAll()
+    })
+
     // ── Batch selection ───────────────────────────────────────────────────────
 
     // Row checkbox delegation
@@ -6251,12 +6933,14 @@ ${rows}
       else if (action === 'move-to-folder') await this.moveSelectedToFolder()
       else if (action === 'touch-to-right') await this.touchSelected('left-to-right')
       else if (action === 'touch-to-left') await this.touchSelected('right-to-left')
+      else if (action === 'quick-compare') this.quickCompareSelected()
     })
 
     // S14-M02: store handler refs so destroy() can remove them.
     this._onDocumentClick = () => {
       if (batchMenu) batchMenu.style.display = 'none'
       if (selectMenu) selectMenu.style.display = 'none'
+      if (this._dom.compareMenu) this._dom.compareMenu.style.display = 'none'
     }
     document.addEventListener('click', this._onDocumentClick)
 
@@ -6266,6 +6950,9 @@ ${rows}
     })
 
     viewPreset?.addEventListener('change', () => {
+      // "自訂組合" is a read-out, not a command: picking it means "leave the
+      // switches alone", so the dropdown is put back where the flags say.
+      if (viewPreset.value === CUSTOM_VIEW_PRESET) { this._syncFilterControls(); return }
       this.setViewPreset(viewPreset.value)
     })
 
@@ -6284,6 +6971,8 @@ ${rows}
     cbOrphan.addEventListener('change', () => {
       this._showOrphan = cbOrphan.checked
       this._markPresetCustom()
+      // Drives both per-side switches, which have to follow it on screen.
+      this._syncFilterControls()
       this._applyFilterAndRender()
     })
 
@@ -7045,12 +7734,23 @@ ${rows}
         return el('span', { className: 'fc-size' }, isDir ? '' : formatSize(entry.size))
       case 'mtime':
         return el('span', { className: 'fc-mtime' }, formatMtime(entry.mtime))
+      case 'created':
+        // Virtual sources (archives, snapshots, remote listings) carry no
+        // creation time; an empty cell says that, a fabricated one would not.
+        return el('span', { className: 'fc-created' }, formatMtime(entry.ctime))
       case 'ext':
         return el('span', { className: 'fc-ext' }, isDir ? '' : extensionOf(entry.name))
       case 'relpath': {
         const rel = this._relativePathOf(row)
         return el('span', { className: 'fc-relpath', title: entry.path ?? rel }, rel)
       }
+      case 'abspath':
+        return el('span', {
+          className: 'fc-abspath',
+          title: entry.path ?? '',
+        }, entry.path ?? '')
+      case 'crc':
+        return this._buildCrcCell(entry, isDir)
       case 'attrs':
         return el('span', {
           className: 'fc-attrs',
@@ -7247,6 +7947,165 @@ ${rows}
       : '')
   }
 
+  // ── Checksum column ─────────────────────────────────────────────────────────
+
+  /**
+   * A checksum cell, filled from cache when possible and queued otherwise.
+   *
+   * Same discipline as {@link _buildVersionCell}, and for a stronger reason:
+   * `hash-file` reads the whole file into the main process, so hashing every
+   * row of a large tree would be far worse than an extra IPC. Only rows the
+   * virtual scroller actually drew are ever queued, each path is asked once,
+   * and files past {@link MAX_CRC_FILE_BYTES} are declined outright.
+   *
+   * @param {FileEntry} entry
+   * @param {boolean} isDir
+   * @returns {HTMLElement}
+   */
+  _buildCrcCell(entry, isDir) {
+    const cell = el('span', { className: 'fc-crc' })
+    if (isDir || !entry?.path) return cell
+
+    if (entry.crc === undefined) {
+      const cached = this._crcCache.get(entry.path)
+      if (cached !== undefined) entry.crc = cached
+    }
+    if (entry.crc !== undefined) {
+      cell.textContent = entry.crc
+      const title = this._crcTitles.get(entry.path)
+      if (title) cell.title = title
+      return cell
+    }
+
+    // Archive, snapshot and remote entries have no path `hash-file` can open.
+    if (sourceKindOf(entry.path) !== 'fs') {
+      this._resolveCrc(entry, '', '此來源不支援檢查碼')
+      cell.textContent = ''
+      return cell
+    }
+    if ((entry.size ?? 0) > MAX_CRC_FILE_BYTES) {
+      this._resolveCrc(entry, '—',
+        `超過 ${Math.floor(MAX_CRC_FILE_BYTES / 1024 / 1024)} MB，未計算檢查碼`)
+      cell.textContent = '—'
+      cell.title = this._crcTitles.get(entry.path) ?? ''
+      return cell
+    }
+
+    cell.classList.add('fc-crc--pending')
+    cell.textContent = '…'
+    cell.dataset.crcPath = entry.path
+    this._queueCrc(entry)
+    return cell
+  }
+
+  /** @param {FileEntry} entry */
+  _queueCrc(entry) {
+    if (this._crcInFlight.has(entry.path)) return
+    if (this._crcQueue.some((job) => job.path === entry.path)) return
+    this._crcQueue.push({ entry, path: entry.path })
+    if (this._crcTimer) return
+    this._crcTimer = setTimeout(() => {
+      this._crcTimer = 0
+      void this._drainCrcQueue()
+    }, 0)
+  }
+
+  /** @returns {Promise<void>} */
+  async _drainCrcQueue() {
+    const jobs = this._crcQueue
+    this._crcQueue = []
+    if (!jobs.length || !window.electronAPI?.hashFile) {
+      for (const job of jobs) this._resolveCrc(job.entry, '', '此環境沒有檢查碼 IPC')
+      return
+    }
+    for (const job of jobs) this._crcInFlight.add(job.path)
+    await _runWithConcurrency(jobs, CRC_CONCURRENCY, async (job) => {
+      let text = ''
+      let title = ''
+      try {
+        text = String(await window.electronAPI.hashFile(job.path))
+        title = `MD5：${text}`
+      } catch (err) {
+        // Informational column: a dialog per unreadable file would be worse
+        // than the dash, but the reason still has to reach the user somewhere.
+        console.warn('FolderCompare: checksum failed:', job.path, err)
+        text = '—'
+        title = `無法計算檢查碼：${errText(err)}`
+      }
+      this._crcInFlight.delete(job.path)
+      this._resolveCrc(job.entry, text, title)
+    })
+  }
+
+  /**
+   * @param {FileEntry} entry
+   * @param {string} text
+   * @param {string} title
+   */
+  _resolveCrc(entry, text, title) {
+    entry.crc = text
+    this._crcCache.set(entry.path, text)
+    if (title) this._crcTitles.set(entry.path, title)
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    for (const cell of vlist.querySelectorAll('.fc-crc--pending')) {
+      if (cell.dataset.crcPath !== entry.path) continue
+      cell.classList.remove('fc-crc--pending')
+      cell.textContent = text
+      if (title) cell.title = title
+    }
+  }
+
+  /**
+   * Read checksums for the rows in the filtered tree, so sorting on the column
+   * has something to sort. Bounded exactly as the version prefetch is.
+   *
+   * @returns {Promise<void>}
+   */
+  async prefetchCrcForSort() {
+    if (!window.electronAPI?.hashFile) return
+    /** @type {FileEntry[]} */
+    const pending = []
+    let skipped = 0
+    for (const flat of this._visibleRows ?? []) {
+      for (const entry of [flat.row.left, flat.row.right]) {
+        if (!entry?.path || entry.isDirectory) continue
+        if (entry.crc !== undefined) continue
+        const cached = this._crcCache.get(entry.path)
+        if (cached !== undefined) { entry.crc = cached; continue }
+        if (sourceKindOf(entry.path) !== 'fs') { this._resolveCrc(entry, '', ''); continue }
+        if ((entry.size ?? 0) > MAX_CRC_FILE_BYTES) { this._resolveCrc(entry, '—', ''); continue }
+        if (pending.length >= MAX_CRC_PREFETCH) { skipped++; continue }
+        pending.push(entry)
+      }
+    }
+    if (!pending.length) {
+      if (skipped) this._setScanStatus(`檢查碼排序：超過 ${MAX_CRC_PREFETCH} 個檔案，其餘未計算`)
+      return
+    }
+
+    this._setScanStatus(`計算檢查碼… 0/${pending.length}`)
+    let done = 0
+    await _runWithConcurrency(pending, CRC_CONCURRENCY, async (entry) => {
+      let text = ''
+      let title = ''
+      try {
+        text = String(await window.electronAPI.hashFile(entry.path))
+        title = `MD5：${text}`
+      } catch (err) {
+        console.warn('FolderCompare: checksum failed:', entry.path, err)
+        text = '—'
+        title = `無法計算檢查碼：${errText(err)}`
+      }
+      this._resolveCrc(entry, text, title)
+      done++
+      if (done % 25 === 0) this._setScanStatus(`計算檢查碼… ${done}/${pending.length}`)
+    })
+    this._setScanStatus(skipped
+      ? `檢查碼排序：僅計算前 ${pending.length} 個檔案，另有 ${skipped} 個未計算`
+      : '')
+  }
+
   _renderStats(rows) {
     if (!this._dom.stats) return
     const stats = this._dom.stats
@@ -7377,6 +8236,31 @@ ${rows}
       items.push({ separator: true })
     }
 
+    // ── 快速比對 / 與其他資料夾比對 ──
+    // Quick Compare works on any paired row, including one a cancelled content
+    // scan left ungraded, so it is offered before the mode-specific items.
+    if (!isDir && leftPath && rightPath) {
+      items.push({
+        label: '快速比對此列（僅大小與時間）',
+        action: () => {
+          this._setFocusedKey(leftPath || rightPath)
+          this.quickCompareSelected()
+        },
+      })
+    }
+    if (isDir) {
+      for (const [path, isFs, label, side] of [
+        [leftPath, leftIsFs, '左側', 'left'], [rightPath, rightIsFs, '右側', 'right'],
+      ]) {
+        if (!path || !isFs) continue
+        items.push({
+          label: `以此資料夾與其他資料夾比對…（${label}）`,
+          action: () => void this.compareFolderTo(path, side),
+        })
+      }
+    }
+    if (items.length && !items.at(-1)?.separator) items.push({ separator: true })
+
     // ── 以其他程式開啟 ──
     // Directories are excluded: showInExplorer already covers "look at this
     // folder", and handing a directory to the file association would open a
@@ -7396,7 +8280,9 @@ ${rows}
         })
       }
     }
-    if (items.length) items.push({ separator: true })
+    // Only when this group actually contributed something; two separators in a
+    // row read as an empty section.
+    if (items.length && !items.at(-1)?.separator) items.push({ separator: true })
 
     // ── 在檔案總管中顯示 ──
     if (leftPath && leftIsFs) {
