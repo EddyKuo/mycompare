@@ -18,7 +18,7 @@ import { basename } from 'path'
 import { gunzipSync } from 'zlib'
 
 import { bunzip2, isBzip2, Bzip2Error } from './bzip2.js'
-import { decodeXz, isXz, LzmaError } from './lzma.js'
+import { decodeXz, isXz, LzmaError, crc32 } from './lzma.js'
 import { is7z, parse7z, extract7zEntry, SevenZipError } from './sevenzip.js'
 import { isCab, parseCab, extractCabEntry, CabError } from './cab.js'
 import { rarGeneration, parseRar, extractRarEntry, RarError } from './rar.js'
@@ -792,8 +792,37 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
     if (hit.size > lim.maxEntryBytes) {
       throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
     }
-    return Buffer.from(withRarErrors(() =>
-      extractRarEntry(buf, parsed, hit.path, { maxBytes: lim.maxEntryBytes })))
+    try {
+      return Buffer.from(withRarErrors(() =>
+        extractRarEntry(buf, parsed, hit.path, { maxBytes: lim.maxEntryBytes })))
+    } catch (err) {
+      // A compressed entry is the one refusal an installed UnRAR can answer.
+      // Links stay refused whatever is installed — their "contents" are a
+      // target, not data — and an encrypted archive never reaches here, since
+      // parseRar rejects it. So the fallback is narrow by construction.
+      if (!(err instanceof ArchiveError) || err.code !== 'unsupported'
+        || hit.method === 0 || hit.redirect) throw err
+
+      const { canExtractCompressed, extractWithUnrar } = await import('./unrar-tool.js')
+      if (!canExtractCompressed()) throw err
+
+      const out = await extractWithUnrar({
+        archivePath,
+        entryPath: hit.path,
+        maxBytes: lim.maxEntryBytes,
+      })
+      // The tool is trusted to decompress, not to have been handed the right
+      // archive: the header's own CRC-32 is what says these bytes belong to
+      // this entry. Without it a silently truncated stdout would pass.
+      if (out.length !== hit.size) {
+        throw new ArchiveError(
+          `UnRAR 回傳 ${out.length} 位元組，但「${hit.path}」宣告 ${hit.size}`, 'corrupt')
+      }
+      if (hit.crc !== null && hit.crc !== undefined && crc32(out) !== hit.crc) {
+        throw new ArchiveError(`「${hit.path}」的 CRC32 與封存檔記載不符`, 'corrupt')
+      }
+      return out
+    }
   }
 
   if (format === '7z') {
