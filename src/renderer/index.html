@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <!-- S12-S04: Content-Security-Policy (defence in depth) -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'" />
+  <!-- frame-src allows blob: only: the print preview renders the exact report
+       HTML that will be printed, in an isolated sandboxed frame. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-src blob:; base-uri 'none'" />
   <!-- T20: Apply theme before CSS loads to prevent FOUC -->
   <script>
     (function() {
@@ -314,65 +316,185 @@
     </div>
   </div>
 
-  <!-- T75: Settings modal (custom shortcuts) -->
+  <!-- P2-24: unified Options dialog (Tools ▸ Options), tabbed like BC's. -->
   <div id="settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" style="display:none">
-    <div class="modal-box" style="width:640px;max-width:95vw">
+    <div class="modal-box modal-box--options">
       <div class="modal-header">
         <span id="settings-modal-title">選項</span>
         <button id="btn-settings-modal-close" class="modal-close">✕</button>
       </div>
-      <div class="modal-body" style="max-height:70vh;overflow:auto">
-        <h4 class="settings-section-title">下一個差異</h4>
-        <div class="settings-prefs" id="settings-nav-prefs">
-          <label class="settings-check">
-            <input type="checkbox" id="chk-nav-wrap" />
-            <span>到達結尾時環繞回開頭</span>
-          </label>
-          <label class="settings-check">
-            <input type="checkbox" id="chk-nav-first-on-load" />
-            <span>載入檔案後跳到第一個差異</span>
-          </label>
-          <label class="settings-check">
-            <input type="checkbox" id="chk-nav-next-after-copy" />
-            <span>複製到另一側後前進到下一個差異</span>
-          </label>
-          <label class="settings-check">
-            <input type="checkbox" id="chk-nav-no-diff-message" />
-            <span>顯示「沒有更多差異」訊息</span>
-          </label>
+
+      <div class="options-layout">
+        <div class="options-tabs" id="options-tabs" role="tablist" aria-label="選項分頁">
+          <button class="options-tab options-tab--active" id="options-tab-general" role="tab" data-pane="general" aria-controls="options-pane-general" aria-selected="true">一般</button>
+          <button class="options-tab" id="options-tab-display" role="tab" data-pane="display" aria-controls="options-pane-display" aria-selected="false">顯示</button>
+          <button class="options-tab" id="options-tab-nav" role="tab" data-pane="nav" aria-controls="options-pane-nav" aria-selected="false">下一個差異</button>
+          <button class="options-tab" id="options-tab-backup" role="tab" data-pane="backup" aria-controls="options-pane-backup" aria-selected="false">備份</button>
+          <button class="options-tab" id="options-tab-shortcuts" role="tab" data-pane="shortcuts" aria-controls="options-pane-shortcuts" aria-selected="false">快捷鍵</button>
+          <button class="options-tab" id="options-tab-appearance" role="tab" data-pane="appearance" aria-controls="options-pane-appearance" aria-selected="false">色彩與字型</button>
         </div>
 
-        <h4 class="settings-section-title">儲存前備份</h4>
-        <div class="settings-prefs" id="settings-backup-prefs">
-          <label class="settings-check">
-            <input type="checkbox" id="chk-backup-enabled" />
-            <span>覆寫檔案前先保留原檔備份</span>
-          </label>
-          <label class="settings-field">
-            <span>命名規則：</span>
-            <select id="sel-backup-naming"></select>
-          </label>
-          <label class="settings-field">
-            <span>備份資料夾：</span>
-            <code id="txt-backup-folder" class="settings-path">（與原檔同一資料夾）</code>
-            <button id="btn-backup-folder">選擇…</button>
-            <button id="btn-backup-folder-clear">清除</button>
-          </label>
-          <p class="settings-hint">
-            資料夾必須用「選擇…」挑選：主程序只接受使用者親自授權過的路徑。
-          </p>
-        </div>
+        <div class="modal-body options-body">
+          <!-- 一般 -->
+          <section class="options-pane" id="options-pane-general" role="tabpanel" aria-labelledby="options-tab-general">
+            <h4 class="settings-section-title">外觀主題</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>主題：</span>
+                <select id="sel-theme-mode">
+                  <option value="system">跟隨系統</option>
+                  <option value="light">淺色</option>
+                  <option value="dark">深色</option>
+                </select>
+              </label>
+            </div>
 
-        <h4 class="settings-section-title">自訂快捷鍵</h4>
-        <p style="margin:0 0 8px;color:var(--text-secondary);font-size:12px">
-          點擊 [錄製] 然後按下想要的組合鍵；按 ESC 取消錄製。
-        </p>
-        <div id="settings-shortcuts-list"></div>
-        <div id="settings-modal-status" style="margin-top:8px;color:var(--text-secondary);font-size:12px"></div>
+            <h4 class="settings-section-title">分頁</h4>
+            <div class="settings-prefs">
+              <label class="settings-check">
+                <input type="checkbox" id="chk-confirm-close-tab" />
+                <span>關閉比對分頁前先確認</span>
+              </label>
+            </div>
+
+            <h4 class="settings-section-title">設定匯出 / 匯入</h4>
+            <div class="settings-prefs">
+              <div class="u-row-gap-6">
+                <button id="btn-settings-export">匯出全部設定…</button>
+                <button id="btn-settings-import">匯入設定…</button>
+              </div>
+              <p class="settings-hint">
+                涵蓋快捷鍵、所有偏好、色彩與字型、已命名設定、工作區、Session 與 Session 群組、
+                資料夾欄位。遠端連線設定檔不在其中：密碼由作業系統金鑰庫保管，連密文也不會寫進檔案。
+              </p>
+            </div>
+          </section>
+
+          <!-- 顯示 -->
+          <section class="options-pane" id="options-pane-display" role="tabpanel" aria-labelledby="options-tab-display" hidden>
+            <h4 class="settings-section-title">介面元件</h4>
+            <div class="settings-prefs">
+              <label class="settings-check">
+                <input type="checkbox" id="chk-show-toolbar" />
+                <span>顯示主工具列</span>
+              </label>
+              <label class="settings-check">
+                <input type="checkbox" id="chk-show-statusbar" />
+                <span>顯示狀態列</span>
+              </label>
+              <p class="settings-hint">
+                工具列隱藏後，所有指令仍可從應用程式選單與快捷鍵取得。
+              </p>
+            </div>
+          </section>
+
+          <!-- 下一個差異 -->
+          <section class="options-pane" id="options-pane-nav" role="tabpanel" aria-labelledby="options-tab-nav" hidden>
+            <h4 class="settings-section-title">下一個差異</h4>
+            <div class="settings-prefs" id="settings-nav-prefs">
+              <label class="settings-check">
+                <input type="checkbox" id="chk-nav-wrap" />
+                <span>到達結尾時環繞回開頭</span>
+              </label>
+              <label class="settings-check">
+                <input type="checkbox" id="chk-nav-first-on-load" />
+                <span>載入檔案後跳到第一個差異</span>
+              </label>
+              <label class="settings-check">
+                <input type="checkbox" id="chk-nav-next-after-copy" />
+                <span>複製到另一側後前進到下一個差異</span>
+              </label>
+              <label class="settings-check">
+                <input type="checkbox" id="chk-nav-no-diff-message" />
+                <span>顯示「沒有更多差異」訊息</span>
+              </label>
+            </div>
+          </section>
+
+          <!-- 備份 -->
+          <section class="options-pane" id="options-pane-backup" role="tabpanel" aria-labelledby="options-tab-backup" hidden>
+            <h4 class="settings-section-title">儲存前備份</h4>
+            <div class="settings-prefs" id="settings-backup-prefs">
+              <label class="settings-check">
+                <input type="checkbox" id="chk-backup-enabled" />
+                <span>覆寫檔案前先保留原檔備份</span>
+              </label>
+              <label class="settings-field">
+                <span>命名規則：</span>
+                <select id="sel-backup-naming"></select>
+              </label>
+              <label class="settings-field">
+                <span>備份資料夾：</span>
+                <code id="txt-backup-folder" class="settings-path">（與原檔同一資料夾）</code>
+                <button id="btn-backup-folder">選擇…</button>
+                <button id="btn-backup-folder-clear">清除</button>
+              </label>
+              <p class="settings-hint">
+                資料夾必須用「選擇…」挑選：主程序只接受使用者親自授權過的路徑。
+              </p>
+            </div>
+          </section>
+
+          <!-- 快捷鍵 -->
+          <section class="options-pane" id="options-pane-shortcuts" role="tabpanel" aria-labelledby="options-tab-shortcuts" hidden>
+            <h4 class="settings-section-title">自訂快捷鍵</h4>
+            <p class="settings-hint">點擊 [錄製] 然後按下想要的組合鍵；按 ESC 取消錄製。</p>
+            <div id="settings-shortcuts-list"></div>
+          </section>
+
+          <!-- 色彩與字型 -->
+          <section class="options-pane" id="options-pane-appearance" role="tabpanel" aria-labelledby="options-tab-appearance" hidden>
+            <h4 class="settings-section-title">差異色彩</h4>
+            <p class="settings-hint" id="colors-theme-hint"></p>
+            <div class="options-colors" id="options-colors"></div>
+
+            <h4 class="settings-section-title">字型</h4>
+            <div class="settings-prefs">
+              <label class="settings-field">
+                <span>介面字型：</span>
+                <input type="text" id="inp-font-ui" class="u-config-input" placeholder="（預設）例：Segoe UI, sans-serif" />
+              </label>
+              <label class="settings-field">
+                <span>比對窗格字型：</span>
+                <input type="text" id="inp-font-mono" class="u-config-input" placeholder="（預設）例：Consolas, monospace" />
+              </label>
+              <label class="settings-field">
+                <span>介面字型大小：</span>
+                <input type="number" id="inp-font-ui-size" min="10" max="22" step="1" class="u-size-input" />
+                <span>px</span>
+              </label>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <span id="settings-modal-status" class="u-modal-status u-push-right-status"></span>
+        <button id="btn-settings-reset" class="danger">恢復此頁預設值</button>
+        <button id="btn-settings-modal-cancel">關閉</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- P2-28: print preview — the report is shown before the print dialog opens. -->
+  <div id="print-preview-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="print-preview-title" style="display:none">
+    <div class="modal-box modal-box--preview">
+      <div class="modal-header">
+        <h3 id="print-preview-title">列印預覽</h3>
+        <button id="btn-print-preview-close" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body print-preview-body">
+        <div id="print-preview-view" class="settings-hint"></div>
+        <!-- sandbox without allow-scripts: the report is static markup, and the
+             frame must not be able to run anything even if that changes. -->
+        <iframe id="print-preview-frame" class="print-preview-frame" title="列印預覽內容"
+                sandbox="allow-same-origin allow-modals"></iframe>
+        <div id="print-preview-status" class="u-modal-status"></div>
       </div>
       <div class="modal-footer">
-        <button id="btn-settings-reset" class="danger">恢復預設</button>
-        <button id="btn-settings-modal-cancel">關閉</button>
+        <button id="btn-print-preview-window">在新視窗開啟</button>
+        <button id="btn-print-preview-print">列印…</button>
+        <button id="btn-print-preview-cancel">關閉</button>
       </div>
     </div>
   </div>

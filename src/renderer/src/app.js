@@ -14,8 +14,13 @@ import { setActiveView } from './core/active-view.js'
 import {
   SettingsStore,
   DEFAULT_SHORTCUTS,
+  DEFAULT_FONTS,
   BACKUP_NAMING_OPTIONS,
+  COLOR_TOKENS,
+  PREF_PAGES,
+  applySettingsBundle,
   eventToCombo,
+  exportSettingsJSON,
   findShortcutConflicts,
   keyComboMatches,
 } from './core/settings-store.js'
@@ -226,11 +231,14 @@ const SOURCE_LABELS = Object.freeze({
 // ---------------------------------------------------------------------------
 export function initApp() {
   setupTheme()
+  applyAppearance()
+  applyDisplayPrefs()
   setupViewSwitching()
   setupToolbarButtons()
   setupPathBarButtons()
   setupMenuActions()
   setupSettingsModal()
+  setupPrintPreview()
   setupDragAndDrop()
   setupKeyboardShortcuts()
   renderRecentSessions(openSession, removeSession)
@@ -771,6 +779,10 @@ function _handleActivateTab(id, force = false) {
 function _handleCloseTab(id) {
   // S14-M03: dispose the matching view if it has no more open tabs of its type.
   const closing = tabMgr.tabs.find(t => t.id === id)
+  if (settings.getPref('confirmOnCloseTab') && closing
+      && !window.confirm(`關閉「${closing.title}」？`)) {
+    return
+  }
   const nextTab = tabMgr.closeTab(id)
   _disposeViewIfUnused(closing?.type ?? '')
   if (nextTab) {
@@ -916,8 +928,8 @@ function setupToolbarButtons() {
     closeIgnoreRulesModal()
   })
 
-  // T62: Print / PDF export
-  el('btn-print-report')?.addEventListener('click', () => void printActiveReport())
+  // T62 / P2-28: print goes through the preview, not straight to the dialog.
+  el('btn-print-report')?.addEventListener('click', openPrintPreview)
 
   // T61: Session Settings Dialog (Named Configs)
   el('btn-config-modal')?.addEventListener('click', openConfigModal)
@@ -1072,6 +1084,113 @@ async function printActiveReport() {
   } catch (err) {
     showError(`列印報告失敗：${err?.message ?? err}`, err)
   }
+}
+
+// ---------------------------------------------------------------------------
+// P2-28: print preview
+// ---------------------------------------------------------------------------
+
+/**
+ * Blob URL backing the preview frame. Held so it can be revoked; leaving one
+ * per preview alive pins the whole report in memory for the session.
+ * @type {string}
+ */
+let _printPreviewUrl = ''
+
+function _revokePrintPreviewUrl() {
+  if (!_printPreviewUrl) return
+  URL.revokeObjectURL(_printPreviewUrl)
+  _printPreviewUrl = ''
+}
+
+/**
+ * @param {string} msg
+ * @param {boolean} [isError]
+ */
+function _setPrintPreviewStatus(msg, isError = false) {
+  const node = el('print-preview-status')
+  if (node) node.textContent = msg
+  if (isError && msg) showError(msg)
+}
+
+/**
+ * Show the report that would be printed, before opening the print dialog.
+ *
+ * Every view's print command routes through here, so what the user sees is
+ * the same document that reaches the printer rather than a second rendering.
+ */
+function openPrintPreview() {
+  const overlay = el('print-preview-modal')
+  const frame = el('print-preview-frame')
+  const src = _activeReportSource()
+
+  if (!(src.html || src.htmlFallback)) {
+    showStatus('目前視圖不支援列印報告')
+    return
+  }
+  if (!overlay || !(frame instanceof HTMLIFrameElement)) {
+    void printActiveReport()
+    return
+  }
+  if (!src.html) {
+    // The view can print but cannot hand over the HTML, so there is nothing to
+    // preview. Say so rather than showing an empty frame.
+    showStatus('目前視圖無法產生預覽，直接開啟列印')
+    void printActiveReport()
+    return
+  }
+
+  let html
+  try {
+    html = src.view.buildHtmlReport()
+  } catch (err) {
+    showError(`建立列印預覽失敗：${err instanceof Error ? err.message : String(err)}`, err)
+    return
+  }
+
+  _revokePrintPreviewUrl()
+  _printPreviewUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }))
+  frame.src = _printPreviewUrl
+
+  const label = el('print-preview-view')
+  if (label) label.textContent = `目前視圖：${REPORT_VIEW_LABELS[currentView] ?? currentView}`
+  _setPrintPreviewStatus('')
+  overlay.style.display = 'flex'
+}
+
+function closePrintPreview() {
+  const overlay = el('print-preview-modal')
+  if (overlay) overlay.style.display = 'none'
+  const frame = el('print-preview-frame')
+  if (frame instanceof HTMLIFrameElement) frame.removeAttribute('src')
+  _revokePrintPreviewUrl()
+}
+
+function setupPrintPreview() {
+  el('btn-print-preview-close')?.addEventListener('click', closePrintPreview)
+  el('btn-print-preview-cancel')?.addEventListener('click', closePrintPreview)
+
+  el('btn-print-preview-print')?.addEventListener('click', () => {
+    const frame = el('print-preview-frame')
+    if (!(frame instanceof HTMLIFrameElement) || !frame.contentWindow) {
+      _setPrintPreviewStatus('預覽尚未載入完成，無法列印', true)
+      return
+    }
+    try {
+      frame.contentWindow.focus()
+      frame.contentWindow.print()
+    } catch (err) {
+      _setPrintPreviewStatus(
+        `列印失敗：${err instanceof Error ? err.message : String(err)}`, true)
+    }
+  })
+
+  // Kept as an escape hatch: if the frame cannot render the report, the user
+  // still has the path that worked before the preview existed.
+  el('btn-print-preview-window')?.addEventListener('click', () => {
+    closePrintPreview()
+    void printActiveReport()
+  })
 }
 
 async function runReportAction(action) {
@@ -1634,10 +1753,9 @@ function setupKeyboardShortcuts() {
       if (active) _handleCloseTab(active.id)
     },
     fullscreen: () => { void window.electronAPI?.toggleFullScreen?.() },
-    print: () => {
-      if (currentView === 'text') void textCompare?.exportHtml({ print: true })
-      else if (currentView === 'folder') void folderCompare?.exportHtml({ print: true })
-    },
+    // P2-28: one preview for every view, instead of two hardcoded branches
+    // that silently did nothing anywhere else.
+    print: () => openPrintPreview(),
   }
 
   document.addEventListener('keydown', (e) => {
@@ -2363,7 +2481,15 @@ function setupMenuActions() {
       if (currentView === 'text') void textCompare?.exportUnifiedDiff()
       else showStatus('Unified Diff 僅適用於文字比對')
     },
-    'file.print': () => void printActiveReport(),
+    'file.print': () => openPrintPreview(),
+    // Wired ahead of the menu entries so main/menu.js can add Tools ▸ Options…
+    // and the two settings-transfer items without a second round trip.
+    'file.printPreview': () => openPrintPreview(),
+    'tools.options': () => el('btn-settings-modal')?.click(),
+    'tools.settings.export': () => el('btn-settings-export')?.click(),
+    'tools.settings.import': () => el('btn-settings-import')?.click(),
+    'view.toggleToolbar': () => _toggleChromePref('showToolbar', '工具列'),
+    'view.toggleStatusBar': () => _toggleChromePref('showStatusBar', '狀態列'),
 
     'edit.undo': () => { if (currentView === 'text') textCompare?.undo() },
     'edit.redo': () => { if (currentView === 'text') textCompare?.redo() },
@@ -2529,6 +2655,8 @@ function setupSettingsModal() {
   }
 
   const renderPrefs = setupPreferenceControls(setStatus)
+  const renderAppearance = setupAppearanceControls(setStatus)
+  const selectPane = setupOptionsTabs()
 
   function render() {
     list.replaceChildren()
@@ -2613,16 +2741,239 @@ function setupSettingsModal() {
     }
   }
 
-  const open = () => { render(); renderPrefs(); setStatus(''); modal.style.display = 'flex' }
+  const refreshAll = () => { render(); renderPrefs(); renderAppearance() }
+  const open = () => { refreshAll(); setStatus(''); modal.style.display = 'flex' }
   const close = () => { stopRecording(); modal.style.display = 'none' }
 
   el('btn-settings-modal')?.addEventListener('click', open)
   el('btn-settings-modal-close')?.addEventListener('click', close)
   el('btn-settings-modal-cancel')?.addEventListener('click', close)
+
+  // Reset is scoped to the visible page. A single button that wiped every page
+  // would be the one control in the dialog whose blast radius is invisible.
   el('btn-settings-reset')?.addEventListener('click', () => {
-    settings.reset()
-    render()
-    setStatus('已恢復預設')
+    const pane = selectPane()
+    if (pane === 'shortcuts') {
+      settings.reset()
+      setStatus('快捷鍵已恢復預設')
+    } else if (pane === 'appearance') {
+      settings.resetAppearance()
+      applyAppearance()
+      setStatus('色彩與字型已恢復預設')
+    } else if (pane === 'general') {
+      settings.resetPrefs(PREF_PAGES.general)
+      setThemeMode('system')
+      setStatus('一般設定已恢復預設')
+    } else {
+      settings.resetPrefs(PREF_PAGES[pane] ?? [])
+      applyDisplayPrefs()
+      setStatus('本頁設定已恢復預設')
+    }
+    refreshAll()
+  })
+
+  setupSettingsTransfer(setStatus, refreshAll)
+}
+
+/**
+ * Wire the Options tab strip.
+ *
+ * @returns {() => string} the id of the page currently shown
+ */
+function setupOptionsTabs() {
+  const strip = el('options-tabs')
+  let current = 'general'
+  if (!strip) return () => current
+
+  /** @type {HTMLButtonElement[]} */
+  const tabs = [...strip.querySelectorAll('.options-tab')]
+
+  /** @param {string} pane */
+  const show = (pane) => {
+    current = pane
+    for (const tab of tabs) {
+      const on = tab.dataset.pane === pane
+      tab.classList.toggle('options-tab--active', on)
+      tab.setAttribute('aria-selected', String(on))
+    }
+    for (const section of document.querySelectorAll('.options-pane')) {
+      section.hidden = section.id !== `options-pane-${pane}`
+    }
+  }
+
+  for (const tab of tabs) {
+    tab.addEventListener('click', () => show(tab.dataset.pane ?? 'general'))
+  }
+  show(current)
+  return () => current
+}
+
+/**
+ * Wire the Colors & Fonts page.
+ *
+ * The colour swatches are built from COLOR_TOKENS rather than from markup so
+ * the set of customisable colours has exactly one definition; the *meaning* of
+ * each slot is fixed by the project's colour semantics and is not editable.
+ *
+ * @param {(msg: string) => void} setStatus
+ * @returns {() => void} re-reads the store into the controls
+ */
+function setupAppearanceControls(setStatus) {
+  const grid = el('options-colors')
+  const hint = el('colors-theme-hint')
+  const inpUi = el('inp-font-ui')
+  const inpMono = el('inp-font-mono')
+  const inpSize = el('inp-font-ui-size')
+
+  /** @returns {'light'|'dark'} */
+  const activeTheme = () => (document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light')
+
+  /**
+   * The value a swatch should show: the user's override if there is one, else
+   * whatever the stylesheet currently resolves the token to.
+   *
+   * @param {string} cssVar
+   * @param {string | undefined} override
+   * @returns {string}
+   */
+  const swatchValue = (cssVar, override) => {
+    if (override) return override
+    const computed = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim()
+    return /^#[0-9a-f]{6}$/i.test(computed) ? computed.toLowerCase() : '#000000'
+  }
+
+  const refresh = () => {
+    const { colors, fonts } = settings.getAppearance()
+    const theme = activeTheme()
+    const overrides = colors[theme] ?? {}
+
+    if (hint) {
+      hint.textContent = `目前編輯的是「${theme === 'dark' ? '深色' : '淺色'}」主題的色彩；`
+        + '另一個主題有自己的一組色彩。語意固定，可自訂的是色值。'
+    }
+
+    if (grid) {
+      grid.replaceChildren()
+      for (const token of COLOR_TOKENS) {
+        const label = document.createElement('span')
+        label.className = 'color-label'
+        label.textContent = token.label
+
+        const input = document.createElement('input')
+        input.type = 'color'
+        input.id = `color-${token.key}`
+        input.value = swatchValue(token.cssVar, overrides[token.key])
+        input.title = token.cssVar
+
+        const value = document.createElement('code')
+        value.className = 'color-value'
+        value.textContent = overrides[token.key] ? input.value : '（預設）'
+
+        input.addEventListener('input', () => {
+          if (!settings.setColor(activeTheme(), token.key, input.value)) {
+            setStatus(`色彩值 ${input.value} 無法使用`)
+            return
+          }
+          applyAppearance()
+          value.textContent = input.value
+          setStatus(`已更新「${token.label}」`)
+        })
+
+        grid.append(label, input, value)
+      }
+    }
+
+    if (inpUi instanceof HTMLInputElement) inpUi.value = fonts.ui
+    if (inpMono instanceof HTMLInputElement) inpMono.value = fonts.mono
+    if (inpSize instanceof HTMLInputElement) inpSize.value = String(fonts.uiSize)
+  }
+
+  /**
+   * @param {HTMLElement | null} node
+   * @param {'ui'|'mono'} name
+   * @param {string} label
+   */
+  const wireFont = (node, name, label) => {
+    if (!(node instanceof HTMLInputElement)) return
+    node.addEventListener('change', () => {
+      if (settings.setFontFamily(name, node.value)) {
+        applyAppearance()
+        setStatus(node.value.trim() ? `已套用${label}` : `${label}已回到預設`)
+      } else {
+        setStatus(`${label}字型設定無效（不可含 ; { } < > 或 url()）`)
+        refresh()
+      }
+    })
+  }
+  wireFont(inpUi, 'ui', '介面字型')
+  wireFont(inpMono, 'mono', '比對窗格字型')
+  _refreshAppearanceControls = refresh
+
+  if (inpSize instanceof HTMLInputElement) {
+    inpSize.addEventListener('change', () => {
+      const stored = settings.setUiFontSize(inpSize.value)
+      inpSize.value = String(stored)
+      applyAppearance()
+      setStatus(`介面字型大小：${stored}px`)
+    })
+  }
+
+  return refresh
+}
+
+// ---------------------------------------------------------------------------
+// P2-38: export / import of every stored setting
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire the two buttons on the General page.
+ *
+ * @param {(msg: string) => void} setStatus
+ * @param {() => void} refreshAll  re-reads every control after an import
+ */
+function setupSettingsTransfer(setStatus, refreshAll) {
+  el('btn-settings-export')?.addEventListener('click', async () => {
+    try {
+      const json = exportSettingsJSON()
+      const saved = await window.electronAPI.saveFile('mycompare-settings.json', json,
+        [{ name: 'JSON', extensions: ['json'] }, { name: '所有檔案', extensions: ['*'] }])
+      setStatus(saved ? `設定已匯出到 ${saved.path ?? ''}` : '已取消匯出')
+    } catch (err) {
+      const msg = `匯出設定失敗：${err instanceof Error ? err.message : String(err)}`
+      setStatus(msg)
+      showError(msg, err)
+    }
+  })
+
+  el('btn-settings-import')?.addEventListener('click', async () => {
+    try {
+      const picked = await window.electronAPI.openFile?.({
+        filters: [{ name: 'JSON', extensions: ['json'] }, { name: '所有檔案', extensions: ['*'] }],
+      })
+      if (!picked?.content) return
+
+      const result = applySettingsBundle(picked.content)
+      if (result.legacySessions) {
+        // A pre-bundle export contained sessions only; hand it to the store
+        // that knows how to validate each record.
+        const { imported, skipped } = store.importJSON(picked.content)
+        setStatus(`舊版 Sessions 匯出檔：匯入 ${imported} 個，跳過 ${skipped} 個`)
+        renderRecentSessions(openSession, removeSession)
+        return
+      }
+
+      applyAppearance()
+      applyDisplayPrefs()
+      refreshAll()
+      renderRecentSessions(openSession, removeSession)
+      setStatus(`已匯入 ${result.applied.length} 個設定區段；部分設定需重新開啟分頁才會生效`)
+    } catch (err) {
+      // Nothing was written: applySettingsBundle validates before it touches
+      // storage, so the user still has the settings they had.
+      const msg = `匯入設定失敗：${err instanceof Error ? err.message : String(err)}`
+      setStatus(msg)
+      showError(msg, err)
+    }
   })
 }
 
@@ -2638,14 +2989,19 @@ function setupSettingsModal() {
  * @returns {() => void} re-reads the store into the controls
  */
 function setupPreferenceControls(setStatus) {
-  /** @type {Array<[string, 'navWrapAround'|'navFirstDiffOnLoad'|'navNextAfterCopy'|'navShowNoDiffMessage'|'backupOnSave', string]>} */
+  /** @type {Array<[string, 'navWrapAround'|'navFirstDiffOnLoad'|'navNextAfterCopy'|'navShowNoDiffMessage'|'backupOnSave'|'confirmOnCloseTab'|'showToolbar'|'showStatusBar', string]>} */
   const CHECKS = [
     ['chk-nav-wrap',             'navWrapAround',        '環繞'],
     ['chk-nav-first-on-load',    'navFirstDiffOnLoad',   '載入後跳到第一個差異'],
     ['chk-nav-next-after-copy',  'navNextAfterCopy',     '複製後前進'],
     ['chk-nav-no-diff-message',  'navShowNoDiffMessage', '無差異訊息'],
     ['chk-backup-enabled',       'backupOnSave',         '儲存前備份'],
+    ['chk-confirm-close-tab',    'confirmOnCloseTab',    '關閉分頁前確認'],
+    ['chk-show-toolbar',         'showToolbar',          '顯示工具列'],
+    ['chk-show-statusbar',       'showStatusBar',        '顯示狀態列'],
   ]
+
+  const themeSel = el('sel-theme-mode')
 
   const namingSel = el('sel-backup-naming')
   if (namingSel instanceof HTMLSelectElement && namingSel.options.length === 0) {
@@ -2670,6 +3026,7 @@ function setupPreferenceControls(setStatus) {
       namingSel.disabled = !backup.enabled
     }
     if (folderEl) folderEl.textContent = backup.folder || '（與原檔同一資料夾）'
+    if (themeSel instanceof HTMLSelectElement) themeSel.value = getThemeMode()
   }
 
   for (const [id, pref, label] of CHECKS) {
@@ -2677,8 +3034,17 @@ function setupPreferenceControls(setStatus) {
     if (!(node instanceof HTMLInputElement)) continue
     node.addEventListener('change', () => {
       settings.setPref(pref, node.checked)
+      applyDisplayPrefs()
       refresh()
       setStatus(`${label}：${node.checked ? '開啟' : '關閉'}`)
+    })
+  }
+
+  if (themeSel instanceof HTMLSelectElement) {
+    themeSel.addEventListener('change', () => {
+      const mode = themeSel.value
+      setThemeMode(mode === 'light' || mode === 'dark' ? mode : 'system')
+      setStatus(`主題：${themeSel.selectedOptions[0]?.textContent ?? mode}`)
     })
   }
 
@@ -2744,6 +3110,7 @@ function initSystemTheme() {
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
     if (!localStorage.getItem('mycompare:theme')) {
       document.documentElement.dataset.theme = e.matches ? 'dark' : 'light'
+      applyAppearance()
     }
   })
 }
@@ -2753,9 +3120,104 @@ function setupTheme() {
   el('btn-theme').addEventListener('click', () => {
     const html = document.documentElement
     const next = html.dataset.theme === 'dark' ? 'light' : 'dark'
-    html.dataset.theme = next
-    localStorage.setItem('mycompare:theme', next)  // T20: persist user choice
+    setThemeMode(next)
   })
+}
+
+/**
+ * The theme the user chose, or 'system' when they have not chosen one.
+ *
+ * Kept in `mycompare:theme` rather than in the preferences object because the
+ * inline script in index.html reads it before any module loads, to avoid a
+ * flash of the wrong theme.
+ *
+ * @returns {'system'|'light'|'dark'}
+ */
+function getThemeMode() {
+  const stored = localStorage.getItem('mycompare:theme')
+  return stored === 'light' || stored === 'dark' ? stored : 'system'
+}
+
+/**
+ * @param {'system'|'light'|'dark'} mode
+ */
+function setThemeMode(mode) {
+  const html = document.documentElement
+  if (mode === 'system') {
+    localStorage.removeItem('mycompare:theme')
+    html.dataset.theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  } else {
+    localStorage.setItem('mycompare:theme', mode)
+    html.dataset.theme = mode
+  }
+  // Colour overrides are stored per theme, so the switch has to re-apply them,
+  // and the swatches in an open Options dialog now describe the other theme.
+  applyAppearance()
+  _refreshAppearanceControls()
+}
+
+/**
+ * Re-reads the Colors & Fonts page. Replaced once that page is wired; the
+ * no-op stands in until then and for tests that never open the dialog.
+ * @type {() => void}
+ */
+let _refreshAppearanceControls = () => {}
+
+// ---------------------------------------------------------------------------
+// P2-34: user colours and fonts
+// ---------------------------------------------------------------------------
+
+/**
+ * Push the stored colour and font overrides onto the document.
+ *
+ * Applied as inline custom properties on <html> so that clearing one simply
+ * hands the token back to the stylesheet — there is no "default" value to
+ * duplicate here and keep in step with variables.css.
+ */
+function applyAppearance() {
+  const root = document.documentElement
+  const { colors, fonts } = settings.getAppearance()
+  const theme = root.dataset.theme === 'dark' ? 'dark' : 'light'
+  const active = colors[theme] ?? {}
+
+  for (const token of COLOR_TOKENS) {
+    const value = active[token.key]
+    if (value) root.style.setProperty(token.cssVar, value)
+    else root.style.removeProperty(token.cssVar)
+  }
+
+  if (fonts.ui) root.style.setProperty('--ui-font-family', fonts.ui)
+  else root.style.removeProperty('--ui-font-family')
+
+  if (fonts.mono) root.style.setProperty('--mono-font-family', fonts.mono)
+  else root.style.removeProperty('--mono-font-family')
+
+  if (fonts.uiSize !== DEFAULT_FONTS.uiSize) {
+    root.style.setProperty('--ui-font-size', `${fonts.uiSize}px`)
+  } else {
+    root.style.removeProperty('--ui-font-size')
+  }
+}
+
+/**
+ * Flip one of the Display page's visibility preferences from a menu command.
+ *
+ * @param {'showToolbar'|'showStatusBar'} pref
+ * @param {string} label
+ */
+function _toggleChromePref(pref, label) {
+  const next = settings.getPref(pref) === false
+  settings.setPref(pref, next)
+  applyDisplayPrefs()
+  showStatus(`${label}：${next ? '顯示' : '隱藏'}`)
+}
+
+/** Show or hide the chrome the Display page controls. */
+function applyDisplayPrefs() {
+  const toolbar = el('toolbar')
+  if (toolbar) toolbar.style.display = settings.getPref('showToolbar') === false ? 'none' : ''
+  const statusbar = el('statusbar')
+  if (statusbar) statusbar.style.display = settings.getPref('showStatusBar') === false ? 'none' : ''
 }
 
 // ---------------------------------------------------------------------------

@@ -114,6 +114,8 @@ export function buildAppMenu(win) {
         item('開啟左側…', 'file.openLeft'),
         item('開啟右側…', 'file.openRight'),
         { type: 'separator' },
+        item('列印預覽…', 'file.printPreview'),
+        { type: 'separator' },
         item('開啟封存檔（左側）…', 'file.openArchiveLeft'),
         item('開啟封存檔（右側）…', 'file.openArchiveRight'),
         { type: 'separator' },
@@ -213,6 +215,9 @@ export function buildAppMenu(win) {
     {
       label: '檢視(&V)',
       submenu: [
+        item('顯示工具列', 'view.toggleToolbar'),
+        item('顯示狀態列', 'view.toggleStatusBar'),
+        { type: 'separator' },
         item('顯示全部', 'view.showAll'),
         item('只顯示差異', 'view.showDiff'),
         item('只顯示相同', 'view.showSame'),
@@ -252,9 +257,14 @@ export function buildAppMenu(win) {
     {
       label: '工具(&T)',
       submenu: [
+        item('選項…', 'tools.options'),
+        { type: 'separator' },
         item('比對規則（忽略設定）…', 'tools.ignoreRules'),
         item('已命名設定…', 'tools.namedConfigs'),
         item('自訂快捷鍵…', 'tools.shortcuts'),
+        { type: 'separator' },
+        item('匯出全部設定…', 'tools.settings.export'),
+        item('匯入設定…', 'tools.settings.import'),
         { type: 'separator' },
         {
           label: '比對演算法',

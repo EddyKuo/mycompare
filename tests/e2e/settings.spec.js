@@ -8,6 +8,24 @@
 import { test, expect } from '@playwright/test'
 import { launchApp, closeApp } from './helpers/electron-app.js'
 
+/**
+ * Open Tools ▸ Options and select a page.
+ *
+ * The dialog became tabbed (P2-24), so a control is only actionable once its
+ * page is showing.
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {string} pane
+ */
+async function openOptions(page, pane) {
+  const modal = page.locator('#settings-modal')
+  if (!(await modal.isVisible())) await page.locator('#btn-settings-modal').click()
+  await expect(modal).toBeVisible()
+  await page.locator(`#options-tab-${pane}`).click()
+  await expect(page.locator(`#options-pane-${pane}`)).toBeVisible()
+}
+
+
 /** @type {import('@playwright/test').ElectronApplication} */
 let app
 /** @type {import('@playwright/test').Page} */
@@ -28,8 +46,7 @@ test.beforeEach(async () => {
 })
 
 test('the shortcuts modal lists bindings instead of being empty', async () => {
-  await win.locator('#btn-settings-modal').click()
-  await expect(win.locator('#settings-modal')).toBeVisible()
+  await openOptions(win, 'shortcuts')
 
   const rows = win.locator('#settings-shortcuts-list .settings-row')
   await expect(rows.first()).toBeVisible()
@@ -40,7 +57,7 @@ test('the shortcuts modal lists bindings instead of being empty', async () => {
 })
 
 test('clearing a binding persists', async () => {
-  await win.locator('#btn-settings-modal').click()
+  await openOptions(win, 'shortcuts')
   const row = win.locator('#settings-shortcuts-list .settings-row').first()
   await row.getByText('清除').click()
 
@@ -53,7 +70,7 @@ test('clearing a binding persists', async () => {
 })
 
 test('reset restores the defaults', async () => {
-  await win.locator('#btn-settings-modal').click()
+  await openOptions(win, 'shortcuts')
   await win.locator('#settings-shortcuts-list .settings-row').first().getByText('清除').click()
   await win.locator('#btn-settings-reset').click()
 
@@ -85,7 +102,7 @@ test('a rebound key drives the action', async () => {
 })
 
 test('every shortcut action shown in the modal has a default binding', async () => {
-  await win.locator('#btn-settings-modal').click()
+  await openOptions(win, 'shortcuts')
 
   const rows = await win.evaluate(() =>
     [...document.querySelectorAll('#settings-shortcuts-list .settings-row')]
@@ -116,7 +133,7 @@ test('Ctrl+P still reaches the print action', async () => {
   })
   // Defaults are only materialised once something is written; read through the
   // rendered modal instead, which merges defaults in.
-  await win.locator('#btn-settings-modal').click()
+  await openOptions(win, 'shortcuts')
   const shown = await win.evaluate(() =>
     [...document.querySelectorAll('#settings-shortcuts-list .settings-row')]
       .some((r) => r.querySelector('.settings-row-combo')?.textContent === 'Ctrl+P'))
