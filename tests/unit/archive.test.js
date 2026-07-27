@@ -377,12 +377,20 @@ describe('detectFormat', () => {
 
   it.each([
     ['7z', Buffer.from('377abcaf271c0004', 'hex')],
-    ['rar', Buffer.from('Rar!\x1a\x07\x00')],
   ])('reports %s as unsupported', (_label, buf) => {
     // These need a decoder Node does not ship and that would take a
     // dependency; saying so beats failing as "unrecognised".
     const err = grab(() => detectFormat('/x/a.bin', buf))
     expect(err.code).toBe('unsupported')
+  })
+
+  it('routes both RAR container generations to the rar reader', () => {
+    // RAR 4 used to be refused here on the grounds that no RAR 4 could be
+    // produced or validated on this machine. That was wrong — 7-Zip reads both
+    // generations — so both now route to the reader, which refuses the
+    // proprietary *compression* by name at extraction instead. See rar.js.
+    expect(detectFormat('/x/a.rar', Buffer.from('Rar!\x1a\x07\x00'))).toBe('rar')
+    expect(detectFormat('/x/b.rar', Buffer.from('Rar!\x1a\x07\x01\x00'))).toBe('rar')
   })
 
   it('reports unknown content as unsupported', () => {
@@ -510,15 +518,16 @@ describe('readArchive / readArchiveEntry', () => {
     expect(err.code).toBe('limit')
   })
 
-  it('refuses an unsupported container', async () => {
-    // RAR is the remaining one: proprietary, with no specification anyone may
-    // reimplement, so it can only ever be reported by name.
+  it('reports a RAR signature followed by garbage as corrupt, not as an empty archive', async () => {
+    // Both RAR container generations are read now, so this is no longer an
+    // "unsupported format" case — it is a RAR 4 signature with nothing behind
+    // it, which must fail loudly rather than list zero entries.
     const p = put('x.rar', Buffer.concat([
       Buffer.from('526172211a0700', 'hex'), Buffer.alloc(64),
     ]))
     const err = await grabAsync(() => readArchive(p))
-    expect(err.code).toBe('unsupported')
-    expect(err.message).toMatch(/RAR/i)
+    expect(err.code).toBe('corrupt')
+    expect(err.message).toMatch(/rar/i)
   })
 
   it('treats a damaged bzip2 payload as corrupt, not unsupported', async () => {

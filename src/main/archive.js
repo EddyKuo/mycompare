@@ -479,22 +479,11 @@ export function detectFormat(filePath, buf) {
   if (isXz(buf)) return /\.(txz|tar\.xz)$/i.test(filePath) ? 'tar.xz' : 'xz'
   if (is7z(buf)) return '7z'
   if (isCab(buf)) return 'cab'
-  // RAR 5 stored entries are read in-tree; the compressed methods refuse
-  // themselves by name from inside rar.js, at extraction, so a listing still
-  // shows the user what the archive holds instead of an empty folder.
-  //
-  // RAR 4 is a different container generation and is refused here, at the
-  // earliest point: nothing on this machine can produce one, so a parser for
-  // it could only be graded by its own author's reading of the spec.
-  const rar = rarGeneration(buf)
-  if (rar === 'rar4') {
-    throw new ArchiveError(
-      'RAR 4（含）以前的封存格式與 RAR 5 的容器結構不同，本版本不支援；'
-      + '請以 RAR 5 格式重新封存',
-      'unsupported',
-    )
-  }
-  if (rar === 'rar5') return 'rar'
+  // Stored entries of both container generations are read in-tree; the
+  // compressed methods refuse themselves by name from inside rar.js, at
+  // extraction, so a listing still shows the user what the archive holds
+  // instead of an empty folder.
+  if (rarGeneration(buf) !== null) return 'rar'
   // ustar magic sits at 257; older v7 tars have none, so fall back to the
   // header checksum, which is what actually proves it is a tar.
   if (buf.length >= TAR_BLOCK && (readString(buf, 257, 5) === 'ustar' || tarChecksumValid(buf.subarray(0, TAR_BLOCK)))) {
