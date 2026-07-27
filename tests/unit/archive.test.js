@@ -439,10 +439,14 @@ describe('readArchive / readArchiveEntry', () => {
   })
 
   it('refuses an unsupported container', async () => {
-    const p = put('x.7z', Buffer.concat([Buffer.from('377abcaf271c0004', 'hex'), Buffer.alloc(32)]))
+    // RAR is the remaining one: proprietary, with no specification anyone may
+    // reimplement, so it can only ever be reported by name.
+    const p = put('x.rar', Buffer.concat([
+      Buffer.from('526172211a0700', 'hex'), Buffer.alloc(64),
+    ]))
     const err = await grabAsync(() => readArchive(p))
     expect(err.code).toBe('unsupported')
-    expect(err.message).toMatch(/7z/)
+    expect(err.message).toMatch(/RAR/i)
   })
 
   it('treats a damaged bzip2 payload as corrupt, not unsupported', async () => {
@@ -598,5 +602,69 @@ describe('xz archives', () => {
     const p = write('bad.tar.xz', bad)
     const err = await grabAsync(() => readArchive(p))
     expect(['corrupt', 'limit']).toContain(err.code)
+  })
+})
+
+// ── 7z ──────────────────────────────────────────────────────────────────────
+
+describe('7z archives', () => {
+  /** @type {string} */
+  let szDir
+
+  // py7zr defaults: BCJ (x86) chained into LZMA2.
+  // { 'a.txt': b'alpha', 'dir/b.txt': b'beta'*10 }
+  const SEVENZ = Buffer.from('N3q8ryccAASTGdj5hQAAAAAAAAAUAAAAAAAAAOLkB/PgACwADl0AMJsKZySQyTQ/qfeDeAAA4AB4AGddAACBMweuD89dLwwHsMPaKtdYZKyzeM5U3dvYYcn8sT+oiYa8+2ZJHY8wMx5YUZ1l9ifkTB/N+KP5iXjXIVeR5iEVGehm3ss/DFKfyxCUq8S8j4kJ3kp4Ncw2bvJoS1HKfRRGT60AAAAAFwYWAQlvAAcLAQABISEBGAx5AAA=', 'base64')
+
+  beforeAll(() => { szDir = mkdtempSync(join(tmpdir(), 'mycompare-7z-')) })
+  afterAll(() => { rmSync(szDir, { recursive: true, force: true }) })
+
+  /** @param {string} name @param {Buffer} data */
+  const write = (name, data) => {
+    const p = join(szDir, name)
+    writeFileSync(p, data)
+    return p
+  }
+
+  it('lists a 7z archive', async () => {
+    const p = write('a.7z', SEVENZ)
+    const { format, entries } = await readArchive(p)
+    expect(format).toBe('7z')
+    expect(entries.map((e) => e.path.split('::')[1]).sort())
+      .toEqual(['a.txt', 'dir/b.txt'])
+  })
+
+  it('reads entries out of a 7z archive', async () => {
+    const p = write('b.7z', SEVENZ)
+    expect((await readArchiveEntry(p, 'a.txt')).toString()).toBe('alpha')
+    expect((await readArchiveEntry(p, 'dir/b.txt')).toString()).toBe('beta'.repeat(10))
+  })
+
+  it('reports a missing entry', async () => {
+    const p = write('c.7z', SEVENZ)
+    const err = await grabAsync(() => readArchiveEntry(p, 'nope.txt'))
+    expect(err.code).toBe('notfound')
+  })
+
+  it('refuses a traversing entry name', async () => {
+    const p = write('d.7z', SEVENZ)
+    const err = await grabAsync(() => readArchiveEntry(p, '../escape'))
+    expect(err.code).toBe('traversal')
+  })
+
+  it('enforces the size ceiling', async () => {
+    const p = write('e.7z', SEVENZ)
+    const err = await grabAsync(() => readArchive(p, { maxTotalBytes: 8 }))
+    expect(err.code).toBe('limit')
+  })
+
+  it('reports a damaged header rather than returning garbage', async () => {
+    // Byte 100 sits in the compressed header, so the damage breaks the decode.
+    // Corruption inside a packed data stream is a different matter: the CRCs
+    // that would catch it are read but not verified.
+    const bad = Buffer.from(SEVENZ)
+    bad[100] ^= 0xff
+    const p = write('f.7z', bad)
+    const err = await grabAsync(() => readArchive(p))
+    expect(['corrupt', 'limit', 'unsupported']).toContain(err.code)
   })
 })

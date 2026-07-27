@@ -389,7 +389,54 @@ function decodeLzmaChunk(rc, st, out, uncompressedLimit) {
 }
 
 /**
- * Decode a raw LZMA1 stream (the `.lzma` / `LZMA_ALONE` container).
+ * Decode a raw LZMA1 stream whose properties and output size are carried by a
+ * container rather than by a header.
+ *
+ * 7z stores the properties byte in its coder record and the unpacked size in
+ * the folder, so the 13-byte LZMA_ALONE header the other entry point expects
+ * is simply not present.
+ *
+ * @param {Uint8Array} buf
+ * @param {{ props: number, unpackSize?: number, maxBytes?: number }} opts
+ * @returns {Uint8Array}
+ */
+export function decodeLzmaRaw(buf, opts = {}) {
+  const maxBytes = opts.maxBytes ?? 268_435_456
+  const props = opts.props
+  if (typeof props !== 'number' || props >= 9 * 5 * 5) {
+    throw new LzmaError('LZMA 屬性位元組不合法')
+  }
+  const lc = props % 9
+  const lp = Math.floor(props / 9) % 5
+  const pb = Math.floor(props / 45)
+
+  const size = opts.unpackSize
+  const known = Number.isFinite(size) && size >= 0
+  if (known && size > maxBytes) {
+    throw new LzmaError('解壓縮結果超過允許的大小上限')
+  }
+
+  const out = new OutWindow(known ? Math.min(size, maxBytes) : maxBytes)
+  const rc = new RangeDecoder(buf, 0)
+  const st = new LzmaState(lc, lp, pb)
+  decodeLzmaChunk(rc, st, out, known ? size : Infinity)
+  return out.result()
+}
+
+/**
+ * Decode a bare LZMA2 stream whose properties come from a container.
+ *
+ * @param {Uint8Array} buf
+ * @param {{ maxBytes?: number }} [opts]
+ * @returns {Uint8Array}
+ */
+export function decodeLzma2Raw(buf, opts = {}) {
+  return decodeLzma2(buf, 0, opts.maxBytes ?? 268_435_456).data
+}
+
+/**
+ * Decode a raw LZMA1 stream in the `.lzma` / `LZMA_ALONE` container, whose
+ * 13-byte header carries the properties and the output size.
  *
  * @param {Uint8Array} buf
  * @param {{ maxBytes?: number }} [opts]

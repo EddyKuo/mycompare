@@ -19,6 +19,7 @@ import { gunzipSync } from 'zlib'
 
 import { bunzip2, isBzip2, Bzip2Error } from './bzip2.js'
 import { decodeXz, isXz, LzmaError } from './lzma.js'
+import { is7z, parse7z, extract7zEntry, SevenZipError } from './sevenzip.js'
 
 /**
  * @typedef {Object} ArchiveEntry
@@ -37,7 +38,7 @@ import { decodeXz, isXz, LzmaError } from './lzma.js'
  */
 
 /**
- * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'} ArchiveFormat
+ * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'|'7z'} ArchiveFormat
  */
 
 /**
@@ -402,6 +403,28 @@ export function unxz(buf, maxBytes = DEFAULT_LIMITS.maxTotalBytes) {
 }
 
 /**
+ * Run a 7z operation, translating its failures into archive errors so callers
+ * see one error shape whatever the format.
+ *
+ * @template T
+ * @param {() => T} fn
+ * @returns {T}
+ */
+function with7zErrors(fn) {
+  try {
+    return fn()
+  } catch (err) {
+    if (err instanceof SevenZipError) throw new ArchiveError(err.message, err.code === 'encrypted' ? 'unsupported' : err.code)
+    // A 7z folder that blows the ceiling surfaces from the LZMA decoder, so
+    // the reason has to be carried across or it reads as corruption.
+    if (err instanceof LzmaError) {
+      throw new ArchiveError(err.message, /大小上限/.test(err.message) ? 'limit' : 'corrupt')
+    }
+    throw new ArchiveError(`Corrupt 7z archive: ${err instanceof Error ? err.message : err}`, 'corrupt')
+  }
+}
+
+/**
  * Identify the container.
  *
  * Content sniffing wins over the extension because an archive's name is the
@@ -419,9 +442,7 @@ export function detectFormat(filePath, buf) {
   if (isGzip(buf)) return /\.(tgz|tar\.gz)$/i.test(filePath) ? 'tar.gz' : 'gzip'
   if (isBzip2(buf)) return /\.(tbz|tbz2|tar\.bz2)$/i.test(filePath) ? 'tar.bz2' : 'bzip2'
   if (isXz(buf)) return /\.(txz|tar\.xz)$/i.test(filePath) ? 'tar.xz' : 'xz'
-  if (buf.length >= 6 && buf.toString('hex', 0, 6) === '377abcaf271c') {
-    throw new ArchiveError('7z archives are not supported (no built-in decoder)', 'unsupported')
-  }
+  if (is7z(buf)) return '7z'
   if (buf.length >= 4 && buf.toString('ascii', 0, 4) === 'Rar!') {
     throw new ArchiveError('RAR archives are not supported (no built-in decoder)', 'unsupported')
   }
@@ -544,6 +565,27 @@ export async function readArchive(archivePath, limits = {}) {
     entries = parseTar(bunzip(buf, lim.maxTotalBytes), lim).map(stripOffset)
   } else if (format === 'tar.xz') {
     entries = parseTar(unxz(buf, lim.maxTotalBytes), lim).map(stripOffset)
+  } else if (format === '7z') {
+    const parsed = with7zErrors(() => parse7z(buf, { maxBytes: lim.maxTotalBytes }))
+    let total = 0
+    entries = parsed.entries.map((e) => {
+      total += e.size
+      if (e.size > lim.maxEntryBytes) {
+        throw new ArchiveError(`Entry "${e.path}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
+      }
+      if (total > lim.maxTotalBytes) {
+        throw new ArchiveError(`Archive expands past the ${lim.maxTotalBytes} byte limit`, 'limit')
+      }
+      return {
+        path: sanitizeEntryPath(e.path),
+        size: e.size,
+        mtime: e.mtime,
+        isDirectory: e.isDirectory,
+      }
+    })
+    if (entries.length > lim.maxEntries) {
+      throw new ArchiveError(`Archive has more than ${lim.maxEntries} entries`, 'limit')
+    }
   } else {
     const cap = Math.min(lim.maxEntryBytes, lim.maxTotalBytes)
     const inflated = format === 'bzip2' ? bunzip(buf, cap)
@@ -609,6 +651,18 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
       throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
     }
     return Buffer.from(await file.async('nodebuffer'))
+  }
+
+  if (format === '7z') {
+    const parsed = with7zErrors(() => parse7z(buf, { maxBytes: lim.maxTotalBytes }))
+    const hit = parsed.entries.find((e) =>
+      !e.isDirectory && safeName(e.path) === wanted)
+    if (!hit) throw new ArchiveError(`No such entry: ${wanted}`, 'notfound')
+    if (hit.size > lim.maxEntryBytes) {
+      throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
+    }
+    return Buffer.from(with7zErrors(() =>
+      extract7zEntry(buf, parsed, hit.path, { maxBytes: lim.maxTotalBytes })))
   }
 
   if (format === 'gzip' || format === 'bzip2' || format === 'xz') {
