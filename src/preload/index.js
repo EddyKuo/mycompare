@@ -79,6 +79,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setArchiveLimits: (enabled, maxEntryMB) =>
     ipcRenderer.invoke('set-archive-limits', enabled, maxEntryMB),
   openNewWindow: (payload) => ipcRenderer.invoke('open-new-window', payload),
+  dropTabAt: (payload, x, y) => ipcRenderer.invoke('drop-tab-at', payload, x, y),
   onAdoptSession: (cb) => _onChannel('adopt-session', cb),
   setMenuVisibility: (hidden) => ipcRenderer.invoke('set-menu-visibility', hidden),
   printToPdf: (html, suggestedName) => ipcRenderer.invoke('print-to-pdf', html, suggestedName),

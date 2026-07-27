@@ -109,3 +109,81 @@ test('the tab menu offers closing even when windows are unavailable', async () =
   await expect(win.locator('.ctx-item', { hasText: '關閉分頁' })).toBeVisible()
   await win.keyboard.press('Escape')
 })
+
+test('dragging a tab onto another window moves it there', async () => {
+  // BC's other route: drag the tab rather than using the menu. HTML5 DnD
+  // cannot express this — its events never cross a window boundary — so the
+  // gesture is mouse-driven and resolved by main from the release point.
+  await win.evaluate(() => window.electronAPI.openNewWindow(null))
+  await expect.poll(() => app.windows().length, { timeout: 10000 }).toBe(2)
+  const second = app.windows().find((w) => w !== win)
+  await second.waitForLoadState('domcontentloaded')
+  await second.waitForFunction(() => !!window.__testAPI, { timeout: 10000 })
+
+  await win.evaluate(([l, r]) => window.__testAPI.openComparison({
+    type: 'text', leftPath: l, rightPath: r,
+  }), [join(dir, 'left.txt'), join(dir, 'right.txt')])
+  const before = await win.evaluate(() => window.__testAPI.tabs().length)
+
+  // Where the other window actually is on screen, which is the only thing the
+  // drop resolves against.
+  const target = await second.evaluate(() => ({
+    x: window.screenX + Math.floor(window.outerWidth / 2),
+    y: window.screenY + Math.floor(window.outerHeight / 2),
+  }))
+
+  const tab = win.locator('.tab-item--active')
+  const box = await tab.boundingBox()
+  await win.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await win.mouse.down()
+  // Past the threshold, so this is a drag and not a wobbling click.
+  await win.mouse.move(box.x + box.width / 2 + 60, box.y + box.height / 2 + 40, { steps: 8 })
+  await expect(win.locator('.tab-item--dragging')).toHaveCount(1)
+
+  await win.evaluate(([x, y]) => {
+    document.dispatchEvent(new MouseEvent('mouseup', {
+      bubbles: true, screenX: x, screenY: y,
+    }))
+  }, [target.x, target.y])
+  await win.mouse.up()
+
+  await second.waitForFunction(() => {
+    const c = window.__testAPI?.textGetContents?.()
+    return !!c && c.left.includes('alpha')
+  }, { timeout: 10000 })
+
+  await expect.poll(
+    () => win.evaluate(() => window.__testAPI.tabs().length), { timeout: 5000 })
+    .toBe(before - 1)
+
+  await closeExtras()
+})
+
+test('a drag released over its own window keeps the tab', async () => {
+  // The wobbling-click case. Moving a tab to the window it is already in must
+  // be a no-op, not a close.
+  await win.evaluate(([l, r]) => window.__testAPI.openComparison({
+    type: 'text', leftPath: l, rightPath: r,
+  }), [join(dir, 'left.txt'), join(dir, 'right.txt')])
+  const before = await win.evaluate(() => window.__testAPI.tabs().length)
+
+  const here = await win.evaluate(() => ({
+    x: window.screenX + Math.floor(window.outerWidth / 2),
+    y: window.screenY + Math.floor(window.outerHeight / 2),
+  }))
+  const tab = win.locator('.tab-item--active')
+  const box = await tab.boundingBox()
+  await win.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await win.mouse.down()
+  await win.mouse.move(box.x + box.width / 2 + 60, box.y + box.height / 2, { steps: 6 })
+  await win.evaluate(([x, y]) => {
+    document.dispatchEvent(new MouseEvent('mouseup', {
+      bubbles: true, screenX: x, screenY: y,
+    }))
+  }, [here.x, here.y])
+  await win.mouse.up()
+
+  await win.waitForTimeout(300)
+  expect(await win.evaluate(() => window.__testAPI.tabs().length)).toBe(before)
+  expect(app.windows().length).toBe(1)
+})

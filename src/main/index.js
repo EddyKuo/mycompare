@@ -766,6 +766,55 @@ ipcMain.handle('set-mtime', async (_event, filePath, mtime) => {
 let hiddenMenuCommands = []
 
 /**
+ * Finish a tab drag at a screen point: hand the session to whichever window is
+ * under the cursor, or to a new one when the cursor is over none.
+ *
+ * HTML5 drag-and-drop cannot do this. Its events do not cross BrowserWindow
+ * boundaries, so the window being dragged *into* never sees dragover or drop —
+ * the source window holds pointer capture for the whole gesture. What does
+ * work is asking, at mouse-up, which window contains the release point, which
+ * is a question only main can answer.
+ *
+ * Dropping outside every window is the tear-off gesture and deliberately makes
+ * a new one, matching what dragging a tab out of a browser does.
+ *
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @param {object} payload session descriptor
+ * @param {number} x screen coordinate
+ * @param {number} y screen coordinate
+ */
+ipcMain.handle('drop-tab-at', async (event, payload, x, y) => {
+  if (!payload || typeof payload !== 'object') return { moved: false }
+
+  const source = BrowserWindow.fromWebContents(event.sender)
+  const px = Math.round(Number(x))
+  const py = Math.round(Number(y))
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return { moved: false }
+
+  const target = BrowserWindow.getAllWindows().find((w) => {
+    if (w.isDestroyed() || w.isMinimized()) return false
+    const b = w.getBounds()
+    return px >= b.x && px < b.x + b.width && py >= b.y && py < b.y + b.height
+  })
+
+  // Released over its own window: an ordinary click-and-wobble, not a move.
+  if (target && source && target.id === source.id) return { moved: false }
+
+  if (target) {
+    target.webContents.send('adopt-session', payload)
+    target.focus()
+    return { moved: true, newWindow: false }
+  }
+
+  const win = createWindow()
+  buildAppMenu(win, hiddenMenuCommands)
+  win.webContents.once('did-finish-load', () => {
+    if (!win.isDestroyed()) win.webContents.send('adopt-session', payload)
+  })
+  return { moved: true, newWindow: true }
+})
+
+/**
  * Open another top-level window, optionally handing it a session to adopt.
  *
  * BC lets a session live in its own window as well as in a tab, and lets a tab

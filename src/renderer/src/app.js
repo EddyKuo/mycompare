@@ -15,7 +15,7 @@ import { setActiveView } from './core/active-view.js'
 import { prompt as promptDialog } from './core/modal.js'
 import { showContextMenu } from './core/context-menu.js'
 import {
-  canOpenWindows, openNewWindow, moveTabToNewWindow, onAdoptSession,
+  canOpenWindows, openNewWindow, moveTabToNewWindow, onAdoptSession, dropTabAt,
 } from './core/window-manager.js'
 import {
   BUILTIN_GRAMMARS,
@@ -224,9 +224,65 @@ class TabManager {
 
       item.addEventListener('click', () => _handleActivateTab(tab.id))
       item.addEventListener('contextmenu', (e) => _showTabMenu(e, tab))
+      item.addEventListener('mousedown', (e) => _beginTabDrag(e, tab, item))
       tabBar.appendChild(item)
     })
   }
+}
+
+/** How far the pointer must travel before a click becomes a drag. */
+const TAB_DRAG_THRESHOLD_PX = 12
+
+/**
+ * Drag a tab out of this window and into another, or onto the desktop.
+ *
+ * Not HTML5 drag-and-drop: its events do not cross window boundaries, so the
+ * window being dragged into never sees dragover or drop. The source window
+ * holds pointer capture for the whole gesture, which means the only reliable
+ * signal is where the button came back up — and only main can say which window
+ * that point belongs to.
+ *
+ * A threshold keeps an ordinary click from becoming a move; without it a tab
+ * would jump to another window on a slightly unsteady click.
+ *
+ * @param {MouseEvent} e
+ * @param {{ id: string }} tab
+ * @param {HTMLElement} item
+ */
+function _beginTabDrag(e, tab, item) {
+  if (e.button !== 0 || !canOpenWindows()) return
+
+  const startX = e.screenX
+  const startY = e.screenY
+  let dragging = false
+
+  const onMove = (ev) => {
+    if (dragging) return
+    if (Math.abs(ev.screenX - startX) + Math.abs(ev.screenY - startY) < TAB_DRAG_THRESHOLD_PX) return
+    dragging = true
+    item.classList.add('tab-item--dragging')
+  }
+
+  const onUp = async (ev) => {
+    document.removeEventListener('mousemove', onMove, true)
+    document.removeEventListener('mouseup', onUp, true)
+    item.classList.remove('tab-item--dragging')
+    if (!dragging) return
+
+    const state = tabMgr.serialisableTab(tab.id)
+    if (!state) return
+    try {
+      const res = await dropTabAt(state, ev.screenX, ev.screenY)
+      // Only close once the other end has taken it. Closing first would lose
+      // the session outright if the hand-off failed.
+      if (res?.moved) _handleCloseTab(tab.id)
+    } catch (err) {
+      showError(`移動分頁失敗：${err instanceof Error ? err.message : String(err)}`, err)
+    }
+  }
+
+  document.addEventListener('mousemove', onMove, true)
+  document.addEventListener('mouseup', onUp, true)
 }
 
 /**

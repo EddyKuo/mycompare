@@ -65,6 +65,27 @@ export async function moveTabToNewWindow(tabState) {
 }
 
 /**
+ * Finish a tab drag at a screen point.
+ *
+ * The renderer cannot tell which window is under the cursor — it does not know
+ * where its own window sits on the desktop, let alone anyone else's — so the
+ * point goes to main, which owns the window list. Released over another
+ * window, the session moves there; released over no window at all, it tears
+ * off into a new one, which is what dragging a tab out of a browser does.
+ *
+ * @param {object} tabState
+ * @param {number} screenX
+ * @param {number} screenY
+ * @returns {Promise<{moved: boolean, newWindow?: boolean}>}
+ */
+export async function dropTabAt(tabState, screenX, screenY) {
+  if (typeof window.electronAPI?.dropTabAt !== 'function' || !tabState) {
+    return { moved: false }
+  }
+  return await window.electronAPI.dropTabAt(tabState, screenX, screenY) ?? { moved: false }
+}
+
+/**
  * Subscribe to a session handed over by whichever window opened this one.
  *
  * Main sends it once this window reports `did-finish-load`; anything sent

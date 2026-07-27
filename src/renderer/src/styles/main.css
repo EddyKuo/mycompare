@@ -608,6 +608,15 @@ body {
 
 .tab-item:hover { background: var(--bg-toolbar); }
 
+/* Dragging a tab towards another window. Feedback matters here because the
+   drop target is a different window entirely — without it there is no sign
+   the gesture has started until the tab disappears. */
+.tab-item--dragging {
+  opacity: 0.55;
+  outline: 1px dashed var(--accent-color);
+  cursor: grabbing;
+}
+
 .tab-item--active {
   background: var(--bg-primary);
   color: var(--text-primary);
