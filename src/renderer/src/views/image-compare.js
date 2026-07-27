@@ -1478,6 +1478,68 @@ export class ImageCompare {
     await this._runDiff()
   }
 
+  /**
+   * Blank one pane's canvas and path label.
+   *
+   * Only reachable from swap() with an odd number of images loaded; without it
+   * the canvas keeps showing the image that has just moved to the other pane.
+   *
+   * @param {'left'|'right'} which
+   */
+  _clearSide(which) {
+    const canvas = /** @type {HTMLCanvasElement | undefined} */ (
+      which === 'left' ? this._dom.canvasLeft : this._dom.canvasRight)
+    const ctx = which === 'left' ? this._leftCtx : this._rightCtx
+    if (canvas && ctx) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      canvas.width = 0
+      canvas.height = 0
+    }
+    this._updatePathDisplay(which, '', 0, 0)
+  }
+
+  /**
+   * Exchange the two images.
+   *
+   * The decoded images are swapped directly rather than re-read from disk:
+   * the base64 is dropped after decode, so re-reading would mean two more IPC
+   * round trips and a second decode to reach a state already in memory. It
+   * also means swapping works for an image that arrived by drop and has no
+   * re-readable path.
+   *
+   * @returns {Promise<void>}
+   */
+  async swap() {
+    if (!this._left && !this._right) {
+      this._emit('status', { message: '沒有可交換的圖片', level: 'warn' })
+      return
+    }
+    const left = this._left
+    const right = this._right
+    this._left = right
+    this._right = left
+
+    // A side that is now empty has to be cleared, or the canvas keeps painting
+    // the image that moved to the other pane.
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const loaded = side === 'left' ? this._left : this._right
+      if (loaded) {
+        this._drawImage(side, loaded.img)
+        this._updatePathDisplay(
+          side, loaded.path, loaded.img.naturalWidth, loaded.img.naturalHeight)
+      } else {
+        this._clearSide(side)
+      }
+    }
+
+    this._pendingFirstDiff = true
+    this._emit('paths-changed', {
+      left: this._left?.path ?? '',
+      right: this._right?.path ?? '',
+    })
+    await this._runDiff()
+  }
+
   // ── Reports ────────────────────────────────────────────────────────────────
 
   /**
@@ -1707,6 +1769,16 @@ export class ImageCompare {
     })
     this._dom.thresholdVal = thresholdVal
     toolbar.appendChild(thresholdVal)
+
+    toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
+    const btnSwap = el('button', {
+      className: 'ic-btn ic-btn-swap',
+      textContent: '⇄ 交換',
+      title: '交換左右兩側',
+    })
+    btnSwap.addEventListener('click', () => { void this.swap() })
+    this._dom.btnSwap = btnSwap
+    toolbar.appendChild(btnSwap)
 
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))

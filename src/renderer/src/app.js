@@ -3060,7 +3060,10 @@ function setupMenuActions() {
     'session.remote.open':        () => void openRemoteFolder(),
 
     'session.swap': () => {
-      const view = { text: textCompare, folder: folderCompare, hex: hexCompare, table: tableCompare }[currentView]
+      const view = {
+        text: textCompare, folder: folderCompare, hex: hexCompare,
+        table: tableCompare, image: imageCompare,
+      }[currentView]
       void view?.swap?.()
     },
     'session.recompare':  () => {

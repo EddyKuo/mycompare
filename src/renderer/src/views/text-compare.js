@@ -42,6 +42,15 @@ const VS_ROW_HEIGHT = 20;
 const VS_OVERSCAN = 5;
 
 /**
+ * Virtual path schemes the filesystem actions cannot act on.
+ *
+ * `snapshot://`, `remote://` and `patch://` name things with no file behind
+ * them, and the path validator refuses all of them — so offering Explorer or
+ * Open With for one would be a menu entry that can only produce an error.
+ */
+const SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
  * Display Font choices (BC View | Display Font). Monospace only — the diff
  * panes, the ruler and the gutter all assume a fixed advance width.
  * @type {Array<{ label: string, value: string }>}
@@ -4414,6 +4423,25 @@ ${rows}
     items.push({ label: '換行：→ LF',       action: () => this._convertFile(side, 'to-lf') });
     items.push({ label: '換行：→ CR',       action: () => this._convertFile(side, 'to-cr') });
 
+    // The other five views have offered this since Sprint 16; text was the one
+    // left out, which is why the audit kept flagging it as the last capability
+    // in the app with no entry point.
+    const filePath = side === 'left' ? this._leftPath : this._rightPath;
+    const isReal = filePath && !filePath.includes('::') && !SCHEME_RE.test(filePath);
+    if (isReal) {
+      items.push({ separator: true });
+      items.push({
+        label: '在檔案總管中顯示',
+        action: () => { void this._revealInExplorer(filePath); },
+      });
+      if (typeof window.electronAPI?.openWith === 'function') {
+        items.push({
+          label: '以預設程式開啟',
+          action: () => { void this._openWithDefault(filePath); },
+        });
+      }
+    }
+
     showContextMenu(e, items);
   }
 
@@ -4596,6 +4624,37 @@ ${rows}
    * @param {'left' | 'right'} side
    * @param {'trim' | 'tabs-to-spaces' | 'spaces-to-tabs' | 'to-crlf' | 'to-lf' | 'to-cr'} op
    */
+  /**
+   * Show the file in the OS file manager.
+   *
+   * Virtual paths — archive entries, snapshots, remote objects — are filtered
+   * out by the caller: there is no folder to reveal for them, and the path
+   * validator would refuse the call regardless.
+   *
+   * @param {string} path
+   */
+  async _revealInExplorer(path) {
+    try {
+      await window.electronAPI.showInExplorer(path);
+    } catch (err) {
+      toast(`無法顯示檔案位置：${err?.message ?? err}`, { type: 'error' });
+    }
+  }
+
+  /**
+   * Hand the file to its associated application.
+   * @param {string} path
+   */
+  async _openWithDefault(path) {
+    try {
+      await window.electronAPI.openWith(path, { withPicker: false });
+    } catch (err) {
+      // A refusal from the OS is exactly what the user needs told: nothing
+      // visible happens otherwise.
+      toast(`無法開啟：${err?.message ?? err}`, { type: 'error' });
+    }
+  }
+
   _convertFile(side, op) {
     if (!this._guardWrite(side)) return;
     const TAB_WIDTH = this._tabWidth;
