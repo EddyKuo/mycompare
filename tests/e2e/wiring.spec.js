@@ -168,11 +168,18 @@ test('two .reg files compare as normalised text', async () => {
   expect(stats.replace + stats.insert + stats.delete).toBeGreaterThan(0)
 })
 
-test('the attributes column reports read-only, and marks hidden as unknown where it is', async () => {
+test('the attributes column reports read-only and the real hidden state', async () => {
   await resetTabs()
   await win.evaluate((folder) => window.__testAPI.folderSetLeft(folder), folderDir)
   // The attributes column is off by default; this is the "欄位選擇" action.
   await win.evaluate(() => window.__testAPI.folderSetColumns(['name', 'size', 'mtime', 'attrs']))
+
+  // Turning the column on now re-scans, because the hidden bit is only read
+  // while scanning. Reading the rows straight away races that rescan.
+  await expect.poll(async () => {
+    const rows = await win.evaluate(() => window.__testAPI.folderRows())
+    return rows.find((r) => r.name === 'locked.txt')?.attrs ?? ''
+  }).toContain('R')
 
   const rows = await win.evaluate(() => window.__testAPI.folderRows())
   const locked = rows.find((r) => r.name === 'locked.txt')
@@ -182,12 +189,10 @@ test('the attributes column reports read-only, and marks hidden as unknown where
   const plain = rows.find((r) => r.name === 'a.txt')
   expect(plain.attrs).not.toContain('R')
 
-  if (platform() === 'win32') {
-    // Windows keeps the hidden bit where fs.Stats cannot see it; the column
-    // must say so rather than claim the file is not hidden.
-    expect(plain.attrs).toContain('?')
-    expect(plain.attrsTitle).toContain('未知')
-  } else {
-    expect(plain.attrs).not.toContain('?')
-  }
+  // This used to assert '?' on Windows, because fs.Stats carries no attribute
+  // bits and the column could only say "cannot tell". read-dir now asks the OS
+  // when the attributes column is on, so the honest answer is available and
+  // the marker must not appear for a file that is simply not hidden.
+  expect(plain.attrs).not.toContain('?')
+  expect(plain.attrs).not.toContain('H')
 })

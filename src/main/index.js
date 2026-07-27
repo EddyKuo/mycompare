@@ -598,6 +598,23 @@ async function hiddenNamesIn(dir) {
   return hidden
 }
 
+// IPC: 讀取單一檔案的中繼資料
+ipcMain.handle('stat-file', async (_event, filePath) => {
+  const safe = validatePath(filePath)
+  const s = await stat(safe)
+  // The file-info panels previously listed the whole parent directory and
+  // matched by path, which reads every sibling to answer about one file.
+  return {
+    path: safe,
+    size: s.size,
+    isDirectory: s.isDirectory(),
+    mtime: s.mtime.toISOString(),
+    ctime: s.ctime.toISOString(),
+    atime: s.atime.toISOString(),
+    ...fileAttributes(basename(safe), s),
+  }
+})
+
 // IPC: 設定或清除 Windows 隱藏屬性
 ipcMain.handle('set-hidden', async (_event, filePath, hidden) => {
   const safe = validatePath(filePath)

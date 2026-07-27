@@ -97,6 +97,23 @@ export function buildAppMenu(win) {
         item('遠端連線設定…', 'session.remote.profiles'),
         item('開啟遠端資料夾…', 'session.remote.open'),
         { type: 'separator' },
+        item('另存 Session…', 'session.saveAs'),
+        item('清空 Session', 'session.clear'),
+        item('鎖定 Session', 'session.locked'),
+        { type: 'separator' },
+        item('比對上層資料夾', 'session.compareParentFolders'),
+        item('以其他方式比對…', 'session.compareUsing'),
+        item('合併上層資料夾', 'session.merge.parentFolders'),
+        {
+          label: '與合併輸出比對',
+          submenu: [
+            item('左側', 'session.merge.compareOutput.left'),
+            item('基準', 'session.merge.compareOutput.base'),
+            item('右側', 'session.merge.compareOutput.right')
+          ]
+        },
+        item('資料夾比對資訊', 'session.folder.info'),
+        { type: 'separator' },
         item('交換兩側', 'session.swap'),
         item('重新比對', 'session.recompare', 'F5'),
         { type: 'separator' },
@@ -113,6 +130,15 @@ export function buildAppMenu(win) {
       submenu: [
         item('開啟左側…', 'file.openLeft'),
         item('開啟右側…', 'file.openRight'),
+        { type: 'separator' },
+        item('複製到指定資料夾…', 'file.copyTo'),
+        {
+          label: '同步時間戳',
+          submenu: [
+            item('左 → 右', 'file.touch.leftToRight'),
+            item('右 → 左', 'file.touch.rightToLeft')
+          ]
+        },
         { type: 'separator' },
         item('列印預覽…', 'file.printPreview'),
         { type: 'separator' },
@@ -215,6 +241,8 @@ export function buildAppMenu(win) {
     {
       label: '檢視(&V)',
       submenu: [
+        item('圖片資訊', 'view.image.info'),
+        { type: 'separator' },
         item('顯示工具列', 'view.toggleToolbar'),
         item('顯示狀態列', 'view.toggleStatusBar'),
         { type: 'separator' },

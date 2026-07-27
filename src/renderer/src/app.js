@@ -6,7 +6,7 @@ import { HexCompare } from './views/hex-compare.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { createSession, updateSession } from './core/session.js'
-import { getViewTypeForPath } from './core/file-type.js'
+import { getViewTypeForPath, getViewChoicesForPath, parentFolderOf } from './core/file-type.js'
 import { NamedConfigStore } from './core/named-config-store.js'
 import { describeNavResult } from './core/diff-nav.js'
 import { WorkspaceStore } from './core/workspace-store.js'
@@ -30,7 +30,8 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * @typedef {{ id: string, type: string, title: string, leftPath: string, rightPath: string, basePath: string, state: object|null }} TabRecord
+ * @typedef {{ id: string, type: string, title: string, leftPath: string, rightPath: string,
+ *             basePath: string, state: object|null, locked: boolean, sessionId?: string }} TabRecord
  */
 
 class TabManager {
@@ -55,7 +56,7 @@ class TabManager {
   addTab(type, title) {
     const id = `tab-${this._nextId++}`
     /** @type {TabRecord} */
-    const tab = { id, type, title, leftPath: '', rightPath: '', basePath: '', state: null }
+    const tab = { id, type, title, leftPath: '', rightPath: '', basePath: '', state: null, locked: false }
     this._tabs.push(tab)
     this._activeId = id
     this._render()
@@ -93,6 +94,19 @@ class TabManager {
     if (!tab) return
     tab.title = title
     this._render()
+  }
+
+  /**
+   * Lock or unlock the active tab.
+   * @param {boolean} locked
+   * @returns {boolean} the resulting state
+   */
+  setActiveLocked(locked) {
+    const tab = this.activeTab
+    if (!tab) return false
+    tab.locked = locked
+    this._render()
+    return locked
   }
 
   /**
@@ -155,8 +169,10 @@ class TabManager {
 
       const titleEl = document.createElement('span')
       titleEl.className = 'tab-title'
-      titleEl.textContent = tab.title
-      titleEl.title = tab.title
+      // The padlock has to be visible on the tab itself: a lock the user cannot
+      // see is indistinguishable from a refresh command that is simply broken.
+      titleEl.textContent = tab.locked ? `🔒 ${tab.title}` : tab.title
+      titleEl.title = tab.locked ? `${tab.title}（已鎖定）` : tab.title
 
       item.appendChild(titleEl)
 
@@ -239,6 +255,8 @@ export function initApp() {
   setupMenuActions()
   setupSettingsModal()
   setupPrintPreview()
+  setupViewPrintInterception()
+  setupViewPicker()
   setupDragAndDrop()
   setupKeyboardShortcuts()
   renderRecentSessions(openSession, removeSession)
@@ -296,10 +314,12 @@ export function initApp() {
     tableGetDiffCellCount: () => document.querySelectorAll('.cell-diff').length,
 
     // S15-U01 3-way
-    mergeSetAll: (left, base, right) => {
-      mergeCompare?.setSide('left',  left)
-      mergeCompare?.setSide('base',  base)
-      mergeCompare?.setSide('right', right)
+    // `paths` is optional so existing specs keep working; without it the view
+    // has no parent folders and the parent-folders hand-off cannot be exercised.
+    mergeSetAll: (left, base, right, paths) => {
+      mergeCompare?.setSide('left',  left,  paths?.left)
+      mergeCompare?.setSide('base',  base,  paths?.base)
+      mergeCompare?.setSide('right', right, paths?.right)
     },
     mergeGetConflictCount: () => document.querySelectorAll('.mw-conflict-card').length,
 
@@ -315,6 +335,20 @@ export function initApp() {
       return view?.getCurrentDiffIndex?.() ?? -1
     },
     navStatusText: () => el('status-message')?.textContent ?? '',
+
+    // Tab bookkeeping and the menu dispatch table, so a spec can drive commands
+    // that only a native menu offers and then assert on what the tabs did.
+    tabs: () => tabMgr.tabs.map((t) => ({
+      id: t.id, type: t.type, title: t.title, locked: t.locked,
+      leftPath: t.leftPath, rightPath: t.rightPath,
+    })),
+    menuCommand: (command) => {
+      const fn = _menuCommands[command]
+      if (!fn) throw new Error(`unhandled menu command: ${command}`)
+      fn()
+    },
+    configListNames: () => [...document.querySelectorAll('#config-list .name')]
+      .map((n) => n.textContent ?? ''),
     navSetPref: (name, value) => settings.setPref(name, value),
 
     // S17: the wiring these specs exercise all sits behind a native dialog,
@@ -511,6 +545,7 @@ function showTableCompare() {
       recordSession('table', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
+      _syncActiveTabPaths(left, right)
       updateToolbar()
     })
   }
@@ -536,6 +571,7 @@ function showImageCompare() {
       recordSession('image', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
+      _syncActiveTabPaths(left, right)
       updateToolbar()
     })
     // A drop that fails has no other way to reach the user.
@@ -566,6 +602,7 @@ function showHexCompare() {
       recordSession('hex', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
       el('path-right').textContent = right || '（未選擇）'
+      _syncActiveTabPaths(left, right)
       updateToolbar()
     })
   }
@@ -605,6 +642,20 @@ function showMerge3() {
 
     mergeCompare.on('ready', () => {
       updateToolbar()
+    })
+
+    // BC's Merge Parent Folders. The view deliberately does not choose which
+    // pair to open — this app has no three-way folder compare, so the choice
+    // only exists at this level. Subscribing is also what enables the view's
+    // button, which stays disabled while nobody can service it.
+    mergeCompare.on('open-parent-folders', ({ left, base, right }) => {
+      void openMergeParentFolders({ left, base, right })
+    })
+
+    // BC's Compare to Output. Without this the view falls back to its own
+    // read-only dialog; a real text-compare tab can be edited and saved.
+    mergeCompare.on('compare-to-output', ({ side, sourcePath, sourceText, outputText }) => {
+      void openMergeOutputCompare(side, sourcePath, sourceText, outputText)
     })
   }
 
@@ -779,7 +830,16 @@ function _handleActivateTab(id, force = false) {
 function _handleCloseTab(id) {
   // S14-M03: dispose the matching view if it has no more open tabs of its type.
   const closing = tabMgr.tabs.find(t => t.id === id)
-  if (settings.getPref('confirmOnCloseTab') && closing
+
+  // Unsaved edits come first: losing typed bytes or edited cells is the only
+  // irreversible thing closing a tab can do, so it is asked about even when the
+  // generic confirmation preference is off.
+  const guard = _confirmDiscardForTab(closing)
+  if (!guard.ok) return
+
+  // Having just answered a question about this very tab, the user does not need
+  // a second, weaker one.
+  if (!guard.asked && settings.getPref('confirmOnCloseTab') && closing
       && !window.confirm(`關閉「${closing.title}」？`)) {
     return
   }
@@ -790,6 +850,66 @@ function _handleCloseTab(id) {
   } else {
     showHome()
   }
+}
+
+/**
+ * Ask the view behind a tab whether its unsaved work may be thrown away.
+ *
+ * Only the table and hex views can hold unsaved edits today; both already
+ * implemented the question and neither was ever asked, so closing a tab
+ * discarded edited cells and typed bytes without a word.
+ *
+ * @param {TabRecord|null|undefined} tab
+ * @returns {{ ok: boolean, asked: boolean }} `asked` reports whether the user
+ *   was actually shown a dialog, so the caller can avoid stacking a second one.
+ */
+function _confirmDiscardForTab(tab) {
+  if (!tab) return { ok: true, asked: false }
+
+  if (tab.type === 'table' && typeof tableCompare?.confirmDiscardChanges === 'function') {
+    const dirty = tableCompare.hasUnsavedChanges?.() === true
+    return { ok: tableCompare.confirmDiscardChanges(), asked: dirty }
+  }
+  if (tab.type === 'hex' && typeof hexCompare?.confirmClose === 'function') {
+    const dirty = hexCompare.hasUnsavedEdits?.() === true
+    return { ok: hexCompare.confirmClose(), asked: dirty }
+  }
+  return { ok: true, asked: false }
+}
+
+/**
+ * Ask once per view type before an operation that closes every tab.
+ *
+ * Views are shared between tabs of the same type, so asking per tab would put
+ * the same question up several times for the same unsaved buffer.
+ *
+ * @returns {boolean} true when it is safe to proceed
+ */
+function _confirmDiscardAllTabs() {
+  const seen = new Set()
+  for (const tab of tabMgr.tabs) {
+    if (seen.has(tab.type)) continue
+    seen.add(tab.type)
+    if (!_confirmDiscardForTab(tab).ok) return false
+  }
+  return true
+}
+
+/**
+ * Record the paths a view just opened onto the active tab.
+ *
+ * The text and folder views did this; table, image and hex did not, which left
+ * their tab records empty — so a saved workspace restored them blank and
+ * anything reading the tab's paths (parent folders, re-open as…) had nothing
+ * to work with.
+ *
+ * @param {string|undefined|null} left
+ * @param {string|undefined|null} right
+ */
+function _syncActiveTabPaths(left, right) {
+  tabMgr.updateActivePaths({ leftPath: left ?? '', rightPath: right ?? '' })
+  const title = _titleFromPaths(left ?? '', right ?? '')
+  if (title) tabMgr.updateActiveTitle(title)
 }
 
 /**
@@ -902,6 +1022,7 @@ function setupToolbarButtons() {
   })
 
   el('btn-refresh').addEventListener('click', () => {
+    if (isActiveTabLocked('重新整理')) return
     if (currentView === 'text') textCompare?.refresh()
     else if (currentView === 'folder') folderCompare?.refresh()
     else if (currentView === 'table') tableCompare?.refresh()
@@ -956,12 +1077,6 @@ function setupToolbarButtons() {
 // Report dialog — save or copy the active view's report
 // ---------------------------------------------------------------------------
 
-/** Human name per view, for the dialog's subtitle. */
-const REPORT_VIEW_LABELS = {
-  text: '文字比對', folder: '資料夾比對', table: '表格比對',
-  image: '圖片比對', hex: 'Hex 比對', merge3: '三向合併',
-}
-
 /**
  * What the active view can produce.
  *
@@ -1002,7 +1117,7 @@ function openReportModal() {
   const subtitle = el('report-modal-view')
   if (subtitle) {
     subtitle.textContent = _hasAnyReport(src)
-      ? `目前視圖：${REPORT_VIEW_LABELS[currentView] ?? currentView}`
+      ? `目前視圖：${VIEW_TYPE_LABELS[currentView] ?? currentView}`
       : '目前視圖不支援報告'
   }
   setDisabled('btn-report-save-html', !(src.html || src.htmlFallback))
@@ -1074,6 +1189,38 @@ async function _folderNav(method, label) {
   } catch (err) {
     showError(`${label}失敗：${err?.message ?? err}`, err)
   }
+}
+
+/**
+ * Copy one side's timestamps onto the other for the selected folder rows.
+ *
+ * @param {'left-to-right'|'right-to-left'} direction
+ */
+async function _folderTouch(direction) {
+  if (currentView !== 'folder' || typeof folderCompare?.touchSelected !== 'function') {
+    showStatus('同步時間戳僅適用於資料夾比對')
+    return
+  }
+  try {
+    await folderCompare.touchSelected(direction)
+  } catch (err) {
+    showError(`同步時間戳失敗：${err instanceof Error ? err.message : String(err)}`, err)
+  }
+}
+
+/**
+ * Diff the merge output against one of its sources.
+ *
+ * @param {'left'|'base'|'right'} side
+ */
+function _mergeCompareOutput(side) {
+  if (currentView !== 'merge3' || !mergeCompare) {
+    showStatus('與合併輸出比對僅適用於三向合併')
+    return
+  }
+  // A false return means the view already told the user why; saying it twice
+  // in two places would be worse than saying it once where they are looking.
+  mergeCompare.compareToOutput(side)
 }
 
 async function printActiveReport() {
@@ -1153,7 +1300,7 @@ function openPrintPreview() {
   frame.src = _printPreviewUrl
 
   const label = el('print-preview-view')
-  if (label) label.textContent = `目前視圖：${REPORT_VIEW_LABELS[currentView] ?? currentView}`
+  if (label) label.textContent = `目前視圖：${VIEW_TYPE_LABELS[currentView] ?? currentView}`
   _setPrintPreviewStatus('')
   overlay.style.display = 'flex'
 }
@@ -1164,6 +1311,45 @@ function closePrintPreview() {
   const frame = el('print-preview-frame')
   if (frame instanceof HTMLIFrameElement) frame.removeAttribute('src')
   _revokePrintPreviewUrl()
+}
+
+/**
+ * Is this the hex or table view's own 🖨 button?
+ *
+ * Matched structurally because those two views are owned elsewhere: the table
+ * button carries an id, the hex one is identified by its class plus the printer
+ * glyph it renders. See the report accompanying this change — the intended
+ * end state is for both views to emit an event instead.
+ *
+ * @param {EventTarget|null} target
+ * @returns {boolean}
+ */
+function _isViewPrintButton(target) {
+  if (!(target instanceof Element)) return false
+  const btn = target.closest('button')
+  if (!btn) return false
+  if (btn.id === 'tc-btn-print') return true
+  return btn.classList.contains('hx-btn-report') && btn.textContent.trim().startsWith('🖨')
+}
+
+/**
+ * Route the hex and table views' print buttons through the shared preview.
+ *
+ * Both call `exportHtml({ print: true })` directly, which opens a second window
+ * and goes straight to the print dialog — so the same command produced two
+ * different experiences depending on which view was open. The listener runs in
+ * the capture phase on the view container, which stops the event before the
+ * button's own handler sees it.
+ */
+function setupViewPrintInterception() {
+  for (const id of ['view-hex', 'view-table']) {
+    el(id)?.addEventListener('click', (e) => {
+      if (!_isViewPrintButton(e.target)) return
+      e.preventDefault()
+      e.stopPropagation()
+      openPrintPreview()
+    }, true)
+  }
 }
 
 function setupPrintPreview() {
@@ -1301,11 +1487,29 @@ function closeConfigModal() {
   if (overlay) overlay.style.display = 'none'
 }
 
+/**
+ * Names in this namespace belong to the app, not to the user.
+ *
+ * The folder view keeps its defaults under `__mycompare:folder-defaults__` in
+ * the same store, so the shared dialog listed an entry the user never created
+ * and could delete by mistake.
+ */
+const RESERVED_CONFIG_PREFIX = '__mycompare:'
+
+/**
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isReservedConfigName(name) {
+  return String(name ?? '').startsWith(RESERVED_CONFIG_PREFIX)
+}
+
 function refreshConfigList() {
   const list = el('config-list')
   if (!list) return
   const { type } = _getActiveConfigurableView()
   const items = namedConfigStore.list(type ?? undefined)
+    .filter((entry) => !isReservedConfigName(entry.name))
   list.replaceChildren()
   if (items.length === 0) {
     const empty = document.createElement('div')
@@ -1370,6 +1574,13 @@ function handleConfigSave() {
   const name = (input?.value ?? '').trim()
   if (!name) {
     _setConfigStatus('請輸入設定名稱')
+    return
+  }
+  // Saving over a reserved name would overwrite the folder view's defaults with
+  // whatever this view happens to expose, and the entry would then be invisible
+  // in this list.
+  if (isReservedConfigName(name)) {
+    _setConfigStatus(`「${RESERVED_CONFIG_PREFIX}」開頭的名稱保留給應用程式使用，請換一個名稱`)
     return
   }
   const { view, type } = _getActiveConfigurableView()
@@ -1495,6 +1706,12 @@ function _setWorkspaceStatus(msg) {
  */
 async function loadWorkspace(entry) {
   if (!entry || !Array.isArray(entry.tabs)) return
+  // Loading a workspace closes everything that is open, so it is as destructive
+  // as closing each tab by hand and asks the same question.
+  if (!_confirmDiscardAllTabs()) {
+    showStatus('已取消載入工作區')
+    return
+  }
   // Close all current tabs (iterate over a copy of ids)
   const currentIds = tabMgr.tabs.map(t => t.id)
   for (const id of currentIds) tabMgr.closeTab(id)
@@ -1651,6 +1868,272 @@ function _defaultTitleForType(type) {
 }
 
 // ---------------------------------------------------------------------------
+// View picker — "which kind of comparison?"
+// ---------------------------------------------------------------------------
+
+/** Human name per session type. */
+const VIEW_TYPE_LABELS = Object.freeze({
+  text: '文字比對', folder: '資料夾比對', table: '表格比對',
+  image: '圖片比對', hex: 'Hex 比對', merge3: '三向合併',
+})
+
+/**
+ * Resolver for the dialog currently open, or null when it is closed.
+ * @type {((value: string|null) => void) | null}
+ */
+let _viewPickerResolve = null
+
+/**
+ * @param {string|null} value the chosen type, or null when dismissed
+ */
+function _closeViewPicker(value) {
+  const overlay = el('view-picker-modal')
+  if (overlay) overlay.style.display = 'none'
+  const resolve = _viewPickerResolve
+  _viewPickerResolve = null
+  // Settled before anything else runs: a caller awaiting this must never be
+  // left hanging because a later dialog replaced the resolver.
+  resolve?.(value)
+}
+
+function setupViewPicker() {
+  el('btn-view-picker-close')?.addEventListener('click', () => _closeViewPicker(null))
+  el('btn-view-picker-cancel')?.addEventListener('click', () => _closeViewPicker(null))
+}
+
+/**
+ * Ask the user which comparison view to use.
+ *
+ * @param {string} description shown above the buttons
+ * @param {string[]} choices session types, in the order they should be offered
+ * @returns {Promise<string|null>} the chosen type, or null when cancelled
+ */
+function pickViewType(description, choices) {
+  const overlay = el('view-picker-modal')
+  const list = el('view-picker-list')
+  if (!overlay || !list || choices.length === 0) return Promise.resolve(null)
+
+  // A second call supersedes the first rather than stacking dialogs.
+  _closeViewPicker(null)
+
+  const desc = el('view-picker-desc')
+  if (desc) desc.textContent = description
+
+  list.replaceChildren()
+  for (const type of choices) {
+    const btn = document.createElement('button')
+    btn.dataset.viewType = type
+    btn.textContent = VIEW_TYPE_LABELS[type] ?? type
+    btn.addEventListener('click', () => _closeViewPicker(type))
+    list.appendChild(btn)
+  }
+
+  overlay.style.display = 'flex'
+  return new Promise((resolve) => { _viewPickerResolve = resolve })
+}
+
+// ---------------------------------------------------------------------------
+// BC Session menu — Save As / Clear / Locked / Parent Folders / Compare Using
+// ---------------------------------------------------------------------------
+
+/**
+ * The active tab's two sides, or null with a message when there is nothing to
+ * act on.
+ *
+ * @param {string} action named in the message, so the user knows what was
+ *   refused rather than only that something was
+ * @returns {{ tab: TabRecord, leftPath: string, rightPath: string } | null}
+ */
+function _activeTabPaths(action) {
+  const tab = tabMgr.activeTab
+  if (!tab) {
+    showStatus(`${action}：目前沒有開啟的比對`)
+    return null
+  }
+  const { leftPath, rightPath } = tab
+  if (!leftPath && !rightPath) {
+    showStatus(`${action}：目前的比對還沒有開啟任何檔案`)
+    return null
+  }
+  // Archive entries, snapshots and remote files exist only inside this window's
+  // session; neither a parent folder nor a re-open by path is meaningful.
+  const virtual = [leftPath, rightPath].find((p) => p && sourceKindOf(p) !== 'fs')
+  if (virtual) {
+    showError(`${action}：「${virtual}」不是本機檔案，無法用於此操作`)
+    return null
+  }
+  return { tab, leftPath, rightPath }
+}
+
+/**
+ * Whether the active tab refuses commands that would reload or recompare it.
+ *
+ * @param {string} action named in the message
+ * @returns {boolean} true when the command must not run
+ */
+function isActiveTabLocked(action) {
+  const tab = tabMgr.activeTab
+  if (!tab?.locked) return false
+  showStatus(`${action}：此比對已鎖定（Session ▸ 鎖定 可解除）`)
+  return true
+}
+
+/** Toggle the lock on the active tab. */
+function toggleSessionLock() {
+  const tab = tabMgr.activeTab
+  if (!tab) {
+    showStatus('鎖定：目前沒有開啟的比對')
+    return
+  }
+  const locked = tabMgr.setActiveLocked(!tab.locked)
+  showStatus(locked
+    ? `已鎖定「${tab.title}」，重新整理與重新比對將被忽略`
+    : `已解除鎖定「${tab.title}」`)
+}
+
+/**
+ * Save the active comparison under a name the user chooses.
+ *
+ * Distinct from the automatic recording behind every path change: that keeps
+ * one rolling entry per tab named after the files, this creates a separate,
+ * durable entry the user named themselves.
+ */
+function saveSessionAs() {
+  const found = _activeTabPaths('另存 Session')
+  if (!found) return
+  const { tab, leftPath, rightPath } = found
+
+  const suggested = tab.title || _titleFromPaths(leftPath, rightPath)
+  const name = window.prompt('Session 名稱：', suggested)
+  if (name === null) return
+  const trimmed = name.trim()
+  if (!trimmed) {
+    showStatus('另存 Session：名稱不可為空')
+    return
+  }
+
+  try {
+    const created = store.save(createSession(tab.type, trimmed, {
+      leftPath, rightPath, basePath: tab.basePath ?? '',
+    }))
+    // The tab now belongs to the named entry, so later path changes update it
+    // instead of leaving the user's named session frozen.
+    tab.sessionId = created.id
+    tabMgr.updateActiveTitle(trimmed)
+    renderRecentSessions(openSession, removeSession)
+    showStatus(`已儲存 Session「${trimmed}」`)
+  } catch (err) {
+    showError(`另存 Session 失敗：${err instanceof Error ? err.message : String(err)}`, err)
+  }
+}
+
+/**
+ * Empty the active comparison, keeping its kind.
+ *
+ * Implemented by replacing the tab rather than reaching into each view: every
+ * view already knows how to start empty, and a per-view reset would be six
+ * more code paths that can rot independently.
+ */
+function clearSession() {
+  const tab = tabMgr.activeTab
+  if (!tab) {
+    showStatus('清空 Session：目前沒有開啟的比對')
+    return
+  }
+  if (isActiveTabLocked('清空 Session')) return
+  if (!_confirmDiscardForTab(tab).ok) return
+
+  const { type } = tab
+  tabMgr.closeTab(tab.id)
+  _disposeViewIfUnused(type)
+  newSession(type)
+  showStatus(`已清空${_defaultTitleForType(type)}`)
+}
+
+/** Open a folder comparison of the directories holding the two current files. */
+async function compareParentFolders() {
+  const found = _activeTabPaths('比對上層資料夾')
+  if (!found) return
+  const { leftPath, rightPath } = found
+
+  const left = parentFolderOf(leftPath)
+  const right = parentFolderOf(rightPath)
+  if (!left && !right) {
+    showError('比對上層資料夾：目前的路徑沒有上層資料夾')
+    return
+  }
+  await openComparison({ type: 'folder', leftPath: left, rightPath: right })
+}
+
+/**
+ * Open a folder comparison for a three-way merge's parent folders.
+ *
+ * Left against right is the pair the merge is actually reconciling, so it is
+ * the default; when one of those is missing, base stands in for it rather than
+ * refusing outright. Which pair was used is said out loud — silently comparing
+ * a different pair than the user expected is worse than not comparing at all.
+ *
+ * @param {{ left: string, base: string, right: string }} parents
+ */
+async function openMergeParentFolders({ left, base, right }) {
+  /** @type {[string, string, string]|null} */
+  let pair = null
+  if (left && right) pair = [left, right, '左側與右側']
+  else if (left && base) pair = [base, left, '基準與左側']
+  else if (base && right) pair = [base, right, '基準與右側']
+
+  if (!pair) {
+    showError('比對上層資料夾：三向合併至少要有兩個已載入的來源檔案')
+    return
+  }
+
+  const [leftPath, rightPath, label] = pair
+  await openComparison({ type: 'folder', leftPath, rightPath })
+  showStatus(`已開啟上層資料夾比對（${label}）`)
+}
+
+/**
+ * Show a merge's output against one of its sources in a text-compare tab.
+ *
+ * The output side is deliberately given no path: it is not a file on disk yet,
+ * and handing the text view a made-up path would make "儲存右側" overwrite
+ * something that was never opened.
+ *
+ * @param {'left'|'base'|'right'} side
+ * @param {string} sourcePath
+ * @param {string} sourceText
+ * @param {string} outputText
+ */
+async function openMergeOutputCompare(side, sourcePath, sourceText, outputText) {
+  const sideLabel = { left: '左側', base: '基準', right: '右側' }[side] ?? side
+
+  await openComparison({
+    type: 'text',
+    leftPath: sourcePath,
+    leftContent: sourceText,
+    rightPath: '',
+    rightContent: outputText,
+  })
+  tabMgr.updateActiveTitle(`${sideLabel} ↔ 合併輸出`)
+  showStatus(`已開啟「${sideLabel} ↔ 合併輸出」；右側尚未存檔，請用「另存」寫入檔案`)
+}
+
+/** Re-open the two current files in a comparison view the user picks. */
+async function compareFilesUsing() {
+  const found = _activeTabPaths('以其他方式比對')
+  if (!found) return
+  const { tab, leftPath, rightPath } = found
+
+  const choices = ['text', 'table', 'hex', 'image'].filter((t) => t !== tab.type)
+  const chosen = await pickViewType(
+    `以哪一種比對重新開啟這兩個檔案？（目前為${VIEW_TYPE_LABELS[tab.type] ?? tab.type}）`,
+    choices)
+  if (!chosen) return
+
+  await openComparison({ type: chosen, leftPath, rightPath })
+}
+
+// ---------------------------------------------------------------------------
 // Path Bar 按鈕
 // ---------------------------------------------------------------------------
 function setupPathBarButtons() {
@@ -1744,6 +2227,7 @@ function setupKeyboardShortcuts() {
     saveLeft:  () => { if (currentView === 'text') void textCompare?.saveLeft() },
     saveRight: () => { if (currentView === 'text') void textCompare?.saveRight() },
     refresh: () => {
+      if (isActiveTabLocked('重新整理')) return
       if (currentView === 'text') textCompare?.refresh()
       else if (currentView === 'folder') void folderCompare?.refresh()
     },
@@ -1806,7 +2290,21 @@ function reportReadFailure(side, path, err) {
 async function openComparison({ type, leftPath, rightPath, basePath, leftContent, rightContent, algorithm } = {}) {
   // An explicit type (from a stored session) wins; otherwise route on the
   // file extension as a folder-compare double-click does.
-  const viewType = type && type !== 'auto' ? type : getViewTypeForPath(leftPath || rightPath)
+  let viewType = type && type !== 'auto' ? type : getViewTypeForPath(leftPath || rightPath)
+
+  if (!type || type === 'auto') {
+    // Some extensions have more than one honest reading — .html is both a text
+    // file and a table container — so the choice is the user's, not a guess
+    // made on their behalf and silently.
+    const choices = getViewChoicesForPath(leftPath || rightPath)
+    if (choices.length > 1) {
+      const chosen = await pickViewType(
+        `「${(leftPath || rightPath).split(/[\\/]/).pop()}」可以用多種方式比對，要用哪一種？`,
+        choices)
+      if (!chosen) return
+      viewType = chosen
+    }
+  }
 
   if (viewType === 'folder') {
     tabMgr.addTab('folder', '資料夾比對')
@@ -2384,9 +2882,13 @@ function recordSession(type, paths) {
  * lives here. Commands that do not apply to the active view are no-ops rather
  * than errors, matching how BC greys out inapplicable items.
  */
-function setupMenuActions() {
-  if (!window.electronAPI?.onMenuAction) return
+/**
+ * The renderer's menu dispatch table, filled in by {@link setupMenuActions}.
+ * @type {Record<string, () => void>}
+ */
+let _menuCommands = {}
 
+function setupMenuActions() {
   /** @param {number} delta */
   const zoom = (delta) => {
     if (currentView === 'text' && textCompare) {
@@ -2421,9 +2923,15 @@ function setupMenuActions() {
       void view?.swap?.()
     },
     'session.recompare':  () => {
+      if (isActiveTabLocked('重新比對')) return
       if (currentView === 'text') textCompare?.refresh()
       else if (currentView === 'folder') folderCompare?.refresh()
     },
+    'session.saveAs':               () => saveSessionAs(),
+    'session.clear':                () => clearSession(),
+    'session.locked':               () => toggleSessionLock(),
+    'session.compareParentFolders': () => void compareParentFolders(),
+    'session.compareUsing':         () => void compareFilesUsing(),
     // Folder navigation. Each says why it did nothing rather than leaving a
     // menu item that appears to do nothing at all.
     'session.folder.up': () => void _folderNav('upOneLevel', '上一層'),
@@ -2432,6 +2940,34 @@ function setupMenuActions() {
 
     'file.openArchiveLeft': () => void _folderNav('openArchiveLeft', '開啟封存檔'),
     'file.openArchiveRight': () => void _folderNav('openArchiveRight', '開啟封存檔'),
+
+    'session.folder.info': () => void _folderNav('openInfoDialog', '資料夾比對資訊'),
+    'file.copyTo': () => void _folderNav('copySelectedToFolder', '複製到指定資料夾'),
+    'file.touch.leftToRight': () => void _folderTouch('left-to-right'),
+    'file.touch.rightToLeft': () => void _folderTouch('right-to-left'),
+
+    'session.merge.parentFolders': () => {
+      if (currentView !== 'merge3' || !mergeCompare) {
+        showStatus('合併上層資料夾僅適用於三向合併')
+        return
+      }
+      // The view refuses when fewer than two sources are loaded, and its own
+      // error path has already said so; only the silent case needs a word here.
+      if (!mergeCompare.mergeParentFolders()) {
+        showStatus('合併上層資料夾：需要至少兩個已載入的來源檔案')
+      }
+    },
+    'session.merge.compareOutput.left':  () => _mergeCompareOutput('left'),
+    'session.merge.compareOutput.base':  () => _mergeCompareOutput('base'),
+    'session.merge.compareOutput.right': () => _mergeCompareOutput('right'),
+
+    'view.image.info': () => {
+      if (currentView !== 'image' || !imageCompare) {
+        showStatus('圖片資訊僅適用於圖片比對')
+        return
+      }
+      showStatus(imageCompare.toggleInfoPanel() ? '已顯示圖片資訊' : '已隱藏圖片資訊')
+    },
 
     'session.close':      () => {
       const active = tabMgr.activeTab
@@ -2567,7 +3103,7 @@ function setupMenuActions() {
     'view.toggleLayout': () => {
       // Every view that has the two layouts implements the same method name,
       // so the menu item works wherever it applies instead of only in text.
-      const view = { text: textCompare, table: tableCompare }[currentView]
+      const view = { text: textCompare, table: tableCompare, image: imageCompare }[currentView]
       if (view) view.toggleLayout()
       else showStatus('目前視圖沒有並排／上下佈局')
     },
@@ -2589,6 +3125,12 @@ function setupMenuActions() {
 
     'help.about': () => showStatus('MyCompare — Electron 版 BeyondCompare 複製品'),
   }
+
+  // Published before the IPC listener is attached so an e2e test can drive a
+  // menu command without a native menu, which Playwright cannot click.
+  _menuCommands = commands
+
+  if (!window.electronAPI?.onMenuAction) return
 
   window.electronAPI.onMenuAction(({ command }) => {
     const fn = commands[command]

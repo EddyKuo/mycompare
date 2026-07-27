@@ -1316,3 +1316,51 @@
 .fc-info-table td {
   font-variant-numeric: tabular-nums;
 }
+
+/* The batch menu had no positioning at all: it was a plain block inside a
+   36px-tall, horizontally scrolling toolbar, so where it landed depended on
+   how wide the toolbar happened to be. Once enough buttons were added it fell
+   outside the viewport and became unclickable. As a real dropdown it is
+   anchored to its own button and independent of the toolbar's width. */
+.fc-batch-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.fc-batch-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 40;
+  min-width: 200px;
+  /* Taller than the window would put the last items out of reach again. */
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 4px 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 25%);
+}
+
+.fc-batch-item {
+  display: block;
+  width: 100%;
+  padding: 6px 14px;
+  font: inherit;
+  color: var(--text-primary);
+  text-align: left;
+  white-space: nowrap;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.fc-batch-item:hover:not(:disabled) {
+  background: var(--bg-hover, rgb(128 128 128 / 18%));
+}
+
+.fc-batch-item:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+}

@@ -24,6 +24,10 @@ import { isActive } from '../core/active-view.js';
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js';
 import { tagConfig, readConfig } from '../core/named-config-store.js';
 import { toast } from '../core/toast.js';
+import {
+  getGrammarForPath, tokenizeLines, maskLine, linesEqualIgnoringElements,
+  lineWeight, elementsOf, getUserGrammars, setUserGrammars,
+} from '../core/grammar.js';
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
@@ -36,6 +40,20 @@ const VS_ROW_HEIGHT = 20;
 
 /** Rows to render above/below viewport to avoid scroll flicker */
 const VS_OVERSCAN = 5;
+
+/**
+ * Display Font choices (BC View | Display Font). Monospace only — the diff
+ * panes, the ruler and the gutter all assume a fixed advance width.
+ * @type {Array<{ label: string, value: string }>}
+ */
+export const FONT_CHOICES = [
+  { label: '預設', value: '' },
+  { label: 'Consolas', value: "Consolas, 'Courier New', monospace" },
+  { label: 'Cascadia Code', value: "'Cascadia Code', Consolas, monospace" },
+  { label: 'Fira Code', value: "'Fira Code', Consolas, monospace" },
+  { label: 'Courier New', value: "'Courier New', monospace" },
+  { label: 'JetBrains Mono', value: "'JetBrains Mono', Consolas, monospace" },
+];
 
 // ---------------------------------------------------------------------------
 // File watching
@@ -188,6 +206,18 @@ function _spliceLine(text, lineIdx, newLine) {
   if (lineIdx >= lines.length) return text;
   lines[lineIdx] = newLine;
   return lines.join('');
+}
+
+/**
+ * Human-readable byte count for the File Info panel.
+ * @param {number} n
+ * @returns {string}
+ */
+function formatBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function escapeHtml(str) {
@@ -750,6 +780,49 @@ export class TextCompare {
     this._redoStack = [];
     this._undoCap = 50;
 
+    // ── P2-29: Grammar ──
+    // Tokens are indexed by 0-based file line, so a row can look up its own
+    // line without re-tokenizing. They are only computed when something needs
+    // them (an ignored element, or the Alignment Details panel).
+    /** @type {import('../core/grammar.js').CompiledGrammar|null} */
+    this._grammarLeft = null;
+    /** @type {import('../core/grammar.js').CompiledGrammar|null} */
+    this._grammarRight = null;
+    /** @type {import('../core/grammar.js').GrammarToken[][]} */
+    this._tokensLeft = [];
+    /** @type {import('../core/grammar.js').GrammarToken[][]} */
+    this._tokensRight = [];
+    /** Element names whose differences are demoted to "unimportant". @type {Set<string>} */
+    this._grammarIgnored = new Set();
+    /** True when a step/length bound stopped the tokenizer short. */
+    this._grammarTruncated = false;
+    /** Guards the truncation toast so a re-diff per keystroke cannot spam it. */
+    this._grammarTruncationReported = false;
+
+    // ── P3: Details panel / Ruler / File Info / Description ──
+    /** @type {'text'|'hex'|'alignment'|null} */
+    this._detailsMode = null;
+    this._detailsEl = null;
+    this._detailsBody = null;
+    this._showRuler = false;
+    this._rulerEl = null;
+    this._showFileInfo = false;
+    this._infoEl = null;
+    this._showDescription = false;
+    this._descriptionEl = null;
+    this._description = '';
+    this._topStrip = null;
+    /** Row the Details panels describe; -1 until the user clicks or navigates. */
+    this._currentRowIdx = -1;
+    /** @type {'left'|'right'} */
+    this._currentSide = 'left';
+
+    // T-P3: Display font family ('' = inherit the stylesheet default)
+    this._fontFamily = '';
+
+    // 1.7 "Prevent editing" — per side, not one global switch.
+    this._readOnly = { left: false, right: false };
+
     this._mounted = false;
   }
 
@@ -1235,6 +1308,24 @@ export class TextCompare {
     });
     this._unsubFileChanged = typeof unsub === 'function' ? unsub : null;
 
+    // P3: destroy() removes the ruler/info/description/details DOM but keeps
+    // the user's choices, so a remount has to rebuild whatever was open.
+    const wanted = {
+      ruler: this._showRuler,
+      info: this._showFileInfo,
+      description: this._showDescription,
+      details: this._detailsMode,
+    };
+    this._showRuler = false;
+    this._showFileInfo = false;
+    this._showDescription = false;
+    this._detailsMode = null;
+    if (wanted.ruler) this.toggleRuler(true);
+    if (wanted.info) this.toggleFileInfo(true);
+    if (wanted.description) this.toggleDescription(true);
+    if (wanted.details) this.setDetailsMode(wanted.details);
+    this.setFontFamily(this._fontFamily);
+
     this._mounted = true;
   }
 
@@ -1306,6 +1397,20 @@ export class TextCompare {
     // Invalidate any in-flight reads.
     this._loadTokenLeft = null;
     this._loadTokenRight = null;
+
+    // P3: the details/ruler/info strips are created in #view-text, which
+    // outlives this instance — they must come out with it.
+    this._detailsEl?.remove();
+    this._detailsEl = null;
+    this._detailsBody = null;
+    this._rulerEl?.remove();
+    this._rulerEl = null;
+    this._infoEl?.remove();
+    this._infoEl = null;
+    this._descriptionEl?.remove();
+    this._descriptionEl = null;
+    this._topStrip?.remove();
+    this._topStrip = null;
 
     // T39: cleanup center gutter
     if (this._gutterCanvas)  { this._gutterCanvas.width = 0; this._gutterCanvas = null; }
@@ -1565,6 +1670,13 @@ export class TextCompare {
     pane.appendChild(ta);
 
     this._on(ta, 'input', () => {
+      // A locked side keeps its textarea readOnly, but a paste through the
+      // native menu can still land here; drop the change and say why.
+      if (this.isSideReadOnly(side)) {
+        ta.value = side === 'left' ? this._leftContent : this._rightContent;
+        this._guardWrite(side);
+        return;
+      }
       const timerKey = side === 'left' ? '_editTimerLeft' : '_editTimerRight';
       clearTimeout(this[timerKey]);
       this[timerKey] = setTimeout(() => {
@@ -1592,6 +1704,13 @@ export class TextCompare {
     if (this._editMode) {
       this._textareaLeft.value  = this._leftContent;
       this._textareaRight.value = this._rightContent;
+      // 1.7 Prevent editing is per side, so entering edit mode must not
+      // unlock a side the user locked.
+      this._textareaLeft.readOnly  = this.isSideReadOnly('left');
+      this._textareaRight.readOnly = this.isSideReadOnly('right');
+      if (this._readOnly.left || this._readOnly.right) {
+        toast(`已鎖定：${[this._readOnly.left ? '左側' : '', this._readOnly.right ? '右側' : ''].filter(Boolean).join('、')}`);
+      }
       this._contentLeft.style.display  = 'none';
       this._contentRight.style.display = 'none';
       this._textareaLeft.style.display  = 'block';
@@ -1704,6 +1823,7 @@ export class TextCompare {
     this._leftContent = content;
     if (encoding) this._encodingLeft = encoding;
     this._eolLeft = detectEol(content); // T01
+    this._resolveGrammars();
     if (this._pathLeft) this._pathLeft.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
     // T33: start watching the new file path (if it's a real file path)
@@ -1733,6 +1853,7 @@ export class TextCompare {
     this._rightContent = content;
     if (encoding) this._encodingRight = encoding;
     this._eolRight = detectEol(content); // T01
+    this._resolveGrammars();
     if (this._pathRight) this._pathRight.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
     // T33: start watching the new file path (if it's a real file path)
@@ -1798,6 +1919,7 @@ export class TextCompare {
   /** Copy ALL diffs to right side: right becomes identical to left (T09) */
   copyAllToRight() {
     if (!this._leftContent) return;
+    if (!this._guardWrite('right')) return;
     this._pushUndoSnapshot();
     this._rightContent = this._leftContent;
     this._runDiff();
@@ -1806,6 +1928,7 @@ export class TextCompare {
   /** Copy ALL diffs to left side: left becomes identical to right (T09) */
   copyAllToLeft() {
     if (!this._rightContent) return;
+    if (!this._guardWrite('left')) return;
     this._pushUndoSnapshot();
     this._leftContent = this._rightContent;
     this._runDiff();
@@ -2252,6 +2375,9 @@ ${rows}
       });
     }
 
+    // P2-29: grammar tokens must exist before importance is decided.
+    this._computeGrammarTokens();
+
     // Apply ignore / unimportant patterns
     this._applyIgnorePatterns();
 
@@ -2264,6 +2390,8 @@ ${rows}
     this._render({ resetScroll });
     this._buildMinimap();
     this._updateStatusBar();
+    this._updateFileInfo();
+    this._updateDetails();
 
     // Reset navigation
     this._currentDiff = this._diffBlocks.length > 0 ? 0 : -1;
@@ -2313,7 +2441,8 @@ ${rows}
         (dl.rightLine != null && manualRight.has(dl.rightLine))
       )
       dl.manualIgnored = manual
-      dl.unimportant = manual ||
+      dl.grammarIgnored = !manual && this._grammarUnimportant(dl)
+      dl.unimportant = manual || dl.grammarIgnored ||
         (unimportantRe.length > 0 && unimportantRe.some(re => re.test(text)))
       // BC's "Ignore Unimportant Differences" downgrades these to equal rather
       // than merely tinting them blue, which is what makes a file with only
@@ -2678,6 +2807,17 @@ ${rows}
       unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
       manualIgnoreLeft:   [...this._manualIgnore.left].sort((a, b) => a - b),
       manualIgnoreRight:  [...this._manualIgnore.right].sort((a, b) => a - b),
+      // P2-29 / P3: grammar + panel state travel with the session settings.
+      grammarIgnore:      [...this._grammarIgnored],
+      userGrammars:       getUserGrammars(),
+      description:        this._description,
+      fontFamily:         this._fontFamily,
+      showRuler:          this._showRuler,
+      showFileInfo:       this._showFileInfo,
+      showDescription:    this._showDescription,
+      detailsMode:        this._detailsMode,
+      readOnlyLeft:       this._readOnly.left,
+      readOnlyRight:      this._readOnly.right,
     })
   }
 
@@ -2711,6 +2851,35 @@ ${rows}
       const value = settings[key]
       for (const n of TextCompare._normaliseLines(Array.isArray(value) ? value : [])) set.add(n)
     }
+
+    // P2-29: restore user grammars before the ignore set, so an element that
+    // only a user grammar defines is still meaningful.
+    if (Object.prototype.hasOwnProperty.call(settings, 'userGrammars')) {
+      const errs = setUserGrammars(settings.userGrammars)
+      if (errs.length > 0) toast(`部分自訂文法無法載入：${errs.join('；')}`, { type: 'error', durationMs: 6000 })
+      this._resolveGrammars()
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, 'grammarIgnore')) {
+      const list = Array.isArray(settings.grammarIgnore) ? settings.grammarIgnore : []
+      this._grammarIgnored = new Set(list.filter(e => typeof e === 'string' && e))
+    }
+
+    // P3 panels. Each toggle builds or removes its own DOM, so they are only
+    // touched when the snapshot actually carries the key.
+    if (typeof settings.description === 'string') this.setDescription(settings.description)
+    if (typeof settings.fontFamily === 'string') this.setFontFamily(settings.fontFamily)
+    if (typeof settings.readOnlyLeft === 'boolean') this.setSideReadOnly('left', settings.readOnlyLeft)
+    if (typeof settings.readOnlyRight === 'boolean') this.setSideReadOnly('right', settings.readOnlyRight)
+    if (typeof settings.showRuler === 'boolean' && settings.showRuler !== this._showRuler) this.toggleRuler(settings.showRuler)
+    if (typeof settings.showFileInfo === 'boolean' && settings.showFileInfo !== this._showFileInfo) this.toggleFileInfo(settings.showFileInfo)
+    if (typeof settings.showDescription === 'boolean' && settings.showDescription !== this._showDescription) {
+      this.toggleDescription(settings.showDescription)
+      this.setDescription(this._description)
+    }
+    if (settings.detailsMode === null || typeof settings.detailsMode === 'string') {
+      this.setDetailsMode(/** @type {'text'|'hex'|'alignment'|null} */ (settings.detailsMode ?? null))
+    }
+
     if (this._leftContent || this._rightContent) {
       this._runDiff()
     }
@@ -2907,6 +3076,9 @@ ${rows}
 
     // Render visible rows into the spacers
     this._renderVisibleRows();
+
+    // The ruler's width follows the widest line, which a re-render can change.
+    this._updateRuler();
 
     // T03: Re-run find if find bar is open
     if (this._findBar?.style.display !== 'none') {
@@ -3384,6 +3556,9 @@ ${rows}
    */
   _scrollToDiff(idx) {
     if (idx < 0 || idx >= this._diffBlocks.length) return;
+    // Details follow navigation as well as clicks; do this before the DOM
+    // capability checks below so a headless view still tracks the position.
+    this._setCurrentRow(this._diffBlocks[idx].startRow);
     // Navigation is now also driven automatically (go-to-first-difference on
     // load), so it can run before the panes exist or in a DOM that has no
     // scrollTo. Scrolling is a convenience; never let it break the diff.
@@ -3412,6 +3587,7 @@ ${rows}
    */
   _copyBlock(targetSide) {
     if (this._currentDiff < 0 || this._currentDiff >= this._diffBlocks.length) return;
+    if (!this._guardWrite(targetSide)) return;
 
     this._pushUndoSnapshot();
 
@@ -3498,6 +3674,7 @@ ${rows}
     this._contentRight.scrollTop = this._contentLeft.scrollTop;
     this._syncLock = false;
     this._updateMinimapViewport();
+    this._syncRulerScroll();
     this._scheduleVsRender();
   }
 
@@ -3507,6 +3684,7 @@ ${rows}
     this._contentLeft.scrollTop = this._contentRight.scrollTop;
     this._syncLock = false;
     this._updateMinimapViewport();
+    this._syncRulerScroll();
     this._scheduleVsRender();
   }
 
@@ -3537,7 +3715,13 @@ ${rows}
 
     // T43: track last clicked row for bookmark toggle
     const rowEl = target.closest('[data-row-idx]');
-    if (rowEl) this._lastClickedRow = parseInt(rowEl.dataset.rowIdx, 10);
+    if (rowEl) {
+      this._lastClickedRow = parseInt(rowEl.dataset.rowIdx, 10);
+      // P3: the Details panels follow the caret, so the click also decides
+      // which side they describe.
+      const side = this._contentRight?.contains(rowEl) ? 'right' : 'left';
+      this._setCurrentRow(this._lastClickedRow, side);
+    }
 
     const collapsed = target.closest('.diff-line.collapsed');
     if (!collapsed) return;
@@ -3659,6 +3843,60 @@ ${rows}
     items.push({ separator: true });
     items.push({ label: '切換書籤 (Ctrl+F2)', action: () => this._toggleBookmark(this._lastClickedRow ?? 0) });
     items.push({ label: '清除所有書籤', action: () => { this._bookmarks.clear(); this._renderVisibleRows(); } });
+
+    // P2-29: Grammar — the elements the active file format defines, each of
+    // which can be excused from the comparison.
+    const elements = this.getGrammarElements();
+    items.push({ separator: true });
+    const info = this.getGrammarInfo();
+    items.push({
+      label: `文法：${info.left ?? '（無）'}${info.right && info.right !== info.left ? ` / ${info.right}` : ''}`,
+      disabled: true,
+      action: () => {},
+    });
+    if (info.errors.length > 0) {
+      items.push({
+        label: `⚠ 文法有 ${info.errors.length} 項錯誤（點擊查看）`,
+        action: () => toast(info.errors.join('\n'), { type: 'error', durationMs: 8000 }),
+      });
+    }
+    for (const el of elements) {
+      items.push({
+        label: (this._grammarIgnored.has(el) ? '✓ ' : '　') + `忽略「${el}」中的差異`,
+        action: () => {
+          const on = this.toggleGrammarElement(el);
+          toast(on ? `已忽略 ${el} 的差異` : `不再忽略 ${el} 的差異`, { type: 'success' });
+        },
+      });
+    }
+    if (elements.length === 0) {
+      items.push({ label: '（此檔案格式沒有可用的文法）', disabled: true, action: () => {} });
+    }
+
+    // P3: view panels
+    items.push({ separator: true });
+    items.push({ label: (this._detailsMode === 'text' ? '✓ ' : '　') + '詳細資料：文字（可編輯）',
+      action: () => this.setDetailsMode(this._detailsMode === 'text' ? null : 'text') });
+    items.push({ label: (this._detailsMode === 'hex' ? '✓ ' : '　') + '詳細資料：Hex（唯讀）',
+      action: () => this.setDetailsMode(this._detailsMode === 'hex' ? null : 'hex') });
+    items.push({ label: (this._detailsMode === 'alignment' ? '✓ ' : '　') + '詳細資料：對齊決策',
+      action: () => this.setDetailsMode(this._detailsMode === 'alignment' ? null : 'alignment') });
+    items.push({ label: (this._showRuler ? '✓ ' : '　') + '欄位標尺', action: () => this.toggleRuler() });
+    items.push({ label: (this._showFileInfo ? '✓ ' : '　') + '檔案資訊', action: () => this.toggleFileInfo() });
+    items.push({ label: (this._showDescription ? '✓ ' : '　') + '說明欄', action: () => this.toggleDescription() });
+    items.push({
+      label: (this.isSideReadOnly(side) ? '✓ ' : '　') + `鎖定${side === 'left' ? '左' : '右'}側（禁止編輯）`,
+      action: () => {
+        const on = this.setSideReadOnly(side);
+        toast(on ? `${side === 'left' ? '左' : '右'}側已鎖定` : `${side === 'left' ? '左' : '右'}側已解鎖`);
+      },
+    });
+    for (const family of FONT_CHOICES) {
+      items.push({
+        label: (this._fontFamily === family.value ? '✓ ' : '　') + `字型：${family.label}`,
+        action: () => this.setFontFamily(family.value),
+      });
+    }
 
     // T45: Convert File items
     items.push({ separator: true });
@@ -3852,6 +4090,7 @@ ${rows}
    * @param {'trim' | 'tabs-to-spaces' | 'spaces-to-tabs' | 'to-crlf' | 'to-lf' | 'to-cr'} op
    */
   _convertFile(side, op) {
+    if (!this._guardWrite(side)) return;
     const TAB_WIDTH = 4;
 
     /**
@@ -4035,6 +4274,644 @@ ${rows}
     }
     // Gutter canvas must be redrawn after layout changes
     this._drawGutter();
+  }
+
+  // -------------------------------------------------------------------------
+  // P2-29: Grammar
+  // -------------------------------------------------------------------------
+
+  /**
+   * Pick the grammar for each side from its filename.
+   *
+   * A side with no matching format borrows the other's, which is BC's
+   * "Same as left" behaviour and matters when comparing a file against
+   * clipboard text or a patch pane, neither of which has a real extension.
+   */
+  _resolveGrammars() {
+    const left = this._leftPath ? getGrammarForPath(this._leftPath) : null;
+    const right = this._rightPath ? getGrammarForPath(this._rightPath) : null;
+    this._grammarLeft = left ?? right;
+    this._grammarRight = right ?? left;
+  }
+
+  /** Whether anything currently needs grammar tokens. */
+  _grammarNeeded() {
+    return this._grammarIgnored.size > 0 || this._detailsMode === 'alignment';
+  }
+
+  /**
+   * Tokenize both sides. Cheap no-op when nothing needs the result, because
+   * this runs on every re-diff — including the 300 ms debounce while typing.
+   */
+  _computeGrammarTokens() {
+    this._grammarTruncated = false;
+    if (!this._grammarNeeded()) {
+      this._tokensLeft = [];
+      this._tokensRight = [];
+      return;
+    }
+    const run = (grammar, content) => {
+      if (!grammar || !content) return { tokens: [], truncated: false };
+      return tokenizeLines(grammar, content.split('\n'));
+    };
+    const l = run(this._grammarLeft, this._leftContent);
+    const r = run(this._grammarRight, this._rightContent);
+    this._tokensLeft = l.tokens;
+    this._tokensRight = r.tokens;
+    this._grammarTruncated = l.truncated || r.truncated;
+
+    // Hitting the bound means part of the file was never classified, so some
+    // differences that should have been demoted will still read as important.
+    // Say so once per transition rather than swallowing it.
+    if (this._grammarTruncated && !this._grammarTruncationReported) {
+      this._grammarTruncationReported = true;
+      toast('檔案過大或行過長，文法解析已提前停止；部分「忽略元素」可能未生效', {
+        type: 'warn', durationMs: 6000,
+      });
+    } else if (!this._grammarTruncated) {
+      this._grammarTruncationReported = false;
+    }
+  }
+
+  /**
+   * Tokens for one file line (1-based, as DiffLine stores them).
+   * @param {'left'|'right'} side
+   * @param {number|null|undefined} lineNum
+   * @returns {import('../core/grammar.js').GrammarToken[]}
+   */
+  _tokensForLine(side, lineNum) {
+    if (lineNum == null) return [];
+    const arr = side === 'left' ? this._tokensLeft : this._tokensRight;
+    return arr[lineNum - 1] ?? [];
+  }
+
+  /**
+   * Demote differences that live entirely inside ignored grammar elements.
+   *
+   * This is the payoff of the whole grammar system: "ignore differences in
+   * comments" becomes "the two lines are equal once comments are blanked out".
+   * It reuses the existing unimportant/ignoreUnimportant machinery rather than
+   * altering the diff itself, so the user still sees the real text.
+   *
+   * @param {import('../core/diff-engine.js').DiffLine} dl
+   * @returns {boolean} whether the line is unimportant by grammar
+   */
+  _grammarUnimportant(dl) {
+    if (this._grammarIgnored.size === 0) return false;
+    const lt = this._tokensForLine('left', dl.leftLine);
+    const rt = this._tokensForLine('right', dl.rightLine);
+    const lText = (dl.leftText ?? '').replace(/\r?\n$/, '');
+    const rText = (dl.rightText ?? '').replace(/\r?\n$/, '');
+
+    if (dl.type === 'replace') {
+      return linesEqualIgnoringElements(lText, rText, lt, rt, this._grammarIgnored);
+    }
+    // An inserted or deleted line that is nothing but ignored elements (a
+    // comment-only line, say) is likewise not a difference worth flagging.
+    const text = dl.type === 'insert' ? rText : lText;
+    const tokens = dl.type === 'insert' ? rt : lt;
+    if (!text.trim()) return false;
+    return maskLine(text, tokens, this._grammarIgnored).trim() === '';
+  }
+
+  /**
+   * Element names offered by the active grammars.
+   * @returns {string[]}
+   */
+  getGrammarElements() {
+    /** @type {string[]} */
+    const out = [];
+    for (const g of [this._grammarLeft, this._grammarRight]) {
+      for (const el of g?.elements ?? []) if (!out.includes(el)) out.push(el);
+    }
+    return out;
+  }
+
+  /**
+   * @returns {{ left: string|null, right: string|null, ignored: string[], errors: string[], truncated: boolean }}
+   */
+  getGrammarInfo() {
+    const errors = [...(this._grammarLeft?.errors ?? []), ...(this._grammarRight?.errors ?? [])];
+    return {
+      left: this._grammarLeft?.name ?? null,
+      right: this._grammarRight?.name ?? null,
+      ignored: [...this._grammarIgnored],
+      errors: [...new Set(errors)],
+      truncated: this._grammarTruncated,
+    };
+  }
+
+  /**
+   * Replace the set of ignored grammar elements.
+   * @param {string[]|Set<string>} elements
+   */
+  setGrammarIgnore(elements) {
+    this._grammarIgnored = new Set(
+      [...(elements ?? [])].filter(e => typeof e === 'string' && e),
+    );
+    this._runDiff();
+  }
+
+  /**
+   * @param {string} element
+   * @returns {boolean} the resulting state
+   */
+  toggleGrammarElement(element) {
+    if (this._grammarIgnored.has(element)) this._grammarIgnored.delete(element);
+    else this._grammarIgnored.add(element);
+    this._runDiff();
+    return this._grammarIgnored.has(element);
+  }
+
+  /**
+   * Alignment weight for one file line, per the active grammar.
+   * @param {'left'|'right'} side
+   * @param {number|null} lineNum
+   * @returns {number}
+   */
+  getLineWeight(side, lineNum) {
+    if (lineNum == null) return 0;
+    const content = side === 'left' ? this._leftContent : this._rightContent;
+    const text = content.split('\n')[lineNum - 1] ?? '';
+    const grammar = side === 'left' ? this._grammarLeft : this._grammarRight;
+    return lineWeight(text, this._tokensForLine(side, lineNum), grammar);
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.7: Prevent editing (per side)
+  // -------------------------------------------------------------------------
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} the resulting lock state
+   */
+  setSideReadOnly(side, on) {
+    const key = side === 'right' ? 'right' : 'left';
+    this._readOnly[key] = on ?? !this._readOnly[key];
+    const ta = key === 'left' ? this._textareaLeft : this._textareaRight;
+    if (ta) ta.readOnly = this._readOnly[key];
+    this._updateFileInfo();
+    return this._readOnly[key];
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {boolean}
+   */
+  isSideReadOnly(side) {
+    return !!this._readOnly[side === 'right' ? 'right' : 'left'];
+  }
+
+  /**
+   * Refuse a write to a locked side, loudly.
+   * @param {'left'|'right'} side
+   * @returns {boolean} true when the write may proceed
+   */
+  _guardWrite(side) {
+    if (!this.isSideReadOnly(side)) return true;
+    toast(`${side === 'left' ? '左' : '右'}側已鎖定，無法修改`, { type: 'error' });
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // P3: Ruler / File Info / Description / Details panels
+  // -------------------------------------------------------------------------
+
+  /** Container that holds the ruler, file-info and description strips. */
+  _ensureTopStrip() {
+    if (this._topStrip?.isConnected) return this._topStrip;
+    const view = document.getElementById('view-text');
+    const area = document.getElementById('compare-area');
+    if (!view || !area) return null;
+    const strip = document.createElement('div');
+    strip.className = 'tc-top-strip';
+    view.insertBefore(strip, area);
+    this._topStrip = strip;
+    return strip;
+  }
+
+  /**
+   * Column ruler.
+   *
+   * Deliberately a single pre-formatted text node per pane rather than one
+   * element per column: the panes hold tens of thousands of virtual rows and
+   * the ruler must not add DOM that scales with content.
+   *
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean}
+   */
+  toggleRuler(on) {
+    this._showRuler = on ?? !this._showRuler;
+    if (!this._showRuler) {
+      this._rulerEl?.remove();
+      this._rulerEl = null;
+      return false;
+    }
+    const strip = this._ensureTopStrip();
+    if (!strip) return false;
+    const ruler = document.createElement('div');
+    ruler.className = 'tc-ruler';
+    for (const side of ['left', 'right']) {
+      const cell = document.createElement('div');
+      cell.className = 'tc-ruler__cell';
+      const scale = document.createElement('div');
+      scale.className = 'tc-ruler__scale';
+      scale.dataset.side = side;
+      cell.appendChild(scale);
+      ruler.appendChild(cell);
+    }
+    strip.prepend(ruler);
+    this._rulerEl = ruler;
+    this._updateRuler();
+    return true;
+  }
+
+  /** Rebuild the ruler text and re-sync it with horizontal scroll. */
+  _updateRuler() {
+    if (!this._rulerEl) return;
+    const cols = Math.min(2000, Math.max(80, this._maxLineChars + 20));
+    let text = '';
+    for (let c = 1; c <= cols; c++) {
+      if (c % 10 === 0) {
+        const label = String(c);
+        // The label is written ending at this column, so overwrite what the
+        // loop already emitted for the digits it occupies.
+        text = text.slice(0, text.length - (label.length - 1)) + label;
+      } else if (c % 5 === 0) text += '+';
+      else text += '·';
+    }
+    for (const scale of this._rulerEl.querySelectorAll('.tc-ruler__scale')) {
+      scale.textContent = text;
+      const pane = scale.dataset.side === 'left' ? this._contentLeft : this._contentRight;
+      scale.style.transform = `translateX(${-(pane?.scrollLeft ?? 0)}px)`;
+    }
+  }
+
+  /** Keep the ruler aligned during horizontal scrolling. */
+  _syncRulerScroll() {
+    if (!this._rulerEl) return;
+    for (const scale of this._rulerEl.querySelectorAll('.tc-ruler__scale')) {
+      const pane = scale.dataset.side === 'left' ? this._contentLeft : this._contentRight;
+      scale.style.transform = `translateX(${-(pane?.scrollLeft ?? 0)}px)`;
+    }
+  }
+
+  /**
+   * File Info panel (path / size / lines / encoding / EOL / lock state).
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean}
+   */
+  toggleFileInfo(on) {
+    this._showFileInfo = on ?? !this._showFileInfo;
+    if (!this._showFileInfo) {
+      this._infoEl?.remove();
+      this._infoEl = null;
+      return false;
+    }
+    const strip = this._ensureTopStrip();
+    if (!strip) return false;
+    const el = document.createElement('div');
+    el.className = 'tc-fileinfo';
+    strip.appendChild(el);
+    this._infoEl = el;
+    this._updateFileInfo();
+    return true;
+  }
+
+  _updateFileInfo() {
+    if (!this._infoEl) return;
+    const enc = new TextEncoder();
+    /** @param {'left'|'right'} side */
+    const describe = (side) => {
+      const path = side === 'left' ? this._leftPath : this._rightPath;
+      const content = side === 'left' ? this._leftContent : this._rightContent;
+      const label = side === 'left' ? '左' : '右';
+      // The lock is shown even with nothing loaded — a lock the user set and
+      // then cannot see is a lock they will be confused by later.
+      if (!path && !content) {
+        return `${label}：（未載入）${this.isSideReadOnly(side) ? '　🔒 已鎖定' : ''}`;
+      }
+      const bytes = enc.encode(content ?? '').length;
+      const lines = content ? content.split('\n').length : 0;
+      const encoding = side === 'left' ? this._encodingLeft : this._encodingRight;
+      const eol = side === 'left' ? this._eolLeft : this._eolRight;
+      const lock = this.isSideReadOnly(side) ? '　🔒 已鎖定' : '';
+      const grammar = (side === 'left' ? this._grammarLeft : this._grammarRight)?.name ?? '—';
+      return `${side === 'left' ? '左' : '右'}：${path || '（貼上）'}　${formatBytes(bytes)}　${lines} 行　${encoding}　${eol}　文法：${grammar}${lock}`;
+    };
+    this._infoEl.replaceChildren();
+    for (const side of /** @type {Array<'left'|'right'>} */ (['left', 'right'])) {
+      const row = document.createElement('div');
+      row.className = 'tc-fileinfo__row';
+      row.textContent = describe(side);
+      this._infoEl.appendChild(row);
+    }
+  }
+
+  /**
+   * Session description box.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean}
+   */
+  toggleDescription(on) {
+    this._showDescription = on ?? !this._showDescription;
+    if (!this._showDescription) {
+      this._descriptionEl?.remove();
+      this._descriptionEl = null;
+      return false;
+    }
+    const strip = this._ensureTopStrip();
+    if (!strip) return false;
+    const wrap = document.createElement('div');
+    wrap.className = 'tc-description';
+    const label = document.createElement('label');
+    label.className = 'tc-description__label';
+    label.textContent = '說明：';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'tc-description__input';
+    input.placeholder = '這次比對的說明（會存入設定與報表）';
+    input.value = this._description;
+    label.appendChild(input);
+    wrap.appendChild(label);
+    strip.appendChild(wrap);
+    this._on(input, 'input', () => { this._description = input.value; });
+    this._descriptionEl = wrap;
+    return true;
+  }
+
+  /** @param {string} text */
+  setDescription(text) {
+    this._description = typeof text === 'string' ? text : '';
+    const input = this._descriptionEl?.querySelector('.tc-description__input');
+    if (input) input.value = this._description;
+  }
+
+  /** @returns {string} */
+  getDescription() { return this._description; }
+
+  /**
+   * Display font family for both panes.
+   *
+   * @param {string} family '' restores the stylesheet default
+   */
+  setFontFamily(family) {
+    this._fontFamily = typeof family === 'string' ? family : '';
+    const target = this._compareArea;
+    if (!target) return;
+    if (this._fontFamily) target.style.setProperty('--mono-font-family', this._fontFamily);
+    else target.style.removeProperty('--mono-font-family');
+  }
+
+  /** @returns {string} */
+  getFontFamily() { return this._fontFamily; }
+
+  /**
+   * Show one of the three Details panels, or hide them.
+   *
+   * The panel renders exactly one row's worth of content, so it costs the same
+   * whether the file has ten lines or a hundred thousand — the virtual scroll
+   * above it is untouched.
+   *
+   * @param {'text'|'hex'|'alignment'|null} mode
+   * @returns {'text'|'hex'|'alignment'|null}
+   */
+  setDetailsMode(mode) {
+    const valid = mode === 'text' || mode === 'hex' || mode === 'alignment' ? mode : null;
+    const needTokensBefore = this._grammarNeeded();
+    this._detailsMode = valid;
+
+    if (!valid) {
+      this._detailsEl?.remove();
+      this._detailsEl = null;
+      this._detailsBody = null;
+      return null;
+    }
+
+    if (!this._detailsEl?.isConnected) {
+      const view = document.getElementById('view-text');
+      if (!view) { this._detailsMode = null; return null; }
+      const panel = document.createElement('div');
+      panel.className = 'tc-details';
+
+      const tabs = document.createElement('div');
+      tabs.className = 'tc-details__tabs';
+      for (const [key, label] of [['text', '文字'], ['hex', 'Hex'], ['alignment', '對齊']]) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'tc-details__tab';
+        btn.dataset.mode = key;
+        btn.textContent = label;
+        this._on(btn, 'click', () => this.setDetailsMode(/** @type {'text'|'hex'|'alignment'} */ (key)));
+        tabs.appendChild(btn);
+      }
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'tc-details__close';
+      close.textContent = '✕';
+      this._on(close, 'click', () => this.setDetailsMode(null));
+      tabs.appendChild(close);
+
+      const body = document.createElement('div');
+      body.className = 'tc-details__body';
+
+      panel.append(tabs, body);
+      view.appendChild(panel);
+      this._detailsEl = panel;
+      this._detailsBody = body;
+    }
+
+    for (const btn of this._detailsEl.querySelectorAll('.tc-details__tab')) {
+      btn.classList.toggle('active', btn.dataset.mode === valid);
+    }
+
+    // Alignment details need tokens that were not being produced before.
+    if (!needTokensBefore && this._grammarNeeded()) {
+      this._computeGrammarTokens();
+    }
+    this._updateDetails();
+    return valid;
+  }
+
+  /** @returns {'text'|'hex'|'alignment'|null} */
+  getDetailsMode() { return this._detailsMode; }
+
+  /**
+   * The DiffLine the Details panels currently describe.
+   * @returns {import('../core/diff-engine.js').DiffLine|null}
+   */
+  _currentDiffLine() {
+    const row = this._rows[this._currentRowIdx];
+    return row && row.kind === 'line' ? row.diffLine : null;
+  }
+
+  /** Repaint whichever Details panel is open. */
+  _updateDetails() {
+    if (!this._detailsMode || !this._detailsBody) return;
+    const dl = this._currentDiffLine();
+    this._detailsBody.replaceChildren();
+
+    if (!dl) {
+      const hint = document.createElement('div');
+      hint.className = 'tc-details__hint';
+      hint.textContent = '點選任一行以顯示詳細資料。';
+      this._detailsBody.appendChild(hint);
+      return;
+    }
+
+    if (this._detailsMode === 'text') this._renderTextDetails(dl);
+    else if (this._detailsMode === 'hex') this._renderHexDetails(dl);
+    else this._renderAlignmentDetails(dl);
+  }
+
+  /**
+   * Text Details — editable, writes the edited line straight back.
+   * @param {import('../core/diff-engine.js').DiffLine} dl
+   */
+  _renderTextDetails(dl) {
+    const side = this._currentSide;
+    const lineNum = side === 'left' ? dl.leftLine : dl.rightLine;
+    const raw = (side === 'left' ? dl.leftText : dl.rightText) ?? '';
+
+    const head = document.createElement('div');
+    head.className = 'tc-details__head';
+    head.textContent = lineNum == null
+      ? `${side === 'left' ? '左' : '右'}側：此行不存在（對側新增）`
+      : `${side === 'left' ? '左' : '右'}側 第 ${lineNum} 行`;
+
+    const ta = document.createElement('textarea');
+    ta.className = 'tc-details__text';
+    ta.spellcheck = false;
+    ta.value = raw.replace(/\r?\n$/, '');
+    const locked = lineNum == null || this.isSideReadOnly(side);
+    ta.readOnly = locked;
+    if (locked) ta.title = lineNum == null ? '此側沒有對應的行' : '此側已鎖定';
+
+    const apply = document.createElement('button');
+    apply.type = 'button';
+    apply.className = 'tc-details__apply';
+    apply.textContent = '套用';
+    apply.disabled = locked;
+    this._on(apply, 'click', () => {
+      if (lineNum == null) return;
+      if (!this._guardWrite(side)) return;
+      this._pushUndoSnapshot();
+      const key = side === 'left' ? '_leftContent' : '_rightContent';
+      // _spliceLine replaces the line *including* its terminator, so the
+      // original one has to be carried over or the next line gets glued on.
+      const eol = /\r?\n$/.exec(raw)?.[0] ?? '';
+      this[key] = _spliceLine(this[key], lineNum - 1, ta.value + eol);
+      this._modified[side] = true;
+      this._updateModifiedIndicator();
+      this._runDiff();
+    });
+
+    this._detailsBody.append(head, ta, apply);
+  }
+
+  /**
+   * Hex Details — read-only byte view of the current line.
+   * @param {import('../core/diff-engine.js').DiffLine} dl
+   */
+  _renderHexDetails(dl) {
+    const side = this._currentSide;
+    const raw = ((side === 'left' ? dl.leftText : dl.rightText) ?? '').replace(/\r?\n$/, '');
+    const bytes = new TextEncoder().encode(raw);
+
+    const head = document.createElement('div');
+    head.className = 'tc-details__head';
+    const lineNum = side === 'left' ? dl.leftLine : dl.rightLine;
+    head.textContent = `${side === 'left' ? '左' : '右'}側 第 ${lineNum ?? '—'} 行　${bytes.length} 位元組（UTF-8）`;
+
+    const pre = document.createElement('pre');
+    pre.className = 'tc-details__hex';
+    // One line's bytes only — capped so a pathological single line cannot
+    // build a giant DOM node here either.
+    const LIMIT = 4096;
+    const shown = bytes.subarray(0, LIMIT);
+    const rows = [];
+    for (let off = 0; off < shown.length; off += 16) {
+      const chunk = shown.subarray(off, off + 16);
+      const hex = [...chunk].map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(47, ' ');
+      const ascii = [...chunk].map(b => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join('');
+      rows.push(`${off.toString(16).padStart(8, '0')}  ${hex}  |${ascii}|`);
+    }
+    if (bytes.length > LIMIT) rows.push(`… 其餘 ${bytes.length - LIMIT} 位元組未顯示`);
+    pre.textContent = rows.join('\n') || '(空行)';
+
+    this._detailsBody.append(head, pre);
+  }
+
+  /**
+   * Alignment Details — why these two lines were paired.
+   * @param {import('../core/diff-engine.js').DiffLine} dl
+   */
+  _renderAlignmentDetails(dl) {
+    const lText = (dl.leftText ?? '').replace(/\r?\n$/, '');
+    const rText = (dl.rightText ?? '').replace(/\r?\n$/, '');
+    const lTok = this._tokensForLine('left', dl.leftLine);
+    const rTok = this._tokensForLine('right', dl.rightLine);
+
+    const TYPE_LABEL = {
+      equal: '相同 — 兩行內容一致，直接配對',
+      replace: '變更 — 演算法認為這兩行互相對應',
+      insert: '僅右側 — 左側沒有可配對的行',
+      delete: '僅左側 — 右側沒有可配對的行',
+    };
+
+    /** Rough similarity, the same signal the algorithm optimises for. */
+    const similarity = () => {
+      if (!lText && !rText) return 1;
+      const a = lText, b = rText;
+      const shorter = a.length < b.length ? a : b;
+      const longer = a.length < b.length ? b : a;
+      if (longer.length === 0) return 1;
+      let same = 0;
+      for (let i = 0; i < shorter.length; i++) if (a[i] === b[i]) same++;
+      return same / longer.length;
+    };
+
+    const rows = [
+      ['對齊結果', TYPE_LABEL[dl.type] ?? dl.type],
+      ['演算法', this._opts.algorithm],
+      ['左行號 / 右行號', `${dl.leftLine ?? '—'} / ${dl.rightLine ?? '—'}`],
+      ['行權重（左 / 右）', `${this.getLineWeight('left', dl.leftLine).toFixed(1)} / ${this.getLineWeight('right', dl.rightLine).toFixed(1)}`],
+      ['字元相似度', `${Math.round(similarity() * 100)} %`],
+      ['文法元素（左）', elementsOf(lTok).join('、') || '—'],
+      ['文法元素（右）', elementsOf(rTok).join('、') || '—'],
+      ['忽略中的元素', [...this._grammarIgnored].join('、') || '（無）'],
+      ['忽略元素後是否相同', this._grammarIgnored.size === 0
+        ? '（未啟用）'
+        : (linesEqualIgnoringElements(lText, rText, lTok, rTok, this._grammarIgnored) ? '是' : '否')],
+      ['判定', dl.manualIgnored ? '手動標記為忽略' : (dl.unimportant ? '不重要差異（藍色）' : (dl.type === 'equal' ? '相同' : '重要差異（紅色）'))],
+    ];
+
+    if (this._grammarTruncated) {
+      rows.push(['注意', '檔案過大或行過長，文法解析已提前停止，元素資訊可能不完整']);
+    }
+
+    const table = document.createElement('dl');
+    table.className = 'tc-details__align';
+    for (const [k, v] of rows) {
+      const dt = document.createElement('dt');
+      dt.textContent = k;
+      const dd = document.createElement('dd');
+      dd.textContent = String(v);
+      table.append(dt, dd);
+    }
+    this._detailsBody.appendChild(table);
+  }
+
+  /**
+   * Remember which row/side the user is on and refresh the Details panels.
+   * @param {number} rowIdx
+   * @param {'left'|'right'} [side]
+   */
+  _setCurrentRow(rowIdx, side) {
+    if (Number.isInteger(rowIdx) && rowIdx >= 0) this._currentRowIdx = rowIdx;
+    if (side === 'left' || side === 'right') this._currentSide = side;
+    this._updateDetails();
   }
 
   // -------------------------------------------------------------------------

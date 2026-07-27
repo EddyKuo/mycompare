@@ -31,6 +31,23 @@ beforeEach(() => {
   localStorage.clear()
 })
 
+/**
+ * Defaults added to the text snapshot by P2-29 (grammar) and P3 (panels).
+ * Kept here so the round-trip assertions stay exhaustive rather than partial.
+ */
+const TEXT_CONFIG_DEFAULTS = {
+  grammarIgnore: [],
+  userGrammars: [],
+  description: '',
+  fontFamily: '',
+  showRuler: false,
+  showFileInfo: false,
+  showDescription: false,
+  detailsMode: null,
+  readOnlyLeft: false,
+  readOnlyRight: false,
+}
+
 // ── T61 NamedConfigStore CRUD ────────────────────────────────────────────────
 
 describe('T61 NamedConfigStore', () => {
@@ -136,6 +153,8 @@ describe('T61 TextCompare config snapshot', () => {
       // P2-30: manual ignore marks travel with the snapshot.
       manualIgnoreLeft: [],
       manualIgnoreRight: [],
+      // P2-29 / P3: grammar + panel state travel with it too.
+      ...TEXT_CONFIG_DEFAULTS,
     })
   })
 
@@ -156,6 +175,7 @@ describe('T61 TextCompare config snapshot', () => {
     expect(tc.getConfig()).toEqual({
       __v: 1, __view: 'text', ...snapshot,
       manualIgnoreLeft: [], manualIgnoreRight: [],
+      ...TEXT_CONFIG_DEFAULTS,
     })
   })
 

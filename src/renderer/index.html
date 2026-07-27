@@ -316,6 +316,25 @@
     </div>
   </div>
 
+  <!-- View picker: used both by Smart Routing when an extension has more than
+       one sensible reading (.html → text or table) and by Session ▸ 以其他方式
+       比對，so the user is asked rather than guessed at. -->
+  <div id="view-picker-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="view-picker-title" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="view-picker-title">選擇比對方式</h3>
+        <button id="btn-view-picker-close" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="view-picker-desc" class="settings-hint"></div>
+        <div id="view-picker-list" class="report-actions"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-view-picker-cancel">取消</button>
+      </div>
+    </div>
+  </div>
+
   <!-- P2-24: unified Options dialog (Tools ▸ Options), tabbed like BC's. -->
   <div id="settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" style="display:none">
     <div class="modal-box modal-box--options">
