@@ -51,11 +51,99 @@ function _arraysEqual(a, b) {
 }
 
 /**
- * @typedef {{ type: 'normal', lines: string[] }} NormalSegment
+ * @typedef {'same'|'left'|'right'|'both'} NormalSegmentKind
+ * @typedef {{ type: 'normal', lines: string[], kind?: NormalSegmentKind }} NormalSegment
  * @typedef {{ type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[], baseStart?: number }} ConflictSegment
  * @typedef {NormalSegment | ConflictSegment} MergeSegment
  * @typedef {'left'|'right'|'base'|'both'} ConflictChoice
  */
+
+/**
+ * How a segment relates to the base, which is the only thing the display
+ * filters below need to know about it.
+ *
+ * @typedef {NormalSegmentKind|'conflict'} SegmentKind
+ */
+
+/**
+ * The BC display filter set.
+ *
+ * @typedef {'all'|'changes'|'left-changes'|'right-changes'|'conflicts'
+ *   |'mergeable'|'unchanged'|'same'|'none'} ShowFilterMode
+ */
+
+/**
+ * Modes in menu order. Exported so a caller can build its own picker without
+ * duplicating the list — and so a test can assert none was forgotten.
+ *
+ * @type {ShowFilterMode[]}
+ */
+export const SHOW_FILTER_MODES = [
+  'all', 'changes', 'left-changes', 'right-changes',
+  'conflicts', 'mergeable', 'unchanged', 'same', 'none',
+]
+
+/** @type {Record<ShowFilterMode, string>} */
+const SHOW_FILTER_LABELS = {
+  all: '全部',
+  changes: '差異',
+  'left-changes': '左側變更',
+  'right-changes': '右側變更',
+  conflicts: '僅衝突',
+  mergeable: '可自動合併',
+  unchanged: '未變更',
+  same: '左右相同',
+  none: '無',
+}
+
+/**
+ * @param {unknown} mode
+ * @returns {mode is ShowFilterMode}
+ */
+export function isShowFilterMode(mode) {
+  return typeof mode === 'string' && SHOW_FILTER_MODES.includes(/** @type {ShowFilterMode} */ (mode))
+}
+
+/**
+ * Classify one segment.
+ *
+ * A normal segment written before kinds existed (or by a test fixture) carries
+ * no `kind`; treating it as unchanged keeps the old two-mode behaviour intact.
+ *
+ * @param {MergeSegment} seg
+ * @returns {SegmentKind}
+ */
+export function segmentKind(seg) {
+  if (!seg) return 'same'
+  if (seg.type === 'conflict') return 'conflict'
+  return seg.kind ?? 'same'
+}
+
+/**
+ * Whether a segment survives one display filter.
+ *
+ * `unchanged` and `same` differ on segments where both sides made the *same*
+ * edit: they changed relative to base (so they are not unchanged) but left and
+ * right agree (so they are the same as each other).
+ *
+ * @param {MergeSegment} seg
+ * @param {ShowFilterMode} mode
+ * @returns {boolean}
+ */
+export function segmentMatchesFilter(seg, mode) {
+  const kind = segmentKind(seg)
+  switch (mode) {
+    case 'none':          return false
+    case 'changes':       return kind !== 'same'
+    case 'left-changes':  return kind === 'left' || kind === 'both' || kind === 'conflict'
+    case 'right-changes': return kind === 'right' || kind === 'both' || kind === 'conflict'
+    case 'conflicts':     return kind === 'conflict'
+    case 'mergeable':     return kind === 'left' || kind === 'right' || kind === 'both'
+    case 'unchanged':     return kind === 'same'
+    case 'same':          return kind === 'same' || kind === 'both'
+    default:              return true
+  }
+}
 
 // ---------------------------------------------------------------------------
 // S16-M01: conflict navigation / filtering / output assembly (pure, testable)
@@ -122,6 +210,27 @@ export function filterSegmentsForConflicts(segments, contextLines = CONFLICT_CON
 }
 
 /**
+ * The segments one display filter leaves visible.
+ *
+ * Filtering happens here, on the data, and never in CSS: the panes are
+ * virtualised, so a hidden row would still occupy its slot in the spacer
+ * height and push every following row out of place.
+ *
+ * @param {MergeSegment[]} segments
+ * @param {ShowFilterMode} mode
+ * @param {number} [contextLines] only used by the 'conflicts' mode
+ * @returns {MergeSegment[]}
+ */
+export function filterSegments(segments, mode, contextLines = CONFLICT_CONTEXT_LINES) {
+  const src = segments || []
+  if (mode === 'all') return src
+  if (mode === 'none') return []
+  // Conflicts keep surrounding context; a conflict with no lead-in is unreadable.
+  if (mode === 'conflicts') return filterSegmentsForConflicts(src, contextLines)
+  return src.filter((seg) => segmentMatchesFilter(seg, mode))
+}
+
+/**
  * Assemble the merged text from segments and the current choices.
  * Unresolved conflicts keep their `<<<` markers so nothing is silently lost.
  *
@@ -154,15 +263,18 @@ export function buildMergedText(segments, choices) {
  *
  * @param {MergeSegment[]} segments
  * @param {number} conflictId
- * @param {'all'|'conflicts'} [showFilter]
+ * @param {ShowFilterMode} [showFilter]
  * @returns {number} row index, or -1 when the conflict is not present
  */
 export function conflictPaneRow(segments, conflictId, showFilter = 'all') {
   const src = segments || []
 
-  if (showFilter === 'conflicts') {
+  if (showFilter !== 'all') {
+    // In every filtered mode the row index has to be counted, because the rows
+    // before the conflict are no longer the base lines before it. A conflict
+    // the filter drops reports -1, so navigation leaves the scroll alone.
     let row = 0
-    for (const seg of filterSegmentsForConflicts(src)) {
+    for (const seg of filterSegments(src, showFilter)) {
       if (seg.type === 'conflict') {
         if (seg.id === conflictId) return row
         row += seg.baseLines.length
@@ -222,8 +334,18 @@ const VIEWPORT_HEIGHT_FALLBACK = 600
 const OUTPUT_PREVIEW_MAX_LINES = 200
 
 /**
- * @typedef {{ type: 'equal'|'insert'|'delete'|'replace'|'conflict', lineNum: number|null, text: string }} PaneRow
+ * @typedef {{
+ *   type: 'equal'|'insert'|'delete'|'replace'|'conflict'|'left'|'right'|'both',
+ *   lineNum: number|null,
+ *   text: string
+ * }} PaneRow
  */
+
+/**
+ * Row type used for each normal-segment kind in the filtered modes.
+ * @type {Record<NormalSegmentKind, PaneRow['type']>}
+ */
+const KIND_ROW_TYPE = { same: 'equal', left: 'left', right: 'right', both: 'both' }
 
 /**
  * Half-open row range `[start, end)` that has to exist in the DOM.
@@ -291,7 +413,7 @@ export function diffToPaneRows(diff) {
  *
  * @param {'left'|'base'|'right'} side
  * @param {{
- *   showFilter?: 'all'|'conflicts',
+ *   showFilter?: ShowFilterMode,
  *   segments?: MergeSegment[],
  *   content?: string,
  *   diff?: import('../core/diff-engine.js').DiffLine[]|null,
@@ -301,14 +423,20 @@ export function diffToPaneRows(diff) {
 export function buildPaneRows(side, opts = {}) {
   const { showFilter = 'all', segments = [], content = '', diff = null } = opts
 
-  if (showFilter === 'conflicts') {
-    // Line numbers are omitted: filtered output is not contiguous.
-    return segmentsToPaneLines(segments ? filterSegmentsForConflicts(segments) : [], side)
-      .map(({ text, conflict }) => ({
-        type: /** @type {PaneRow['type']} */ (conflict ? 'conflict' : 'equal'),
-        lineNum: null,
-        text,
-      }))
+  if (showFilter !== 'all') {
+    const key = /** @type {'leftLines'|'baseLines'|'rightLines'} */ (`${side}Lines`)
+    /** @type {PaneRow[]} */
+    const rows = []
+    for (const seg of filterSegments(segments || [], showFilter)) {
+      // Line numbers are omitted: filtered output is not contiguous.
+      if (seg.type === 'conflict') {
+        for (const text of seg[key]) rows.push({ type: 'conflict', lineNum: null, text })
+      } else {
+        const type = KIND_ROW_TYPE[seg.kind ?? 'same'] ?? 'equal'
+        for (const text of seg.lines) rows.push({ type, lineNum: null, text })
+      }
+    }
+    return rows
   }
 
   if (!diff) {
@@ -406,7 +534,7 @@ export class ThreeWayCompare {
     /** @type {boolean} set by setSide, consumed after the next merge */
     this._pendingFirstDiff = false
 
-    /** @type {'all'|'conflicts'} */
+    /** @type {ShowFilterMode} */
     this._showFilter = 'all'
 
     /** Full row lists per pane; only a window of these reaches the DOM. */
@@ -489,19 +617,39 @@ export class ThreeWayCompare {
   }
 
   /**
-   * Restrict the side panes to conflicts (plus context) or show everything.
-   * @param {'all'|'conflicts'} mode
+   * Restrict the side panes to one class of segment, or show everything.
+   * An unknown mode is ignored rather than blanking the panes.
+   *
+   * @param {ShowFilterMode} mode
    */
   setShowFilter(mode) {
-    if (mode !== 'all' && mode !== 'conflicts') return
+    if (!isShowFilterMode(mode)) return
     this._showFilter = mode
     this._renderSides()
     this._updateFilterButton()
   }
 
-  /** @returns {'all'|'conflicts'} */
+  /** @returns {ShowFilterMode} */
   getShowFilter() {
     return this._showFilter
+  }
+
+  /**
+   * Choose the line-alignment algorithm the base→left and base→right diffs
+   * use. Changing it changes which hunks overlap, so the merge is redone.
+   *
+   * @param {'myers'|'patience'|'histogram'} algorithm
+   */
+  setAlgorithm(algorithm) {
+    if (algorithm !== 'myers' && algorithm !== 'patience' && algorithm !== 'histogram') return
+    if (algorithm === this._algorithm) return
+    this._algorithm = algorithm
+    this._runMerge()
+  }
+
+  /** @returns {'myers'|'patience'|'histogram'} */
+  getAlgorithm() {
+    return this._algorithm
   }
 
   /**
@@ -761,7 +909,9 @@ ${body}
     const c = readConfig('merge3', cfg)
     if (!c) return
 
-    if (c.showFilter === 'all' || c.showFilter === 'conflicts') this._showFilter = c.showFilter
+    // Snapshots written before the filter set grew only ever held 'all' or
+    // 'conflicts', both of which are still valid members of the wider set.
+    if (isShowFilterMode(c.showFilter)) this._showFilter = c.showFilter
     if (c.algorithm === 'myers' || c.algorithm === 'patience' || c.algorithm === 'histogram') {
       this._algorithm = c.algorithm
     }
@@ -851,6 +1001,17 @@ ${body}
           <span class="mw-conflict-counter">無衝突</span>
           <span class="mw-toolbar-sep"></span>
           <button class="mw-btn-filter" title="只顯示衝突段落">顯示：全部</button>
+          <select class="mw-filter-select" title="顯示篩選">
+            ${SHOW_FILTER_MODES.map((m) => `<option value="${m}">${SHOW_FILTER_LABELS[m]}</option>`).join('')}
+          </select>
+          <span class="mw-toolbar-sep"></span>
+          <label class="mw-algo-label">對齊
+            <select class="mw-algo-select" title="對齊演算法">
+              <option value="myers">Myers</option>
+              <option value="patience">Patience</option>
+              <option value="histogram">Histogram</option>
+            </select>
+          </label>
           <span class="mw-toolbar-sep"></span>
           <button class="mw-btn-all-left">全部採用左側</button>
           <button class="mw-btn-all-right">全部採用右側</button>
@@ -995,8 +1156,18 @@ ${body}
     // S16-M01: conflict navigation / filter / batch resolve toolbar
     this._q('.mw-btn-prev')?.addEventListener('click', () => this.prevConflict())
     this._q('.mw-btn-next')?.addEventListener('click', () => this.nextConflict())
+    // The button stays a one-click "just the conflicts" toggle; the select
+    // beside it reaches the rest of the modes.
     this._q('.mw-btn-filter')?.addEventListener('click', () => {
       this.setShowFilter(this._showFilter === 'all' ? 'conflicts' : 'all')
+    })
+    const filterSelect = /** @type {HTMLSelectElement|null} */ (this._q('.mw-filter-select'))
+    filterSelect?.addEventListener('change', () => {
+      this.setShowFilter(/** @type {ShowFilterMode} */ (filterSelect.value))
+    })
+    const algoSelect = /** @type {HTMLSelectElement|null} */ (this._q('.mw-algo-select'))
+    algoSelect?.addEventListener('change', () => {
+      this.setAlgorithm(/** @type {'myers'|'patience'|'histogram'} */ (algoSelect.value))
     })
     this._q('.mw-btn-all-left')?.addEventListener('click', () => this.resolveAll('left'))
     this._q('.mw-btn-all-right')?.addEventListener('click', () => this.resolveAll('right'))
@@ -1173,9 +1344,18 @@ ${body}
 
   _updateFilterButton() {
     const btn = this._q('.mw-btn-filter')
-    if (!btn) return
-    btn.textContent = this._showFilter === 'conflicts' ? '顯示：僅衝突' : '顯示：全部'
-    btn.classList.toggle('active', this._showFilter === 'conflicts')
+    if (btn) {
+      btn.textContent = `顯示：${SHOW_FILTER_LABELS[this._showFilter]}`
+      btn.classList.toggle('active', this._showFilter !== 'all')
+    }
+    const select = /** @type {HTMLSelectElement|null} */ (this._q('.mw-filter-select'))
+    if (select && select.value !== this._showFilter) select.value = this._showFilter
+  }
+
+  /** Keep the algorithm picker in step with a change made through the API. */
+  _updateAlgoSelect() {
+    const select = /** @type {HTMLSelectElement|null} */ (this._q('.mw-algo-select'))
+    if (select && select.value !== this._algorithm) select.value = this._algorithm
   }
 
   /**
@@ -1232,6 +1412,7 @@ ${body}
     this._renderOutputPane()
     this._updateConflictCounter()
     this._updateFilterButton()
+    this._updateAlgoSelect()
     this._consumePendingFirstDiff()
 
     this._emit('ready', { hasConflicts })
@@ -1337,10 +1518,7 @@ ${body}
    * @returns {{
    *   leftDiff: import('../core/diff-engine.js').DiffLine[],
    *   rightDiff: import('../core/diff-engine.js').DiffLine[],
-   *   segments: Array<
-   *     { type: 'normal', lines: string[] } |
-   *     { type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[] }
-   *   >,
+   *   segments: MergeSegment[],
    *   hasConflicts: boolean
    * }}
    */
@@ -1361,7 +1539,7 @@ ${body}
     const leftHunks  = _buildHunks(leftDiff)
     const rightHunks = _buildHunks(rightDiff)
 
-    /** @type {Array<{ type: 'normal', lines: string[] } | { type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[] }>} */
+    /** @type {MergeSegment[]} */
     const segments = []
     let hasConflicts = false
     let conflictId = 0
@@ -1370,7 +1548,8 @@ ${body}
     let pendingNormal = []
     const flushNormal = () => {
       if (pendingNormal.length > 0) {
-        segments.push({ type: 'normal', lines: pendingNormal })
+        // Runs of base lines neither side touched.
+        segments.push({ type: 'normal', lines: pendingNormal, kind: 'same' })
         pendingNormal = []
       }
     }
@@ -1395,8 +1574,13 @@ ${body}
         const leftLines  = lh ? lh.newLines : baseSlice
         const rightLines = rh ? rh.newLines : baseSlice
         if (_arraysEqual(leftLines, rightLines)) {
-          // Both sides made the identical edit — not a real conflict.
-          segments.push({ type: 'normal', lines: leftLines })
+          // Both sides made the identical edit — not a real conflict. It is
+          // still a change unless the "edit" happens to reproduce the base.
+          segments.push({
+            type: 'normal',
+            lines: leftLines,
+            kind: _arraysEqual(leftLines, baseSlice) ? 'same' : 'both',
+          })
         } else {
           hasConflicts = true
           segments.push({
@@ -1413,12 +1597,12 @@ ${body}
         if (rh && rh.baseStart < endBase) ri++
       } else if (lhAt) {
         flushNormal()
-        segments.push({ type: 'normal', lines: lh.newLines })
+        segments.push({ type: 'normal', lines: lh.newLines, kind: 'left' })
         i = lh.baseEnd
         li++
       } else if (rhAt) {
         flushNormal()
-        segments.push({ type: 'normal', lines: rh.newLines })
+        segments.push({ type: 'normal', lines: rh.newLines, kind: 'right' })
         i = rh.baseEnd
         ri++
       } else if (i < baseLines.length) {

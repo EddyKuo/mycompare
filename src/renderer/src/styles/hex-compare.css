@@ -407,6 +407,67 @@
   font-weight: bold;
 }
 
+/* ── Byte editing (P2-22) ───────────────────────────────────────────────────── */
+
+.hx-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 6px;
+}
+
+.hx-toolbar .hx-btn-edit {
+  padding: 3px 8px;
+}
+
+.hx-toolbar .hx-btn-edit:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hx-toolbar .hx-btn-edit.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+.hx-dirty-info {
+  font-size: 11px;
+  color: #9c27b0;
+  font-weight: 600;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+/* Modified bytes use a hue no diff state uses (purple + a solid underline), so
+   "I changed this" stays readable on top of red / green / orange diff fills. */
+.hx-byte.hx-modified,
+.hx-ascii-char.hx-modified {
+  background: rgba(156, 39, 176, 0.28);
+  box-shadow: inset 0 -2px 0 0 #9c27b0;
+  font-weight: bold;
+}
+
+/* The edit caret. hx-cursor-n1 means the high nibble is already typed. */
+.hx-byte.hx-cursor,
+.hx-ascii-char.hx-cursor {
+  outline: 2px solid #9c27b0;
+  outline-offset: -1px;
+}
+
+.hx-byte.hx-cursor-n1 {
+  background: rgba(156, 39, 176, 0.45);
+}
+
+.hex-compare.hx-editing .hx-scroll {
+  cursor: text;
+}
+
+.hex-compare.hx-editing .hx-scroll:focus-visible {
+  outline: 1px solid var(--accent, #4a90d9);
+  outline-offset: -1px;
+}
+
 /* ── Selected byte highlight (T27) ──────────────────────────────────────────── */
 
 .hx-byte.hx-selected,

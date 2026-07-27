@@ -132,6 +132,25 @@ function createWindow() {
     }
   })
 
+  // A renderer that cancels beforeunload makes the window unclosable unless
+  // main answers this event — the window would simply refuse to close with no
+  // dialog and no explanation. So the renderer may only raise the question;
+  // the decision is taken here, and defaults to staying open.
+  win.webContents.on('will-prevent-unload', (event) => {
+    const { response } = dialog.showMessageBoxSync
+      ? { response: dialog.showMessageBoxSync(win, {
+        type: 'warning',
+        buttons: ['取消', '放棄變更並關閉'],
+        defaultId: 0,
+        cancelId: 0,
+        title: '尚有未儲存的變更',
+        message: '有編輯過的內容還沒有儲存。',
+        detail: '關閉後這些變更就會遺失。',
+      }) }
+      : { response: 0 }
+    if (response === 1) event.preventDefault() // proceed with the unload
+  })
+
   // S12-W: Close all file watchers owned by this window when it goes away.
   win.on('closed', () => {
     for (const w of _fileWatchers.values()) {

@@ -150,6 +150,49 @@ test('衝突導航把遠處的衝突捲進可見範圍', async () => {
   expect(await visible()).toBe(true)
 })
 
+test('八種顯示篩選在生產版本下都只渲染可見列', async () => {
+  await goToMerge(win)
+  // A document carrying one of every segment kind, so no mode is trivially
+  // empty: left-only, right-only, identical-on-both and conflicting edits.
+  await win.evaluate((n) => {
+    const make = (role) => Array.from({ length: n }, (_, i) => {
+      const slot = i % 400
+      if (i > 0 && slot === 0) return role === 'base' ? `line${i}` : `${role}c${i}`
+      if (slot === 100) return role === 'left' ? `Lonly${i}` : `line${i}`
+      if (slot === 200) return role === 'right' ? `Ronly${i}` : `line${i}`
+      if (slot === 300) return role === 'base' ? `line${i}` : `Xboth${i}`
+      return `line${i}`
+    }).join('\n')
+    window.__testAPI.mergeSetAll(make('left'), make('base'), make('right'))
+  }, BIG_LINES)
+
+  const modes = ['all', 'changes', 'left-changes', 'right-changes',
+    'conflicts', 'mergeable', 'unchanged', 'same', 'none']
+
+  for (const mode of modes) {
+    await win.locator('#view-merge3 .mw-filter-select').selectOption(mode)
+
+    const counts = await win.evaluate(() =>
+      ['left', 'base', 'right'].map((side) =>
+        document.querySelectorAll(`#view-merge3 .mw-content-${side} .mw-line`).length))
+    for (const c of counts) expect(c).toBeLessThan(200)
+    if (mode === 'none') expect(counts).toEqual([0, 0, 0])
+    else expect(counts[0]).toBeGreaterThan(0)
+  }
+
+  await win.locator('#view-merge3 .mw-filter-select').selectOption('all')
+})
+
+test('對齊演算法可切換，且合併仍然成立', async () => {
+  await goToMerge(win)
+  await loadBig(win, 500, 200)
+
+  for (const algorithm of ['patience', 'histogram', 'myers']) {
+    await win.locator('#view-merge3 .mw-algo-select').selectOption(algorithm)
+    expect(await win.evaluate(() => window.__testAPI.mergeGetConflictCount())).toBe(1)
+  }
+})
+
 test('批次解決把輸出寫滿，且不留衝突標記', async () => {
   await goToMerge(win)
   await loadBig(win, 500, 200)

@@ -40,6 +40,12 @@ const MAX_BYTES  = 10_485_760    // 10 MB
  */
 const HEX_COMPLETE_MAX_D = 4096
 
+/** P2-22: cap on the undo and redo stacks (each). */
+const MAX_UNDO_STACK = 500
+
+/** P2-22: how long re-colouring waits after the last keystroke, in ms. */
+const EDIT_REFLOW_MS = 120
+
 // S14-M10: rAF throttle — coalesce calls to the next animation frame.
 function _rafThrottle(fn) {
   let scheduled = false
@@ -280,6 +286,224 @@ export function searchHexBytes(haystack, needle) {
   return results
 }
 
+// ── P2-22: byte-level editing primitives (pure, exported for unit testing) ────
+
+/**
+ * A hex document: the bytes themselves plus a parallel "was this byte modified
+ * by the user" flag array. The flags travel with the bytes through every splice
+ * so that insert/delete keeps every marker attached to the byte it describes,
+ * instead of to an offset that has since moved.
+ *
+ * @typedef {{ bytes: Uint8Array, flags: Uint8Array }} HexDoc
+ */
+
+/**
+ * One reversible edit. `before`/`after` are the byte runs that occupy
+ * [offset, offset + length) before and after the edit, so a single splice
+ * expresses overwrite (equal lengths), insert (empty before) and delete
+ * (empty after), and the inverse is obtained by swapping the two pairs.
+ *
+ * @typedef {{ offset: number, before: Uint8Array, beforeFlags: Uint8Array,
+ *             after: Uint8Array, afterFlags: Uint8Array }} HexEdit
+ */
+
+/** @type {Uint8Array} */
+const EMPTY_BYTES = new Uint8Array(0)
+
+/**
+ * @param {number} n
+ * @returns {Uint8Array} n flags all set to "modified"
+ */
+function onesFlags(n) {
+  const out = new Uint8Array(n)
+  out.fill(1)
+  return out
+}
+
+/**
+ * Build a document, tolerating a missing or mis-sized flag array.
+ * @param {Uint8Array|null} bytes
+ * @param {Uint8Array|null} [flags]
+ * @returns {HexDoc}
+ */
+export function makeHexDoc(bytes, flags = null) {
+  const b = bytes ?? EMPTY_BYTES
+  if (flags && flags.length === b.length) return { bytes: b, flags }
+  const f = new Uint8Array(b.length)
+  if (flags) f.set(flags.subarray(0, Math.min(flags.length, b.length)), 0)
+  return { bytes: b, flags: f }
+}
+
+/**
+ * Replace `removeCount` bytes at `offset` with `insertBytes`.
+ *
+ * Returns new arrays rather than mutating: the undo stack holds references to
+ * byte runs, and an in-place edit would rewrite history.
+ *
+ * @param {HexDoc} doc
+ * @param {number} offset
+ * @param {number} removeCount
+ * @param {Uint8Array|null} [insertBytes]
+ * @param {Uint8Array|null} [insertFlags]
+ * @returns {HexDoc}
+ */
+export function spliceHexDoc(doc, offset, removeCount, insertBytes = null, insertFlags = null) {
+  const src = makeHexDoc(doc.bytes, doc.flags)
+  const len = src.bytes.length
+  const start = Math.max(0, Math.min(Math.trunc(offset), len))
+  const remove = Math.max(0, Math.min(Math.trunc(removeCount), len - start))
+  const ins = insertBytes ?? EMPTY_BYTES
+  const insFlags = insertFlags && insertFlags.length === ins.length
+    ? insertFlags
+    : onesFlags(ins.length)
+
+  const outLen = len - remove + ins.length
+  const bytes = new Uint8Array(outLen)
+  const flags = new Uint8Array(outLen)
+
+  bytes.set(src.bytes.subarray(0, start), 0)
+  flags.set(src.flags.subarray(0, start), 0)
+  bytes.set(ins, start)
+  flags.set(insFlags, start)
+  bytes.set(src.bytes.subarray(start + remove), start + ins.length)
+  flags.set(src.flags.subarray(start + remove), start + ins.length)
+
+  return { bytes, flags }
+}
+
+/**
+ * @param {HexDoc} doc
+ * @param {number} offset
+ * @param {Uint8Array|number[]} values
+ * @returns {HexEdit|null} null when out of range or when nothing would change
+ */
+export function makeOverwriteEdit(doc, offset, values) {
+  const src = makeHexDoc(doc.bytes, doc.flags)
+  const after = Uint8Array.from(values)
+  const start = Math.trunc(offset)
+  if (after.length === 0) return null
+  if (start < 0 || start + after.length > src.bytes.length) return null
+
+  const before = src.bytes.slice(start, start + after.length)
+  const beforeFlags = src.flags.slice(start, start + after.length)
+  // Re-typing the value a byte already has, on a byte already marked, changes
+  // nothing — recording it would put a no-op on the undo stack.
+  let identical = true
+  for (let i = 0; i < after.length; i++) {
+    if (before[i] !== after[i] || beforeFlags[i] !== 1) { identical = false; break }
+  }
+  if (identical) return null
+
+  return { offset: start, before, beforeFlags, after, afterFlags: onesFlags(after.length) }
+}
+
+/**
+ * @param {HexDoc} doc
+ * @param {number} offset  clamped to [0, length]; appending at the end is legal
+ * @param {Uint8Array|number[]} values
+ * @returns {HexEdit|null}
+ */
+export function makeInsertEdit(doc, offset, values) {
+  const src = makeHexDoc(doc.bytes, doc.flags)
+  const after = Uint8Array.from(values)
+  if (after.length === 0) return null
+  const start = Math.max(0, Math.min(Math.trunc(offset), src.bytes.length))
+  return {
+    offset: start,
+    before: EMPTY_BYTES,
+    beforeFlags: EMPTY_BYTES,
+    after,
+    afterFlags: onesFlags(after.length),
+  }
+}
+
+/**
+ * @param {HexDoc} doc
+ * @param {number} offset
+ * @param {number} [count=1]
+ * @returns {HexEdit|null}
+ */
+export function makeDeleteEdit(doc, offset, count = 1) {
+  const src = makeHexDoc(doc.bytes, doc.flags)
+  const start = Math.trunc(offset)
+  if (start < 0 || start >= src.bytes.length) return null
+  const n = Math.max(0, Math.min(Math.trunc(count), src.bytes.length - start))
+  if (n === 0) return null
+  return {
+    offset: start,
+    before: src.bytes.slice(start, start + n),
+    beforeFlags: src.flags.slice(start, start + n),
+    after: EMPTY_BYTES,
+    afterFlags: EMPTY_BYTES,
+  }
+}
+
+/**
+ * @param {HexDoc} doc
+ * @param {HexEdit} edit
+ * @returns {HexDoc}
+ */
+export function applyHexEdit(doc, edit) {
+  return spliceHexDoc(doc, edit.offset, edit.before.length, edit.after, edit.afterFlags)
+}
+
+/**
+ * @param {HexEdit} edit
+ * @returns {HexEdit}
+ */
+export function invertHexEdit(edit) {
+  return {
+    offset: edit.offset,
+    before: edit.after,
+    beforeFlags: edit.afterFlags,
+    after: edit.before,
+    afterFlags: edit.beforeFlags,
+  }
+}
+
+/**
+ * Push onto a bounded stack, dropping the oldest entries when full.
+ *
+ * Bounded because each entry pins the byte runs it replaced; an unbounded
+ * history of large-region edits would retain more memory than the file itself.
+ *
+ * @template T
+ * @param {T[]} stack
+ * @param {T} item
+ * @param {number} limit
+ * @returns {T[]} the same array, mutated
+ */
+export function pushBounded(stack, item, limit) {
+  stack.push(item)
+  if (limit > 0 && stack.length > limit) stack.splice(0, stack.length - limit)
+  return stack
+}
+
+/**
+ * Net change in the number of bytes marked modified.
+ * @param {HexEdit} edit
+ * @returns {number}
+ */
+export function modifiedDelta(edit) {
+  let sum = 0
+  for (let i = 0; i < edit.afterFlags.length; i++) sum += edit.afterFlags[i]
+  for (let i = 0; i < edit.beforeFlags.length; i++) sum -= edit.beforeFlags[i]
+  return sum
+}
+
+/**
+ * @param {string} ch
+ * @returns {number} 0–15, or -1 when not a hex digit
+ */
+export function hexNibbleValue(ch) {
+  if (ch.length !== 1) return -1
+  const code = ch.charCodeAt(0)
+  if (code >= 48 && code <= 57) return code - 48        // 0-9
+  if (code >= 97 && code <= 102) return code - 87       // a-f
+  if (code >= 65 && code <= 70) return code - 55        // A-F
+  return -1
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -440,6 +664,34 @@ export class HexCompare {
      * @type {Int32Array|null}
      */
     this._rowToVisual = null
+
+    // ── P2-22: byte editing ───────────────────────────────────────────────────
+    /** @type {boolean} */
+    this._editMode = false
+    /**
+     * Per-byte "modified" markers, parallel to _leftBytes / _rightBytes. Kept in
+     * the data model rather than on the DOM nodes because the virtual scroller
+     * throws rows away as soon as they leave the viewport.
+     * @type {{ left: Uint8Array|null, right: Uint8Array|null }}
+     */
+    this._flags = { left: null, right: null }
+    /** @type {{ left: number, right: number }} bytes currently marked modified */
+    this._modifiedCount = { left: 0, right: 0 }
+    /**
+     * @type {{ side: 'left'|'right', offset: number, field: 'hex'|'ascii',
+     *          nibble: 0|1 }|null}
+     */
+    this._cursor = null
+    /** @type {Array<{ side: 'left'|'right', edit: HexEdit }>} */
+    this._undoStack = []
+    /** @type {Array<{ side: 'left'|'right', edit: HexEdit }>} */
+    this._redoStack = []
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    this._reflowTimer = null
+    /** @type {((e: Event) => void)|null} */
+    this._closeGuard = null
+    /** @type {((e: KeyboardEvent) => void)|null} */
+    this._closeKeyGuard = null
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -465,6 +717,11 @@ export class HexCompare {
       this._dropCleanup()
       this._dropCleanup = null
     }
+    this._removeCloseGuards()
+    if (this._reflowTimer !== null) {
+      clearTimeout(this._reflowTimer)
+      this._reflowTimer = null
+    }
     // T27: 清除所有 hx-selected 高亮
     // S14-M04: scope to this container so we don't wipe highlights on other hex tabs.
     const scope = this._container ?? document
@@ -487,6 +744,11 @@ export class HexCompare {
     this._currentDiffIdx = -1
     this._filteredRows = null
     this._rowToVisual = null
+    this._cursor = null
+    this._undoStack = []
+    this._redoStack = []
+    this._flags = { left: null, right: null }
+    this._modifiedCount = { left: 0, right: 0 }
   }
 
   /**
@@ -528,6 +790,7 @@ export class HexCompare {
     this._leftOriginalSize = raw.byteLength
     this._leftTruncated = raw.byteLength > MAX_BYTES
     this._leftBytes = this._leftTruncated ? raw.slice(0, MAX_BYTES) : raw
+    this._resetEditState('left')
     this._pendingFirstDiff = true
     this._updatePathDisplay('left', path)
     this._updateSizeInfo()
@@ -546,6 +809,7 @@ export class HexCompare {
     this._rightOriginalSize = raw.byteLength
     this._rightTruncated = raw.byteLength > MAX_BYTES
     this._rightBytes = this._rightTruncated ? raw.slice(0, MAX_BYTES) : raw
+    this._resetEditState('right')
     this._pendingFirstDiff = true
     this._updatePathDisplay('right', path)
     this._updateSizeInfo()
@@ -932,6 +1196,496 @@ ${body}
     if (isError) window.alert(message)
   }
 
+  // ── Public: byte editing (P2-22) ────────────────────────────────────────────
+
+  /**
+   * Drop every edit-related state for one side. Called when that side is
+   * (re)loaded: the undo history describes bytes that no longer exist.
+   * @param {'left'|'right'} side
+   */
+  _resetEditState(side) {
+    const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+    this._flags[side] = new Uint8Array(bytes ? bytes.length : 0)
+    this._modifiedCount[side] = 0
+    this._undoStack = this._undoStack.filter((e) => e.side !== side)
+    this._redoStack = this._redoStack.filter((e) => e.side !== side)
+    if (this._cursor?.side === side) this._cursor = null
+    this._syncEditControls()
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {HexDoc}
+   */
+  _doc(side) {
+    const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+    return makeHexDoc(bytes, this._flags[side])
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {HexDoc} doc
+   */
+  _setDoc(side, doc) {
+    if (side === 'left') this._leftBytes = doc.bytes
+    else this._rightBytes = doc.bytes
+    this._flags[side] = doc.flags
+  }
+
+  /** @returns {boolean} */
+  isEditMode() { return this._editMode }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the mode actually in effect
+   */
+  setEditMode(on) {
+    const want = Boolean(on)
+    if (want && this._leftTruncated && this._rightTruncated) {
+      this._notify(this._truncatedReason('兩側'), true)
+      return this._editMode
+    }
+    this._editMode = want
+    if (!this._editMode) this._cursor = null
+    if (this._dom.root) this._dom.root.classList.toggle('hx-editing', this._editMode)
+    if (this._dom.btnEdit) this._dom.btnEdit.classList.toggle('active', this._editMode)
+    this._syncEditControls()
+    this._renderPaneContent('left')
+    this._renderPaneContent('right')
+    return this._editMode
+  }
+
+  /** @returns {boolean} */
+  toggleEditMode() { return this.setEditMode(!this._editMode) }
+
+  /**
+   * @param {string} label
+   * @returns {string}
+   */
+  _truncatedReason(label) {
+    return `${label}檔案超過 ${formatSize(MAX_BYTES)}，只載入了前段內容。` +
+      '編輯後存檔會把未載入的部分整段截掉，因此這個檔案不允許編輯或寫入。'
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {boolean} [quiet] suppress the message (used by UI enable/disable)
+   * @returns {boolean}
+   */
+  _canEdit(side, quiet = false) {
+    if (!this._editMode) {
+      if (!quiet) this._notify('請先按「✎ 編輯」進入編輯模式', true)
+      return false
+    }
+    const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+    const sideName = side === 'left' ? '左側' : '右側'
+    if (!bytes) {
+      if (!quiet) this._notify(`${sideName}尚未載入檔案，無法編輯`, true)
+      return false
+    }
+    if (side === 'left' ? this._leftTruncated : this._rightTruncated) {
+      if (!quiet) this._notify(this._truncatedReason(sideName), true)
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Overwrite bytes in place (file length unchanged).
+   * @param {'left'|'right'} side
+   * @param {number} offset
+   * @param {Uint8Array|number[]} values
+   * @returns {boolean} true when the document changed
+   */
+  overwriteBytes(side, offset, values) {
+    if (!this._canEdit(side)) return false
+    return this._applyEdit(side, makeOverwriteEdit(this._doc(side), offset, values))
+  }
+
+  /**
+   * Insert bytes, growing the file.
+   * @param {'left'|'right'} side
+   * @param {number} offset
+   * @param {Uint8Array|number[]} values
+   * @returns {boolean}
+   */
+  insertBytesAt(side, offset, values) {
+    if (!this._canEdit(side)) return false
+    return this._applyEdit(side, makeInsertEdit(this._doc(side), offset, values))
+  }
+
+  /**
+   * Delete bytes, shrinking the file.
+   * @param {'left'|'right'} side
+   * @param {number} offset
+   * @param {number} [count=1]
+   * @returns {boolean}
+   */
+  deleteBytesAt(side, offset, count = 1) {
+    if (!this._canEdit(side)) return false
+    return this._applyEdit(side, makeDeleteEdit(this._doc(side), offset, count))
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {HexEdit|null} edit
+   * @returns {boolean}
+   */
+  _applyEdit(side, edit) {
+    if (!edit) return false
+    this._applyEditRaw(side, edit)
+    pushBounded(this._undoStack, { side, edit }, MAX_UNDO_STACK)
+    this._redoStack = []
+    this._afterEdit(side, edit)
+    return true
+  }
+
+  /**
+   * Splice one edit into a side and keep the modified-byte counter in step.
+   * The counter is maintained incrementally because rescanning a 10 MB flag
+   * array on every keystroke would be the most expensive thing in the view.
+   * @param {'left'|'right'} side
+   * @param {HexEdit} edit
+   */
+  _applyEditRaw(side, edit) {
+    this._setDoc(side, applyHexEdit(this._doc(side), edit))
+    this._modifiedCount[side] = Math.max(0, this._modifiedCount[side] + modifiedDelta(edit))
+  }
+
+  /** @returns {boolean} true when an edit was undone */
+  undo() {
+    const entry = this._undoStack.pop()
+    if (!entry) return false
+    this._applyEditRaw(entry.side, invertHexEdit(entry.edit))
+    pushBounded(this._redoStack, entry, MAX_UNDO_STACK)
+    this._moveCursorTo(entry.side, entry.edit.offset)
+    this._afterEdit(entry.side, entry.edit)
+    return true
+  }
+
+  /** @returns {boolean} true when an edit was redone */
+  redo() {
+    const entry = this._redoStack.pop()
+    if (!entry) return false
+    this._applyEditRaw(entry.side, entry.edit)
+    pushBounded(this._undoStack, entry, MAX_UNDO_STACK)
+    this._moveCursorTo(entry.side, entry.edit.offset)
+    this._afterEdit(entry.side, entry.edit)
+    return true
+  }
+
+  /** @returns {boolean} */
+  canUndo() { return this._undoStack.length > 0 }
+  /** @returns {boolean} */
+  canRedo() { return this._redoStack.length > 0 }
+
+  /**
+   * @param {'left'|'right'} [side]
+   * @returns {boolean} whether that side (or either side) has unsaved edits
+   */
+  hasUnsavedEdits(side) {
+    if (side) return this._modifiedCount[side] > 0
+    return this._modifiedCount.left > 0 || this._modifiedCount.right > 0
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {number} number of bytes marked modified on that side
+   */
+  getModifiedCount(side) { return this._modifiedCount[side] }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {Uint8Array} per-byte modified markers (live reference; read only)
+   */
+  getModifiedFlags(side) { return this._flags[side] ?? new Uint8Array(0) }
+
+  /**
+   * Post-edit bookkeeping: repaint the edited side now (cheap — only the rows
+   * on screen) and defer the expensive re-diff so that held-down typing is not
+   * quadratic in file size.
+   * @param {'left'|'right'} side
+   * @param {HexEdit} edit
+   */
+  _afterEdit(side, edit) {
+    if (edit.before.length !== edit.after.length) this._invalidateFind()
+    this._updateSizeInfo()
+    this._syncEditControls()
+    this._renderPaneContent(side)
+    this._scheduleEditReflow()
+  }
+
+  /**
+   * Search hits are byte offsets; an insert or delete moves every offset after
+   * it, so the stale hit list is discarded rather than silently mis-highlighted.
+   */
+  _invalidateFind() {
+    if (this._findMatches.length === 0) return
+    this._clearFindHighlights()
+    this._findMatches = []
+    this._findCurrentIdx = -1
+    const { findCount } = this._dom
+    if (findCount) findCount.textContent = '內容已變更，請重新搜尋'
+  }
+
+  /** Debounced re-diff / repaint after edits. */
+  _scheduleEditReflow() {
+    if (this._reflowTimer !== null) return
+    this._reflowTimer = setTimeout(() => {
+      this._reflowTimer = null
+      this._editReflowNow()
+    }, EDIT_REFLOW_MS)
+  }
+
+  /** Immediate version of the debounced reflow. */
+  _editReflowNow() {
+    if (this._reflowTimer !== null) {
+      clearTimeout(this._reflowTimer)
+      this._reflowTimer = null
+    }
+    this._recomputeCompleteIfNeeded()
+    this._recomputeDiffRegions()
+    this._renderPaneContent('left')
+    this._renderPaneContent('right')
+  }
+
+  // ── Public: saving edited bytes ─────────────────────────────────────────────
+
+  /**
+   * Write one side's edited bytes back to its file.
+   * @param {'left'|'right'} side
+   * @returns {Promise<boolean>} true when the file was written
+   */
+  async saveSide(side) {
+    const sideName = side === 'left' ? '左側' : '右側'
+    const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    const truncated = side === 'left' ? this._leftTruncated : this._rightTruncated
+
+    if (!bytes) {
+      this._notify(`${sideName}尚未載入檔案`, true)
+      return false
+    }
+    if (truncated) {
+      // The in-memory copy stops at MAX_BYTES; writing it back would delete
+      // everything past that point.
+      this._notify(this._truncatedReason(sideName), true)
+      return false
+    }
+    if (!path) {
+      this._notify(`${sideName}沒有檔案路徑，無法寫入`, true)
+      return false
+    }
+    if (this._modifiedCount[side] === 0) {
+      this._notify(`${sideName}沒有未儲存的修改`, false)
+      return false
+    }
+
+    let result
+    try {
+      result = await window.electronAPI.saveFile(
+        path,
+        // latin1 round-trips every byte 0x00–0xFF unchanged.
+        bytesToLatin1(bytes),
+        [{ name: '所有檔案', extensions: ['*'] }],
+        'binary',
+        _settings.getPref('backupOnSave'))
+    } catch (err) {
+      this._notify(`寫入失敗：${err instanceof Error ? err.message : String(err)}`, true)
+      return false
+    }
+    if (!result) return false
+
+    // The saved bytes are now the file's bytes, so nothing is "modified" any
+    // more; the undo history stays, and undoing past this point marks it again.
+    this._flags[side] = new Uint8Array(bytes.length)
+    this._modifiedCount[side] = 0
+    this._syncEditControls()
+    this._renderPaneContent(side)
+
+    const backup = result.backup
+    if (backup?.backedUp) this._notify(`已儲存${sideName}，備份於 ${backup.path}`, false)
+    else if (backup?.reason) this._notify(`已儲存${sideName}，但備份失敗：${backup.reason}`, true)
+    else this._notify(`已儲存${sideName}`, false)
+    return true
+  }
+
+  /** @returns {Promise<boolean>} */
+  saveLeft() { return this.saveSide('left') }
+  /** @returns {Promise<boolean>} */
+  saveRight() { return this.saveSide('right') }
+
+  /**
+   * Ask before throwing unsaved edits away.
+   * @returns {boolean} true when it is safe to close
+   */
+  confirmClose() {
+    if (!this.hasUnsavedEdits()) return true
+    const sides = []
+    if (this._modifiedCount.left > 0) sides.push(`左側 ${this._modifiedCount.left} 個位元組`)
+    if (this._modifiedCount.right > 0) sides.push(`右側 ${this._modifiedCount.right} 個位元組`)
+    return window.confirm(
+      `Hex 比對有尚未儲存的修改（${sides.join('、')}）。\n關閉後這些修改會遺失，確定要關閉嗎？`)
+  }
+
+  // ── Private: cursor ─────────────────────────────────────────────────────────
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {number} offset
+   * @param {'hex'|'ascii'} [field]
+   */
+  _moveCursorTo(side, offset, field) {
+    const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+    const len = bytes ? bytes.length : 0
+    if (len === 0) { this._cursor = null; return }
+    const clamped = Math.max(0, Math.min(Math.trunc(offset), len - 1))
+    this._cursor = {
+      side,
+      offset: clamped,
+      field: field ?? this._cursor?.field ?? 'hex',
+      nibble: 0,
+    }
+  }
+
+  /**
+   * @returns {{ side: 'left'|'right', offset: number, field: 'hex'|'ascii', nibble: 0|1 }|null}
+   */
+  getCursor() {
+    return this._cursor
+  }
+
+  /** Scroll the cursor's row into view without disturbing the position otherwise. */
+  _ensureCursorVisible() {
+    if (!this._cursor) return
+    const scroll = this._dom[`scroll_${this._cursor.side}`]
+    if (!scroll) return
+    const visual = this._visualIndexOf(Math.floor(this._cursor.offset / this._bytesPerRow))
+    const top = visual * ROW_HEIGHT
+    const viewHeight = scroll.clientHeight || 300
+    if (top < scroll.scrollTop) scroll.scrollTop = top
+    else if (top + ROW_HEIGHT > scroll.scrollTop + viewHeight) {
+      scroll.scrollTop = top + ROW_HEIGHT - viewHeight
+    }
+  }
+
+  // ── Private: keyboard editing ───────────────────────────────────────────────
+
+  /**
+   * Typing, navigation and insert/delete inside a pane.
+   * @param {KeyboardEvent} e
+   * @param {'left'|'right'} side
+   */
+  _onEditKeyDown(e, side) {
+    // Ctrl/Alt combinations belong to the document-level handler; handling them
+    // here as well would run undo twice for one Ctrl+Z.
+    if (e.ctrlKey || e.metaKey || e.altKey) return
+    if (!this._editMode) return
+    const cursor = this._cursor
+    if (!cursor || cursor.side !== side) return
+
+    const bpr = this._bytesPerRow
+    const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+    if (!bytes) return
+
+    /** @param {number} next */
+    const moveTo = (next) => {
+      this._moveCursorTo(side, next, cursor.field)
+      this._ensureCursorVisible()
+      this._renderPaneContent(side)
+    }
+
+    switch (e.key) {
+      case 'ArrowLeft':  e.preventDefault(); moveTo(cursor.offset - 1); return
+      case 'ArrowRight': e.preventDefault(); moveTo(cursor.offset + 1); return
+      case 'ArrowUp':    e.preventDefault(); moveTo(cursor.offset - bpr); return
+      case 'ArrowDown':  e.preventDefault(); moveTo(cursor.offset + bpr); return
+      case 'Home':       e.preventDefault(); moveTo(cursor.offset - (cursor.offset % bpr)); return
+      case 'End':        e.preventDefault(); moveTo(cursor.offset - (cursor.offset % bpr) + bpr - 1); return
+      case 'Tab':
+        e.preventDefault()
+        this._cursor = { ...cursor, field: cursor.field === 'hex' ? 'ascii' : 'hex', nibble: 0 }
+        this._renderPaneContent(side)
+        return
+      case 'Insert':
+        e.preventDefault()
+        if (this.insertBytesAt(side, cursor.offset, [0x00])) {
+          this._moveCursorTo(side, cursor.offset, cursor.field)
+          this._renderPaneContent(side)
+        }
+        return
+      case 'Delete':
+        e.preventDefault()
+        if (this.deleteBytesAt(side, cursor.offset, 1)) {
+          this._moveCursorTo(side, cursor.offset, cursor.field)
+          this._renderPaneContent(side)
+        }
+        return
+      case 'Backspace':
+        e.preventDefault()
+        if (cursor.offset > 0 && this.deleteBytesAt(side, cursor.offset - 1, 1)) {
+          this._moveCursorTo(side, cursor.offset - 1, cursor.field)
+          this._renderPaneContent(side)
+        }
+        return
+      default:
+        break
+    }
+
+    if (e.key.length !== 1) return
+
+    if (cursor.field === 'ascii') {
+      const code = e.key.charCodeAt(0)
+      if (code > 0xff) return
+      e.preventDefault()
+      if (this.overwriteBytes(side, cursor.offset, [code])) {
+        this._moveCursorTo(side, cursor.offset + 1, 'ascii')
+        this._ensureCursorVisible()
+        this._renderPaneContent(side)
+      }
+      return
+    }
+
+    const nibble = hexNibbleValue(e.key)
+    if (nibble < 0) return
+    e.preventDefault()
+    const current = bytes[cursor.offset]
+    const value = cursor.nibble === 0
+      ? ((nibble << 4) | (current & 0x0f))
+      : ((current & 0xf0) | nibble)
+    const changed = this.overwriteBytes(side, cursor.offset, [value])
+    // The cursor advances even when the byte already held that value, so typing
+    // "41" over an existing 0x41 still walks forward as the user expects.
+    if (cursor.nibble === 0) {
+      this._cursor = { side, offset: cursor.offset, field: 'hex', nibble: 1 }
+    } else {
+      this._moveCursorTo(side, cursor.offset + 1, 'hex')
+      this._ensureCursorVisible()
+    }
+    if (!changed) this._renderPaneContent(side)
+  }
+
+  /** Enable/disable the edit toolbar controls and refresh the dirty marker. */
+  _syncEditControls() {
+    const { btnUndo, btnRedo, btnSaveLeft, btnSaveRight, dirtyInfo, btnEdit } = this._dom
+    if (btnUndo instanceof HTMLButtonElement) btnUndo.disabled = !this.canUndo()
+    if (btnRedo instanceof HTMLButtonElement) btnRedo.disabled = !this.canRedo()
+    if (btnSaveLeft instanceof HTMLButtonElement) {
+      btnSaveLeft.disabled = this._modifiedCount.left === 0 || this._leftTruncated
+    }
+    if (btnSaveRight instanceof HTMLButtonElement) {
+      btnSaveRight.disabled = this._modifiedCount.right === 0 || this._rightTruncated
+    }
+    if (btnEdit) btnEdit.classList.toggle('active', this._editMode)
+    if (dirtyInfo) {
+      const parts = []
+      if (this._modifiedCount.left > 0) parts.push(`左 ${this._modifiedCount.left}`)
+      if (this._modifiedCount.right > 0) parts.push(`右 ${this._modifiedCount.right}`)
+      dirtyInfo.textContent = parts.length ? `● 未儲存（${parts.join('、')} bytes）` : ''
+      dirtyInfo.style.display = parts.length ? '' : 'none'
+    }
+  }
+
   // ── Public: difference navigation (S16) ─────────────────────────────────────
 
   /**
@@ -995,6 +1749,16 @@ ${body}
       [this._rightOriginalSize, this._leftOriginalSize]
     ;[this._completeLeftClass, this._completeRightClass] =
       [this._completeRightClass, this._completeLeftClass]
+    ;[this._flags.left, this._flags.right] = [this._flags.right, this._flags.left]
+    ;[this._modifiedCount.left, this._modifiedCount.right] =
+      [this._modifiedCount.right, this._modifiedCount.left]
+    // Undo entries name a side, so they have to be relabelled rather than left
+    // pointing at bytes that are now on the other pane.
+    for (const entry of [...this._undoStack, ...this._redoStack]) {
+      entry.side = entry.side === 'left' ? 'right' : 'left'
+    }
+    if (this._cursor) this._cursor.side = this._cursor.side === 'left' ? 'right' : 'left'
+    this._syncEditControls()
 
     this._updatePathDisplay('left', this._leftPath ?? '（未選擇）')
     this._updatePathDisplay('right', this._rightPath ?? '（未選擇）')
@@ -1141,6 +1905,29 @@ ${body}
     toolbar.appendChild(btnCopyRight)
     toolbar.appendChild(btnCopyLeft)
 
+    // ── P2-22: byte editing ────────────────────────────────────────────────────
+    const editBar = el('div', { className: 'hx-edit-bar' })
+    const btnEdit = el('button', { className: 'hx-btn-edit', title: '切換編輯模式（可直接輸入 hex 或 ASCII）' }, '✎ 編輯')
+    const btnUndo = el('button', { className: 'hx-btn-edit', title: '復原（Ctrl+Z）' }, '↶')
+    const btnRedo = el('button', { className: 'hx-btn-edit', title: '重做（Ctrl+Y）' }, '↷')
+    const btnSaveLeft  = el('button', { className: 'hx-btn-edit', title: '儲存左側檔案' }, '💾 存左')
+    const btnSaveRight = el('button', { className: 'hx-btn-edit', title: '儲存右側檔案' }, '💾 存右')
+    const dirtyInfo = el('span', { className: 'hx-dirty-info' })
+    dirtyInfo.style.display = 'none'
+    this._dom.btnEdit = btnEdit
+    this._dom.btnUndo = btnUndo
+    this._dom.btnRedo = btnRedo
+    this._dom.btnSaveLeft = btnSaveLeft
+    this._dom.btnSaveRight = btnSaveRight
+    this._dom.dirtyInfo = dirtyInfo
+    editBar.appendChild(btnEdit)
+    editBar.appendChild(btnUndo)
+    editBar.appendChild(btnRedo)
+    editBar.appendChild(btnSaveLeft)
+    editBar.appendChild(btnSaveRight)
+    editBar.appendChild(dirtyInfo)
+    toolbar.appendChild(editBar)
+
     // S16: Swap sides
     const btnSwap = el('button', { className: 'hx-btn-swap', title: '交換左右兩側' }, '⇄ 交換')
     this._dom.btnSwap = btnSwap
@@ -1272,7 +2059,9 @@ ${body}
     pane.appendChild(header)
 
     // Virtual scroll 容器
-    const scroll = el('div', { className: 'hx-scroll' })
+    // tabindex: editing needs key events, and the rows themselves are recycled
+    // by the virtual scroller, so the scroller is the stable focus holder.
+    const scroll = el('div', { className: 'hx-scroll', tabindex: '0' })
     this._dom[`scroll_${side}`] = scroll
 
     // Inner（高度由 JS 設定）
@@ -1359,10 +2148,32 @@ ${body}
       // 高亮對應的 hex + ascii span
       hexSpans[clickedIdx]?.classList.add('hx-selected')
       asciiSpans[clickedIdx]?.classList.add('hx-selected')
+
+      // P2-22: the same click places the edit cursor.
+      const sourceRow = parseInt(rowEl.dataset.row ?? '', 10)
+      if (Number.isNaN(sourceRow)) return
+      const side = rowEl.closest('.hx-pane')?.dataset.side
+      if (side !== 'left' && side !== 'right') return
+      const field = target?.classList.contains('hx-ascii-char') ? 'ascii' : 'hex'
+      this._moveCursorTo(side, sourceRow * this._bytesPerRow + clickedIdx, field)
+      if (this._editMode) this._renderPaneContent(side)
     }
 
     scroll_left.addEventListener('click',  onHexPaneClick)
     scroll_right.addEventListener('click', onHexPaneClick)
+
+    // ── P2-22: byte editing ────────────────────────────────────────────────────
+    scroll_left.addEventListener('keydown', (/** @type {KeyboardEvent} */ e) => this._onEditKeyDown(e, 'left'))
+    scroll_right.addEventListener('keydown', (/** @type {KeyboardEvent} */ e) => this._onEditKeyDown(e, 'right'))
+
+    const { btnEdit, btnUndo, btnRedo, btnSaveLeft, btnSaveRight } = this._dom
+    btnEdit.addEventListener('click', () => this.toggleEditMode())
+    btnUndo.addEventListener('click', () => this.undo())
+    btnRedo.addEventListener('click', () => this.redo())
+    btnSaveLeft.addEventListener('click',  () => void this.saveSide('left'))
+    btnSaveRight.addEventListener('click', () => void this.saveSide('right'))
+    this._syncEditControls()
+    this._installCloseGuards()
 
     // ── T10: Find bar ──────────────────────────────────────────────────────────
     findInput.addEventListener('input', () => this._runFind())
@@ -1378,13 +2189,36 @@ ${body}
     btnFindPrev.addEventListener('click', () => this._stepFind(-1))
     btnFindNext.addEventListener('click', () => this._stepFind(1))
 
-    // Ctrl+F opens find bar and focuses input
+    // Ctrl+F opens find bar and focuses input; Ctrl+Z/Y/S/E drive editing.
+    // Editing accelerators live here rather than on the panes so that one key
+    // press cannot be handled twice as the event bubbles.
     this._ctrlFHandler = (/** @type {KeyboardEvent} */ e) => {
       if (!isActive('hex')) return
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      if (!(e.ctrlKey || e.metaKey)) return
+      const inField = e.target instanceof Element &&
+        e.target.matches('input, textarea, select')
+      const key = e.key.toLowerCase()
+
+      if (key === 'f') {
         e.preventDefault()
         findInput.focus()
         findInput.select()
+        return
+      }
+      if (inField) return
+      if (key === 'e') {
+        e.preventDefault()
+        this.toggleEditMode()
+      } else if (key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        this.undo()
+      } else if (key === 'y' || (key === 'z' && e.shiftKey)) {
+        e.preventDefault()
+        this.redo()
+      } else if (key === 's') {
+        e.preventDefault()
+        const side = e.shiftKey ? 'right' : (this._cursor?.side ?? 'left')
+        void this.saveSide(side)
       }
     }
     document.addEventListener('keydown', this._ctrlFHandler)
@@ -1421,6 +2255,55 @@ ${body}
     // every F8 press advance two differences.
 
     this._setupDropTargets()
+  }
+
+  // ── Private: unsaved-changes guards (P2-22) ─────────────────────────────────
+
+  /**
+   * Warn before unsaved bytes are thrown away.
+   *
+   * The host closes tabs without asking the view, so the guards run in the
+   * capture phase and cancel the event when the user says no. `confirmClose()`
+   * is also public so the host can call it directly once it grows a hook.
+   */
+  _installCloseGuards() {
+    this._closeGuard = (/** @type {Event} */ e) => {
+      if (!this.hasUnsavedEdits() || !isActive('hex')) return
+      const target = e.target instanceof Element ? e.target : null
+      const btn = target?.closest('.tab-close')
+      // Only the active tab's close button can be closing *this* view.
+      if (!btn || !btn.closest('.tab-item--active')) return
+      if (this.confirmClose()) return
+      e.preventDefault()
+      e.stopImmediatePropagation()
+    }
+    document.addEventListener('click', this._closeGuard, true)
+
+    this._closeKeyGuard = (/** @type {KeyboardEvent} */ e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'w') return
+      if (!this.hasUnsavedEdits() || !isActive('hex')) return
+      if (this.confirmClose()) return
+      e.preventDefault()
+      e.stopImmediatePropagation()
+    }
+    document.addEventListener('keydown', this._closeKeyGuard, true)
+
+    // No beforeunload guard: in Electron a renderer that cancels beforeunload
+    // leaves the window unclosable unless the main process handles
+    // 'will-prevent-unload', which this view cannot arrange from here. Guarding
+    // the window close is therefore left to the main process.
+  }
+
+  /** Remove the guards installed by _installCloseGuards. */
+  _removeCloseGuards() {
+    if (this._closeGuard) {
+      document.removeEventListener('click', this._closeGuard, true)
+      this._closeGuard = null
+    }
+    if (this._closeKeyGuard) {
+      document.removeEventListener('keydown', this._closeKeyGuard, true)
+      this._closeKeyGuard = null
+    }
   }
 
   // ── Private: Drag & drop ─────────────────────────────────────────────────────
@@ -2212,6 +3095,8 @@ ${body}
 
     // 對側 bytes（用於 diff 著色）
     const otherBytes = side === 'left' ? this._rightBytes : this._leftBytes
+    const flags = this._flags[side]
+    const cursor = this._cursor && this._cursor.side === side ? this._cursor : null
 
     const rowEl = el('div', { className: 'hx-row' })
 
@@ -2244,14 +3129,26 @@ ${body}
       const diffClass = this._getDiffClass(side, byteOffset, byteVal, otherBytes)
 
       // Hex span
-      const hexSpan = el('span', { className: diffClass ? `hx-byte ${diffClass}` : 'hx-byte' },
+      // P2-22: the modified marker comes from the data model, so it survives a
+      // row being discarded and rebuilt by the virtual scroller.
+      const extra = []
+      if (diffClass) extra.push(diffClass)
+      if (flags && flags[byteOffset] === 1) extra.push('hx-modified')
+      const cls = extra.length ? ` ${extra.join(' ')}` : ''
+      const atCursor = cursor !== null && cursor.offset === byteOffset
+      const hexCursor = atCursor && cursor.field === 'hex'
+        ? ` hx-cursor hx-cursor-n${cursor.nibble}`
+        : ''
+      const asciiCursor = atCursor && cursor.field === 'ascii' ? ' hx-cursor' : ''
+
+      const hexSpan = el('span', { className: `hx-byte${cls}${hexCursor}` },
         toHex(byteVal) + (i < bpr - 1 ? ' ' : '')
       )
       hexCol.appendChild(hexSpan)
 
       // ASCII span
       const asciiSpan = el('span',
-        { className: diffClass ? `hx-ascii-char ${diffClass}` : 'hx-ascii-char' },
+        { className: `hx-ascii-char${cls}${asciiCursor}` },
         toAsciiChar(byteVal)
       )
       asciiCol.appendChild(asciiSpan)

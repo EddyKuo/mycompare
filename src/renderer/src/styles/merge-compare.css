@@ -26,6 +26,22 @@
 .mw-toolbar button.active { border-color: #2563eb; background: #dbeafe; }
 .mw-toolbar-sep { width: 1px; height: 14px; background: #d9d9d9; margin: 0 4px; }
 .mw-conflict-counter { min-width: 96px; }
+.mw-toolbar select {
+  padding: 1px 4px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+.mw-algo-label { display: inline-flex; align-items: center; gap: 4px; }
+
+/* Filtered modes label each row by which side changed it, following the
+   project-wide colour semantics (left = insert, right = delete, both = the
+   non-conflicting "changed on both sides" case). */
+.mw-line--left { background: var(--diff-insert-bg); }
+.mw-line--right { background: var(--diff-delete-bg); }
+.mw-line--both { background: var(--diff-replace-bg); }
 
 /* Three input panes means the drop has to say which one it meant, so the pane
    under the cursor has to be identifiable before the mouse is released. */
