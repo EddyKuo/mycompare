@@ -29,6 +29,10 @@
  *       Stafford and its compressor never shipped in the public SDK.
  *     - A sweep of every cabinet on both drives — 686 that parse as MSCF —
  *       found 404 LZX, 277 MSZIP, 5 uncompressed, and not one Quantum.
+ *     - cabextract's own test suite — from the reference implementation that
+ *       *has* a Quantum decoder — ships 17 cabinets: 8 uncompressed, 6 MSZIP,
+ *       1 LZX. No Quantum there either, which is the strongest single signal:
+ *       the project best placed to publish one does not.
  *
  *   So no Quantum cabinet can be produced or found here, and a decoder could
  *   only ever be checked against itself. One that agrees only with itself is
