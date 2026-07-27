@@ -476,45 +476,6 @@ async function backupExisting(filePath, backup) {
   return result
 }
 
-// IPC: 開啟 Zip 檔案並回傳虛擬目錄項目清單
-ipcMain.handle('open-zip', async (event) => {
-  const win = BrowserWindow.fromWebContents(event.sender)
-  const opts = {
-    properties: ['openFile'],
-    filters: [{ name: 'Zip 檔案', extensions: ['zip'] }, { name: '所有檔案', extensions: ['*'] }],
-  }
-  const { canceled, filePaths } = win
-    ? await dialog.showOpenDialog(win, opts)
-    : await dialog.showOpenDialog(opts)
-  if (canceled || !filePaths.length) return null
-
-  const zipPath = filePaths[0]
-  registerRoot(zipPath)
-  const JSZip = (await import('jszip')).default
-  const buffer = await readFile(zipPath)
-  const zip = await JSZip.loadAsync(buffer)
-
-  const entries = []
-  zip.forEach((relativePath, file) => {
-    const parts = relativePath.replace(/\/$/, '').split('/')
-    const name = parts[parts.length - 1]
-    if (!name) return
-    entries.push({
-      name,
-      path: `${zipPath}::${relativePath}`,
-      isDirectory: file.dir,
-      size: file._data?.uncompressedSize ?? 0,
-      mtime: (file.date ?? new Date()).toISOString(),
-      zipPath,
-      zipEntry: relativePath,
-      depth: parts.length - 1,
-      parentPath: parts.length > 1 ? `${zipPath}::${parts.slice(0, -1).join('/')}/` : zipPath,
-    })
-  })
-
-  return { zipPath, entries }
-})
-
 // IPC: 讀取壓縮檔目錄（tar / gzip / tar.gz / zip 家族），回傳統一形狀
 ipcMain.handle('read-archive', async (_event, archivePath) => {
   const safe = validatePath(archivePath)

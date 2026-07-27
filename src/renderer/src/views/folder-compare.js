@@ -2854,6 +2854,8 @@ export class FolderCompare {
 
       /** @type {Array<{ side: 'left'|'right', entry: FileEntry, cb: HTMLInputElement }>} */
       const editable = []
+      /** @type {Array<{ side: 'left'|'right', entry: FileEntry, cb: HTMLInputElement }>} */
+      const editableHidden = []
       for (const side of ['left', 'right']) {
         const entry = side === 'left' ? row.left : row.right
         if (!entry?.path) continue
@@ -2872,11 +2874,27 @@ export class FolderCompare {
         block.appendChild(cbWrap)
         if (writable) editable.push({ side, entry, cb })
 
-        const hiddenText = entry.hidden === true ? '是'
-          : entry.hidden === false ? '否'
-            : '未知（此平台無法判讀）'
-        block.appendChild(el('div', { className: 'fc-attrs-hidden' },
-          `隱藏（H）：${hiddenText} — 不支援修改（沒有對應的 IPC）`))
+        // hidden is editable only where the platform has the attribute and the
+        // scan actually read it. Offering a checkbox for a value we could not
+        // read would make the dialog claim knowledge it does not have.
+        const hiddenKnown = typeof entry.hidden === 'boolean'
+        const canEditHidden = writable && hiddenKnown
+          && typeof window.electronAPI?.setHidden === 'function'
+        if (canEditHidden) {
+          const hb = el('input', { type: 'checkbox', className: `fc-attr-hidden fc-attr-hidden-${side}` })
+          hb.checked = entry.hidden === true
+          const hWrap = el('label', { className: 'fc-modal-check' })
+          hWrap.appendChild(hb)
+          hWrap.appendChild(document.createTextNode(' 隱藏（H）'))
+          block.appendChild(hWrap)
+          editableHidden.push({ side, entry, cb: hb })
+        } else {
+          const hiddenText = entry.hidden === true ? '是'
+            : entry.hidden === false ? '否'
+              : '未知（此來源未讀取屬性）'
+          block.appendChild(el('div', { className: 'fc-attrs-hidden' },
+            `隱藏（H）：${hiddenText}${hiddenKnown ? ' — 此來源唯讀' : ''}`))
+        }
         modal.appendChild(block)
       }
 
@@ -2906,8 +2924,13 @@ export class FolderCompare {
         const changes = editable
           .filter((f) => f.cb.checked !== !!f.entry.readOnly)
           .map((f) => ({ side: f.side, entry: f.entry, readOnly: f.cb.checked }))
+        const hiddenChanges = editableHidden
+          .filter((f) => f.cb.checked !== (f.entry.hidden === true))
+          .map((f) => ({ side: f.side, entry: f.entry, hidden: f.cb.checked }))
         finish()
-        if (changes.length) void this._applyAttributeChanges(changes)
+        if (changes.length || hiddenChanges.length) {
+          void this._applyAttributeChanges(changes, hiddenChanges)
+        }
       })
       backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish() })
       document.addEventListener('keydown', onKey, true)
@@ -2916,12 +2939,43 @@ export class FolderCompare {
   }
 
   /**
+   * Hand a file to the OS.
+   *
+   * @param {string} path
+   * @param {boolean} withPicker show the "open with" chooser instead of the
+   *   default association
+   */
+  async _openWith(path, withPicker) {
+    try {
+      await window.electronAPI.openWith(path, { withPicker })
+    } catch (err) {
+      // The OS refusing to open something is exactly the case the user needs
+      // told about — nothing visible happens otherwise.
+      alert(`無法開啟：
+${path}
+
+${errText(err)}`)
+    }
+  }
+
+  /**
    * @param {Array<{ side: 'left'|'right', entry: FileEntry, readOnly: boolean }>} changes
+   * @param {Array<{ side: 'left'|'right', entry: FileEntry, hidden: boolean }>} [hiddenChanges]
    * @returns {Promise<void>}
    */
-  async _applyAttributeChanges(changes) {
+  async _applyAttributeChanges(changes, hiddenChanges = []) {
     /** @type {string[]} */
     const failures = []
+    for (const change of hiddenChanges) {
+      try {
+        const res = await window.electronAPI.setHidden(change.entry.path, change.hidden)
+        change.entry.hidden = typeof res?.hidden === 'boolean' ? res.hidden : change.hidden
+      } catch (err) {
+        console.error('FolderCompare setHidden failed:', change.entry.path, err)
+        failures.push(`• ${change.entry.path}
+　${errText(err)}`)
+      }
+    }
     for (const change of changes) {
       try {
         const res = await window.electronAPI.setReadOnly(change.entry.path, change.readOnly)
@@ -6055,6 +6109,27 @@ ${rows}
       })
       items.push({ separator: true })
     }
+
+    // ── 以其他程式開啟 ──
+    // Directories are excluded: showInExplorer already covers "look at this
+    // folder", and handing a directory to the file association would open a
+    // second explorer window at best.
+    for (const [path, isFs, label] of [
+      [leftPath, leftIsFs, '左側'], [rightPath, rightIsFs, '右側'],
+    ]) {
+      if (!path || !isFs || isDir || typeof window.electronAPI?.openWith !== 'function') continue
+      items.push({
+        label: `以預設程式開啟（${label}）`,
+        action: () => void this._openWith(path, false)
+      })
+      if (navigator.platform.startsWith('Win')) {
+        items.push({
+          label: `開啟方式…（${label}）`,
+          action: () => void this._openWith(path, true)
+        })
+      }
+    }
+    if (items.length) items.push({ separator: true })
 
     // ── 在檔案總管中顯示 ──
     if (leftPath && leftIsFs) {

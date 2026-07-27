@@ -22,12 +22,12 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 | 比對類型 | 說明 |
 |----------|------|
-| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則、編輯模式、可逆摺疊、書籤、Find & Replace |
-| **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、ZIP 瀏覽、批次操作 |
-| **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、差異區塊導航、搜尋、Offset 跳轉 |
+| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則（含手動逐行標記）、文法感知比對、編輯模式、可逆摺疊、書籤、Find & Replace、Patch 檢視器 |
+| **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、封存檔瀏覽、移動／互換／Touch、版本欄位、上下層導覽 |
+| **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、行內編輯與 undo/redo、18 種數值判讀面板、標尺、差異篩選 |
 | **圖片比對** | 像素級差異、Auto Scale 尺寸對齊、差異強度分級、旋轉翻轉、同步縮放 |
-| **表格比對** | CSV / Excel、虛擬捲動、數值與日期容差比對、多欄複合 key、忽略欄位 |
-| **三向合併** | 3-way merge、衝突導航、只顯示衝突、Take Left/Center/Right/Both、批次解決 |
+| **表格比對** | CSV / Excel 多工作表 / HTML 表格、虛擬捲動、儲存格編輯與 undo/redo、數值與日期容差比對、多欄複合 key、欄位顯示與排除 |
+| **三向合併** | 3-way merge、八種顯示篩選、可調脈絡行數、Favor Left/Right、演算法選擇、衝突導航、批次解決 |
 
 其他功能：
 
@@ -37,7 +37,10 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - 資料夾快照（記錄結構與時間戳供日後比對，可選內容雜湊）
 - Session 資料夾分類
 - 多分頁（tab）工作區與工作區儲存
-- 深色 / 淺色主題（跟隨系統或手動切換）
+- 統一的選項對話框（一般 / 顯示 / 差異導航 / 備份 / 快捷鍵 / 色彩與字型）
+- 深色 / 淺色主題（跟隨系統或手動切換），差異色彩與字型可自訂
+- 設定匯出／匯入（快捷鍵、偏好、色彩、具名設定、工作區、Session；不含任何密碼）
+- 刪除預設走資源回收桶；備份支援四種命名規則與自訂位置
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
 - 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz、7z
@@ -53,7 +56,8 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 ### 尚未實作
 
 - **Dropbox / OneDrive**：需要 OAuth 流程與各自的 API，並須自行申請應用程式憑證
-- **RAR**：專有格式，無可自由重新實作的規格
+- **RAR**：RARLAB 公開的只有封存結構，壓縮演算法本身是專有的。更關鍵的是這台機器上
+  沒有任何 RAR 工具可以產生測試檔——無法對照參考實作驗證的二進位解析器，比不做更糟
 - **7z 部分編碼**：BCJ2 等多輸入 filter、以及加密壓縮檔會明確報錯而非誤解碼
 
 ---
@@ -61,7 +65,7 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 ## 技術棧
 
 ```
-Electron 31          — 桌面應用程式殼層（main / preload / renderer 三程序架構）
+Electron 33          — 桌面應用程式殼層（main / preload / renderer 三程序架構）
 electron-vite 2      — 開發伺服器 + 生產建置（Vite 5 + esbuild）
 Vanilla JS ES2022+   — renderer UI（無前端框架）
 highlight.js 11      — 語法高亮（文字比對）

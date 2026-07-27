@@ -2081,8 +2081,8 @@ export class TableCompare {
    * @returns {Promise<void>}
    */
   async _loadFileStats() {
-    const readDir = window.electronAPI?.readDir
-    if (typeof readDir !== 'function') return
+    const statFile = window.electronAPI?.statFile
+    if (typeof statFile !== 'function') return
     // `_statAttempted` and not just `_statCache`: a path whose folder cannot be
     // listed never lands in the cache, and repainting the panel calls back into
     // here — without this the pair would loop.
@@ -2094,12 +2094,9 @@ export class TableCompare {
     /** @type {string[]} */
     const failures = []
     for (const path of wanted) {
-      const dir = String(path).replace(/[\\/][^\\/]*$/, '')
-      if (!dir || dir === path) continue
       try {
-        const entries = await readDir(dir)
-        const hit = (entries ?? []).find((entry) => entry?.path === path)
-        if (hit) this._statCache.set(String(path), { size: hit.size, mtime: hit.mtime })
+        const info = await statFile(path)
+        if (info) this._statCache.set(String(path), { size: info.size, mtime: info.mtime })
       } catch (err) {
         failures.push(`${path}：${err instanceof Error ? err.message : String(err)}`)
       }

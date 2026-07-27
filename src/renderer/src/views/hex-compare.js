@@ -3616,14 +3616,16 @@ ${body}
   /**
    * Fill `_mtimeCache` for the loaded paths by listing their parent folders.
    *
-   * There is no per-file stat IPC; `read-dir` is the narrowest existing channel
-   * that carries mtime. One listing per folder, cached by path.
+   * Asks about the one file rather than listing its folder, which is what this
+   * did before a per-file channel existed: reading every sibling to answer
+   * about one of them is slow in a large directory, and fails outright where
+   * the folder is unreadable but the file is not.
    *
    * @returns {Promise<void>}
    */
   async _loadMtimes() {
-    const readDir = window.electronAPI?.readDir
-    if (typeof readDir !== 'function') {
+    const statFile = window.electronAPI?.statFile
+    if (typeof statFile !== 'function') {
       this._setMtimeText('（此環境無法讀取修改時間）')
       return
     }
@@ -3636,15 +3638,10 @@ ${body}
     }
 
     for (const path of wanted) {
-      const dir = path.replace(/[\\/][^\\/]*$/, '')
-      if (!dir || dir === path) {
-        this._mtimeCache.set(path, '（無法判斷所在資料夾）')
-        continue
-      }
       try {
-        const entries = await readDir(dir)
-        const hit = (entries ?? []).find((entry) => entry?.path === path || entry?.name === path.slice(dir.length + 1))
-        this._mtimeCache.set(path, hit?.mtime ? new Date(hit.mtime).toLocaleString() : '（找不到此檔案）')
+        const info = await statFile(path)
+        this._mtimeCache.set(path,
+          info?.mtime ? new Date(info.mtime).toLocaleString() : '（找不到此檔案）')
       } catch (err) {
         this._mtimeCache.set(path, `（讀取失敗：${err instanceof Error ? err.message : String(err)}）`)
       }

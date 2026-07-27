@@ -627,21 +627,24 @@ describe('P2-41 表格 — Text Details / File Info 面板', () => {
     expect(text).toContain('未提供')
   })
 
-  it('read-dir 拿到 mtime 後補進面板', async () => {
-    window.electronAPI.readDir = vi.fn().mockResolvedValue([
-      { path: 'C:/tmp/left.csv', name: 'left.csv', size: 1234, mtime: '2024-01-02T03:04:05.000Z' },
-    ])
+  it('stat-file 拿到大小與時間後補進面板', async () => {
+    // 這裡本來用 read-dir 列出整個資料夾再比對路徑；改用單檔 stat 之後，
+    // 只問這一個檔案——大目錄不必為了一個檔案讀完所有同層項目。
+    window.electronAPI.statFile = vi.fn().mockResolvedValue({
+      path: 'C:/tmp/left.csv', size: 1234, mtime: '2024-01-02T03:04:05.000Z',
+    })
     const view = mountTable(LEFT, RIGHT)
     view.setFileInfoVisible(true)
     await vi.waitFor(() => {
       expect(view._statCache.get('C:/tmp/left.csv')).toBeTruthy()
     })
+    expect(window.electronAPI.statFile).toHaveBeenCalledWith('C:/tmp/left.csv')
     expect(view._dom.fileInfoBody.textContent).toContain('1.2 KB')
   })
 
-  it('read-dir 失敗時把錯誤講出來，不靜默吞掉', async () => {
+  it('stat-file 失敗時把錯誤講出來，不靜默吞掉', async () => {
     const errors = []
-    window.electronAPI.readDir = vi.fn().mockRejectedValue(new Error('EACCES'))
+    window.electronAPI.statFile = vi.fn().mockRejectedValue(new Error('EACCES'))
     const view = mountTable(LEFT, RIGHT)
     view.on('status', (payload) => errors.push(payload))
     view.setFileInfoVisible(true)

@@ -702,17 +702,46 @@ describe('FolderCompare.openAttributesDialog', () => {
     expect(row.left.readOnly).toBe(true)
   })
 
-  it('says out loud that hidden cannot be changed', async () => {
+  it('offers a hidden control only for a side whose value was actually read', async () => {
+    // This used to assert that hidden could never be changed. It can now — the
+    // set-hidden IPC exists — but only where the scan actually read the value.
+    // A checkbox for an unread value would claim knowledge the dialog lacks.
+    window.electronAPI.setHidden = vi.fn(async (path, hidden) => ({ path, hidden }))
     const fc = mountFC()
     const row = mkRow({ name: 'a.txt', left: { hidden: null }, right: { hidden: true } })
     const done = fc.openAttributesDialog(row)
+
+    // Left is unknown: shown as text, no control.
     const texts = [...document.querySelectorAll('.fc-attrs-hidden')].map((e) => e.textContent)
     expect(texts[0]).toContain('未知')
-    expect(texts.every((t) => t.includes('不支援修改'))).toBe(true)
-    // No control is offered for it, so there is nothing to click that lies.
-    expect(document.querySelector('.fc-attrs-backdrop input[data-attr="hidden"]')).toBeNull()
+    expect(document.querySelector('.fc-attr-hidden-left')).toBeNull()
+
+    // Right was read, so it is editable.
+    const rightBox = document.querySelector('.fc-attr-hidden-right')
+    expect(rightBox).not.toBeNull()
+    expect(rightBox.checked).toBe(true)
+
     document.querySelector('.fc-attrs-backdrop .fc-modal-cancel').click()
     await done
+  })
+
+  it('applies a hidden change through the IPC and trusts what came back', async () => {
+    const calls = []
+    window.electronAPI.setHidden = vi.fn(async (path, hidden) => {
+      calls.push({ path, hidden })
+      return { path, hidden }
+    })
+    const fc = mountFC()
+    const row = mkRow({ name: 'a.txt', left: { hidden: false }, right: { hidden: false } })
+    const done = fc.openAttributesDialog(row)
+
+    const box = document.querySelector('.fc-attr-hidden-left')
+    box.checked = true
+    document.querySelector('.fc-attrs-backdrop .fc-modal-ok').click()
+    await done
+    await Promise.resolve()
+
+    expect(calls).toEqual([{ path: row.left.path, hidden: true }])
   })
 
   it('disables the read-only box on a browse-only side', async () => {

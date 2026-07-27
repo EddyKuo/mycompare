@@ -9,6 +9,9 @@ import { describe, it, expect } from 'vitest'
 import {
   PROFILE_KINDS,
   UNSUPPORTED_KINDS,
+  OAUTH_KINDS,
+  CLIENT_ID_HELP,
+  isOAuthKind,
   NULL_CRYPTO,
   defaultPort,
   normaliseProfilePath,
@@ -35,18 +38,46 @@ const ftpProfile = (over = {}) => ({
 })
 
 describe('kinds', () => {
-  it('supports ftp, ftps, sftp and s3', () => {
-    expect([...PROFILE_KINDS].sort()).toEqual(['ftp', 'ftps', 's3', 'sftp'])
+  it('supports ftp, ftps, sftp, s3 and the two cloud drives', () => {
+    expect([...PROFILE_KINDS].sort())
+      .toEqual(['dropbox', 'ftp', 'ftps', 'onedrive', 's3', 'sftp'])
   })
 
-  it('names the kinds it cannot do, with a reason', () => {
-    // The cloud drives need an OAuth flow and a registered client ID. Saying so
-    // beats letting a user create a profile that can never connect.
-    for (const [kind, reason] of Object.entries(UNSUPPORTED_KINDS)) {
+  it('no longer claims the cloud drives are impossible', () => {
+    // The OAuth flow is implemented; the client ID was never ours to ship, so
+    // it is a profile field. Listing these as unsupported would now be a lie.
+    expect(Object.keys(UNSUPPORTED_KINDS)).not.toContain('dropbox')
+    expect(Object.keys(UNSUPPORTED_KINDS)).not.toContain('onedrive')
+    expect(PROFILE_KINDS).toContain('dropbox')
+    expect(PROFILE_KINDS).toContain('onedrive')
+  })
+
+  it('keeps the unsupported-kind mechanism honest for whatever comes next', () => {
+    // The map is currently empty; the invariant it has to keep is that a kind
+    // is never in both lists, and never listed without a reason a user can
+    // read. Asserted as an invariant rather than by looping over nothing.
+    const entries = Object.entries(UNSUPPORTED_KINDS)
+    for (const [kind, reason] of entries) {
       expect(PROFILE_KINDS).not.toContain(kind)
       expect(String(reason).length).toBeGreaterThan(0)
     }
-    expect(Object.keys(UNSUPPORTED_KINDS)).toContain('dropbox')
+    // Every kind must be classified exactly once, which is the property the
+    // loop above cannot check while the map is empty.
+    for (const kind of PROFILE_KINDS) {
+      expect(Object.prototype.hasOwnProperty.call(UNSUPPORTED_KINDS, kind)).toBe(false)
+      expect(validateProfile({ name: 'x', kind }).errors.join(' '))
+        .not.toMatch(/not supported/i)
+    }
+  })
+
+  it('tells the user where to get a client ID for each OAuth kind', () => {
+    for (const kind of OAUTH_KINDS) {
+      expect(isOAuthKind(kind)).toBe(true)
+      // A registration URL is the one thing the message cannot omit.
+      expect(CLIENT_ID_HELP[kind]).toMatch(/https:\/\//)
+      expect(CLIENT_ID_HELP[kind]).toMatch(/127\.0\.0\.1:53682\/callback/)
+    }
+    expect(isOAuthKind('ftp')).toBe(false)
   })
 
   it('defaults the port by kind', () => {
@@ -54,6 +85,8 @@ describe('kinds', () => {
     expect(defaultPort('ftps')).toBe(21)
     expect(defaultPort('sftp')).toBe(22)
     expect(defaultPort('s3')).toBe(443)
+    expect(defaultPort('dropbox')).toBe(443)
+    expect(defaultPort('onedrive')).toBe(443)
   })
 })
 
@@ -93,9 +126,26 @@ describe('validateProfile', () => {
     expect(validateProfile(ftpProfile({ kind: 'gopher' })).errors.length).toBeGreaterThan(0)
   })
 
-  it('rejects a kind that is known but unsupported, by name', () => {
-    const { errors } = validateProfile(ftpProfile({ kind: 'dropbox' }))
-    expect(errors.join(' ')).toMatch(/dropbox/i)
+  it('accepts a cloud-drive profile once it has a client ID', () => {
+    expect(validateProfile({
+      id: 'd1', name: 'My Dropbox', kind: 'dropbox', clientId: 'abc123xyz',
+    }).errors).toEqual([])
+  })
+
+  it('refuses a cloud-drive profile with no client ID, and says where to get one', () => {
+    // Rejecting with the registration instructions is the whole point: the
+    // user has a step to do, not a typo to fix.
+    const { errors } = validateProfile({ id: 'd1', name: 'My Dropbox', kind: 'dropbox' })
+    expect(errors.join(' ')).toMatch(/client ID/i)
+    expect(errors.join(' ')).toMatch(/dropbox\.com\/developers/)
+  })
+
+  it('refuses a client ID that is not shaped like one', () => {
+    // It ends up interpolated into an authorization URL.
+    const { errors } = validateProfile({
+      id: 'd1', name: 'My Dropbox', kind: 'dropbox', clientId: 'abc&redirect_uri=evil',
+    })
+    expect(errors.join(' ')).toMatch(/client ID/i)
   })
 
   it('accepts an sftp profile', () => {
@@ -152,6 +202,23 @@ describe('redactProfile', () => {
 })
 
 describe('serialise / parse', () => {
+  it('keeps an accepted SSH host key across a save and load', () => {
+    // This was dropped by the serialiser, so an accepted key never reached
+    // disk and every connection re-asked. That prompt only protects anyone
+    // while it is rare — asking every time is how it becomes a reflex.
+    //
+    // An in-memory store cannot catch this: the value is there until it is
+    // written out. The bug survived a test that asserted "the profile
+    // remembers the key" for exactly that reason, so this one goes through
+    // serialise and parse.
+    const line = '[example.test]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5'
+    const { json } = serialiseProfiles([{
+      id: 'p1', name: 'box', kind: 'sftp', host: 'example.test', port: 22,
+      user: 'me', knownHosts: line, saveSecret: false,
+    }], fakeCrypto)
+    expect(parseProfiles(json, fakeCrypto).profiles[0].knownHosts).toBe(line)
+  })
+
   it('round-trips a profile and its secret when encryption is available', () => {
     const { json, warnings } = serialiseProfiles([ftpProfile()], fakeCrypto)
     expect(warnings).toEqual([])

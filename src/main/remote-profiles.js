@@ -28,19 +28,24 @@
  * copied to another machine loads with its secrets missing rather than failing —
  * `load()` reports that as a warning and marks the profile `needsSecret`.
  *
- * ## Unsupported kinds
+ * ## Cloud drives (Dropbox, OneDrive)
  *
- * Beyond Compare also offers Dropbox and OneDrive. Those are rejected here
- * rather than half-implemented:
+ * These were once listed as unsupported "because they need an OAuth flow and a
+ * registered client ID". Only half of that was a real obstacle: the flow is
+ * implemented in `oauth.js`, and the client ID was never ours to ship. Beyond
+ * Compare uses the client ID **it** registered; any other application must
+ * register its own, so the ID belongs to the user's installation and is
+ * therefore a **profile field** (`clientId`) like a hostname — not a reason to
+ * drop the feature. `CLIENT_ID_HELP` carries the registration instructions so
+ * the UI can tell the user exactly where to get one.
  *
- *   - **Dropbox / OneDrive** need an interactive OAuth 2.0 authorization-code +
- *     PKCE flow, a registered per-vendor application client ID, a redirect
- *     listener, refresh-token rotation, and each vendor's own REST API. There is
- *     no protocol to implement; it is a per-vendor integration with an external
- *     registration prerequisite.
+ * For these kinds `secret` holds the **OAuth refresh token** rather than a
+ * password. That is deliberate: it is a long-lived credential and it then
+ * inherits the safeStorage-or-nothing rule above unchanged, instead of growing
+ * a second, weaker storage path.
  *
- * `UNSUPPORTED_KINDS` carries the user-facing reason so the UI can explain the
- * gap instead of showing an empty dropdown.
+ * `UNSUPPORTED_KINDS` remains as the mechanism for naming a kind we genuinely
+ * cannot do, and is currently empty.
  *
  * ## Testability
  *
@@ -54,14 +59,48 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 
 /** Kinds this application can actually talk to. */
-export const PROFILE_KINDS = Object.freeze(['ftp', 'ftps', 'sftp', 's3'])
+export const PROFILE_KINDS = Object.freeze([
+  'ftp', 'ftps', 'sftp', 's3', 'dropbox', 'onedrive',
+])
 
-/** Kinds Beyond Compare has that we deliberately do not, with the reason. */
-export const UNSUPPORTED_KINDS = Object.freeze({
-  dropbox: 'Dropbox requires an interactive OAuth 2.0 flow and a registered ' +
-    'application client ID, which this application does not have.',
-  onedrive: 'OneDrive requires an interactive OAuth 2.0 flow and a registered ' +
-    'Microsoft application client ID, which this application does not have.',
+/** Kinds whose credential is an OAuth token rather than a password. */
+export const OAUTH_KINDS = Object.freeze(['dropbox', 'onedrive'])
+
+/**
+ * Kinds Beyond Compare has that we deliberately do not, with the reason.
+ *
+ * Empty: the mechanism stays because the next vendor-specific remote may well
+ * be one we cannot do, and an explained gap beats a dropdown entry that fails
+ * on click.
+ *
+ * @type {Readonly<Record<string, string>>}
+ */
+export const UNSUPPORTED_KINDS = Object.freeze({})
+
+/**
+ * Where a user gets the client ID for each OAuth kind.
+ *
+ * Kept here rather than in the vendor modules so that validation — which runs
+ * without any network code loaded — can quote it, and so there is one copy.
+ */
+export const CLIENT_ID_HELP = Object.freeze({
+  dropbox:
+    'Dropbox 需要你自己註冊的應用程式 client ID（Beyond Compare 用的是它自己註冊的，任何複製品都必須用自己的）。\n' +
+    '取得方式：登入 https://www.dropbox.com/developers/apps → Create app → 選 Scoped access → ' +
+    'Full Dropbox 或 App folder → 命名後建立。\n' +
+    '在 Permissions 分頁勾選 account_info.read、files.metadata.read、files.content.read 並儲存；\n' +
+    '在 Settings 分頁的 Redirect URIs 加入 http://127.0.0.1:53682/callback' +
+    '（Dropbox 要求完全相同的網址，含連接埠）。\n' +
+    '最後把 Settings 分頁的 App key 填進 client ID 欄位。App secret 不需要，也不要填' +
+    '——桌面程式無法保守祕密。',
+  onedrive:
+    'OneDrive 需要你自己註冊的 Microsoft 應用程式 client ID（Beyond Compare 用的是它自己註冊的，' +
+    '任何複製品都必須用自己的）。\n' +
+    '取得方式：登入 https://portal.azure.com → Microsoft Entra ID → App registrations → New registration；\n' +
+    'Supported account types 選「Accounts in any organizational directory and personal Microsoft accounts」；\n' +
+    'Redirect URI 選 Public client/native，填 http://127.0.0.1:53682/callback。\n' +
+    '在 API permissions 加入 Microsoft Graph 委派權限 User.Read、Files.Read、Files.Read.All、offline_access。\n' +
+    '最後把 Overview 頁的 Application (client) ID 填進 client ID 欄位。用戶端密碼不需要，也不要填。',
 })
 
 /** Filename under `app.getPath('userData')`. */
@@ -77,7 +116,7 @@ export const MAX_PROFILE_FILE_BYTES = 4 * 1024 * 1024
  * @typedef {object} RemoteProfile
  * @property {string} id
  * @property {string} name
- * @property {'ftp'|'ftps'|'s3'} kind
+ * @property {'ftp'|'ftps'|'sftp'|'s3'|'dropbox'|'onedrive'} kind
  * @property {string} host        FTP/FTPS host, or the S3 endpoint override ('' for AWS)
  * @property {number} port        FTP/FTPS only
  * @property {string} user        FTP username, or the S3 access key id
@@ -86,6 +125,9 @@ export const MAX_PROFILE_FILE_BYTES = 4 * 1024 * 1024
  * @property {string} bucket      S3 only
  * @property {string} region      S3 only
  * @property {boolean} pathStyle  S3 only
+ * @property {string} clientId    OAuth kinds only; the user's own registered
+ *   application ID (see `CLIENT_ID_HELP`). Not a secret — a public client's ID
+ *   is visible in the browser's address bar during authorization.
  * @property {boolean} saveSecret whether the secret may be persisted
  * @property {boolean} needsSecret true when a secret is required but not loaded
  * @property {string} [secret]    IN MEMORY ONLY — never serialised in the clear
@@ -119,9 +161,17 @@ export const NULL_CRYPTO = Object.freeze({
  * @returns {number}
  */
 export function defaultPort(kind) {
-  if (kind === 's3') return 443
+  if (kind === 's3' || kind === 'dropbox' || kind === 'onedrive') return 443
   if (kind === 'sftp') return 22
   return 21
+}
+
+/**
+ * @param {string} kind
+ * @returns {boolean}
+ */
+export function isOAuthKind(kind) {
+  return OAUTH_KINDS.includes(kind)
 }
 
 /**
@@ -219,6 +269,19 @@ export function validateProfile(input) {
     }
   }
 
+  if (isOAuthKind(kind)) {
+    const clientId = String(input.clientId ?? '').trim()
+    if (clientId === '') {
+      // Not "invalid input" so much as a step the user has not done yet, so
+      // the message is the instructions rather than a complaint.
+      errors.push(`${kind} 需要 client ID。\n${CLIENT_ID_HELP[kind]}`)
+    } else if (!/^[A-Za-z0-9._~-]{4,128}$/.test(clientId)) {
+      // The value is interpolated into an authorization URL; restricting it to
+      // the shape both vendors actually issue keeps anything else out of it.
+      errors.push('client ID contains invalid characters')
+    }
+  }
+
   return { ok: errors.length === 0, errors }
 }
 
@@ -252,6 +315,7 @@ export function normaliseProfile(input, opts = {}) {
     bucket: kind === 's3' ? String(input.bucket ?? '').trim() : '',
     region: kind === 's3' ? String(input.region ?? '').trim() : '',
     pathStyle: kind === 's3' ? Boolean(input.pathStyle) : false,
+    clientId: isOAuthKind(kind) ? String(input.clientId ?? '').trim() : '',
     saveSecret,
     needsSecret: false,
     // The host key the user has already accepted, in known_hosts line form. A
@@ -314,24 +378,36 @@ export function serialiseProfiles(profiles, crypto = NULL_CRYPTO) {
       bucket: p.bucket,
       region: p.region,
       pathStyle: p.pathStyle,
+      clientId: p.clientId,
+      // Without this the accepted SSH host key was re-asked for on every
+      // connection, which is exactly how a known_hosts prompt becomes noise
+      // people click through.
+      knownHosts: p.knownHosts,
       saveSecret: Boolean(p.saveSecret),
       /** @type {string|undefined} */
       encryptedSecret: undefined,
     }
 
+    // For the OAuth kinds the stored secret is a refresh token, so the wording
+    // has to match what the user will actually be asked to redo.
+    const secretNoun = isOAuthKind(p.kind) ? 'OAuth 授權' : 'password'
+    const redo = isOAuthKind(p.kind)
+      ? 'You will be asked to authorize again on each connection.'
+      : 'It will be requested on each connection.'
+
     if (p.secret && p.saveSecret) {
       if (!available) {
         record.saveSecret = false
         warnings.push(
-          `Profile "${p.name}": OS encryption is unavailable, so the password was ` +
-          'not saved. It will be requested on each connection.',
+          `Profile "${p.name}": OS encryption is unavailable, so the ${secretNoun} was ` +
+          `not saved. ${redo}`,
         )
       } else {
         try {
           record.encryptedSecret = Buffer.from(crypto.encryptString(p.secret)).toString('base64')
         } catch (err) {
           record.saveSecret = false
-          warnings.push(`Profile "${p.name}": password could not be encrypted (${err.message}); not saved.`)
+          warnings.push(`Profile "${p.name}": ${secretNoun} could not be encrypted (${err.message}); not saved.`)
         }
       }
     }

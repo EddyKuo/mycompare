@@ -1,0 +1,90 @@
+/**
+ * Every exposed IPC method is called by something.
+ *
+ * This project's most persistent bug is a capability that is fully built,
+ * correctly exposed through preload, unit-tested, and reached by no code at
+ * all. Two audits found nine of them, and three were mine, added in this
+ * session while policing exactly that pattern.
+ *
+ * Unit tests cannot catch it, because the module works. Only the absence of a
+ * caller gives it away, and nothing at runtime ever looks for that.
+ */
+import { describe, it, expect } from 'vitest'
+import { readFileSync, readdirSync, statSync } from 'fs'
+import { join } from 'path'
+import { fileURLToPath } from 'url'
+
+const ROOT = fileURLToPath(new URL('../..', import.meta.url))
+const PRELOAD = readFileSync(join(ROOT, 'src/preload/index.js'), 'utf-8')
+
+/** @param {string} dir @returns {string[]} every .js beneath it */
+function jsFiles(dir) {
+  const out = []
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name)
+    if (statSync(full).isDirectory()) out.push(...jsFiles(full))
+    else if (name.endsWith('.js')) out.push(full)
+  }
+  return out
+}
+
+const RENDERER = jsFiles(join(ROOT, 'src/renderer'))
+  .map((f) => readFileSync(f, 'utf-8'))
+  .join('\n')
+
+/**
+ * Methods on the object handed to contextBridge.
+ *
+ * Anchored to two-space indentation so object literals nested inside a method
+ * body are not mistaken for further methods.
+ */
+function exposedMethods() {
+  return [...PRELOAD.matchAll(/^ {2}([a-zA-Z]\w*)\s*:/gm)].map((m) => m[1])
+}
+
+/**
+ * Whether anything in the renderer references the method.
+ *
+ * Deliberately any `.name`, not `electronAPI.name`: several call sites take a
+ * local alias first (`const api = window.electronAPI`, then `api.readRegFile`).
+ * Insisting on the qualified form reported three working features as orphans,
+ * which would have had me "fix" code that was already correct. The looser match
+ * can only cause a false negative — a same-named method on some other object —
+ * and a missed orphan is a far cheaper mistake than a fabricated one.
+ *
+ * @param {string} name
+ */
+function isCalled(name) {
+  return new RegExp(`\\.${name}\\b`).test(RENDERER)
+}
+
+/**
+ * Exposed but deliberately uncalled, with the reason.
+ *
+ * An entry here is a standing claim that the gap is intentional. It is not a
+ * place to quiet a failure — that is how the original nine survived.
+ */
+const ALLOWED = new Map()
+
+describe('preload surface', () => {
+  it('finds the exposed methods at all', () => {
+    // Without this, a change to preload's shape would empty the list and the
+    // check below would pass by examining nothing.
+    expect(exposedMethods().length).toBeGreaterThan(30)
+  })
+
+  it('reads the renderer sources at all', () => {
+    expect(RENDERER.length).toBeGreaterThan(100000)
+  })
+
+  it('has a renderer caller for every exposed method', () => {
+    const orphans = exposedMethods().filter((n) => !ALLOWED.has(n) && !isCalled(n))
+    expect(orphans, 'exposed through preload but never called').toEqual([])
+  })
+
+  it('carries no stale exemption', () => {
+    // An exemption that has since gained a caller hides the next real orphan.
+    const stale = [...ALLOWED.keys()].filter(isCalled)
+    expect(stale, 'listed as uncalled but now called').toEqual([])
+  })
+})
