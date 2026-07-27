@@ -38,6 +38,54 @@ import {
 /** Fixed row height in px — must match CSS line-height (1.5 × 13px ≈ 20px) */
 const VS_ROW_HEIGHT = 20;
 
+/**
+ * The identifier surrounding an offset in a string.
+ *
+ * Word characters are letters, digits, underscore and the CJK ranges — a
+ * search seeded from source code should pick up `foo_bar` and `使用者名稱`
+ * whole rather than stopping at the first underscore or at an ASCII boundary.
+ *
+ * @param {string} text
+ * @param {number} offset
+ * @returns {string}
+ */
+export function wordAt(text, offset) {
+  if (typeof text !== 'string' || !text) return '';
+  // The same class `wordBoundsAt` uses: Unicode letters and numbers plus
+  // _ and $, so an identifier is taken whole in any script rather than
+  // stopping at the first non-ASCII character.
+  const isWord = (ch) => /[\p{L}\p{N}_$]/u.test(ch);
+  let i = Math.max(0, Math.min(offset, text.length));
+  // An offset just past the end of a word still belongs to it: the caret sits
+  // after the last character when you finish typing a name.
+  if (i > 0 && (i >= text.length || !isWord(text[i])) && isWord(text[i - 1])) i -= 1;
+  if (i >= text.length || !isWord(text[i])) return '';
+  let start = i;
+  while (start > 0 && isWord(text[start - 1])) start -= 1;
+  let end = i;
+  while (end < text.length && isWord(text[end])) end += 1;
+  return text.slice(start, end);
+}
+
+/**
+ * What Find should be pre-filled with.
+ *
+ * A non-empty selection wins; otherwise the word under the caret. A selection
+ * spanning lines is ignored — it is a range, not a search term.
+ *
+ * @returns {string}
+ */
+export function selectedTextOrWordAtCaret() {
+  const sel = typeof window !== 'undefined' ? window.getSelection?.() : null;
+  if (!sel || sel.rangeCount === 0) return '';
+  const text = String(sel.toString() ?? '');
+  if (text && !text.includes('\n')) return text.trim();
+  if (text) return '';
+  const node = sel.anchorNode;
+  if (!node || node.nodeType !== 3) return '';
+  return wordAt(String(node.textContent ?? ''), sel.anchorOffset);
+}
+
 /** Rows to render above/below viewport to avoid scroll flicker */
 const VS_OVERSCAN = 5;
 
@@ -1879,6 +1927,16 @@ export class TextCompare {
     if (replaceMode && !this._replaceMode) {
       this._toggleReplaceMode();
     }
+
+    // Seed from the selection, or the word under the caret. Opening Find on a
+    // symbol you are looking at and having to retype it is the common case,
+    // and the previous query is still there when neither applies.
+    const seed = selectedTextOrWordAtCaret();
+    if (seed && this._findInput) {
+      this._findInput.value = seed;
+      this._findQuery = seed;
+    }
+
     this._findInput?.focus();
     this._findInput?.select();
     this._runFind();
