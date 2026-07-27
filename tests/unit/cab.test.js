@@ -108,13 +108,15 @@ describe('extractCabEntry', () => {
 })
 
 describe('decodeFolder', () => {
-  it('names Quantum and LZX rather than mis-decoding them', () => {
-    // Neither can be verified against a reference implementation here, so an
-    // honest refusal beats a decoder that only agrees with itself.
-    for (const [compress, name] of [[2, 'Quantum'], [3, 'LZX']]) {
-      expect(() => decodeFolder(MULTI_CAB, { coffData: 112, blocks: 1, compress }, { data: 0 }))
-        .toThrow(new RegExp(name))
-    }
+  it('names Quantum rather than mis-decoding it', () => {
+    // `makecab` on this machine rejects CompressionType=QUANTUM, so a Quantum
+    // decoder here could only ever be checked against itself. An honest
+    // refusal beats a decoder that only agrees with itself. LZX used to be
+    // refused alongside it on the same stated grounds, and those grounds were
+    // wrong — makecab writes LZX happily — so LZX is decoded now, and covered
+    // against real makecab output in cab-lzx.test.js.
+    expect(() => decodeFolder(MULTI_CAB, { coffData: 112, blocks: 1, compress: 2 }, { data: 0 }))
+      .toThrow(/Quantum/)
   })
 
   it('refuses an unknown compression type by number', () => {
