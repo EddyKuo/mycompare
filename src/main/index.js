@@ -853,6 +853,15 @@ ipcMain.handle('hash-file', async (_event, filePath) => {
   return computeMd5(buffer)
 })
 
+// A real CRC-32, not MD5 under another name. The folder view offers both, each
+// labelled for what it is, so a value checked against unzip or `7z l` matches.
+ipcMain.handle('crc32-file', async (_event, filePath) => {
+  const safe = validatePath(filePath)
+  const { computeCrc32 } = await import('./file-hash.js')
+  const buffer = await readFile(safe)
+  return computeCrc32(buffer)
+})
+
 // IPC: T33 — 監視檔案變更（fs.watch，callback-based，非 promises）
 ipcMain.handle('watch-file', (event, filePath) => {
   const safe = validatePath(filePath)

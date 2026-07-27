@@ -3054,6 +3054,8 @@ export class FolderCompare {
 
     // Checksum column, same lazy shape as the version column above.
     /** @type {Map<string, string>} */
+    /** @type {'crc32'|'md5'} BC's column is a CRC-32, so that is the default. */
+    this._checksumAlgo = 'crc32'
     this._crcCache = new Map()
     /** @type {Set<string>} */
     this._crcInFlight = new Set()
@@ -7781,11 +7783,17 @@ ${rows}
       for (const def of this._columnDefs()) {
         const sorted = this._sortKey === def.id
         const arrow = sorted ? (this._sortDir > 0 ? ' ▲' : ' ▼') : ''
+        // The checksum column names its algorithm in the heading. A value the
+        // user means to check against unzip's CRC has to say whether that is
+        // what it is.
+        const label = def.id === 'crc'
+          ? (this._checksumAlgo === 'crc32' ? 'CRC-32' : 'MD5')
+          : def.label
         sideEl.appendChild(el('div', {
           className: `fc-col fc-col-${def.id}${sorted ? ' fc-col--sorted' : ''}`,
           'data-column': def.id,
-          title: `依「${def.label}」排序`,
-        }, def.label + arrow))
+          title: `依「${label}」排序`,
+        }, label + arrow))
       }
       header.appendChild(sideEl)
     }
@@ -7812,11 +7820,22 @@ ${rows}
    * @param {MouseEvent} e
    */
   _openColumnMenu(e) {
-    showContextMenu(e, FOLDER_COLUMN_DEFS.map((def) => ({
+    /** @type {Array<object>} */
+    const items = FOLDER_COLUMN_DEFS.map((def) => ({
       label: `${this._columns.includes(def.id) ? '✓ ' : '　 '}${def.label}`,
       disabled: !!def.locked,
       action: () => this.toggleColumn(def.id),
-    })))
+    }))
+    // Offered here rather than in a settings page: this is where the column is
+    // turned on, so it is where someone is deciding what they want from it.
+    items.push({ separator: true })
+    for (const algo of FolderCompare.checksumAlgorithms) {
+      items.push({
+        label: `${this._checksumAlgo === algo.id ? '✓ ' : '　 '}檢查碼：${algo.label}`,
+        action: () => this.setChecksumAlgorithm(algo.id),
+      })
+    }
+    showContextMenu(e, items)
   }
 
   /** Whether focus is in a control that consumes ordinary key presses. */
@@ -9266,28 +9285,91 @@ ${rows}
     }, 0)
   }
 
+  /**
+   * The checksum algorithms the column can show.
+   *
+   * BC's column is a CRC-32; this one was backed by `hash-file`, which is MD5.
+   * Both are useful — MD5 for "are these the same file", CRC-32 for checking a
+   * value against what unzip or `7z l` prints — but only one of them is what
+   * the word CRC means, and showing MD5 under that name gives a user a value
+   * that will never match and no way to see why.
+   *
+   * @returns {ReadonlyArray<{id: 'crc32'|'md5', label: string}>}
+   */
+  static get checksumAlgorithms() {
+    return Object.freeze([
+      Object.freeze({ id: 'crc32', label: 'CRC-32' }),
+      Object.freeze({ id: 'md5', label: 'MD5' }),
+    ])
+  }
+
+  /** @returns {'crc32'|'md5'} */
+  getChecksumAlgorithm() { return this._checksumAlgo }
+
+  /**
+   * @param {'crc32'|'md5'} algo
+   * @returns {'crc32'|'md5'} the algorithm now in effect
+   */
+  setChecksumAlgorithm(algo) {
+    if (algo !== 'crc32' && algo !== 'md5') return this._checksumAlgo
+    if (algo === this._checksumAlgo) return this._checksumAlgo
+    this._checksumAlgo = algo
+    // Every cached value was produced by the other algorithm. Keeping them
+    // would leave the column showing a mix of the two under one heading.
+    this._crcCache.clear()
+    this._crcTitles.clear()
+    // eachRow, not flattenRows: the latter hands out shallow copies, so the
+    // deletes would land on throwaway objects and the stale values would stay.
+    for (const row of eachRow(this._rows ?? [])) {
+      for (const entry of [row.left, row.right]) {
+        if (entry) delete entry.crc
+      }
+    }
+    this._applyFilterAndRender()
+    return this._checksumAlgo
+  }
+
+  /** @returns {boolean} whether the selected algorithm has an IPC behind it */
+  _checksumAvailable() {
+    return typeof (this._checksumAlgo === 'crc32'
+      ? window.electronAPI?.crc32File
+      : window.electronAPI?.hashFile) === 'function'
+  }
+
+  /**
+   * Compute one file's checksum with the selected algorithm.
+   * @param {string} path
+   * @returns {Promise<{text: string, title: string}>}
+   */
+  async _checksumFor(path) {
+    const useCrc = this._checksumAlgo === 'crc32'
+    const call = useCrc ? window.electronAPI?.crc32File : window.electronAPI?.hashFile
+    const name = useCrc ? 'CRC-32' : 'MD5'
+    if (typeof call !== 'function') {
+      return { text: '', title: `此環境沒有 ${name} IPC` }
+    }
+    try {
+      const text = String(await call(path))
+      return { text, title: `${name}：${text}` }
+    } catch (err) {
+      console.warn('FolderCompare: checksum failed:', path, err)
+      return { text: '—', title: `無法計算${name}：${errText(err)}` }
+    }
+  }
+
   /** @returns {Promise<void>} */
   async _drainCrcQueue() {
     const jobs = this._crcQueue
     this._crcQueue = []
-    if (!jobs.length || !window.electronAPI?.hashFile) {
+    if (!jobs.length || !this._checksumAvailable()) {
       for (const job of jobs) this._resolveCrc(job.entry, '', '此環境沒有檢查碼 IPC')
       return
     }
     for (const job of jobs) this._crcInFlight.add(job.path)
     await _runWithConcurrency(jobs, CRC_CONCURRENCY, async (job) => {
-      let text = ''
-      let title = ''
-      try {
-        text = String(await window.electronAPI.hashFile(job.path))
-        title = `MD5：${text}`
-      } catch (err) {
-        // Informational column: a dialog per unreadable file would be worse
-        // than the dash, but the reason still has to reach the user somewhere.
-        console.warn('FolderCompare: checksum failed:', job.path, err)
-        text = '—'
-        title = `無法計算檢查碼：${errText(err)}`
-      }
+      // Informational column: a dialog per unreadable file would be worse than
+      // the dash, but the reason still has to reach the user somewhere.
+      const { text, title } = await this._checksumFor(job.path)
       this._crcInFlight.delete(job.path)
       this._resolveCrc(job.entry, text, title)
     })
@@ -9319,7 +9401,7 @@ ${rows}
    * @returns {Promise<void>}
    */
   async prefetchCrcForSort() {
-    if (!window.electronAPI?.hashFile) return
+    if (!this._checksumAvailable()) return
     /** @type {FileEntry[]} */
     const pending = []
     let skipped = 0
@@ -9343,16 +9425,7 @@ ${rows}
     this._setScanStatus(`計算檢查碼… 0/${pending.length}`)
     let done = 0
     await _runWithConcurrency(pending, CRC_CONCURRENCY, async (entry) => {
-      let text = ''
-      let title = ''
-      try {
-        text = String(await window.electronAPI.hashFile(entry.path))
-        title = `MD5：${text}`
-      } catch (err) {
-        console.warn('FolderCompare: checksum failed:', entry.path, err)
-        text = '—'
-        title = `無法計算檢查碼：${errText(err)}`
-      }
+      const { text, title } = await this._checksumFor(entry.path)
       this._resolveCrc(entry, text, title)
       done++
       if (done % 25 === 0) this._setScanStatus(`計算檢查碼… ${done}/${pending.length}`)
