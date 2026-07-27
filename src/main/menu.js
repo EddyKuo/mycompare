@@ -205,6 +205,38 @@ export function buildAppMenu(win) {
         { type: 'separator' },
         item('切換編輯模式', 'edit.toggleEditMode', 'CmdOrCtrl+E'),
         { type: 'separator' },
+        {
+          label: '行編輯',
+          submenu: [
+            item('複製此行到右側', 'text.copyLineRight', 'Alt+Shift+Right'),
+            item('複製此行到左側', 'text.copyLineLeft', 'Alt+Shift+Left'),
+            item('複製此行到對側', 'text.copyLineOther', 'Alt+Shift+O'),
+            item('複製此區塊到對側', 'text.copyOtherSide', 'Alt+O'),
+            { type: 'separator' },
+            item('在上方插入一行', 'text.insertLineBefore', 'CmdOrCtrl+Shift+Enter'),
+            item('在下方插入一行', 'text.insertLineAfter', 'CmdOrCtrl+Enter'),
+            { type: 'separator' },
+            item('刪除整行', 'text.deleteLine', 'CmdOrCtrl+D'),
+            item('刪除至行首', 'text.deleteToStartOfLine', 'CmdOrCtrl+Shift+Backspace'),
+            item('刪除至行尾', 'text.deleteToEndOfLine', 'CmdOrCtrl+Shift+Delete'),
+            item('刪除一個字', 'text.deleteWord', 'CmdOrCtrl+Delete'),
+            { type: 'separator' },
+            item('增加縮排', 'text.increaseIndent', 'CmdOrCtrl+]'),
+            item('減少縮排', 'text.decreaseIndent', 'CmdOrCtrl+[')
+          ]
+        },
+        {
+          label: '選取與對齊',
+          submenu: [
+            item('選取目前差異區塊', 'text.selectSection', 'Alt+S'),
+            item('全選', 'text.selectAll', 'CmdOrCtrl+A'),
+            { type: 'separator' },
+            item('對齊此兩行', 'text.alignWith', 'CmdOrCtrl+Alt+A'),
+            item('清除手動對齊', 'text.clearAlignAnchors', 'CmdOrCtrl+Alt+Shift+A'),
+            item('單獨比對選取範圍', 'text.isolate', 'CmdOrCtrl+Alt+I')
+          ]
+        },
+        { type: 'separator' },
         item('複製區塊到左側', 'edit.copyToLeft', 'Alt+Left'),
         item('複製區塊到右側', 'edit.copyToRight', 'Alt+Right'),
         item('複製全部差異到左側', 'edit.copyAllToLeft'),
@@ -229,6 +261,11 @@ export function buildAppMenu(win) {
         item('跳至行號…', 'search.gotoLine', 'CmdOrCtrl+G'),
         { type: 'separator' },
         item('下一個差異', 'search.nextDiff', 'F8'),
+        { type: 'separator' },
+        item('下一個行內差異', 'text.nextInlineDiff', 'CmdOrCtrl+F8'),
+        item('上一個行內差異', 'text.prevInlineDiff', 'CmdOrCtrl+F7'),
+        item('下一個編輯位置', 'text.nextEdit', 'Alt+F8'),
+        item('上一個編輯位置', 'text.prevEdit', 'Alt+F7'),
         item('上一個差異', 'search.prevDiff', 'F7'),
         item('第一個差異', 'search.firstDiff', 'Alt+Home'),
         item('最後一個差異', 'search.lastDiff', 'Alt+End'),

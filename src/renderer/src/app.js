@@ -1247,6 +1247,49 @@ function _mergeCompareOutput(side) {
   mergeCompare.compareToOutput(side)
 }
 
+/**
+ * Text edit commands that also appear in the native menu.
+ *
+ * Listed rather than derived because the menu is built in the main process,
+ * before any view exists. `tests/unit/text-menu-commands.test.js` asserts this
+ * matches the view's own table, so adding a command without a menu entry — or
+ * the reverse — fails rather than going unnoticed.
+ */
+const TEXT_EDIT_COMMAND_IDS = Object.freeze([
+  'text.copyLineRight', 'text.copyLineLeft', 'text.copyLineOther', 'text.copyOtherSide',
+  'text.insertLineBefore', 'text.insertLineAfter',
+  'text.deleteLine', 'text.deleteToStartOfLine', 'text.deleteToEndOfLine', 'text.deleteWord',
+  'text.increaseIndent', 'text.decreaseIndent',
+  'text.selectSection', 'text.selectAll',
+  'text.alignWith', 'text.clearAlignAnchors', 'text.isolate',
+  'text.nextInlineDiff', 'text.prevInlineDiff', 'text.nextEdit', 'text.prevEdit',
+])
+
+/**
+ * Menu handlers for every text edit command, keyed by the view's own ids.
+ *
+ * Generated rather than listed: a hand-written copy is a third place the set
+ * of commands has to be kept in step, and the one most likely to be forgotten.
+ *
+ * @returns {Record<string, () => void>}
+ */
+function _textEditCommandHandlers() {
+  /** @type {Record<string, () => void>} */
+  const out = {}
+  for (const id of TEXT_EDIT_COMMAND_IDS) {
+    out[id] = () => {
+      if (currentView !== 'text' || !textCompare) {
+        showStatus('此項目僅適用於文字比對')
+        return
+      }
+      const cmd = textCompare.editCommands().find((c) => c.id === id)
+      if (!cmd) { showStatus(`找不到指令：${id}`); return }
+      cmd.run()
+    }
+  }
+  return out
+}
+
 async function printActiveReport() {
   const src = _activeReportSource()
   if (!src.htmlFallback) { showStatus('目前視圖不支援列印報告'); return }
@@ -3089,6 +3132,11 @@ function setupMenuActions() {
       el('btn-edit-mode').classList.toggle('active', isEdit)
       el('btn-edit-mode').title = isEdit ? '退出編輯模式 (Ctrl+E)' : '切換編輯模式 (Ctrl+E)'
     },
+    // The text view owns one table of edit commands; its keyboard handler and
+    // context menu are both generated from it, so the menu dispatches by the
+    // same id instead of keeping a third copy that can drift.
+    ..._textEditCommandHandlers(),
+
     'edit.copyToLeft':     () => { if (currentView === 'text') textCompare?.copyToLeft() },
     'edit.copyToRight':    () => { if (currentView === 'text') textCompare?.copyToRight() },
     'edit.copyAllToLeft':  () => { if (currentView === 'text') textCompare?.copyAllToLeft() },

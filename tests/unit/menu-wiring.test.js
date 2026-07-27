@@ -35,6 +35,20 @@ function dispatchIds() {
   return [...APP.matchAll(/'([a-z][\w-]*(?:\.[\w-]+)+)'\s*:/g)].map((m) => m[1])
 }
 
+/**
+ * Ids handled by a generated block rather than a literal key.
+ *
+ * The text edit commands are spread in from one table, so the view's keyboard
+ * handler, its context menu and the native menu cannot drift apart. That also
+ * means no `'text.deleteLine':` key exists for the scan above to find, so they
+ * are read from the id list instead.
+ */
+function generatedIds() {
+  const block = /TEXT_EDIT_COMMAND_IDS = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(APP)
+  if (!block) return []
+  return [...block[1].matchAll(/'([\w.]+)'/g)].map((m) => m[1])
+}
+
 describe('menu wiring', () => {
   it('finds the menu items at all, so a rename cannot make this test vacuous', () => {
     // Without this, a change to the item() signature would leave the test
@@ -43,9 +57,16 @@ describe('menu wiring', () => {
   })
 
   it('has a dispatch entry for every menu id', () => {
-    const handled = new Set(dispatchIds())
+    const handled = new Set([...dispatchIds(), ...generatedIds()])
     const missing = menuIds().filter((id) => !handled.has(id))
     expect(missing).toEqual([])
+  })
+
+  it('finds the generated command ids at all', () => {
+    // If the id list is renamed, generatedIds() returns nothing and every one
+    // of those commands looks unhandled. Asserting it found them keeps the
+    // check above from passing for the wrong reason in either direction.
+    expect(generatedIds().length).toBeGreaterThan(15)
   })
 
   it('has no duplicate menu ids', () => {

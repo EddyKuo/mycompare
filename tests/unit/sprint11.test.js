@@ -47,6 +47,10 @@ const TEXT_CONFIG_DEFAULTS = {
   detailsMode: null,
   readOnlyLeft: false,
   readOnlyRight: false,
+  // 1.4: Align With anchors and the indent step travel with the snapshot too.
+  alignAnchors: [],
+  tabWidth: 4,
+  indentWithTabs: false,
 }
 
 // ── T61 NamedConfigStore CRUD ────────────────────────────────────────────────

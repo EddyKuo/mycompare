@@ -17,7 +17,7 @@
 
 import { diffLines, diffChars } from '../core/diff-engine.js';
 import { showContextMenu } from '../core/context-menu.js';
-import { SettingsStore } from '../core/settings-store.js';
+import { SettingsStore, keyComboMatches } from '../core/settings-store.js';
 import { renderTextTable, reportHeader, reportSummary } from '../core/report.js';
 import { detectEol } from '../core/eol-detect.js';
 import { isActive } from '../core/active-view.js';
@@ -507,6 +507,385 @@ export function buildPatchSides(files) {
 }
 
 // ---------------------------------------------------------------------------
+// 1.4 / 1.5 — primitives behind the Edit and Search command sets
+//
+// Every one of these is DOM-free and takes "old text in, new text out". The
+// panes are virtualised, so a command that patched the DOM would lose its
+// effect the moment the row scrolled out of view; expressing an edit as a
+// transformation of the model is what makes it survive.
+// ---------------------------------------------------------------------------
+
+/**
+ * Split text into lines that each carry their own terminator.
+ *
+ * Deliberately mirrors diff-engine's private splitLines so that index N here
+ * is the same line as `leftLine === N + 1` in a DiffLine.
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function splitLinesKeepEol(text) {
+  if (typeof text !== 'string' || text === '') return [];
+  /** @type {string[]} */
+  const lines = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) {
+      lines.push(text.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  if (start < text.length) lines.push(text.slice(start));
+  return lines;
+}
+
+/**
+ * Split one line into its body and its terminator.
+ * @param {string} line
+ * @returns {{ body: string, eol: string }}
+ */
+export function splitEol(line) {
+  const m = /\r\n$|[\r\n]$/.exec(line ?? '');
+  const eol = m ? m[0] : '';
+  return { body: eol ? line.slice(0, line.length - eol.length) : (line ?? ''), eol };
+}
+
+/**
+ * Insert a blank line before or after `lineIdx`.
+ *
+ * @param {string} text
+ * @param {number} lineIdx 0-based
+ * @param {'before'|'after'} position
+ * @param {string} [eol]
+ * @returns {string}
+ */
+export function insertBlankLine(text, lineIdx, position, eol = '\n') {
+  const lines = splitLinesKeepEol(text);
+  if (lines.length === 0) return eol;
+  const i = Math.min(Math.max(lineIdx, 0), lines.length - 1);
+  const at = position === 'before' ? i : i + 1;
+  if (at >= lines.length) {
+    // A file whose last line has no terminator cannot hold a line after it;
+    // give the old last line one so the new blank line is representable.
+    const last = lines.length - 1;
+    if (!/\n$/.test(lines[last])) lines[last] += eol;
+    lines.push(eol);
+  } else {
+    lines.splice(at, 0, eol);
+  }
+  return lines.join('');
+}
+
+/**
+ * Remove one whole line.
+ * @param {string} text
+ * @param {number} lineIdx 0-based
+ * @returns {string}
+ */
+export function removeLine(text, lineIdx) {
+  const lines = splitLinesKeepEol(text);
+  if (lineIdx < 0 || lineIdx >= lines.length) return text;
+  lines.splice(lineIdx, 1);
+  return lines.join('');
+}
+
+/**
+ * Replace one line's body, keeping whatever terminator it had.
+ * @param {string} text
+ * @param {number} lineIdx 0-based
+ * @param {string} newBody body without a terminator
+ * @returns {string}
+ */
+export function replaceLineBody(text, lineIdx, newBody) {
+  const lines = splitLinesKeepEol(text);
+  if (lineIdx < 0 || lineIdx >= lines.length) return text;
+  lines[lineIdx] = newBody + splitEol(lines[lineIdx]).eol;
+  return lines.join('');
+}
+
+/**
+ * Bounds of the word Ctrl+Delete would swallow, starting at `col`:
+ * any run of whitespace, then the run of word- or of punctuation-characters
+ * that follows it.
+ *
+ * @param {string} body line body, no terminator
+ * @param {number} col 0-based caret column
+ * @returns {{ start: number, end: number }} `start === end` when there is
+ *   nothing to delete
+ */
+export function wordBoundsAt(body, col) {
+  const n = body.length;
+  const start = Math.min(Math.max(col | 0, 0), n);
+  let i = start;
+  const isSpace = (ch) => /\s/.test(ch);
+  const isWord = (ch) => /[\p{L}\p{N}_$]/u.test(ch);
+  while (i < n && isSpace(body[i])) i++;
+  if (i < n) {
+    const wordish = isWord(body[i]);
+    while (i < n && !isSpace(body[i]) && isWord(body[i]) === wordish) i++;
+  }
+  return { start, end: i };
+}
+
+/**
+ * Add or remove one indent step on a range of lines.
+ *
+ * Blank lines are left alone when indenting, which is what every editor and
+ * BC itself do — indenting nothing produces trailing whitespace.
+ *
+ * @param {string} text
+ * @param {number} startLine 0-based, inclusive
+ * @param {number} endLine   0-based, inclusive
+ * @param {1|-1} delta
+ * @param {number} [tabWidth]
+ * @param {boolean} [useTabs] insert a tab rather than `tabWidth` spaces
+ * @returns {string}
+ */
+export function indentLines(text, startLine, endLine, delta, tabWidth = 4, useTabs = false) {
+  if (delta !== 1 && delta !== -1) return text;
+  const lines = splitLinesKeepEol(text);
+  if (lines.length === 0) return text;
+  const width = Number.isInteger(tabWidth) && tabWidth > 0 ? tabWidth : 4;
+  const unit = useTabs ? '\t' : ' '.repeat(width);
+  const lo = Math.max(0, startLine);
+  const hi = Math.min(lines.length - 1, endLine);
+  for (let i = lo; i <= hi; i++) {
+    const { body, eol } = splitEol(lines[i]);
+    let next = body;
+    if (delta > 0) {
+      if (body.length === 0) continue;
+      next = unit + body;
+    } else if (body.startsWith('\t')) {
+      next = body.slice(1);
+    } else {
+      let k = 0;
+      while (k < width && body[k] === ' ') k++;
+      next = body.slice(k);
+    }
+    lines[i] = next + eol;
+  }
+  return lines.join('');
+}
+
+/**
+ * @typedef {{ left: number, right: number }} AlignAnchor
+ *   1-based line numbers the user pinned to each other.
+ */
+
+/**
+ * True when two anchors cannot both hold: they name the same line on one side,
+ * or they cross (left order and right order disagree).
+ *
+ * @param {AlignAnchor} a
+ * @param {AlignAnchor} b
+ * @returns {boolean}
+ */
+export function anchorsConflict(a, b) {
+  const dl = a.left - b.left;
+  const dr = a.right - b.right;
+  if (dl === 0 || dr === 0) return true;
+  return (dl > 0) !== (dr > 0);
+}
+
+/**
+ * Drop anchors that are out of range or that cross an earlier one, and sort
+ * what remains. Callers that need to know an anchor was rejected should
+ * compare lengths — this function never throws, so a stale saved session
+ * cannot break the view.
+ *
+ * @param {unknown} anchors
+ * @param {number} leftCount total lines on the left
+ * @param {number} rightCount total lines on the right
+ * @returns {AlignAnchor[]}
+ */
+export function normaliseAnchors(anchors, leftCount, rightCount) {
+  /** @type {AlignAnchor[]} */
+  const clean = [];
+  for (const a of Array.isArray(anchors) ? anchors : []) {
+    const left = Number(a?.left);
+    const right = Number(a?.right);
+    if (!Number.isInteger(left) || !Number.isInteger(right)) continue;
+    if (left < 1 || right < 1 || left > leftCount || right > rightCount) continue;
+    clean.push({ left, right });
+  }
+  clean.sort((x, y) => x.left - y.left || x.right - y.right);
+  /** @type {AlignAnchor[]} */
+  const out = [];
+  for (const a of clean) {
+    const prev = out[out.length - 1];
+    if (prev && anchorsConflict(a, prev)) continue;
+    out.push(a);
+  }
+  return out;
+}
+
+/**
+ * Cut both files into the independent regions the anchors define.
+ * Ranges are 0-based, `*End` exclusive; `kind: 'anchor'` segments are the
+ * pinned line pairs themselves.
+ *
+ * @param {number} leftCount
+ * @param {number} rightCount
+ * @param {AlignAnchor[]} anchors already normalised
+ * @returns {Array<{ kind: 'diff'|'anchor', leftStart: number, leftEnd: number,
+ *   rightStart: number, rightEnd: number }>}
+ */
+export function splitByAnchors(leftCount, rightCount, anchors) {
+  const segs = [];
+  let l = 0;
+  let r = 0;
+  for (const a of anchors) {
+    segs.push({ kind: 'diff', leftStart: l, leftEnd: a.left - 1, rightStart: r, rightEnd: a.right - 1 });
+    segs.push({ kind: 'anchor', leftStart: a.left - 1, leftEnd: a.left, rightStart: a.right - 1, rightEnd: a.right });
+    l = a.left;
+    r = a.right;
+  }
+  segs.push({ kind: 'diff', leftStart: l, leftEnd: leftCount, rightStart: r, rightEnd: rightCount });
+  return segs.filter(s => s.kind === 'anchor' || s.leftEnd > s.leftStart || s.rightEnd > s.rightStart);
+}
+
+/**
+ * Shift the line numbers of a sub-diff back into whole-file coordinates.
+ * @param {import('../core/diff-engine.js').DiffLine[]} dls
+ * @param {number} leftOffset
+ * @param {number} rightOffset
+ * @returns {import('../core/diff-engine.js').DiffLine[]}
+ */
+export function offsetDiffLines(dls, leftOffset, rightOffset) {
+  return dls.map(d => ({
+    ...d,
+    leftLine: d.leftLine == null ? null : d.leftLine + leftOffset,
+    rightLine: d.rightLine == null ? null : d.rightLine + rightOffset,
+  }));
+}
+
+/**
+ * BC's "Align With": diff each anchor-delimited region on its own so the
+ * pinned lines are guaranteed to end up on the same row, then stitch the
+ * results back together.
+ *
+ * @param {string} leftText
+ * @param {string} rightText
+ * @param {AlignAnchor[]} anchors
+ * @param {Record<string, unknown>} [opts] passed through to `diffFn`;
+ *   `leftWeights`/`rightWeights` are sliced per region
+ * @param {(l: string, r: string, o: Record<string, unknown>) =>
+ *   import('../core/diff-engine.js').DiffLine[]} [diffFn]
+ * @returns {import('../core/diff-engine.js').DiffLine[]}
+ */
+export function diffWithAnchors(leftText, rightText, anchors, opts = {}, diffFn = diffLines) {
+  const L = splitLinesKeepEol(leftText);
+  const R = splitLinesKeepEol(rightText);
+  const list = normaliseAnchors(anchors, L.length, R.length);
+  if (list.length === 0) return diffFn(leftText, rightText, opts);
+
+  /** @type {import('../core/diff-engine.js').DiffLine[]} */
+  const out = [];
+  for (const seg of splitByAnchors(L.length, R.length, list)) {
+    if (seg.kind === 'anchor') {
+      const leftLineText = L[seg.leftStart] ?? '';
+      const rightLineText = R[seg.rightStart] ?? '';
+      out.push({
+        type: leftLineText === rightLineText ? 'equal' : 'replace',
+        leftLine: seg.leftStart + 1,
+        rightLine: seg.rightStart + 1,
+        leftText: leftLineText,
+        rightText: rightLineText,
+        alignAnchor: true,
+      });
+      continue;
+    }
+    const subOpts = { ...opts };
+    if (Array.isArray(opts.leftWeights)) subOpts.leftWeights = opts.leftWeights.slice(seg.leftStart, seg.leftEnd);
+    if (Array.isArray(opts.rightWeights)) subOpts.rightWeights = opts.rightWeights.slice(seg.rightStart, seg.rightEnd);
+    const sub = diffFn(
+      L.slice(seg.leftStart, seg.leftEnd).join(''),
+      R.slice(seg.rightStart, seg.rightEnd).join(''),
+      subOpts,
+    );
+    out.push(...offsetDiffLines(sub, seg.leftStart, seg.rightStart));
+  }
+  return out;
+}
+
+/**
+ * BC's "Isolate": pull one line range out of each side so only those lines
+ * are compared.
+ *
+ * @param {string} leftText
+ * @param {string} rightText
+ * @param {{ start: number, end: number }|null} leftRange 1-based, inclusive
+ * @param {{ start: number, end: number }|null} rightRange 1-based, inclusive
+ * @returns {{ left: string, right: string }}
+ */
+export function isolateRanges(leftText, rightText, leftRange, rightRange) {
+  /**
+   * @param {string} text
+   * @param {{ start: number, end: number }|null} range
+   * @returns {string}
+   */
+  const take = (text, range) => {
+    if (!range) return '';
+    const lines = splitLinesKeepEol(text);
+    const a = Math.max(1, Math.trunc(range.start));
+    const b = Math.min(lines.length, Math.trunc(range.end));
+    if (b < a) return '';
+    return lines.slice(a - 1, b).join('');
+  };
+  return { left: take(leftText, leftRange), right: take(rightText, rightRange) };
+}
+
+/**
+ * Collapse a character-level diff into the individual changed runs a user
+ * would call "one difference inside this line". A delete immediately followed
+ * by an insert is a single replacement, not two.
+ *
+ * @param {import('../core/diff-engine.js').CharDiff[]} charDiffs
+ * @returns {Array<{ leftStart: number, leftEnd: number, rightStart: number, rightEnd: number }>}
+ */
+export function inlineSegments(charDiffs) {
+  const segs = [];
+  let l = 0;
+  let r = 0;
+  for (const cd of Array.isArray(charDiffs) ? charDiffs : []) {
+    const n = (cd?.text ?? '').length;
+    if (!cd || cd.type === 'equal') { l += n; r += n; continue; }
+    const prev = segs[segs.length - 1];
+    const adjacent = prev && prev.leftEnd === l && prev.rightEnd === r;
+    if (cd.type === 'delete') {
+      if (adjacent) prev.leftEnd = l + n;
+      else segs.push({ leftStart: l, leftEnd: l + n, rightStart: r, rightEnd: r });
+      l += n;
+    } else {
+      if (adjacent) prev.rightEnd = r + n;
+      else segs.push({ leftStart: l, leftEnd: l, rightStart: r, rightEnd: r + n });
+      r += n;
+    }
+  }
+  return segs;
+}
+
+/**
+ * Move recorded edit positions after lines were inserted or removed, so
+ * "Next Edit" still points at the text the user actually touched.
+ *
+ * @param {number[]} marks 1-based line numbers
+ * @param {number} atLine 1-based line the change started at
+ * @param {number} delta lines added (positive) or removed (negative)
+ * @returns {number[]} sorted, de-duplicated
+ */
+export function rebaseEditMarks(marks, atLine, delta) {
+  /** @type {number[]} */
+  const out = [];
+  for (const m of Array.isArray(marks) ? marks : []) {
+    if (!Number.isInteger(m) || m < 1) continue;
+    if (delta < 0 && m >= atLine && m < atLine - delta) continue; // sat on a removed line
+    out.push(m >= atLine ? m + delta : m);
+  }
+  return [...new Set(out)].filter(n => n >= 1).sort((a, b) => a - b);
+}
+
+// ---------------------------------------------------------------------------
 // Render helpers
 // ---------------------------------------------------------------------------
 
@@ -831,6 +1210,34 @@ export class TextCompare {
     // 1.7 "Prevent editing" — per side, not one global switch.
     this._readOnly = { left: false, right: false };
 
+    // ── 1.4 / 1.5: Edit & navigation command set ──
+    // The caret is stored as a file line number per side, never as a row index
+    // or a DOM node: rows are virtualised and _rows is rebuilt on every
+    // re-diff, so anything else would evaporate as soon as the user scrolled.
+    /** @type {{ left: number|null, right: number|null }} */
+    this._caret = { left: null, right: null };
+    /** 0-based column within the caret line, from the last click. */
+    this._caretCol = 0;
+
+    /** Indent step used by Increase/Decrease Indent and by Convert File. */
+    this._tabWidth = 4;
+    this._indentWithTabs = false;
+
+    /** @type {AlignAnchor[]} manual Align With pins, 1-based line numbers */
+    this._alignAnchors = [];
+    /** First half of an Align With pair, waiting for the other side. @type {{side:'left'|'right', line:number}|null} */
+    this._pendingAlign = null;
+
+    /** Lines this session's edit commands touched, for Next/Previous Edit. */
+    /** @type {{ left: number[], right: number[] }} */
+    this._editMarks = { left: [], right: [] };
+
+    /** Position of the in-line difference cursor. @type {{ diffIndex: number, segIndex: number }|null} */
+    this._inlineCursor = null;
+
+    /** Saved panes from before Isolate, so it can be undone. @type {Array<object>} */
+    this._isolateStack = [];
+
     this._mounted = false;
   }
 
@@ -1076,6 +1483,21 @@ export class TextCompare {
       }
     };
     document.addEventListener('keydown', this._onKeyDownTextGaps);
+
+    // 1.4 / 1.5: the BC Edit and Search command set. Kept in this view rather
+    // than in app.js's SettingsStore bindings because every one of them needs
+    // the caret and the live DOM selection, which only this view resolves.
+    this._onKeyDownEditCmds = (e) => {
+      if (!this._mounted || !isActive('text')) return;
+      // Never steal a key from the find/goto inputs or the edit-mode textarea.
+      const tag = e.target instanceof Element ? e.target.tagName : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const cmd = this._matchEditCommand(e);
+      if (!cmd) return;
+      e.preventDefault();
+      cmd();
+    };
+    document.addEventListener('keydown', this._onKeyDownEditCmds);
 
     // ── T16: Go-to-line bar setup ──
     this._gotoBar   = document.getElementById('goto-bar');
@@ -1380,6 +1802,11 @@ export class TextCompare {
     // P1-19 / P2-25 / P2-30: cleanup selection & patch shortcuts
     if (this._onKeyDownTextGaps) {
       document.removeEventListener('keydown', this._onKeyDownTextGaps);
+    }
+
+    // 1.4 / 1.5: cleanup the edit & navigation command shortcuts
+    if (this._onKeyDownEditCmds) {
+      document.removeEventListener('keydown', this._onKeyDownEditCmds);
     }
 
     // T49: cleanup font size shortcuts
@@ -1829,6 +2256,7 @@ export class TextCompare {
     }
     this._leftPath = path;
     this._leftContent = content;
+    this._resetPerDocumentState('left');
     if (encoding) this._encodingLeft = encoding;
     this._eolLeft = detectEol(content); // T01
     this._resolveGrammars();
@@ -1837,6 +2265,22 @@ export class TextCompare {
     // T33: start watching the new file path (if it's a real file path)
     _watch(path);
     this._runDiff({ resetScroll: true });
+  }
+
+  /**
+   * Forget the state that describes positions in a document that has just
+   * been replaced. Edit marks, the caret and manual alignment all name line
+   * numbers; carried over to different content they would point at unrelated
+   * text and quietly mislead Next Edit and Align With.
+   * @param {'left'|'right'} side
+   */
+  _resetPerDocumentState(side) {
+    this._editMarks[side] = [];
+    this._caret[side] = null;
+    this._caretCol = 0;
+    this._inlineCursor = null;
+    this._pendingAlign = null;
+    this._alignAnchors = [];
   }
 
   /**
@@ -1859,6 +2303,7 @@ export class TextCompare {
     }
     this._rightPath = path;
     this._rightContent = content;
+    this._resetPerDocumentState('right');
     if (encoding) this._encodingRight = encoding;
     this._eolRight = detectEol(content); // T01
     this._resolveGrammars();
@@ -2378,7 +2823,7 @@ ${rows}
       }));
     } else {
       const weights = this._alignmentWeights();
-      this._diffResult = diffLines(this._leftContent, this._rightContent, {
+      const diffOpts = {
         algorithm: this._opts.algorithm,
         ignoreWhitespace: this._opts.ignoreWhitespace,
         ignoreCase: this._opts.ignoreCase,
@@ -2387,15 +2832,21 @@ ${rows}
         ignoreCrlf: this._opts.ignoreCrlf,
         leftWeights: weights?.left,
         rightWeights: weights?.right,
-      });
+      };
+      // 1.4 Align With: anchors cut the files into regions that are diffed
+      // independently, which is what forces the pinned lines onto one row.
+      this._diffResult = this._alignAnchors.length > 0
+        ? diffWithAnchors(this._leftContent, this._rightContent, this._alignAnchors, diffOpts)
+        : diffLines(this._leftContent, this._rightContent, diffOpts);
     }
 
     // Apply ignore / unimportant patterns
     this._applyIgnorePatterns();
 
     // Fold state is expressed as _diffResult index ranges, which a fresh diff
-    // invalidates.
+    // invalidates. The in-line difference cursor is indexed the same way.
     this._expandedRuns.clear();
+    this._inlineCursor = null;
 
     this._buildRows();
     this._buildDiffBlocks();
@@ -2831,6 +3282,10 @@ ${rows}
       detailsMode:        this._detailsMode,
       readOnlyLeft:       this._readOnly.left,
       readOnlyRight:      this._readOnly.right,
+      // 1.4: manual alignment and the indent step are per-session choices.
+      alignAnchors:       this.getAlignAnchors(),
+      tabWidth:           this._tabWidth,
+      indentWithTabs:     this._indentWithTabs,
     })
   }
 
@@ -2864,6 +3319,18 @@ ${rows}
       const value = settings[key]
       for (const n of TextCompare._normaliseLines(Array.isArray(value) ? value : [])) set.add(n)
     }
+
+    // 1.4: alignment anchors are validated against the current files, so a
+    // snapshot taken on different content cannot produce a crossing pair.
+    if (Object.prototype.hasOwnProperty.call(settings, 'alignAnchors')) {
+      this._alignAnchors = normaliseAnchors(
+        settings.alignAnchors,
+        splitLinesKeepEol(this._leftContent).length,
+        splitLinesKeepEol(this._rightContent).length,
+      )
+    }
+    if (Number.isInteger(settings.tabWidth)) this.setTabWidth(settings.tabWidth)
+    if (typeof settings.indentWithTabs === 'boolean') this._indentWithTabs = settings.indentWithTabs
 
     // P2-29: restore user grammars before the ignore set, so an element that
     // only a user grammar defines is still meaningful.
@@ -3174,6 +3641,7 @@ ${rows}
       }
     }
 
+    this._paintInlineCursor();
     this._drawGutter();
   }
 
@@ -3202,6 +3670,9 @@ ${rows}
       // Distinct hook so a user-placed mark is visually separable from a
       // pattern-driven one while keeping the same blue "unimportant" semantics.
       if (dl.manualIgnored) cls += ' manual-ignored';
+      // 1.4 Align With: the user needs to see which rows they pinned, or
+      // there is no way to tell a forced alignment from a computed one.
+      if (dl.alignAnchor) cls += ' align-anchor';
       return cls;
     };
 
@@ -3210,15 +3681,16 @@ ${rows}
     switch (dl.type) {
       case 'equal': {
         const html = buildLineHTML(dl.leftText, 'equal', 'left', null, this._hlLeft, ws);
+        const equalCls = dl.alignAnchor ? 'align-anchor' : '';
         const leftEl = createLineEl({
-          cssClass: '',
+          cssClass: equalCls,
           lineNum: dl.leftLine,
           innerHtml: html,
           dataLeft: dl.leftLine,
           dataRight: dl.rightLine,
         });
         const rightEl = createLineEl({
-          cssClass: '',
+          cssClass: equalCls,
           lineNum: dl.rightLine,
           innerHtml: buildLineHTML(dl.rightText, 'equal', 'right', null, this._hlRight, ws),
           dataLeft: dl.leftLine,
@@ -3733,6 +4205,7 @@ ${rows}
       // P3: the Details panels follow the caret, so the click also decides
       // which side they describe.
       const side = this._contentRight?.contains(rowEl) ? 'right' : 'left';
+      this._caretCol = this._caretColumnIn(rowEl);
       this._setCurrentRow(this._lastClickedRow, side);
     }
 
@@ -3755,6 +4228,19 @@ ${rows}
   _handleContextMenu(e, side) {
     const selection = window.getSelection()?.toString() ?? '';
     const hasSelection = selection.length > 0;
+
+    // The pane the user right-clicked is the active one from here on: every
+    // command in editCommands() is relative to it.
+    this._currentSide = side;
+    const clickedRow = e.target instanceof Element ? e.target.closest('[data-row-idx]') : null;
+    if (clickedRow) {
+      const idx = parseInt(clickedRow.dataset.rowIdx ?? '', 10);
+      if (!isNaN(idx)) {
+        this._lastClickedRow = idx;
+        this._caretCol = this._caretColumnIn(clickedRow);
+        this._setCurrentRow(idx, side);
+      }
+    }
 
     // Determine which diff block (if any) was clicked
     const target = e.target instanceof Element ? e.target : null;
@@ -3792,18 +4278,18 @@ ${rows}
         disabled: !hasSelection,
         action: () => navigator.clipboard.writeText(selection)
       },
-      {
-        label: '全選',
-        action: () => {
-          const el = side === 'left' ? this._contentLeft : this._contentRight;
-          const range = document.createRange();
-          range.selectNodeContents(el);
-          const sel = window.getSelection();
-          sel.removeAllRanges();
-          sel.addRange(range);
-        }
-      },
     ];
+
+    // 1.4 / 1.5: the whole Edit/Search command set, generated from the same
+    // table the shortcuts use so neither can gain an entry the other lacks.
+    items.push({ separator: true });
+    for (const cmd of this.editCommands()) {
+      items.push({
+        label: `${cmd.label} (${cmd.combo})`,
+        disabled: cmd.disabled === true,
+        action: cmd.run,
+      });
+    }
 
     if (diffBlockIdx >= 0) {
       items.push({ separator: true });
@@ -4112,7 +4598,7 @@ ${rows}
    */
   _convertFile(side, op) {
     if (!this._guardWrite(side)) return;
-    const TAB_WIDTH = 4;
+    const TAB_WIDTH = this._tabWidth;
 
     /**
      * @param {string} text
@@ -4986,7 +5472,909 @@ ${rows}
   _setCurrentRow(rowIdx, side) {
     if (Number.isInteger(rowIdx) && rowIdx >= 0) this._currentRowIdx = rowIdx;
     if (side === 'left' || side === 'right') this._currentSide = side;
+    this._syncCaretFromRow();
     this._updateDetails();
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.4 / 1.5 — caret model
+  //
+  // "Where the user is" has to be a file line number, not a row index: _rows
+  // is rebuilt by every re-diff and only a window of it exists in the DOM.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Refresh `_caret` from `_currentRowIdx`.
+   *
+   * A row that exists on one side only (insert/delete) has no line number
+   * there, so that side falls back to the nearest preceding real line — that
+   * is the line an "insert after" or an indent has to act on.
+   */
+  _syncCaretFromRow() {
+    for (const side of /** @type {Array<'left'|'right'>} */ (['left', 'right'])) {
+      const key = side === 'left' ? 'leftLine' : 'rightLine';
+      let found = null;
+      for (let i = this._currentRowIdx; i >= 0; i--) {
+        const row = this._rows[i];
+        if (!row || row.kind !== 'line') continue;
+        const n = row.diffLine[key];
+        if (n != null) { found = n; break; }
+      }
+      if (found != null) this._caret[side] = found;
+    }
+  }
+
+  /** The pane the user last interacted with. @returns {'left'|'right'} */
+  activeSide() {
+    return this._currentSide === 'right' ? 'right' : 'left';
+  }
+
+  /** The pane the user is *not* on — BC's "other side". @returns {'left'|'right'} */
+  otherSide() {
+    return this.activeSide() === 'left' ? 'right' : 'left';
+  }
+
+  /**
+   * Caret line on one side, 1-based, or null when nothing has been focused.
+   * @param {'left'|'right'} [side] defaults to the active side
+   * @returns {number|null}
+   */
+  caretLine(side) {
+    return this._caret[side ?? this.activeSide()] ?? null;
+  }
+
+  /**
+   * Move the caret to a file line and bring it into view.
+   * @param {'left'|'right'} side
+   * @param {number} line 1-based
+   * @returns {boolean} whether a matching row was found
+   */
+  setCaret(side, line) {
+    if (!Number.isInteger(line) || line < 1) return false;
+    this._currentSide = side === 'right' ? 'right' : 'left';
+    this._caret[this._currentSide] = line;
+    const rowIdx = this._rowIndexForLine(this._currentSide, line);
+    if (rowIdx < 0) {
+      this._updateDetails();
+      return false;
+    }
+    this._currentRowIdx = rowIdx;
+    this._lastClickedRow = rowIdx;
+    this._scrollRowIntoView(rowIdx);
+    this._updateDetails();
+    return true;
+  }
+
+  /**
+   * Row index showing a given file line, or -1.
+   * @param {'left'|'right'} side
+   * @param {number} line 1-based
+   * @returns {number}
+   */
+  _rowIndexForLine(side, line) {
+    const key = side === 'left' ? 'leftLine' : 'rightLine';
+    for (let i = 0; i < this._rows.length; i++) {
+      const row = this._rows[i];
+      if (row.kind === 'line' && row.diffLine[key] === line) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Put `_currentRowIdx` back on the caret line after a re-diff renumbered
+   * the rows. Falls back to the nearest earlier line so a caret that sat on a
+   * line the edit deleted still lands somewhere sensible.
+   */
+  _restoreCaretRow() {
+    const side = this.activeSide();
+    const line = this._caret[side];
+    if (line == null) return;
+    for (let n = line; n >= 1; n--) {
+      const idx = this._rowIndexForLine(side, n);
+      if (idx >= 0) {
+        this._currentRowIdx = idx;
+        this._caret[side] = n;
+        this._syncCaretFromRow();
+        return;
+      }
+    }
+  }
+
+  /**
+   * Scroll a row into view without disturbing the horizontal position.
+   * @param {number} rowIdx
+   */
+  _scrollRowIntoView(rowIdx) {
+    const pane = this._contentLeft;
+    if (!pane || typeof pane.scrollTop !== 'number') return;
+    const top = rowIdx * this._rowHeight;
+    const viewH = pane.clientHeight || 0;
+    const cur = pane.scrollTop;
+    if (top >= cur && top + this._rowHeight <= cur + viewH) return;
+    const target = Math.max(0, top - Math.floor(viewH / 3));
+    pane.scrollTop = target;
+    if (this._contentRight) this._contentRight.scrollTop = target;
+    this._renderVisibleRows();
+  }
+
+  /**
+   * Column of the DOM selection inside a rendered row's text span, so
+   * Delete Word / Delete to Start-or-End of Line have something to act on.
+   * Falls back to 0 when the click did not land in text.
+   * @param {HTMLElement} rowEl
+   * @returns {number}
+   */
+  _caretColumnIn(rowEl) {
+    const textSpan = rowEl.querySelector('.line-text');
+    const sel = window.getSelection?.();
+    const node = sel?.anchorNode;
+    if (!textSpan || !node || !textSpan.contains(node)) return 0;
+    // Sum the text before the anchor node, which is what "column" means once
+    // syntax highlighting has split the line into many spans.
+    const walker = document.createTreeWalker(textSpan, NodeFilter.SHOW_TEXT);
+    let col = 0;
+    let cur = walker.nextNode();
+    while (cur) {
+      if (cur === node) return col + (sel.anchorOffset ?? 0);
+      col += cur.nodeValue?.length ?? 0;
+      cur = walker.nextNode();
+    }
+    return col;
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.4 / 1.5 — one table, two entry points
+  //
+  // The keyboard handler and the context menu are both generated from
+  // editCommands(). A command added here therefore cannot end up reachable
+  // from neither: there is no second list to forget to update.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Every BC Edit/Search command this view implements.
+   * @returns {Array<{ id: string, label: string, combo: string,
+   *   run: () => void, disabled?: boolean }>}
+   */
+  editCommands() {
+    const other = this.otherSide() === 'left' ? '左' : '右';
+    const active = this.activeSide() === 'left' ? '左' : '右';
+    const locked = this.isSideReadOnly(this.activeSide());
+    return [
+      { id: 'text.copyLineRight', label: '複製此行 → 右側', combo: 'Alt+Shift+ArrowRight',
+        disabled: this.isSideReadOnly('right'), run: () => this.copyLineToRight() },
+      { id: 'text.copyLineLeft', label: '複製此行 → 左側', combo: 'Alt+Shift+ArrowLeft',
+        disabled: this.isSideReadOnly('left'), run: () => this.copyLineToLeft() },
+      { id: 'text.copyLineOther', label: `複製此行 → 另一側（${other}）`, combo: 'Alt+Shift+o',
+        disabled: this.isSideReadOnly(this.otherSide()), run: () => this.copyLineToOtherSide() },
+      { id: 'text.copyOtherSide', label: `複製此差異 → 另一側（${other}）`, combo: 'Alt+o',
+        disabled: this.isSideReadOnly(this.otherSide()), run: () => this.copyToOtherSide() },
+
+      { id: 'text.insertLineBefore', label: `在此行前插入空行（${active}側）`, combo: 'Ctrl+Shift+Enter',
+        disabled: locked, run: () => this.insertLineBefore() },
+      { id: 'text.insertLineAfter', label: `在此行後插入空行（${active}側）`, combo: 'Ctrl+Enter',
+        disabled: locked, run: () => this.insertLineAfter() },
+      { id: 'text.deleteLine', label: `刪除此行（${active}側）`, combo: 'Ctrl+d',
+        disabled: locked, run: () => this.deleteLine() },
+      { id: 'text.deleteToStartOfLine', label: '刪除到行首', combo: 'Ctrl+Shift+Backspace',
+        disabled: locked, run: () => this.deleteToStartOfLine() },
+      { id: 'text.deleteToEndOfLine', label: '刪除到行尾', combo: 'Ctrl+Shift+Delete',
+        disabled: locked, run: () => this.deleteToEndOfLine() },
+      { id: 'text.deleteWord', label: '刪除單字', combo: 'Ctrl+Delete',
+        disabled: locked, run: () => this.deleteWord() },
+
+      { id: 'text.increaseIndent', label: '增加縮排', combo: 'Ctrl+]',
+        disabled: locked, run: () => this.increaseIndent() },
+      { id: 'text.decreaseIndent', label: '減少縮排', combo: 'Ctrl+[',
+        disabled: locked, run: () => this.decreaseIndent() },
+
+      { id: 'text.selectSection', label: '選取此差異區塊', combo: 'Alt+s',
+        run: () => this.selectSection() },
+      { id: 'text.selectAll', label: '全選', combo: 'Ctrl+a',
+        run: () => this.selectAll() },
+
+      { id: 'text.nextInlineDiff', label: '下一個行內差異', combo: 'Ctrl+F8',
+        run: () => this.nextInlineDiff() },
+      { id: 'text.prevInlineDiff', label: '上一個行內差異', combo: 'Ctrl+F7',
+        run: () => this.prevInlineDiff() },
+      { id: 'text.nextEdit', label: '下一個編輯位置', combo: 'Alt+F8',
+        run: () => this.nextEdit() },
+      { id: 'text.prevEdit', label: '上一個編輯位置', combo: 'Alt+F7',
+        run: () => this.prevEdit() },
+
+      { id: 'text.alignWith', label: this._pendingAlign
+          ? `完成對齊（已標記${this._pendingAlign.side === 'left' ? '左' : '右'}側第 ${this._pendingAlign.line} 行）`
+          : '設為對齊錨點（Align With）',
+        combo: 'Ctrl+Alt+a', run: () => this.markAlignAnchor() },
+      { id: 'text.clearAlignAnchors', label: `清除所有對齊錨點（${this._alignAnchors.length}）`,
+        combo: 'Ctrl+Alt+Shift+a', disabled: this._alignAnchors.length === 0,
+        run: () => {
+          const n = this.clearAlignAnchors();
+          toast(`已清除 ${n} 個對齊錨點`, { type: 'success' });
+        } },
+      { id: 'text.isolate', label: this.isIsolated() ? '離開 Isolate' : 'Isolate（只比對選取的行）',
+        combo: 'Ctrl+Alt+i', run: () => this.toggleIsolate() },
+    ];
+  }
+
+  /**
+   * @param {KeyboardEvent} e
+   * @returns {(() => void)|null}
+   */
+  _matchEditCommand(e) {
+    for (const cmd of this.editCommands()) {
+      if (keyComboMatches(e, cmd.combo)) return cmd.run;
+    }
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.4 — Edit commands
+  //
+  // All of them funnel through _editSide() so that a locked side, the undo
+  // stack, the modified marker, the edit-mode textarea and the caret can
+  // never be handled inconsistently between one command and the next.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Apply a text transformation to one side.
+   *
+   * @param {'left'|'right'} side
+   * @param {(text: string) => string} mutate
+   * @param {{ markLine?: number|null, shiftAt?: number, shiftBy?: number }} [meta]
+   *   `markLine` is remembered for Next/Previous Edit; `shiftAt`/`shiftBy`
+   *   rebase the marks already recorded when lines were added or removed.
+   * @returns {boolean} whether anything changed
+   */
+  _editSide(side, mutate, meta = {}) {
+    if (!this._guardWrite(side)) return false;
+    const key = side === 'left' ? '_leftContent' : '_rightContent';
+    const before = this[key];
+    let after;
+    try {
+      after = mutate(before);
+    } catch (err) {
+      toast(`編輯失敗：${err instanceof Error ? err.message : String(err)}`, { type: 'error' });
+      return false;
+    }
+    if (typeof after !== 'string' || after === before) return false;
+
+    this._pushUndoSnapshot();
+    this[key] = after;
+    this._modified[side] = true;
+
+    // Edit mode shows a textarea, not the panes; leaving it stale would make
+    // the next keystroke there resurrect the pre-command text.
+    const ta = side === 'left' ? this._textareaLeft : this._textareaRight;
+    if (ta) ta.value = after;
+
+    if (meta.shiftBy) {
+      this._editMarks[side] = rebaseEditMarks(this._editMarks[side], meta.shiftAt ?? 1, meta.shiftBy);
+    }
+    if (meta.markLine != null) {
+      this._editMarks[side] = rebaseEditMarks([...this._editMarks[side], meta.markLine], 1, 0);
+    }
+
+    this._updateModifiedIndicator();
+    this._runDiff();
+    this._restoreCaretRow();
+    return true;
+  }
+
+  /**
+   * Rebuild one side from the diff result, taking the listed DiffLines from
+   * the opposite side. Same rebuild _copyBlock does, at single-line
+   * granularity: an insert row copied this way removes the target line, a
+   * delete row inserts one, which is what makes "Copy Line" work on rows that
+   * exist on one side only.
+   *
+   * @param {'left'|'right'} targetSide side to overwrite
+   * @param {Set<object>} sourceLines DiffLine objects to take from the source
+   * @returns {boolean}
+   */
+  _copyDiffLines(targetSide, sourceLines) {
+    if (sourceLines.size === 0) return false;
+    const sourceSide = targetSide === 'right' ? 'left' : 'right';
+    return this._editSide(targetSide, () => {
+      let out = '';
+      for (const dl of this._diffResult) {
+        const text = sourceLines.has(dl)
+          ? (sourceSide === 'left' ? dl.leftText : dl.rightText)
+          : (targetSide === 'left' ? dl.leftText : dl.rightText);
+        if (text) out += text;
+      }
+      return out;
+    }, { markLine: this._caret[targetSide] });
+  }
+
+  /** The DiffLine under the caret, or null. @returns {object|null} */
+  _caretDiffLine() {
+    const row = this._rows[this._currentRowIdx];
+    return row && row.kind === 'line' ? row.diffLine : null;
+  }
+
+  /** Index of the caret's DiffLine within _diffResult, or -1. @returns {number} */
+  _caretDiffIndex() {
+    const dl = this._caretDiffLine();
+    return dl ? this._diffResult.indexOf(dl) : -1;
+  }
+
+  /**
+   * Copy just the caret's line to the other pane (BC "Copy Line to …").
+   * @param {'left'|'right'} targetSide
+   * @returns {boolean}
+   */
+  copyLineTo(targetSide) {
+    const dl = this._caretDiffLine();
+    if (!dl) {
+      toast('請先點選一行', { type: 'warn' });
+      return false;
+    }
+    if (!this._copyDiffLines(targetSide, new Set([dl]))) return false;
+    toast(`已複製一行到${targetSide === 'left' ? '左' : '右'}側`, { type: 'success' });
+    return true;
+  }
+
+  /** @returns {boolean} */
+  copyLineToRight() { return this.copyLineTo('right'); }
+
+  /** @returns {boolean} */
+  copyLineToLeft() { return this.copyLineTo('left'); }
+
+  /** Copy the caret's line to whichever pane the user is *not* on. @returns {boolean} */
+  copyLineToOtherSide() { return this.copyLineTo(this.otherSide()); }
+
+  /** Copy the current difference section to the non-active pane. */
+  copyToOtherSide() { this._copyBlock(this.otherSide()); }
+
+  /**
+   * Insert a blank line relative to the caret.
+   * @param {'before'|'after'} position
+   * @returns {boolean}
+   */
+  insertLine(position) {
+    const side = this.activeSide();
+    const line = this.caretLine(side);
+    if (line == null) {
+      toast('請先點選一行', { type: 'warn' });
+      return false;
+    }
+    const eol = (side === 'left' ? this._eolLeft : this._eolRight) === 'CRLF' ? '\r\n' : '\n';
+    const at = position === 'before' ? line : line + 1;
+    const ok = this._editSide(side, (text) => insertBlankLine(text, line - 1, position, eol),
+      { shiftAt: at, shiftBy: 1, markLine: at });
+    if (ok) this.setCaret(side, at);
+    return ok;
+  }
+
+  /** @returns {boolean} */
+  insertLineBefore() { return this.insertLine('before'); }
+
+  /** @returns {boolean} */
+  insertLineAfter() { return this.insertLine('after'); }
+
+  /** Delete the caret's whole line. @returns {boolean} */
+  deleteLine() {
+    const side = this.activeSide();
+    const line = this.caretLine(side);
+    if (line == null) {
+      toast('請先點選一行', { type: 'warn' });
+      return false;
+    }
+    return this._editSide(side, (text) => removeLine(text, line - 1),
+      { shiftAt: line, shiftBy: -1 });
+  }
+
+  /**
+   * Delete part of the caret's line.
+   * @param {'to-start'|'to-end'|'word'} what
+   * @returns {boolean}
+   */
+  deleteInLine(what) {
+    const side = this.activeSide();
+    const line = this.caretLine(side);
+    if (line == null) {
+      toast('請先點選一行', { type: 'warn' });
+      return false;
+    }
+    const col = this._caretCol;
+    return this._editSide(side, (text) => {
+      const lines = splitLinesKeepEol(text);
+      const raw = lines[line - 1];
+      if (raw === undefined) return text;
+      const { body } = splitEol(raw);
+      const c = Math.min(Math.max(col, 0), body.length);
+      let next = body;
+      if (what === 'to-start') next = body.slice(c);
+      else if (what === 'to-end') next = body.slice(0, c);
+      else {
+        const { start, end } = wordBoundsAt(body, c);
+        next = body.slice(0, start) + body.slice(end);
+      }
+      return replaceLineBody(text, line - 1, next);
+    }, { markLine: line });
+  }
+
+  /** @returns {boolean} */
+  deleteToStartOfLine() { return this.deleteInLine('to-start'); }
+
+  /** @returns {boolean} */
+  deleteToEndOfLine() { return this.deleteInLine('to-end'); }
+
+  /** @returns {boolean} */
+  deleteWord() { return this.deleteInLine('word'); }
+
+  /**
+   * Line range the command set should act on: the DOM selection when there is
+   * one, otherwise the caret's single line.
+   * @param {'left'|'right'} side
+   * @returns {{ start: number, end: number }|null}
+   */
+  _commandRange(side) {
+    const selected = this._selectedLineNumbers(side);
+    if (selected.length > 0) return { start: selected[0], end: selected[selected.length - 1] };
+    const line = this.caretLine(side);
+    return line == null ? null : { start: line, end: line };
+  }
+
+  /**
+   * Increase or decrease the indent of the selected lines (or the caret line).
+   * @param {1|-1} delta
+   * @returns {boolean}
+   */
+  changeIndent(delta) {
+    const side = this._selectionSide() ?? this.activeSide();
+    const range = this._commandRange(side);
+    if (!range) {
+      toast('請先選取或點選要縮排的行', { type: 'warn' });
+      return false;
+    }
+    const ok = this._editSide(side,
+      (text) => indentLines(text, range.start - 1, range.end - 1, delta, this._tabWidth, this._indentWithTabs),
+      { markLine: range.start });
+    if (!ok && !this.isSideReadOnly(side)) {
+      toast(delta > 0 ? '沒有可縮排的內容' : '這些行已經沒有縮排', { type: 'warn' });
+    }
+    return ok;
+  }
+
+  /** @returns {boolean} */
+  increaseIndent() { return this.changeIndent(1); }
+
+  /** @returns {boolean} */
+  decreaseIndent() { return this.changeIndent(-1); }
+
+  /**
+   * Indent step used by Increase/Decrease Indent and Convert File.
+   * @param {number} width
+   * @param {boolean} [useTabs]
+   * @returns {number} the resulting width
+   */
+  setTabWidth(width, useTabs) {
+    if (Number.isInteger(width) && width > 0 && width <= 16) this._tabWidth = width;
+    if (typeof useTabs === 'boolean') this._indentWithTabs = useTabs;
+    return this._tabWidth;
+  }
+
+  /** @returns {{ width: number, useTabs: boolean }} */
+  getTabSettings() {
+    return { width: this._tabWidth, useTabs: this._indentWithTabs };
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.4 — Selection commands
+  // -------------------------------------------------------------------------
+
+  /**
+   * Select every rendered row of one pane.
+   * @param {'left'|'right'} [side] defaults to the active side
+   * @returns {boolean}
+   */
+  selectAll(side) {
+    const pane = (side ?? this.activeSide()) === 'right' ? this._contentRight : this._contentLeft;
+    const sel = window.getSelection?.();
+    if (!pane || !sel || typeof document.createRange !== 'function') return false;
+    const range = document.createRange();
+    range.selectNodeContents(pane);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  }
+
+  /** Index of the difference block containing the caret, or -1. @returns {number} */
+  _caretBlockIndex() {
+    for (let i = 0; i < this._diffBlocks.length; i++) {
+      const b = this._diffBlocks[i];
+      if (this._currentRowIdx >= b.startRow && this._currentRowIdx <= b.endRow) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * BC "Select Section" — select the difference block the caret sits in.
+   *
+   * Virtual scrolling means only part of a long block is in the DOM, so the
+   * block is scrolled into view first and the user is told when the selection
+   * had to stop at the rendered edge rather than silently selecting less.
+   *
+   * @returns {boolean}
+   */
+  selectSection() {
+    const idx = this._caretBlockIndex() >= 0 ? this._caretBlockIndex() : this._currentDiff;
+    const block = this._diffBlocks[idx];
+    if (!block) {
+      toast('游標不在任何差異區塊內', { type: 'warn' });
+      return false;
+    }
+    this._currentDiff = idx;
+    this._scrollRowIntoView(block.startRow);
+    this._renderVisibleRows();
+
+    const pane = this.activeSide() === 'right' ? this._contentRight : this._contentLeft;
+    const sel = window.getSelection?.();
+    if (!pane || !sel || typeof document.createRange !== 'function') return false;
+    const first = pane.querySelector(`[data-row-idx="${block.startRow}"]`);
+    let lastRow = block.endRow;
+    let last = pane.querySelector(`[data-row-idx="${lastRow}"]`);
+    while (!last && lastRow > block.startRow) {
+      lastRow -= 1;
+      last = pane.querySelector(`[data-row-idx="${lastRow}"]`);
+    }
+    if (!first || !last) {
+      toast('此差異區塊尚未渲染，請稍候再試', { type: 'warn' });
+      return false;
+    }
+    const range = document.createRange();
+    range.setStartBefore(first);
+    range.setEndAfter(last);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    if (lastRow < block.endRow) {
+      toast(`區塊過長，只選取到第 ${lastRow - block.startRow + 1} 行（畫面外的行尚未渲染）`, { type: 'warn' });
+    }
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.5 — In-line and edit navigation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Changed character runs inside one DiffLine, computed on demand and cached
+   * on the DiffLine (a fresh diff hands out fresh objects, so the cache dies
+   * with the data it describes).
+   * @param {number} diffIndex
+   * @returns {Array<{ leftStart: number, leftEnd: number, rightStart: number, rightEnd: number }>}
+   */
+  _segmentsAt(diffIndex) {
+    const dl = this._diffResult[diffIndex];
+    if (!dl || dl.type !== 'replace') return [];
+    if (dl._charDiffs === undefined) {
+      dl._charDiffs = diffChars(
+        (dl.leftText ?? '').replace(/\r?\n$/, ''),
+        (dl.rightText ?? '').replace(/\r?\n$/, ''),
+      );
+    }
+    if (dl._inlineSegs === undefined) dl._inlineSegs = inlineSegments(dl._charDiffs);
+    return dl._inlineSegs;
+  }
+
+  /**
+   * BC's Next/Previous Difference: one changed run *inside* a line at a time,
+   * not a whole section.
+   * @param {number} dir +1 forward, -1 backward
+   * @returns {boolean} whether the cursor moved
+   */
+  navigateInlineDiff(dir) {
+    const step = dir >= 0 ? 1 : -1;
+    const total = this._diffResult.length;
+    if (total === 0) {
+      toast('沒有可導覽的行內差異', { type: 'warn' });
+      return false;
+    }
+
+    let di;
+    let si;
+    if (this._inlineCursor) {
+      di = this._inlineCursor.diffIndex;
+      si = this._inlineCursor.segIndex + step;
+    } else {
+      di = Math.max(0, this._caretDiffIndex());
+      si = step > 0 ? 0 : this._segmentsAt(di).length - 1;
+    }
+
+    for (let guard = 0; guard <= total; guard++) {
+      const segs = this._segmentsAt(di);
+      if (si >= 0 && si < segs.length) {
+        this._focusInlineSegment(di, si);
+        return true;
+      }
+      di += step;
+      if (di < 0 || di >= total) {
+        toast(step > 0 ? '已到最後一個行內差異' : '已到第一個行內差異', { type: 'warn' });
+        return false;
+      }
+      si = step > 0 ? 0 : this._segmentsAt(di).length - 1;
+    }
+    return false;
+  }
+
+  /**
+   * @param {number} diffIndex
+   * @param {number} segIndex
+   */
+  _focusInlineSegment(diffIndex, segIndex) {
+    this._inlineCursor = { diffIndex, segIndex };
+    const dl = this._diffResult[diffIndex];
+    const side = this.activeSide();
+    const line = side === 'left' ? dl.leftLine : dl.rightLine;
+    const seg = this._segmentsAt(diffIndex)[segIndex];
+    if (line != null) {
+      // setCaret rebuilds the highlight through _renderVisibleRows.
+      this._caretCol = side === 'left' ? seg.leftStart : seg.rightStart;
+      this.setCaret(side, line);
+    }
+    this._renderVisibleRows();
+    this._emit('status', {
+      message: `行內差異 ${segIndex + 1}/${this._segmentsAt(diffIndex).length}　第 ${line ?? '—'} 行`,
+    });
+  }
+
+  /** @returns {boolean} */
+  nextInlineDiff() { return this.navigateInlineDiff(1); }
+
+  /** @returns {boolean} */
+  prevInlineDiff() { return this.navigateInlineDiff(-1); }
+
+  /**
+   * Paint the in-line difference cursor onto whichever rows are rendered.
+   * Called from _renderVisibleRows so the mark survives scrolling away and
+   * back — it lives in _inlineCursor, not in the DOM.
+   */
+  _paintInlineCursor() {
+    const cls = 'char-diff--current';
+    for (const pane of [this._contentLeft, this._contentRight]) {
+      pane?.querySelectorAll?.('.' + cls)?.forEach(el => el.classList.remove(cls));
+    }
+    const cur = this._inlineCursor;
+    if (!cur) return;
+    const dl = this._diffResult[cur.diffIndex];
+    if (!dl) return;
+    const rowIdx = this._rows.findIndex(r => r.kind === 'line' && r.diffLine === dl);
+    if (rowIdx < 0) return;
+
+    const segs = this._segmentsAt(cur.diffIndex);
+    const seg = segs[cur.segIndex];
+    if (!seg) return;
+    let leftNth = 0;
+    let rightNth = 0;
+    for (let i = 0; i < cur.segIndex; i++) {
+      if (segs[i].leftEnd > segs[i].leftStart) leftNth++;
+      if (segs[i].rightEnd > segs[i].rightStart) rightNth++;
+    }
+    /**
+     * @param {Element|null} pane
+     * @param {string} selector
+     * @param {number} nth
+     * @param {boolean} present
+     */
+    const mark = (pane, selector, nth, present) => {
+      if (!present || !pane?.querySelector) return;
+      const row = pane.querySelector(`[data-row-idx="${rowIdx}"]`);
+      row?.querySelectorAll(selector)?.[nth]?.classList.add(cls);
+    };
+    mark(this._contentLeft, '.char-delete', leftNth, seg.leftEnd > seg.leftStart);
+    mark(this._contentRight, '.char-insert', rightNth, seg.rightEnd > seg.rightStart);
+  }
+
+  /**
+   * BC "Next Edit" / "Previous Edit" — jump between the lines this session's
+   * edit commands touched on the active side.
+   * @param {number} dir
+   * @returns {boolean}
+   */
+  navigateEdit(dir) {
+    const side = this.activeSide();
+    const marks = this._editMarks[side];
+    if (marks.length === 0) {
+      toast(`${side === 'left' ? '左' : '右'}側還沒有編輯過的位置`, { type: 'warn' });
+      return false;
+    }
+    const cur = this._caret[side] ?? 0;
+    const target = dir >= 0
+      ? marks.find(n => n > cur)
+      : [...marks].reverse().find(n => n < cur);
+    if (target == null) {
+      toast(dir >= 0 ? '已到最後一個編輯位置' : '已到第一個編輯位置', { type: 'warn' });
+      return false;
+    }
+    this.setCaret(side, target);
+    return true;
+  }
+
+  /** @returns {boolean} */
+  nextEdit() { return this.navigateEdit(1); }
+
+  /** @returns {boolean} */
+  prevEdit() { return this.navigateEdit(-1); }
+
+  /** Lines the edit commands touched, for tests and for session settings. */
+  getEditMarks() {
+    return { left: [...this._editMarks.left], right: [...this._editMarks.right] };
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.4 — Align With
+  // -------------------------------------------------------------------------
+
+  /** @returns {AlignAnchor[]} */
+  getAlignAnchors() {
+    return this._alignAnchors.map(a => ({ ...a }));
+  }
+
+  /**
+   * Pin a left line and a right line to the same row.
+   *
+   * Anchors that would cross an existing one have no valid alignment, so the
+   * conflicting anchors are dropped and the user is told how many — silently
+   * ignoring the new anchor would look like the command did nothing.
+   *
+   * @param {number} leftLine 1-based
+   * @param {number} rightLine 1-based
+   * @returns {boolean}
+   */
+  alignWith(leftLine, rightLine) {
+    const leftCount = splitLinesKeepEol(this._leftContent).length;
+    const rightCount = splitLinesKeepEol(this._rightContent).length;
+    if (!Number.isInteger(leftLine) || !Number.isInteger(rightLine) ||
+        leftLine < 1 || rightLine < 1 || leftLine > leftCount || rightLine > rightCount) {
+      toast('對齊錨點的行號超出檔案範圍', { type: 'error' });
+      return false;
+    }
+    const anchor = { left: leftLine, right: rightLine };
+    const kept = this._alignAnchors.filter(a => !anchorsConflict(anchor, a));
+    const dropped = this._alignAnchors.length - kept.length;
+    this._alignAnchors = normaliseAnchors([...kept, anchor], leftCount, rightCount);
+    this._pendingAlign = null;
+    this._runDiff();
+    this._restoreCaretRow();
+    toast(dropped > 0
+      ? `已對齊 左 ${leftLine} ↔ 右 ${rightLine}（取代了 ${dropped} 個衝突的錨點）`
+      : `已對齊 左 ${leftLine} ↔ 右 ${rightLine}`, { type: 'success' });
+    return true;
+  }
+
+  /**
+   * Two-step entry point: the first call remembers one side's line, the second
+   * call on the other side completes the pair.
+   * @param {'left'|'right'} [side] defaults to the active side
+   * @param {number} [line] defaults to the caret
+   * @returns {boolean} true once a pair was formed
+   */
+  markAlignAnchor(side, line) {
+    const s = side ?? this.activeSide();
+    const l = line ?? this.caretLine(s);
+    if (l == null) {
+      toast('請先點選要對齊的行', { type: 'warn' });
+      return false;
+    }
+    if (this._pendingAlign && this._pendingAlign.side !== s) {
+      const left = s === 'left' ? l : this._pendingAlign.line;
+      const right = s === 'right' ? l : this._pendingAlign.line;
+      return this.alignWith(left, right);
+    }
+    this._pendingAlign = { side: s, line: l };
+    toast(`已標記${s === 'left' ? '左' : '右'}側第 ${l} 行，請再於${s === 'left' ? '右' : '左'}側選一行完成對齊`);
+    return false;
+  }
+
+  /** Drop every manual alignment. @returns {number} how many were removed */
+  clearAlignAnchors() {
+    const n = this._alignAnchors.length;
+    this._alignAnchors = [];
+    this._pendingAlign = null;
+    if (n > 0) {
+      this._runDiff();
+      this._restoreCaretRow();
+    }
+    return n;
+  }
+
+  // -------------------------------------------------------------------------
+  // 1.4 — Isolate
+  // -------------------------------------------------------------------------
+
+  /** @returns {boolean} */
+  isIsolated() { return this._isolateStack.length > 0; }
+
+  /**
+   * BC "Isolate" — compare only the selected lines.
+   *
+   * The selection on each side is used independently; a side with no
+   * selection falls back to the caret's difference block so the command still
+   * does something predictable when only one pane is selected in.
+   *
+   * @returns {boolean}
+   */
+  isolate() {
+    if (this._modified.left || this._modified.right) {
+      toast('請先儲存或還原未儲存的變更，再使用 Isolate', { type: 'warn' });
+      return false;
+    }
+    let left = this._selectedLineNumbers('left').length > 0 ? this._commandRange('left') : null;
+    let right = this._selectedLineNumbers('right').length > 0 ? this._commandRange('right') : null;
+    if (!left && !right) {
+      const block = this._diffBlocks[this._caretBlockIndex() >= 0 ? this._caretBlockIndex() : this._currentDiff];
+      if (block) {
+        const rows = this._rows.slice(block.startRow, block.endRow + 1)
+          .filter(r => r.kind === 'line').map(r => r.diffLine);
+        const ls = rows.map(d => d.leftLine).filter(n => n != null);
+        const rs = rows.map(d => d.rightLine).filter(n => n != null);
+        if (ls.length > 0) left = { start: ls[0], end: ls[ls.length - 1] };
+        if (rs.length > 0) right = { start: rs[0], end: rs[rs.length - 1] };
+      }
+    }
+    if (!left && !right) {
+      toast('請先選取要單獨比對的行', { type: 'warn' });
+      return false;
+    }
+
+    const { left: lt, right: rt } = isolateRanges(this._leftContent, this._rightContent, left, right);
+    this._isolateStack.push({
+      leftPath: this._leftPath,
+      rightPath: this._rightPath,
+      leftContent: this._leftContent,
+      rightContent: this._rightContent,
+      anchors: this._alignAnchors,
+      editMarks: { left: [...this._editMarks.left], right: [...this._editMarks.right] },
+      undoStack: this._undoStack,
+      redoStack: this._redoStack,
+      label: `${left ? `左 ${left.start}–${left.end}` : '左（無）'}　${right ? `右 ${right.start}–${right.end}` : '右（無）'}`,
+    });
+    this._alignAnchors = [];
+    this._editMarks = { left: [], right: [] };
+    this._undoStack = [];
+    this._redoStack = [];
+    this.setLeft(`isolate://${this._leftPath || '左'}`, lt);
+    this.setRight(`isolate://${this._rightPath || '右'}`, rt);
+    toast('已進入 Isolate；再按一次可返回完整檔案', { type: 'success' });
+    return true;
+  }
+
+  /**
+   * Leave Isolate and put the whole files back.
+   * @returns {boolean}
+   */
+  endIsolate() {
+    const snap = this._isolateStack.pop();
+    if (!snap) {
+      toast('目前不在 Isolate 模式', { type: 'warn' });
+      return false;
+    }
+    // Isolated panes hold only a fragment, so edits made inside cannot be
+    // merged back automatically. Say so rather than dropping them quietly.
+    if ((this._modified.left || this._modified.right) &&
+        typeof window.confirm === 'function' && !window.confirm('Isolate 期間的修改將被捨棄，確定返回？')) {
+      this._isolateStack.push(snap);
+      return false;
+    }
+    this._modified = { left: false, right: false };
+    // setLeft/setRight clear the per-document state, so the snapshot has to be
+    // put back afterwards, not before.
+    this.setLeft(snap.leftPath, snap.leftContent);
+    this.setRight(snap.rightPath, snap.rightContent);
+    this._alignAnchors = snap.anchors;
+    this._editMarks = snap.editMarks;
+    this._undoStack = snap.undoStack;
+    this._redoStack = snap.redoStack;
+    if (this._alignAnchors.length > 0) this._runDiff();
+    this._updateModifiedIndicator();
+    toast('已離開 Isolate', { type: 'success' });
+    return true;
+  }
+
+  /** Toggle Isolate — the shortcut and the menu item both use this. @returns {boolean} */
+  toggleIsolate() {
+    return this.isIsolated() ? this.endIsolate() : this.isolate();
   }
 
   // -------------------------------------------------------------------------
