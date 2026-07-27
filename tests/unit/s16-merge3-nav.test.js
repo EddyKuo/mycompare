@@ -24,9 +24,11 @@ const RIGHT = ['a', 'R1', 'c', 'd', 'e', 'R2', 'g'].join('\n')
  * @returns {{ view: ThreeWayCompare, host: HTMLElement }}
  */
 function mountView(contents = {}) {
-  // Kept out of document.body on purpose: several instances coexist across
-  // tests and jsdom's `#id` lookup resolves duplicates document-wide.
+  // Attached to the live document on purpose: the view must not depend on
+  // being the only merge instance in it, and a detached host would hide any
+  // regression back to document-wide lookups.
   const host = document.createElement('div')
+  document.body.appendChild(host)
   const view = new ThreeWayCompare()
   view.mount(host)
   view.setSide('base', contents.base ?? BASE)
@@ -142,16 +144,16 @@ describe('S16 merge3 — conflict navigation', () => {
   })
 
   it('updates the toolbar counter', () => {
-    const counter = host.querySelector('#mw-conflict-counter')
+    const counter = host.querySelector('.mw-conflict-counter')
     expect(counter.textContent).toContain('/ 2')
     view.nextConflict()
     expect(counter.textContent).toBe('第 1 / 2 個衝突')
   })
 
   it('toolbar ▲▼ buttons drive navigation', () => {
-    host.querySelector('#mw-btn-next').click()
+    host.querySelector('.mw-btn-next').click()
     expect(view.getCurrentConflictIndex()).toBe(0)
-    host.querySelector('#mw-btn-prev').click()
+    host.querySelector('.mw-btn-prev').click()
     expect(view.getCurrentConflictIndex()).toBe(1)
   })
 
@@ -164,7 +166,7 @@ describe('S16 merge3 — conflict navigation', () => {
     expect(clean.prevConflict()).toBe(-1)
     expect(clean.firstConflict()).toBe(-1)
     expect(clean.lastConflict()).toBe(-1)
-    expect(cleanHost.querySelector('#mw-conflict-counter').textContent).toBe('無衝突')
+    expect(cleanHost.querySelector('.mw-conflict-counter').textContent).toBe('無衝突')
     expect(clean.resolveAll('left')).toBe(0)
     clean.destroy()
     cleanHost.remove()
@@ -185,7 +187,7 @@ describe('S16 merge3 — Take Center', () => {
     expect(btn.textContent).toBe('採用中間')
     btn.click()
 
-    const output = host.querySelector('#mw-output').value
+    const output = host.querySelector('.mw-output-textarea').value
     expect(output).toContain('\nb\n')       // base version of conflict 0
     expect(output).not.toContain('L1')
     expect(output).not.toContain('R1')
@@ -208,7 +210,7 @@ describe('S16 merge3 — resolveAll', () => {
   it('applies one choice to all conflicts', () => {
     const { view, host } = mountView()
     expect(view.resolveAll('right')).toBe(2)
-    const output = host.querySelector('#mw-output').value
+    const output = host.querySelector('.mw-output-textarea').value
     expect(output).toBe(['a', 'R1', 'c', 'd', 'e', 'R2', 'g'].join('\n'))
     expect(output).not.toContain('<<<<<<<')
     view.destroy(); host.remove()
@@ -217,7 +219,7 @@ describe('S16 merge3 — resolveAll', () => {
   it('resolveAll("base") restores the base text', () => {
     const { view, host } = mountView()
     view.resolveAll('base')
-    expect(host.querySelector('#mw-output').value).toBe(BASE)
+    expect(host.querySelector('.mw-output-textarea').value).toBe(BASE)
     view.destroy(); host.remove()
   })
 
@@ -225,7 +227,7 @@ describe('S16 merge3 — resolveAll', () => {
     const { view, host } = mountView()
     view.setConflictChoice(0, 'left')
     expect(view.resolveAll('right')).toBe(1)
-    expect(host.querySelector('#mw-output').value)
+    expect(host.querySelector('.mw-output-textarea').value)
       .toBe(['a', 'L1', 'c', 'd', 'e', 'R2', 'g'].join('\n'))
     view.destroy(); host.remove()
   })
@@ -233,14 +235,14 @@ describe('S16 merge3 — resolveAll', () => {
   it('ignores an unknown choice', () => {
     const { view, host } = mountView()
     expect(view.resolveAll(/** @type {'left'} */ ('nope'))).toBe(0)
-    expect(host.querySelector('#mw-output').value).toContain('<<<<<<<')
+    expect(host.querySelector('.mw-output-textarea').value).toContain('<<<<<<<')
     view.destroy(); host.remove()
   })
 
   it('toolbar batch buttons resolve everything', () => {
     const { view, host } = mountView()
-    host.querySelector('#mw-btn-all-left').click()
-    expect(host.querySelector('#mw-output').value).toBe(LEFT)
+    host.querySelector('.mw-btn-all-left').click()
+    expect(host.querySelector('.mw-output-textarea').value).toBe(LEFT)
     view.destroy(); host.remove()
   })
 })
@@ -254,22 +256,22 @@ describe('S16 merge3 — show filter', () => {
     })
     expect(view.getConflictCount()).toBe(1)
 
-    const allCount = host.querySelectorAll('#mw-content-left .mw-line').length
+    const allCount = host.querySelectorAll('.mw-content-left .mw-line').length
     view.setShowFilter('conflicts')
     expect(view.getShowFilter()).toBe('conflicts')
-    const filteredCount = host.querySelectorAll('#mw-content-left .mw-line').length
+    const filteredCount = host.querySelectorAll('.mw-content-left .mw-line').length
     expect(filteredCount).toBeLessThan(allCount)
     expect(filteredCount).toBe(5) // 2 context + 1 conflict line + 2 context
-    expect(host.querySelectorAll('#mw-content-left .mw-line--conflict').length).toBe(1)
+    expect(host.querySelectorAll('.mw-content-left .mw-line--conflict').length).toBe(1)
 
     view.setShowFilter('all')
-    expect(host.querySelectorAll('#mw-content-left .mw-line').length).toBe(allCount)
+    expect(host.querySelectorAll('.mw-content-left .mw-line').length).toBe(allCount)
     view.destroy(); host.remove()
   })
 
   it('filter button toggles label and state', () => {
     const { view, host } = mountView()
-    const btn = host.querySelector('#mw-btn-filter')
+    const btn = host.querySelector('.mw-btn-filter')
     expect(btn.textContent).toBe('顯示：全部')
     btn.click()
     expect(view.getShowFilter()).toBe('conflicts')

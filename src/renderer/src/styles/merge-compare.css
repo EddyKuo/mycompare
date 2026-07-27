@@ -1,0 +1,80 @@
+/**
+ * Three-way merge view.
+ *
+ * Previously emitted as an inline <style> block inside the view's own markup,
+ * which meant a second merge tab injected a second identical copy. Import it
+ * from the view module instead so the bundler emits it exactly once.
+ */
+
+.mw-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-bottom: 1px solid #d9d9d9;
+}
+.mw-toolbar button {
+  padding: 2px 8px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+.mw-toolbar button.active { border-color: #2563eb; background: #dbeafe; }
+.mw-toolbar-sep { width: 1px; height: 14px; background: #d9d9d9; margin: 0 4px; }
+.mw-conflict-counter { min-width: 96px; }
+
+.mw-conflict-card {
+  border: 1px solid #e0a000;
+  border-radius: 4px;
+  margin: 4px 0;
+  background: #fffbe6;
+}
+.mw-conflict-card--current { outline: 2px solid #2563eb; outline-offset: 1px; }
+.mw-line--conflict { background: #fff3cd; }
+
+.mw-conflict-choices { display: flex; gap: 4px; padding: 4px 8px; }
+.mw-choice-btn {
+  padding: 2px 8px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.mw-choice-btn.active { border-color: #2563eb; background: #dbeafe; }
+.mw-choice-left.active { background: #d1fae5; border-color: #059669; }
+.mw-choice-right.active { background: #fee2e2; border-color: #dc2626; }
+.mw-choice-base.active { background: #e0e7ff; border-color: #4f46e5; }
+
+.mw-conflict-preview { display: flex; gap: 0; }
+.mw-conflict-left,
+.mw-conflict-base,
+.mw-conflict-right { flex: 1; padding: 4px 8px; font-size: 12px; }
+.mw-conflict-left { background: #f0fdf4; }
+.mw-conflict-base {
+  background: #f8fafc;
+  border-left: 1px solid #e2e8f0;
+  border-right: 1px solid #e2e8f0;
+}
+.mw-conflict-right { background: #fef2f2; }
+.mw-conflict-label { font-size: 10px; color: #888; display: block; margin-bottom: 2px; }
+
+.mw-normal-seg { margin: 0; padding: 2px 8px; font-size: 12px; white-space: pre-wrap; }
+.mw-output-pane-inner { padding: 4px 0; overflow: auto; }
+.mw-output-textarea { display: none; }
+
+/* Virtualisation assumes every row is exactly ROW_HEIGHT tall (see
+   three-way-compare.js). A wrapped line would desynchronise the spacer height
+   from the real content height, so wrapping is disabled on purpose. */
+.mw-content .mw-vspacer { position: relative; width: 100%; }
+.mw-content .mw-vwindow { position: absolute; top: 0; left: 0; right: 0; }
+.mw-content .mw-line { height: 18px; min-height: 18px; box-sizing: border-box; overflow: hidden; }
+.mw-content .mw-linetext {
+  white-space: pre;
+  word-break: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

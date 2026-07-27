@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   ThreeWayCompare,
   computeVisibleRange,
+  conflictPaneRow,
   diffToPaneRows,
   buildPaneRows,
 } from '../../src/renderer/src/views/three-way-compare.js'
@@ -306,6 +307,199 @@ describe('S16 merge3 — two instances coexist in one document', () => {
 })
 
 // ---------------------------------------------------------------------------
+
+describe('S16 merge3 — the view owns no element ids', () => {
+  it('renders no id attributes at all', () => {
+    const { view, host } = mountView()
+    expect(host.querySelectorAll('[id]').length).toBe(0)
+    view.destroy(); host.remove()
+  })
+
+  it('leaves the historical #mw-* handles unresolvable document-wide', () => {
+    const a = mountView()
+    const b = mountView()
+    for (const id of [
+      'mw-output', 'mw-output-pane', 'mw-content-left', 'mw-content-base',
+      'mw-content-right', 'mw-conflict-counter', 'mw-btn-filter', 'mw-btn-next',
+      'mw-btn-prev', 'mw-btn-save', 'mw-divider', 'mw-path-left',
+    ]) {
+      expect(document.getElementById(id)).toBeNull()
+    }
+    a.view.destroy(); b.view.destroy()
+  })
+
+  it('ships no per-instance <style> block', () => {
+    const a = mountView()
+    const b = mountView()
+    // The stylesheet is imported by the module; duplicating it per mount is
+    // what the inline block used to do.
+    expect(a.host.querySelectorAll('style').length).toBe(0)
+    expect(b.host.querySelectorAll('style').length).toBe(0)
+    a.view.destroy(); b.view.destroy()
+  })
+
+  it('addresses every pane through its own container', () => {
+    const a = mountView({ base: bigText(2000), left: bigText(2000, [500], 'L'), right: bigText(2000, [500], 'R') })
+    const b = mountView({ base: bigText(2000), left: bigText(2000), right: bigText(2000) })
+
+    // The toolbars are identical markup in the same document; a document-wide
+    // lookup would drive the first instance from the second one's button.
+    b.host.querySelector('.mw-btn-filter').click()
+    expect(b.view.getShowFilter()).toBe('conflicts')
+    expect(a.view.getShowFilter()).toBe('all')
+    expect(a.host.querySelector('.mw-btn-filter').classList.contains('active')).toBe(false)
+
+    b.host.querySelector('.mw-btn-all-left').click()
+    expect(a.host.querySelector('.mw-output-textarea').value).toContain('L500')
+
+    a.view.destroy(); b.view.destroy()
+  })
+})
+
+describe('S16 merge3 — conflict navigation scrolls the virtualised panes', () => {
+  const N = 20000
+
+  it('computes a row for a conflict in both filter modes', () => {
+    const segments = [
+      { type: 'normal', lines: ['a', 'b', 'c', 'd'] },
+      { type: 'conflict', id: 0, leftLines: ['L'], baseLines: ['B'], rightLines: ['R'], baseStart: 4 },
+      { type: 'normal', lines: ['e', 'f', 'g', 'h'] },
+      { type: 'conflict', id: 1, leftLines: ['L2'], baseLines: ['B2'], rightLines: ['R2'], baseStart: 9 },
+    ]
+    expect(conflictPaneRow(segments, 0)).toBe(4)
+    expect(conflictPaneRow(segments, 1)).toBe(9)
+    expect(conflictPaneRow(segments, 99)).toBe(-1)
+    expect(conflictPaneRow(null, 0)).toBe(-1)
+
+    // Filtered mode drops most normal lines, so rows move up.
+    expect(conflictPaneRow(segments, 0, 'conflicts')).toBe(2)
+    expect(conflictPaneRow(segments, 1, 'conflicts')).toBeLessThan(9)
+  })
+
+  it('returns -1 for segments built without positions', () => {
+    expect(conflictPaneRow([
+      { type: 'conflict', id: 0, leftLines: ['L'], baseLines: ['B'], rightLines: ['R'] },
+    ], 0)).toBe(-1)
+  })
+
+  it('brings a far-away conflict into the rendered window', () => {
+    const { view, host } = mountView({
+      base: bigText(N),
+      left: bigText(N, [17000], 'L'),
+      right: bigText(N, [17000], 'R'),
+    })
+    expect(view.getConflictCount()).toBe(1)
+    expect(renderedTexts(host)).not.toContain('L17000')
+
+    view.nextConflict()
+    expect(renderedTexts(host)).toContain('L17000')
+    expect(lineCount(host)).toBeLessThan(100)
+
+    view.destroy(); host.remove()
+  })
+
+  it('walks a long conflict list without ever growing the DOM', () => {
+    const changed = Array.from({ length: 300 }, (_, i) => i * 60)
+    const { view, host } = mountView({
+      base: bigText(N),
+      left: bigText(N, changed, 'L'),
+      right: bigText(N, changed, 'R'),
+    })
+    expect(view.getConflictCount()).toBe(300)
+
+    for (let i = 0; i < 300; i++) {
+      view.nextConflict()
+      expect(lineCount(host)).toBeLessThan(100)
+    }
+    // Wrapped exactly once.
+    expect(view.getCurrentConflictIndex()).toBe(299)
+    expect(renderedTexts(host)).toContain('L17940')
+
+    view.destroy(); host.remove()
+  })
+
+  it('navigates independently in two mounted instances', () => {
+    const a = mountView({ base: bigText(N), left: bigText(N, [8000], 'L'), right: bigText(N, [8000], 'R') })
+    const b = mountView({ base: bigText(N), left: bigText(N, [3000], 'L'), right: bigText(N, [3000], 'R') })
+
+    a.view.nextConflict()
+    expect(renderedTexts(a.host)).toContain('L8000')
+    expect(renderedTexts(b.host)).toContain('line0')
+    expect(renderedTexts(b.host)).not.toContain('L3000')
+
+    b.view.nextConflict()
+    expect(renderedTexts(b.host)).toContain('L3000')
+    expect(renderedTexts(a.host)).toContain('L8000')
+
+    a.view.destroy(); b.view.destroy()
+  })
+
+  it('keeps navigation working in conflicts-only mode', () => {
+    const changed = Array.from({ length: 200 }, (_, i) => i * 90)
+    const { view, host } = mountView({
+      base: bigText(N),
+      left: bigText(N, changed, 'L'),
+      right: bigText(N, changed, 'R'),
+    })
+    view.setShowFilter('conflicts')
+    view.lastConflict()
+
+    expect(renderedTexts(host)).toContain('L17910')
+    expect(lineCount(host)).toBeLessThan(100)
+    view.destroy(); host.remove()
+  })
+})
+
+describe('S16 merge3 — the output pane stays bounded too', () => {
+  it('elides a single conflict spanning thousands of lines', () => {
+    const N = 6000
+    const half = Array.from({ length: N / 2 }, (_, i) => `line${i}`)
+    const { view, host } = mountView({
+      base: [...half, ...Array.from({ length: N / 2 }, (_, i) => `B${i}`)].join('\n'),
+      left: [...half, ...Array.from({ length: N / 2 }, (_, i) => `L${i}`)].join('\n'),
+      right: [...half, ...Array.from({ length: N / 2 }, (_, i) => `R${i}`)].join('\n'),
+    })
+    expect(view.getConflictCount()).toBe(1)
+
+    const previews = [...host.querySelectorAll('.mw-conflict-preview pre')]
+    expect(previews.length).toBe(3)
+    for (const pre of previews) {
+      expect(pre.textContent.split('\n').length).toBeLessThan(250)
+      expect(pre.textContent).toContain('省略')
+    }
+    // Everything the preview hid is still in the saved output.
+    view.resolveAll('left')
+    expect(host.querySelector('.mw-output-textarea').value).toContain(`L${N / 2 - 1}`)
+
+    view.destroy(); host.remove()
+  })
+
+  it('renders conflict text without interpreting markup', () => {
+    const { view, host } = mountView({
+      base: 'a\nb\nc',
+      left: 'a\n<img src=x onerror=alert(1)>\nc',
+      right: 'a\nR\nc',
+    })
+    const pre = host.querySelector('.mw-conflict-left pre')
+    expect(pre.textContent).toContain('<img')
+    expect(host.querySelectorAll('.mw-conflict-left img').length).toBe(0)
+    view.destroy(); host.remove()
+  })
+
+  it('keeps the view node count proportional to conflicts, not to lines', () => {
+    const conflicts = 200
+    const changed = Array.from({ length: conflicts }, (_, i) => i * 90)
+    const { view, host } = mountView({
+      base: bigText(20000),
+      left: bigText(20000, changed, 'L'),
+      right: bigText(20000, changed, 'R'),
+    })
+    expect(view.getConflictCount()).toBe(conflicts)
+    // 20k lines × 3 panes unvirtualised would be 60k row elements alone.
+    expect(host.querySelectorAll('*').length).toBeLessThan(conflicts * 30)
+    view.destroy(); host.remove()
+  })
+})
 
 describe('S16 merge3 — getConfig / applyConfig', () => {
   it('exposes both halves of the contract', () => {

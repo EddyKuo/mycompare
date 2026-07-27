@@ -4,6 +4,9 @@
  */
 
 import { diffLines } from '../core/diff-engine.js'
+// Imported here rather than from the renderer entry so the view stays
+// self-contained; the bundler emits it once no matter how many tabs mount.
+import '../styles/merge-compare.css'
 
 // ---------------------------------------------------------------------------
 // S13-C01: 3-way merge helpers (module-private)
@@ -45,7 +48,7 @@ function _arraysEqual(a, b) {
 
 /**
  * @typedef {{ type: 'normal', lines: string[] }} NormalSegment
- * @typedef {{ type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[] }} ConflictSegment
+ * @typedef {{ type: 'conflict', id: number, leftLines: string[], baseLines: string[], rightLines: string[], baseStart?: number }} ConflictSegment
  * @typedef {NormalSegment | ConflictSegment} MergeSegment
  * @typedef {'left'|'right'|'base'|'both'} ConflictChoice
  */
@@ -132,6 +135,46 @@ export function buildMergedText(segments, choices) {
     if (choice === 'both')  return [...seg.leftLines, ...seg.rightLines].join('\n')
     return ['<<<<<<< LEFT', ...seg.leftLines, '||||||| BASE', ...seg.baseLines, '=======', ...seg.rightLines, '>>>>>>> RIGHT'].join('\n')
   }).join('\n')
+}
+
+/**
+ * Row a conflict starts on, in the coordinate space the panes scroll in.
+ *
+ * Once the panes are virtualised, "reveal the conflict" can no longer be left
+ * to the browser — the target row usually is not in the DOM at all, so the
+ * scroll offset has to be computed.
+ *
+ * The three panes share one scrollTop, so no single row index can be exact for
+ * all of them; base-line coordinates are used, which are exact for the base
+ * pane and off by the length difference of preceding edits for left/right.
+ *
+ * @param {MergeSegment[]} segments
+ * @param {number} conflictId
+ * @param {'all'|'conflicts'} [showFilter]
+ * @returns {number} row index, or -1 when the conflict is not present
+ */
+export function conflictPaneRow(segments, conflictId, showFilter = 'all') {
+  const src = segments || []
+
+  if (showFilter === 'conflicts') {
+    let row = 0
+    for (const seg of filterSegmentsForConflicts(src)) {
+      if (seg.type === 'conflict') {
+        if (seg.id === conflictId) return row
+        row += seg.baseLines.length
+      } else {
+        row += seg.lines.length
+      }
+    }
+    return -1
+  }
+
+  for (const seg of src) {
+    if (seg.type === 'conflict' && seg.id === conflictId) {
+      return Number.isFinite(seg.baseStart) ? /** @type {number} */ (seg.baseStart) : -1
+    }
+  }
+  return -1
 }
 
 /**
@@ -278,15 +321,10 @@ export function buildPaneRows(side, opts = {}) {
 // ThreeWayCompare
 // ---------------------------------------------------------------------------
 
-/** Distinguishes instances so two mounted merge tabs cannot share element ids. */
-let _instanceSeq = 0
-
 export class ThreeWayCompare {
   constructor() {
     /** @type {HTMLElement|null} */
     this._container = null
-
-    this._uid = ++_instanceSeq
 
     this._leftPath = ''
     this._basePath = ''
@@ -504,7 +542,6 @@ export class ThreeWayCompare {
   mount(containerEl) {
     this._container = containerEl
     this._render()
-    this._disambiguateIds()
     this._bindEvents()
   }
 
@@ -547,86 +584,56 @@ export class ThreeWayCompare {
   // ---------------------------------------------------------------------------
 
   _render() {
+    // No element carries an `id`: two merge tabs mounted at once would
+    // otherwise share every id in this markup, and a document-wide lookup
+    // would resolve to whichever tab happened to mount first. Every handle
+    // below is reached through `_q()`, which is scoped to this container.
     this._container.innerHTML = `
       <div class="mw-layout">
         <div class="mw-toolbar">
-          <button class="mw-btn-prev" id="mw-btn-prev" title="上一個衝突">▲</button>
-          <button class="mw-btn-next" id="mw-btn-next" title="下一個衝突">▼</button>
-          <span class="mw-conflict-counter" id="mw-conflict-counter">無衝突</span>
+          <button class="mw-btn-prev" title="上一個衝突">▲</button>
+          <button class="mw-btn-next" title="下一個衝突">▼</button>
+          <span class="mw-conflict-counter">無衝突</span>
           <span class="mw-toolbar-sep"></span>
-          <button class="mw-btn-filter" id="mw-btn-filter" title="只顯示衝突段落">顯示：全部</button>
+          <button class="mw-btn-filter" title="只顯示衝突段落">顯示：全部</button>
           <span class="mw-toolbar-sep"></span>
-          <button class="mw-btn-all-left" id="mw-btn-all-left">全部採用左側</button>
-          <button class="mw-btn-all-right" id="mw-btn-all-right">全部採用右側</button>
+          <button class="mw-btn-all-left">全部採用左側</button>
+          <button class="mw-btn-all-right">全部採用右側</button>
         </div>
         <div class="mw-top">
-          <!-- Left Pane -->
-          <div class="mw-pane" id="mw-pane-left">
+          <div class="mw-pane mw-pane--left" data-side="left">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="left">開啟左側…</button>
-              <span class="mw-path" data-side="left" id="mw-path-left">（未選擇）</span>
+              <span class="mw-path" data-side="left">（未選擇）</span>
             </div>
-            <div class="mw-content mw-content-left" data-side="left" id="mw-content-left"></div>
+            <div class="mw-content mw-content-left" data-side="left"></div>
           </div>
           <div class="mw-pane-divider"></div>
-          <!-- Base Pane -->
-          <div class="mw-pane" id="mw-pane-base">
+          <div class="mw-pane mw-pane--base" data-side="base">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="base">開啟基底…</button>
-              <span class="mw-path" data-side="base" id="mw-path-base">（未選擇）</span>
+              <span class="mw-path" data-side="base">（未選擇）</span>
             </div>
-            <div class="mw-content mw-content-base" data-side="base" id="mw-content-base"></div>
+            <div class="mw-content mw-content-base" data-side="base"></div>
           </div>
           <div class="mw-pane-divider"></div>
-          <!-- Right Pane -->
-          <div class="mw-pane" id="mw-pane-right">
+          <div class="mw-pane mw-pane--right" data-side="right">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="right">開啟右側…</button>
-              <span class="mw-path" data-side="right" id="mw-path-right">（未選擇）</span>
+              <span class="mw-path" data-side="right">（未選擇）</span>
             </div>
-            <div class="mw-content mw-content-right" data-side="right" id="mw-content-right"></div>
+            <div class="mw-content mw-content-right" data-side="right"></div>
           </div>
         </div>
-        <div class="mw-divider" id="mw-divider"></div>
+        <div class="mw-divider"></div>
         <div class="mw-output-pane">
           <div class="mw-output-header">
             <span>合併輸出</span>
-            <button class="mw-btn-save" id="mw-btn-save">儲存輸出…</button>
+            <button class="mw-btn-save">儲存輸出…</button>
           </div>
-          <div class="mw-output-content" id="mw-output-pane"></div>
-          <textarea class="mw-output-textarea" id="mw-output" spellcheck="false"></textarea>
+          <div class="mw-output-content"></div>
+          <textarea class="mw-output-textarea" spellcheck="false"></textarea>
         </div>
-        <style>
-.mw-toolbar { display:flex; align-items:center; gap:4px; padding:4px 8px; font-size:12px; border-bottom:1px solid #d9d9d9; }
-.mw-toolbar button { padding:2px 8px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:12px; background:transparent; color:inherit; }
-.mw-toolbar button.active { border-color:#2563eb; background:#dbeafe; }
-.mw-toolbar-sep { width:1px; height:14px; background:#d9d9d9; margin:0 4px; }
-.mw-conflict-counter { min-width:96px; }
-.mw-conflict-card { border: 1px solid #e0a000; border-radius:4px; margin:4px 0; background:#fffbe6; }
-.mw-conflict-card--current { outline:2px solid #2563eb; outline-offset:1px; }
-.mw-choice-base.active { background:#e0e7ff; border-color:#4f46e5; }
-.mw-line--conflict { background:#fff3cd; }
-.mw-conflict-choices { display:flex; gap:4px; padding:4px 8px; }
-.mw-choice-btn { padding:2px 8px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:12px; }
-.mw-choice-btn.active { border-color: #2563eb; background:#dbeafe; }
-.mw-choice-left.active { background:#d1fae5; border-color:#059669; }
-.mw-choice-right.active { background:#fee2e2; border-color:#dc2626; }
-.mw-conflict-preview { display:flex; gap:0; }
-.mw-conflict-left,.mw-conflict-base,.mw-conflict-right { flex:1; padding:4px 8px; font-size:12px; }
-.mw-conflict-left { background:#f0fdf4; }
-.mw-conflict-base { background:#f8fafc; border-left:1px solid #e2e8f0; border-right:1px solid #e2e8f0; }
-.mw-conflict-right { background:#fef2f2; }
-.mw-conflict-label { font-size:10px; color:#888; display:block; margin-bottom:2px; }
-.mw-normal-seg { margin:0; padding:2px 8px; font-size:12px; white-space:pre-wrap; }
-.mw-output-pane-inner { padding:4px 0; overflow:auto; }
-.mw-output-textarea { display:none; }
-/* Virtual scrolling only holds together while every row is exactly
-   ROW_HEIGHT tall, so wrapping is disabled here on purpose. */
-.mw-content .mw-vspacer { position:relative; width:100%; }
-.mw-content .mw-vwindow { position:absolute; top:0; left:0; right:0; }
-.mw-content .mw-line { height:18px; min-height:18px; box-sizing:border-box; overflow:hidden; }
-.mw-content .mw-linetext { white-space:pre; word-break:normal; overflow:hidden; text-overflow:ellipsis; }
-        </style>
       </div>
     `
 
@@ -665,21 +672,6 @@ export class ThreeWayCompare {
   /** @returns {HTMLElement[]} the three scrollable side panes that exist */
   _panes() {
     return [this._contentEls.left, this._contentEls.base, this._contentEls.right].filter(Boolean)
-  }
-
-  /**
-   * Suffix any element id that another instance already owns.
-   *
-   * The markup keeps its historical ids for readability and for outside
-   * callers, but duplicated ids across two merge tabs would make a
-   * document-wide `#mw-output` lookup resolve to the wrong tab.
-   */
-  _disambiguateIds() {
-    if (!this._container) return
-    for (const el of this._container.querySelectorAll('[id]')) {
-      const owner = document.getElementById(el.id)
-      if (owner && owner !== el) el.id = `${el.id}--${this._uid}`
-    }
   }
 
   _setupDividerDrag() {
@@ -765,10 +757,18 @@ export class ThreeWayCompare {
    */
   _gotoConflict(index) {
     this._currentConflict = index
+    const ids = collectConflictIds(this._segments)
+    const targetId = index >= 0 ? ids[index] : null
+
+    if (targetId != null) {
+      const row = conflictPaneRow(this._segments, targetId, this._showFilter)
+      // A couple of lines of lead-in, so the conflict is not flush against
+      // the top edge of the pane.
+      if (row >= 0) this.scrollToRow(Math.max(0, row - CONFLICT_CONTEXT_LINES))
+    }
+
     const pane = this._outputPaneEl
     if (pane) {
-      const ids = collectConflictIds(this._segments)
-      const targetId = index >= 0 ? ids[index] : null
       pane.querySelectorAll('.mw-conflict-card').forEach(card => {
         const isCurrent = targetId != null && card.dataset.conflictId === String(targetId)
         card.classList.toggle('mw-conflict-card--current', isCurrent)
@@ -1009,6 +1009,9 @@ export class ThreeWayCompare {
             type: 'conflict',
             id: conflictId++,
             leftLines, baseLines: baseSlice, rightLines,
+            // Kept so navigation can compute a scroll offset without walking
+            // the segment list to reconstruct base positions.
+            baseStart: i,
           })
         }
         i = endBase
@@ -1066,10 +1069,7 @@ export class ThreeWayCompare {
         pre.className = 'mw-normal-seg'
         // The textarea below still carries every line; only this preview is
         // elided, so a 100k-line unchanged run cannot stall layout.
-        const extra = seg.lines.length - OUTPUT_PREVIEW_MAX_LINES
-        pre.textContent = extra > 0
-          ? [...seg.lines.slice(0, OUTPUT_PREVIEW_MAX_LINES), `… 省略 ${extra} 行（輸出內容不受影響）`].join('\n')
-          : seg.lines.join('\n')
+        pre.textContent = this._elideLines(seg.lines)
         frag.appendChild(pre)
       } else {
         // Conflict card
@@ -1114,22 +1114,9 @@ export class ThreeWayCompare {
 
         const previewDiv = document.createElement('div')
         previewDiv.className = 'mw-conflict-preview'
-
-        const leftDiv = document.createElement('div')
-        leftDiv.className = 'mw-conflict-left'
-        leftDiv.innerHTML = `<span class="mw-conflict-label">LEFT</span><pre>${this._escapeHtml(seg.leftLines.join('\n'))}</pre>`
-
-        const baseDiv = document.createElement('div')
-        baseDiv.className = 'mw-conflict-base'
-        baseDiv.innerHTML = `<span class="mw-conflict-label">BASE</span><pre>${this._escapeHtml(seg.baseLines.join('\n'))}</pre>`
-
-        const rightDiv = document.createElement('div')
-        rightDiv.className = 'mw-conflict-right'
-        rightDiv.innerHTML = `<span class="mw-conflict-label">RIGHT</span><pre>${this._escapeHtml(seg.rightLines.join('\n'))}</pre>`
-
-        previewDiv.appendChild(leftDiv)
-        previewDiv.appendChild(baseDiv)
-        previewDiv.appendChild(rightDiv)
+        previewDiv.appendChild(this._makeConflictSide('mw-conflict-left', 'LEFT', seg.leftLines))
+        previewDiv.appendChild(this._makeConflictSide('mw-conflict-base', 'BASE', seg.baseLines))
+        previewDiv.appendChild(this._makeConflictSide('mw-conflict-right', 'RIGHT', seg.rightLines))
 
         card.appendChild(choicesDiv)
         card.appendChild(previewDiv)
@@ -1187,19 +1174,45 @@ export class ThreeWayCompare {
   }
 
   /**
-   * Escape HTML special characters for safe innerHTML insertion.
-   * @param {string} str
-   * @returns {string}
+   * One side of a conflict card.
+   *
+   * Built as nodes with textContent rather than escaped innerHTML: file
+   * contents are the one thing here that is fully attacker-controlled, and a
+   * single conflict can span thousands of lines, which the preview elides.
+   *
+   * @param {string} className
+   * @param {string} label
+   * @param {string[]} lines
+   * @returns {HTMLElement}
    */
-  _escapeHtml(str) {
-    // S13-C07: also escape the apostrophe — without it, content rendered into
-    // attribute-like contexts could break out.
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;')
+  _makeConflictSide(className, label, lines) {
+    const div = document.createElement('div')
+    div.className = className
+
+    const labelEl = document.createElement('span')
+    labelEl.className = 'mw-conflict-label'
+    labelEl.textContent = label
+
+    const pre = document.createElement('pre')
+    pre.textContent = this._elideLines(lines)
+
+    div.appendChild(labelEl)
+    div.appendChild(pre)
+    return div
+  }
+
+  /**
+   * @param {string[]} lines
+   * @returns {string} at most OUTPUT_PREVIEW_MAX_LINES lines plus a marker
+   */
+  _elideLines(lines) {
+    const src = lines || []
+    const extra = src.length - OUTPUT_PREVIEW_MAX_LINES
+    if (extra <= 0) return src.join('\n')
+    return [
+      ...src.slice(0, OUTPUT_PREVIEW_MAX_LINES),
+      `… 省略 ${extra} 行（輸出內容不受影響）`,
+    ].join('\n')
   }
 
   // ---------------------------------------------------------------------------
