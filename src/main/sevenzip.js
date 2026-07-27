@@ -10,7 +10,8 @@
  *   decoded through the same machinery before it can be read.
  *
  *   Read-only, and only the coders that can be decoded here: Copy, LZMA, LZMA2
- *   and the x86 BCJ filter. Anything else is named rather than mis-decoded.
+ *   and the x86 filters BCJ and BCJ2. Anything else is named rather than
+ *   mis-decoded.
  *
  *   Per-substream CRC32s are verified on extraction. Without that, corruption
  *   that happens not to derail the coder produces wrong bytes that look
@@ -49,11 +50,11 @@ const CODER_LZMA2 = '21'
 const CODER_LZMA1 = '030101'
 
 const CODER_BCJ_X86 = '03030103'
+const CODER_BCJ2 = '0303011b'
 
 /** Names for the coders that are recognised but cannot be decoded here. */
 const KNOWN_UNSUPPORTED = {
   '03': 'Delta',
-  '0303011b': 'BCJ2',
   '03030205': 'BCJ (PPC)',
   '03030301': 'BCJ (IA64)',
   '03030501': 'BCJ (ARM)',
@@ -146,6 +147,186 @@ export class SevenZipError extends Error {
     this.name = 'SevenZipError'
     this.code = code
   }
+}
+
+/**
+ * Range decoder for BCJ2's status bits.
+ *
+ * This is the same arithmetic coder LZMA uses, and duplicating it is not the
+ * preference — `lzma.js` has one, but it is module-private there and this task
+ * is scoped to this file. It is kept to the two operations BCJ2 needs (init and
+ * one adaptive bit) rather than copied wholesale, and the constants below are
+ * the format's, not a second interpretation of them.
+ *
+ * Initialisation is deferred: a folder whose data contains no branch opcodes at
+ * all gets an empty control stream from the encoder, and demanding five header
+ * bytes up front would reject it.
+ */
+class Bcj2RangeDecoder {
+  /** @param {Uint8Array} buf */
+  constructor(buf) {
+    this.buf = buf
+    this.pos = 0
+    this.range = 0
+    this.code = 0
+    this.started = false
+  }
+
+  _byte() {
+    if (this.pos >= this.buf.length) {
+      throw new SevenZipError('7z BCJ2 控制串流在解碼中途結束')
+    }
+    return this.buf[this.pos++]
+  }
+
+  _start() {
+    this.started = true
+    this.range = 0xffffffff
+    this.code = 0
+    // The first byte is padding in a well-formed stream.
+    this._byte()
+    for (let i = 0; i < 4; i++) this.code = ((this.code << 8) | this._byte()) >>> 0
+  }
+
+  /**
+   * @param {Uint16Array} probs
+   * @param {number} index
+   * @returns {number} 0 or 1
+   */
+  decodeBit(probs, index) {
+    if (!this.started) this._start()
+    const prob = probs[index]
+    const bound = (this.range >>> 11) * prob
+    let bit
+    if ((this.code >>> 0) < bound) {
+      this.range = bound
+      probs[index] = prob + (((1 << 11) - prob) >>> 5)
+      bit = 0
+    } else {
+      this.range = (this.range - bound) >>> 0
+      this.code = (this.code - bound) >>> 0
+      probs[index] = prob - (prob >>> 5)
+      bit = 1
+    }
+    if (this.range < (1 << 24)) {
+      this.range = (this.range << 8) >>> 0
+      this.code = ((this.code << 8) | this._byte()) >>> 0
+    }
+    return bit
+  }
+}
+
+/**
+ * Is `b1` the opcode byte of a branch whose displacement BCJ2 may have
+ * converted? CALL (E8), JMP (E9), and the two-byte near Jcc forms (0F 8x).
+ *
+ * @param {number} b0 previous byte
+ * @param {number} b1
+ */
+function isBcj2Branch(b0, b1) {
+  return (b1 & 0xfe) === 0xe8 || (b0 === 0x0f && (b1 & 0xf0) === 0x80)
+}
+
+/**
+ * Undo the BCJ2 filter.
+ *
+ * BCJ2 is the branching x86 filter: instead of rewriting displacements in
+ * place like BCJ does, the encoder *removes* the converted ones from the byte
+ * stream and parks them in two side streams — one for CALL, one for JMP — so
+ * that the addresses, which compress badly interleaved with code, get a
+ * compressor of their own. A fourth stream carries one arithmetic-coded bit
+ * per branch opcode saying whether that opcode's operand was actually taken
+ * out, which is what makes the split reversible: an E8 byte inside a constant
+ * or in the middle of another instruction is left alone, and only the bit can
+ * tell the two cases apart.
+ *
+ * The probability model is context-indexed, and the contexts are
+ * (CALL, previous byte) for each of the 256 possible previous bytes, plus one
+ * each for JMP and Jcc. Which slot of the 258 a context maps to is arbitrary —
+ * every slot starts at the same value and adapts independently, so any
+ * bijection agrees with any encoder's; what must not vary is the set of
+ * contexts itself.
+ *
+ * Addresses are stored big-endian in the side streams (the rest of the format
+ * is little-endian) and are absolute; the relative displacement the instruction
+ * actually needs is recovered by subtracting the address of the next
+ * instruction.
+ *
+ * @param {Uint8Array[]} streams  main, call, jump, control
+ * @param {number} outSize
+ * @param {number} maxBytes
+ * @returns {Uint8Array}
+ */
+export function bcj2Decode(streams, outSize, maxBytes) {
+  const [main, call, jump, control] = streams
+  if (!main || !call || !jump || !control) {
+    throw new SevenZipError('7z BCJ2 需要四個輸入串流')
+  }
+  if (!Number.isSafeInteger(outSize) || outSize < 0) {
+    throw new SevenZipError('7z BCJ2 的輸出大小不合理')
+  }
+  // A declared size is a claim, not a measurement: allocate against the limit
+  // first, or a header with a large number in it is an allocation primitive.
+  if (outSize > maxBytes) {
+    throw new SevenZipError('7z 解壓縮結果超過允許的大小上限', 'limit')
+  }
+
+  const out = new Uint8Array(outSize)
+  const probs = new Uint16Array(2 + 256).fill(1024)
+  const rc = new Bcj2RangeDecoder(control)
+
+  let mainPos = 0
+  let callPos = 0
+  let jumpPos = 0
+  let outPos = 0
+  let prev = 0
+
+  while (outPos < outSize) {
+    let b = 0
+    let branch = false
+    while (outPos < outSize) {
+      if (mainPos >= main.length) {
+        throw new SevenZipError('7z BCJ2 主串流在解碼中途結束')
+      }
+      b = main[mainPos++]
+      out[outPos++] = b
+      if (isBcj2Branch(prev, b)) { branch = true; break }
+      prev = b
+    }
+    // An opcode with nothing after it cannot have had an operand removed, and
+    // the encoder spends no status bit on it.
+    if (!branch || outPos === outSize) break
+
+    const index = b === 0xe8 ? 2 + prev : (b === 0xe9 ? 1 : 0)
+    if (rc.decodeBit(probs, index) === 0) {
+      prev = b
+      continue
+    }
+
+    if (outPos + 4 > outSize) {
+      throw new SevenZipError('7z BCJ2 的位址超出輸出範圍，檔案可能已損毀')
+    }
+    const src = b === 0xe8 ? call : jump
+    const srcPos = b === 0xe8 ? callPos : jumpPos
+    if (srcPos + 4 > src.length) {
+      throw new SevenZipError('7z BCJ2 位址串流在解碼中途結束')
+    }
+    const abs = ((src[srcPos] << 24) | (src[srcPos + 1] << 16) |
+                 (src[srcPos + 2] << 8) | src[srcPos + 3]) >>> 0
+    if (b === 0xe8) callPos += 4; else jumpPos += 4
+    const rel = (abs - (outPos + 4)) >>> 0
+
+    out[outPos++] = rel & 0xff
+    out[outPos++] = (rel >>> 8) & 0xff
+    out[outPos++] = (rel >>> 16) & 0xff
+    out[outPos++] = (rel >>> 24) & 0xff
+    prev = (rel >>> 24) & 0xff
+  }
+
+  if (outPos !== outSize) {
+    throw new SevenZipError('7z BCJ2 解碼的長度與標頭宣告不符，檔案可能已損毀')
+  }
+  return out
 }
 
 /** @param {Uint8Array} buf */
@@ -282,6 +463,12 @@ function readFolder(r) {
 
     const numIn = isComplex ? r.number() : 1
     const numOut = isComplex ? r.number() : 1
+    // BCJ2 is the widest coder in the format at four inputs; anything past a
+    // handful is a header claiming a graph no coder has, and the counts are
+    // used to size arrays.
+    if (numIn < 1 || numIn > 8 || numOut < 1 || numOut > 8) {
+      throw new SevenZipError('7z coder 的串流數量不合理')
+    }
     let props = null
     if (hasAttrs) {
       const propsSize = r.number()
@@ -298,6 +485,7 @@ function readFolder(r) {
   }
 
   const numPackedStreams = totalInStreams - numBindPairs
+  if (numPackedStreams < 1) throw new SevenZipError('7z folder 沒有輸入串流')
   const packedIndices = []
   if (numPackedStreams === 1) {
     // The single unbound input is implicit.
@@ -483,18 +671,22 @@ function readStreamsInfo(r) {
 /**
  * Decode one folder's packed bytes through its coder chain.
  *
- * Only linear chains are handled: each coder takes the previous one's output.
- * A branching chain (BCJ2 is the common one) needs its own wiring and is
- * reported rather than guessed at.
+ * The chain is a graph, not a line: a coder input is fed either by another
+ * coder's output (a bind pair) or straight from one of the folder's packed
+ * streams, and BCJ2 has four inputs of which three are usually other coders and
+ * one is packed. Resolving each input separately rather than assuming "the
+ * previous coder's output" is what makes the branching case work.
  *
- * @param {Uint8Array} packed
+ * @param {Uint8Array|Uint8Array[]} packed  one stream, or the folder's packed
+ *   streams in `packedIndices` order
  * @param {object} folder
  * @param {number} maxBytes
  * @returns {Uint8Array}
  */
 export function decodeFolder(packed, folder, maxBytes) {
-  if (folder.packedIndices.length !== 1) {
-    throw new SevenZipError('7z folder 有多個輸入串流，此讀取器不支援', 'unsupported')
+  const packedStreams = Array.isArray(packed) ? packed : [packed]
+  if (packedStreams.length !== folder.packedIndices.length) {
+    throw new SevenZipError('7z folder 的封裝串流數量與標頭不符')
   }
 
   // Coders are listed in no particular order; the bind pairs say which output
@@ -528,18 +720,42 @@ export function decodeFolder(packed, folder, maxBytes) {
    * @returns {Uint8Array}
    */
   const run = (coderIdx) => {
-    if (++depth.n > 8) throw new SevenZipError('7z coder 鏈過深或成環')
+    if (++depth.n > 16) throw new SevenZipError('7z coder 鏈過深或成環')
     const coder = folder.coders[coderIdx]
+
+    /** @param {number} globalIn @returns {Uint8Array} */
+    const input = (globalIn) => {
+      const bind = folder.bindPairs.find((bp) => bp.inIndex === globalIn)
+      if (bind) return run(coderForOut(bind.outIndex))
+      const k = folder.packedIndices.indexOf(globalIn)
+      if (k < 0) throw new SevenZipError('7z folder 的輸入串流沒有來源')
+      return packedStreams[k]
+    }
+
+    const size = folder.unpackSizes[outStart[coderIdx]]
+
+    if (coder.id === CODER_BCJ2) {
+      if (coder.numIn !== 4) {
+        throw new SevenZipError('7z BCJ2 的輸入串流數量不是四個', 'corrupt')
+      }
+      // Checked before the sub-streams are decoded: an oversized declaration
+      // should not first cost three LZMA decodes' worth of memory.
+      if (size > maxBytes) {
+        throw new SevenZipError('7z 解壓縮結果超過允許的大小上限', 'limit')
+      }
+      return bcj2Decode(
+        Array.from({ length: 4 }, (_, i) => input(inStart[coderIdx] + i)),
+        size, maxBytes)
+    }
+
+    const sources = Array.from({ length: coder.numIn },
+      (_, i) => input(inStart[coderIdx] + i))
+    const source = sources[0]
     if (coder.numIn !== 1) {
       const name = KNOWN_UNSUPPORTED[coder.id]
       throw new SevenZipError(
         `7z 使用了多輸入的 ${name ?? coder.id} 編碼，此讀取器不支援`, 'unsupported')
     }
-
-    const globalIn = inStart[coderIdx]
-    const bind = folder.bindPairs.find((bp) => bp.inIndex === globalIn)
-    const source = bind ? run(coderForOut(bind.outIndex)) : packed
-    const size = folder.unpackSizes[outStart[coderIdx]]
 
     if (coder.id === CODER_COPY) return source
     if (coder.id === CODER_BCJ_X86) return bcjX86Decode(source)
@@ -694,9 +910,7 @@ export function parse7z(buf, opts = {}) {
     const info = readStreamsInfo(header)
     const folder = info.folders[0]
     if (!folder) throw new SevenZipError('7z 壓縮標頭缺少 folder')
-    const packStart = SIGNATURE_HEADER_SIZE + info.packInfo.packPos
-    const packSize = info.packInfo.packSizes[0]
-    const packed = buf.subarray(packStart, packStart + packSize)
+    const packed = folderPackedStreams(buf, info, 0)
     const decoded = decodeFolder(packed, folder, maxBytes)
     header = new Reader(decoded)
     id = header.number()
@@ -783,14 +997,42 @@ export function parse7z(buf, opts = {}) {
  * @returns {Uint8Array}
  */
 export function folderPackedBytes(buf, streams, folderIndex) {
+  return folderPackedStreams(buf, streams, folderIndex)[0]
+}
+
+/**
+ * All of a folder's packed streams, in `packedIndices` order.
+ *
+ * Pack streams are laid out end to end across the whole archive and handed to
+ * folders in order, so a folder's own streams are found by skipping however
+ * many the folders before it claimed — a folder with one input is the common
+ * case, not the rule.
+ *
+ * @param {Uint8Array} buf
+ * @param {object} streams
+ * @param {number} folderIndex
+ * @returns {Uint8Array[]}
+ */
+export function folderPackedStreams(buf, streams, folderIndex) {
   let packStreamIdx = 0
   for (let i = 0; i < folderIndex; i++) {
     packStreamIdx += streams.folders[i].packedIndices.length
   }
   let start = SIGNATURE_HEADER_SIZE + streams.packInfo.packPos
   for (let i = 0; i < packStreamIdx; i++) start += streams.packInfo.packSizes[i]
-  const size = streams.packInfo.packSizes[packStreamIdx]
-  return buf.subarray(start, start + size)
+
+  const count = streams.folders[folderIndex].packedIndices.length
+  /** @type {Uint8Array[]} */
+  const out = []
+  for (let i = 0; i < count; i++) {
+    const size = streams.packInfo.packSizes[packStreamIdx + i]
+    if (size == null || start + size > buf.length) {
+      throw new SevenZipError('7z 的封裝串流超出檔案範圍')
+    }
+    out.push(buf.subarray(start, start + size))
+    start += size
+  }
+  return out
 }
 
 /**
@@ -812,7 +1054,7 @@ export function extract7zEntry(buf, parsed, path, opts = {}) {
   if (entry.folderIndex === null) return new Uint8Array(0)
 
   const folder = parsed.streams.folders[entry.folderIndex]
-  const packed = folderPackedBytes(buf, parsed.streams, entry.folderIndex)
+  const packed = folderPackedStreams(buf, parsed.streams, entry.folderIndex)
   const decoded = decodeFolder(packed, folder, maxBytes)
   const out = decoded.subarray(entry.offsetInFolder, entry.offsetInFolder + entry.size)
 
