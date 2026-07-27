@@ -137,6 +137,40 @@ describe('cabinets with a reserved area', () => {
     expect(compared, 'no entry was actually compared').toBeGreaterThan(0)
   }, 60000)
 
+  it('reads a sample of this machine\'s real cabinets exactly as 7-Zip does', async () => {
+    // Hand-picked fixtures prove a path works. A sample of whatever is
+    // actually installed proves it works on the shapes the format occurs in —
+    // and a sweep of all 686 cabinets on this machine turned up 404 LZX, 277
+    // MSZIP and 5 uncompressed folders, which no curated fixture set covered.
+    if (!cabs.length || !sevenZip) return
+
+    const sample = findReservedCabs(6)
+    let compared = 0
+    for (const src of sample) {
+      const dir = mkdtempSync(join(tmpdir(), 'cab-corpus-'))
+      const cab = join(dir, 'in.cab')
+      copyFileSync(src, cab)
+      const refDir = join(dir, 'ref')
+      try {
+        execFileSync(SEVENZIP, ['x', '-y', cab, '-o' + refDir], { stdio: 'ignore' })
+      } catch {
+        continue // 7-Zip declined it, so there is no reference to compare to
+      }
+
+      const r = await readArchive(cab)
+      for (const e of (r.entries ?? r).slice(0, 6)) {
+        const full = String(e.path ?? e.name)
+        const name = full.includes('::') ? full.split('::').pop() : full
+        const refPath = join(refDir, ...name.split('/'))
+        if (!existsSync(refPath)) continue
+        const ours = await readArchiveEntry(cab, name)
+        expect(Buffer.compare(ours, readFileSync(refPath)), `differs from 7-Zip: ${name}`).toBe(0)
+        compared++
+      }
+    }
+    expect(compared, 'no entry was actually compared').toBeGreaterThan(0)
+  }, 120000)
+
   it('refuses a corrupted signed cabinet rather than decoding it', async () => {
     // Deliberately not called a checksum test. Disabling the checksum
     // verification entirely still leaves this passing, because a flipped byte

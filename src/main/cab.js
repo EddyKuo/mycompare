@@ -20,10 +20,12 @@
  *
  *   Quantum is recognised and refused by name rather than mis-decoded, and
  *   the reason has been checked rather than inherited: `makecab` rejects
- *   `CompressionType=QUANTUM`, and a scan of all 42 cabinets under
- *   C:\Windows found only MSZIP and LZX. With no Quantum cabinet obtainable,
- *   a decoder here could only ever be checked against itself, and one that
- *   agrees only with itself is worse than an honest refusal.
+ *   `CompressionType=QUANTUM`, and a sweep of every cabinet on both drives —
+ *   686 of them that parse as MSCF — found 404 LZX, 277 MSZIP, 5 uncompressed
+ *   and not one Quantum. With no Quantum cabinet obtainable and no generator
+ *   that will emit one, a decoder here could only ever be checked against
+ *   itself, and one that agrees only with itself is worse than an honest
+ *   refusal.
  *
  *   Say that carefully, because LZX carried the identical stated reason and
  *   it was simply false — `makecab /D CompressionType=LZX` works. Two more
