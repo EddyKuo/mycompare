@@ -4,8 +4,10 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  font-size: 13px;
+  /* --ui-font-* are set at runtime from Options ▸ 色彩與字型; the literals here
+     stay as the fallback so an unset or rejected value renders as shipped. */
+  font-family: var(--ui-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+  font-size: var(--ui-font-size, 13px);
   background: var(--bg-primary);
   color: var(--text-primary);
   height: 100vh;
@@ -181,7 +183,7 @@ body {
   border: none;
   outline: none;
   padding: 4px 8px;
-  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-family: var(--mono-font-family, 'Cascadia Code', 'Fira Code', 'Consolas', monospace);
   font-size: 13px;
   line-height: 1.5;
   background: var(--bg-primary);
@@ -194,7 +196,7 @@ body {
 .pane-content {
   flex: 1;
   overflow: auto;
-  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-family: var(--mono-font-family, 'Cascadia Code', 'Fira Code', 'Consolas', monospace);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -253,6 +255,10 @@ body {
 .diff-line.delete  .line-gutter::after  { content: '−'; color: rgba(255,255,255,0.9); }
 .diff-line.replace .line-gutter::after  { content: '≠'; color: rgba(255,255,255,0.9); }
 .diff-line.unimportant .line-gutter::after { content: '·'; color: rgba(255,255,255,0.9); }
+/* P2-30: a user-placed ignore keeps the blue "unimportant" semantics but gets
+ * its own glyph, so it is distinguishable from a pattern-driven one. */
+.diff-line.manual-ignored .line-gutter::after { content: '⊘'; color: rgba(255,255,255,0.9); }
+.diff-line.manual-ignored .line-text { opacity: 0.7; font-style: italic; }
 
 /* Inline char highlights */
 .char-insert { background: var(--diff-char-insert); border-radius: 2px; }
@@ -672,7 +678,7 @@ body {
 .mw-content {
   flex: 1;
   overflow: auto;
-  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-family: var(--mono-font-family, 'Cascadia Code', 'Fira Code', 'Consolas', monospace);
   font-size: 12px;
 }
 
@@ -723,7 +729,7 @@ body {
   resize: none;
   border: none;
   padding: 4px 8px;
-  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-family: var(--mono-font-family, 'Cascadia Code', 'Fira Code', 'Consolas', monospace);
   font-size: 12px;
   background: var(--bg-primary);
   color: var(--text-primary);
@@ -1004,4 +1010,102 @@ body {
   flex-wrap: wrap;
   gap: 8px;
   margin: 10px 0;
+}
+
+/* ── P2-24: Options dialog (tabbed) ── */
+.modal-box--options {
+  width: 760px;
+  max-width: 95vw;
+  height: 560px;
+  max-height: 90vh;
+}
+.options-layout {
+  display: grid;
+  grid-template-columns: 148px 1fr;
+  flex: 1;
+  min-height: 0;
+}
+.options-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  overflow: auto;
+}
+.options-tab {
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 12px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.options-tab:hover { background: var(--bg-toolbar); }
+.options-tab--active {
+  background: var(--accent-strong);
+  border-color: transparent;
+  color: var(--accent-fg);
+}
+.options-body {
+  overflow: auto;
+  min-height: 0;
+}
+.options-pane[hidden] { display: none; }
+.u-size-input {
+  width: 72px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  font-size: 12px;
+}
+/* The status line sits left of the buttons rather than above them: the footer
+   is the only part of the dialog that never scrolls out of view. */
+.u-push-right-status { margin-right: auto; align-self: center; }
+
+.options-colors {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 6px 10px;
+}
+.options-colors .color-label { font-size: 12px; }
+.options-colors input[type="color"] {
+  width: 44px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-secondary);
+  cursor: pointer;
+}
+.options-colors .color-value {
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-width: 68px;
+  text-align: right;
+}
+
+/* ── P2-28: print preview ── */
+.modal-box--preview {
+  width: 900px;
+  max-width: 95vw;
+  height: 80vh;
+}
+.print-preview-body {
+  flex: 1;
+  min-height: 0;
+}
+.print-preview-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: #ffffff;
 }

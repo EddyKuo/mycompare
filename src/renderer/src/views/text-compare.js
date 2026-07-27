@@ -23,6 +23,7 @@ import { detectEol } from '../core/eol-detect.js';
 import { isActive } from '../core/active-view.js';
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js';
 import { tagConfig, readConfig } from '../core/named-config-store.js';
+import { toast } from '../core/toast.js';
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
@@ -55,6 +56,7 @@ function _isWatchablePath(path) {
   if (!path) return false;
   return !path.startsWith('snapshot://') &&
     !path.startsWith('remote://') &&
+    !path.startsWith('patch://') &&
     !path.includes('::');
 }
 
@@ -247,6 +249,231 @@ function buildLineHTML(rawText, type, side, charDiffs, hl, showWhitespace = fals
   }
 
   return highlightText(displayText, hl);
+}
+
+// ---------------------------------------------------------------------------
+// P2-25: unified diff (patch) parsing
+//
+// Pure, DOM-free functions so the format handling can be tested directly.
+// Every malformed input raises UnifiedDiffParseError instead of producing a
+// half-parsed result: a patch viewer that silently drops lines is worse than
+// one that refuses the file, because the user cannot tell the difference.
+// ---------------------------------------------------------------------------
+
+/** Thrown by parseUnifiedDiff() when the input is not a well-formed patch. */
+export class UnifiedDiffParseError extends Error {
+  /**
+   * @param {string} message
+   * @param {number} [lineNumber] 1-based line of the offending input line
+   */
+  constructor(message, lineNumber) {
+    super(lineNumber != null ? `${message}（第 ${lineNumber} 行）` : message);
+    this.name = 'UnifiedDiffParseError';
+    /** @type {number | null} */
+    this.lineNumber = lineNumber ?? null;
+  }
+}
+
+/**
+ * @typedef {{ type: ' ' | '-' | '+', text: string, noNewline: boolean }} PatchLine
+ * @typedef {{
+ *   oldStart: number, oldCount: number,
+ *   newStart: number, newCount: number,
+ *   section: string,
+ *   lines: PatchLine[],
+ * }} PatchHunk
+ * @typedef {{ oldPath: string, newPath: string, hunks: PatchHunk[] }} PatchFile
+ */
+
+const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+
+/**
+ * Parse a unified diff / patch into a structured form.
+ *
+ * Supports multi-file patches, hunk headers with omitted counts
+ * (`@@ -3 +3 @@` means one line), `\ No newline at end of file` markers, and
+ * arbitrary preamble noise between files (`diff --git`, `index …`).
+ *
+ * @param {string} text raw patch contents
+ * @returns {PatchFile[]}
+ * @throws {UnifiedDiffParseError} on any malformed hunk header, truncated
+ *   hunk, line-count mismatch, or input containing no hunk at all.
+ */
+export function parseUnifiedDiff(text) {
+  if (typeof text !== 'string') {
+    throw new UnifiedDiffParseError('patch 內容必須是字串');
+  }
+
+  const lines = text.split(/\r\n|\n|\r/);
+  // A trailing newline yields one empty tail element that is an artefact of the
+  // split, not a patch line; keeping it would let a truncated hunk consume it
+  // as an empty context line and pass validation.
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+  /** @type {PatchFile[]} */
+  const files = [];
+  /** @type {PatchFile | null} */
+  let current = null;
+  let i = 0;
+
+  /** @param {string} raw @returns {string} */
+  const stripPathMeta = (raw) => raw.split('\t')[0].trim();
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (line.startsWith('--- ')) {
+      const next = lines[i + 1];
+      if (next == null || !next.startsWith('+++ ')) {
+        throw new UnifiedDiffParseError('`---` 檔頭之後缺少對應的 `+++` 檔頭', i + 1);
+      }
+      current = {
+        oldPath: stripPathMeta(line.slice(4)),
+        newPath: stripPathMeta(next.slice(4)),
+        hunks: [],
+      };
+      files.push(current);
+      i += 2;
+      continue;
+    }
+
+    if (line.startsWith('@@')) {
+      const m = HUNK_HEADER_RE.exec(line);
+      if (!m) {
+        throw new UnifiedDiffParseError(`無法解析的 hunk 標頭：${line}`, i + 1);
+      }
+      if (!current) {
+        // A bare hunk with no file header is legal `diff -u` fragment output.
+        current = { oldPath: '(old)', newPath: '(new)', hunks: [] };
+        files.push(current);
+      }
+      const oldStart = Number(m[1]);
+      const oldCount = m[2] === undefined ? 1 : Number(m[2]);
+      const newStart = Number(m[3]);
+      const newCount = m[4] === undefined ? 1 : Number(m[4]);
+      i += 1;
+
+      /** @type {PatchLine[]} */
+      const hunkLines = [];
+      let oldRemaining = oldCount;
+      let newRemaining = newCount;
+
+      while (oldRemaining > 0 || newRemaining > 0) {
+        if (i >= lines.length) {
+          throw new UnifiedDiffParseError(
+            `hunk 在檔案結束前被截斷（還缺 ${oldRemaining} 行原始、${newRemaining} 行新增）`,
+            i,
+          );
+        }
+        const raw = lines[i];
+        if (raw.startsWith('\\')) {
+          if (hunkLines.length === 0) {
+            throw new UnifiedDiffParseError('`\\ No newline` 標記前沒有任何 hunk 行', i + 1);
+          }
+          hunkLines[hunkLines.length - 1].noNewline = true;
+          i += 1;
+          continue;
+        }
+        // Many tools strip the trailing space of an empty context line.
+        const marker = raw === '' ? ' ' : raw[0];
+        const body = raw === '' ? '' : raw.slice(1);
+
+        if (marker === ' ') {
+          if (oldRemaining <= 0 || newRemaining <= 0) {
+            throw new UnifiedDiffParseError('hunk 內容行數超過標頭宣告的行數', i + 1);
+          }
+          oldRemaining -= 1;
+          newRemaining -= 1;
+        } else if (marker === '-') {
+          if (oldRemaining <= 0) {
+            throw new UnifiedDiffParseError('hunk 的刪除行數超過標頭宣告的原始行數', i + 1);
+          }
+          oldRemaining -= 1;
+        } else if (marker === '+') {
+          if (newRemaining <= 0) {
+            throw new UnifiedDiffParseError('hunk 的新增行數超過標頭宣告的新增行數', i + 1);
+          }
+          newRemaining -= 1;
+        } else {
+          throw new UnifiedDiffParseError(`hunk 內出現無法解析的行：${raw}`, i + 1);
+        }
+
+        hunkLines.push({ type: marker, text: body, noNewline: false });
+        i += 1;
+      }
+
+      // A `\ No newline` marker may also sit immediately after the last line.
+      if (i < lines.length && lines[i].startsWith('\\') && hunkLines.length > 0) {
+        hunkLines[hunkLines.length - 1].noNewline = true;
+        i += 1;
+      }
+
+      // A body-looking line immediately after a satisfied hunk means the
+      // header under-declared its counts. Silently treating it as preamble
+      // would drop real content, so it is an error. `--- `/`+++ ` are file
+      // headers, and a bare empty line is a common inter-hunk separator.
+      const after = lines[i];
+      if (after != null && after !== '' &&
+          (after[0] === ' ' || after[0] === '-' || after[0] === '+') &&
+          !after.startsWith('--- ') && !after.startsWith('+++ ')) {
+        throw new UnifiedDiffParseError(
+          'hunk 內容行數超過標頭宣告的行數', i + 1,
+        );
+      }
+
+      current.hunks.push({
+        oldStart, oldCount, newStart, newCount,
+        section: m[5] ?? '',
+        lines: hunkLines,
+      });
+      continue;
+    }
+
+    // Anything else between hunks (`diff --git`, `index …`, prose) is preamble.
+    i += 1;
+  }
+
+  const totalHunks = files.reduce((sum, f) => sum + f.hunks.length, 0);
+  if (totalHunks === 0) {
+    throw new UnifiedDiffParseError('內容中找不到任何 unified diff hunk');
+  }
+
+  return files;
+}
+
+/**
+ * Reconstruct the "before" and "after" text a patch describes.
+ *
+ * A patch only carries the hunk neighbourhoods, so the result is not the whole
+ * file. Skipped regions and file/hunk headers are emitted identically on both
+ * sides, which makes the diff engine render them as context and keeps the two
+ * panes aligned.
+ *
+ * @param {PatchFile[]} files output of parseUnifiedDiff()
+ * @returns {{ oldText: string, newText: string }}
+ */
+export function buildPatchSides(files) {
+  /** @type {string[]} */
+  const oldLines = [];
+  /** @type {string[]} */
+  const newLines = [];
+  /** @param {string} s */
+  const both = (s) => { oldLines.push(s); newLines.push(s); };
+
+  for (const file of files) {
+    if (oldLines.length > 0) both('');
+    both(`═══ ${file.oldPath} → ${file.newPath} ═══`);
+    for (const hunk of file.hunks) {
+      both(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@${hunk.section}`);
+      for (const l of hunk.lines) {
+        if (l.type === ' ') { oldLines.push(l.text); newLines.push(l.text); }
+        else if (l.type === '-') oldLines.push(l.text);
+        else newLines.push(l.text);
+      }
+    }
+  }
+
+  return { oldText: oldLines.join('\n'), newText: newLines.join('\n') };
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +733,12 @@ export class TextCompare {
     /** @type {Map<string, RegExp | null>} */
     this._unimportantRegexCache = new Map();
 
+    // P2-30: manually ignored lines, keyed by 1-based file line number per
+    // side. Line numbers (rather than row indices) are used so the marks
+    // survive a re-diff, a Show-filter change and a fold/unfold.
+    /** @type {{ left: Set<number>, right: Set<number> }} */
+    this._manualIgnore = { left: new Set(), right: new Set() };
+
     // T50: Layout mode toggle
     /** @type {'side-by-side' | 'over-under'} */
     this._layoutMode = 'side-by-side';
@@ -744,6 +977,24 @@ export class TextCompare {
       }
     };
     document.addEventListener('keydown', this._onKeyDownBookmark);
+
+    // P1-19 / P2-30 / P2-25 shortcuts. These are deliberately not routed
+    // through app.js's SettingsStore bindings — they are text-view-only and
+    // need the live DOM selection, which only this view can resolve.
+    this._onKeyDownTextGaps = (e) => {
+      if (!this._mounted || !isActive('text')) return;
+      if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
+        e.preventDefault();
+        void this.compareSelectionToClipboard();
+      } else if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
+        e.preventDefault();
+        void this.openPatchFile();
+      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'i' || e.key === 'I')) {
+        e.preventDefault();
+        this.toggleIgnoreSelection();
+      }
+    };
+    document.addEventListener('keydown', this._onKeyDownTextGaps);
 
     // ── T16: Go-to-line bar setup ──
     this._gotoBar   = document.getElementById('goto-bar');
@@ -1025,6 +1276,11 @@ export class TextCompare {
     // T43: cleanup bookmark shortcuts
     if (this._onKeyDownBookmark) {
       document.removeEventListener('keydown', this._onKeyDownBookmark);
+    }
+
+    // P1-19 / P2-25 / P2-30: cleanup selection & patch shortcuts
+    if (this._onKeyDownTextGaps) {
+      document.removeEventListener('keydown', this._onKeyDownTextGaps);
     }
 
     // T49: cleanup font size shortcuts
@@ -2039,6 +2295,10 @@ ${rows}
     const unimportantRe = this._opts.unimportantPatterns
       .map(p => compile(p, this._unimportantRegexCache)).filter(Boolean);
 
+    const manualLeft = this._manualIgnore.left
+    const manualRight = this._manualIgnore.right
+    const hasManual = manualLeft.size > 0 || manualRight.size > 0
+
     for (const dl of this._diffResult) {
       if (dl.type === 'equal') continue
       const text = (dl.leftText || dl.rightText || '').slice(0, MAX_TEXT_LEN)
@@ -2046,7 +2306,15 @@ ${rows}
         dl.type = 'equal'
         continue
       }
-      dl.unimportant = unimportantRe.length > 0 && unimportantRe.some(re => re.test(text))
+      // P2-30: a manual mark on either side is enough — a replace line is one
+      // logical difference even though it occupies a line number on both sides.
+      const manual = hasManual && (
+        (dl.leftLine != null && manualLeft.has(dl.leftLine)) ||
+        (dl.rightLine != null && manualRight.has(dl.rightLine))
+      )
+      dl.manualIgnored = manual
+      dl.unimportant = manual ||
+        (unimportantRe.length > 0 && unimportantRe.some(re => re.test(text)))
       // BC's "Ignore Unimportant Differences" downgrades these to equal rather
       // than merely tinting them blue, which is what makes a file with only
       // cosmetic changes read as identical.
@@ -2114,6 +2382,285 @@ ${rows}
     this._runDiff()
   }
 
+  // -------------------------------------------------------------------------
+  // Public: P2-30 — manual ignore
+  // -------------------------------------------------------------------------
+
+  /**
+   * Normalise an arbitrary caller-supplied list into positive integer line
+   * numbers, so a stray NaN can never poison the persisted config.
+   * @param {Iterable<unknown>} lines
+   * @returns {number[]}
+   */
+  static _normaliseLines(lines) {
+    /** @type {number[]} */
+    const out = []
+    for (const raw of lines ?? []) {
+      const n = Math.trunc(Number(raw))
+      if (Number.isFinite(n) && n > 0) out.push(n)
+    }
+    return out
+  }
+
+  /**
+   * Mark file lines as manually ignored. They render as unimportant (blue),
+   * and are downgraded to "equal" when Ignore Unimportant is on.
+   * @param {'left' | 'right'} side
+   * @param {Iterable<number>} lines 1-based file line numbers
+   * @returns {number} how many marks the call actually added
+   */
+  markIgnoredLines(side, lines) {
+    const set = side === 'right' ? this._manualIgnore.right : this._manualIgnore.left
+    const before = set.size
+    for (const n of TextCompare._normaliseLines(lines)) set.add(n)
+    const added = set.size - before
+    if (added > 0) this._runDiff()
+    return added
+  }
+
+  /**
+   * Remove manual ignore marks.
+   * @param {'left' | 'right'} side
+   * @param {Iterable<number>} lines
+   * @returns {number} how many marks were removed
+   */
+  unmarkIgnoredLines(side, lines) {
+    const set = side === 'right' ? this._manualIgnore.right : this._manualIgnore.left
+    let removed = 0
+    for (const n of TextCompare._normaliseLines(lines)) {
+      if (set.delete(n)) removed++
+    }
+    if (removed > 0) this._runDiff()
+    return removed
+  }
+
+  /**
+   * Toggle a run of lines: mark them all unless every one is already marked,
+   * in which case clear them. Matches how a single menu entry behaves in BC.
+   * @param {'left' | 'right'} side
+   * @param {Iterable<number>} lines
+   * @returns {'marked' | 'unmarked' | 'noop'}
+   */
+  toggleIgnoredLines(side, lines) {
+    const nums = TextCompare._normaliseLines(lines)
+    if (nums.length === 0) return 'noop'
+    const set = side === 'right' ? this._manualIgnore.right : this._manualIgnore.left
+    const allMarked = nums.every(n => set.has(n))
+    if (allMarked) {
+      this.unmarkIgnoredLines(side, nums)
+      return 'unmarked'
+    }
+    this.markIgnoredLines(side, nums)
+    return 'marked'
+  }
+
+  /** Drop every manual ignore mark on both sides. @returns {number} removed */
+  clearManualIgnores() {
+    const removed = this._manualIgnore.left.size + this._manualIgnore.right.size
+    if (removed === 0) return 0
+    this._manualIgnore.left.clear()
+    this._manualIgnore.right.clear()
+    this._runDiff()
+    return removed
+  }
+
+  /**
+   * Currently marked line numbers, ascending, as plain arrays.
+   * @returns {{ left: number[], right: number[] }}
+   */
+  getManualIgnores() {
+    const asc = (a, b) => a - b
+    return {
+      left: [...this._manualIgnore.left].sort(asc),
+      right: [...this._manualIgnore.right].sort(asc),
+    }
+  }
+
+  /**
+   * Human-readable summary of the manual ignores, with runs collapsed to
+   * ranges ("3, 7–12"). Used by the context-menu listing.
+   * @returns {string}
+   */
+  describeManualIgnores() {
+    const { left, right } = this.getManualIgnores()
+    /** @param {number[]} nums */
+    const ranges = (nums) => {
+      /** @type {string[]} */
+      const parts = []
+      for (let i = 0; i < nums.length;) {
+        let j = i
+        while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j++
+        parts.push(i === j ? String(nums[i]) : `${nums[i]}–${nums[j]}`)
+        i = j + 1
+      }
+      return parts.join(', ')
+    }
+    if (left.length === 0 && right.length === 0) return '目前沒有手動忽略的行'
+    const out = []
+    if (left.length) out.push(`左側：${ranges(left)}`)
+    if (right.length) out.push(`右側：${ranges(right)}`)
+    return out.join('\n')
+  }
+
+  /**
+   * File line numbers covered by the current DOM text selection in one pane.
+   * Only rendered rows can be selected, so virtual scrolling bounds this
+   * naturally.
+   * @param {'left' | 'right'} side
+   * @returns {number[]}
+   */
+  _selectedLineNumbers(side) {
+    const pane = side === 'right' ? this._contentRight : this._contentLeft
+    const sel = window.getSelection?.()
+    if (!pane || !sel || sel.rangeCount === 0 || sel.isCollapsed) return []
+    const attr = side === 'right' ? 'rightLine' : 'leftLine'
+    /** @type {number[]} */
+    const out = []
+    for (const el of pane.querySelectorAll('.diff-line')) {
+      const n = parseInt(el.dataset?.[attr] ?? '', 10)
+      if (isNaN(n)) continue
+      if (typeof sel.containsNode === 'function' && !sel.containsNode(el, true)) continue
+      out.push(n)
+    }
+    return [...new Set(out)].sort((a, b) => a - b)
+  }
+
+  /**
+   * Which pane holds the current selection, or null when there is none.
+   * @returns {'left' | 'right' | null}
+   */
+  _selectionSide() {
+    const sel = window.getSelection?.()
+    const node = sel?.anchorNode
+    if (!sel || !node || sel.isCollapsed) return null
+    if (this._contentLeft?.contains?.(node)) return 'left'
+    if (this._contentRight?.contains?.(node)) return 'right'
+    return null
+  }
+
+  /**
+   * Toggle manual ignore over the selected lines of one pane.
+   * @param {'left' | 'right'} [side] defaults to wherever the selection is
+   * @returns {boolean} whether anything changed
+   */
+  toggleIgnoreSelection(side) {
+    const target = side ?? this._selectionSide()
+    if (!target) {
+      toast('請先在某一側選取要忽略的行', { type: 'warn' })
+      return false
+    }
+    const lines = this._selectedLineNumbers(target)
+    if (lines.length === 0) {
+      toast('選取範圍內沒有可標記的行', { type: 'warn' })
+      return false
+    }
+    const result = this.toggleIgnoredLines(target, lines)
+    toast(result === 'marked'
+      ? `已忽略 ${lines.length} 行`
+      : `已取消忽略 ${lines.length} 行`, { type: 'success' })
+    return true
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P1-19 — compare selection to clipboard
+  // -------------------------------------------------------------------------
+
+  /**
+   * Replace the panes with (selected text) vs (clipboard text).
+   *
+   * The selection keeps the side it came from so the user's mental left/right
+   * mapping survives; the clipboard lands on the opposite pane.
+   *
+   * @param {'left' | 'right'} [side] defaults to wherever the selection is
+   * @returns {Promise<boolean>} whether the comparison was opened
+   */
+  async compareSelectionToClipboard(side) {
+    const target = side ?? this._selectionSide()
+    const selection = window.getSelection?.()?.toString() ?? ''
+    if (!target || selection.length === 0) {
+      toast('請先選取要與剪貼簿比較的文字', { type: 'warn' })
+      return false
+    }
+
+    let clip = ''
+    try {
+      clip = await navigator.clipboard.readText()
+    } catch (err) {
+      toast(`無法讀取剪貼簿：${err instanceof Error ? err.message : String(err)}`, { type: 'error' })
+      return false
+    }
+    if (clip.length === 0) {
+      toast('剪貼簿是空的', { type: 'warn' })
+      return false
+    }
+
+    // Plain text on both sides — a syntax highlighter carried over from the
+    // previous file would mis-colour an arbitrary fragment.
+    this._hlLeft = null
+    this._hlRight = null
+    this._manualIgnore.left.clear()
+    this._manualIgnore.right.clear()
+
+    if (target === 'right') {
+      this.setLeft('（剪貼簿）', clip)
+      this.setRight('（選取內容）', selection)
+    } else {
+      this.setLeft('（選取內容）', selection)
+      this.setRight('（剪貼簿）', clip)
+    }
+    return true
+  }
+
+  // -------------------------------------------------------------------------
+  // Public: P2-25 — text patch viewer
+  // -------------------------------------------------------------------------
+
+  /**
+   * Show a unified diff's before/after content in the two panes.
+   * @param {string} patchText
+   * @param {string} [label] shown in the path bars
+   * @returns {PatchFile[]} the parsed patch
+   * @throws {UnifiedDiffParseError} propagated so callers can report it
+   */
+  openPatch(patchText, label = 'patch') {
+    const files = parseUnifiedDiff(patchText)
+    const { oldText, newText } = buildPatchSides(files)
+    this._hlLeft = null
+    this._hlRight = null
+    this._manualIgnore.left.clear()
+    this._manualIgnore.right.clear()
+    // patch:// keeps the file watcher from trying to open a synthetic path.
+    this.setLeft(`patch://${label}（原始）`, oldText)
+    this.setRight(`patch://${label}（套用後）`, newText)
+    return files
+  }
+
+  /**
+   * Prompt for a .patch/.diff file and open it in the patch viewer.
+   * @returns {Promise<boolean>} whether a patch was opened
+   */
+  async openPatchFile() {
+    const result = await window.electronAPI.openFile({
+      filters: [
+        { name: 'Patch', extensions: ['patch', 'diff'] },
+        { name: '所有檔案', extensions: ['*'] },
+      ],
+    })
+    if (!result) return false
+    try {
+      const files = this.openPatch(result.content, result.path)
+      const hunks = files.reduce((n, f) => n + f.hunks.length, 0)
+      toast(`已載入 patch：${files.length} 個檔案、${hunks} 個 hunk`, { type: 'success' })
+      return true
+    } catch (err) {
+      toast(err instanceof UnifiedDiffParseError
+        ? `Patch 格式錯誤：${err.message}`
+        : `無法開啟 patch：${err instanceof Error ? err.message : String(err)}`,
+      { type: 'error', durationMs: 8000 })
+      return false
+    }
+  }
+
   /**
    * Return the current view settings as a plain JSON-serialisable object.
    * Used by T61 Session Settings Dialog to persist a snapshot under a name.
@@ -2129,6 +2676,8 @@ ${rows}
       ignoreUnimportant:  this._opts.ignoreUnimportant,
       ignorePatterns:     Array.isArray(this._opts.ignorePatterns) ? [...this._opts.ignorePatterns] : [],
       unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
+      manualIgnoreLeft:   [...this._manualIgnore.left].sort((a, b) => a - b),
+      manualIgnoreRight:  [...this._manualIgnore.right].sort((a, b) => a - b),
     })
   }
 
@@ -2150,6 +2699,17 @@ ${rows}
           this._opts[key] = value
         }
       }
+    }
+    // P2-30: manual marks live outside _opts (they are per-file state, not
+    // diff options), so they are restored separately.
+    for (const [key, set] of /** @type {Array<[string, Set<number>]>} */ ([
+      ['manualIgnoreLeft', this._manualIgnore.left],
+      ['manualIgnoreRight', this._manualIgnore.right],
+    ])) {
+      if (!Object.prototype.hasOwnProperty.call(settings, key)) continue
+      set.clear()
+      const value = settings[key]
+      for (const n of TextCompare._normaliseLines(Array.isArray(value) ? value : [])) set.add(n)
     }
     if (this._leftContent || this._rightContent) {
       this._runDiff()
@@ -2451,7 +3011,14 @@ ${rows}
       charDiffs = dl._charDiffs;
     }
 
-    const uiClass = (base) => dl.unimportant ? `${base} unimportant` : base;
+    const uiClass = (base) => {
+      let cls = base;
+      if (dl.unimportant) cls += ' unimportant';
+      // Distinct hook so a user-placed mark is visually separable from a
+      // pattern-driven one while keeping the same blue "unimportant" semantics.
+      if (dl.manualIgnored) cls += ' manual-ignored';
+      return cls;
+    };
 
     const ws = this._showWhitespace;
 
@@ -3055,6 +3622,38 @@ ${rows}
         });
       }
     }
+
+    // P1-19 / P2-30: selection-scoped commands
+    items.push({ separator: true });
+    items.push({
+      label: '與剪貼簿比較選取內容 (Ctrl+Shift+C)',
+      disabled: !hasSelection,
+      action: () => { void this.compareSelectionToClipboard(side); },
+    });
+    items.push({
+      label: '切換選取行的忽略標記 (Ctrl+I)',
+      disabled: !hasSelection,
+      action: () => { this.toggleIgnoreSelection(side); },
+    });
+    items.push({
+      label: '列出手動忽略的行…',
+      action: () => { toast(this.describeManualIgnores(), { durationMs: 6000 }); },
+    });
+    items.push({
+      label: '清除所有手動忽略',
+      disabled: this._manualIgnore.left.size + this._manualIgnore.right.size === 0,
+      action: () => {
+        const n = this.clearManualIgnores();
+        toast(`已清除 ${n} 個手動忽略標記`, { type: 'success' });
+      },
+    });
+
+    // P2-25: patch viewer
+    items.push({ separator: true });
+    items.push({
+      label: '開啟 Patch 檔… (Ctrl+Shift+P)',
+      action: () => { void this.openPatchFile(); },
+    });
 
     // T43: Bookmark items
     items.push({ separator: true });

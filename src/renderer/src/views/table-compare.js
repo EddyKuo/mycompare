@@ -607,6 +607,97 @@ function stepIndexWrapped(current, total, delta) {
   return ((current + delta) % total + total) % total
 }
 
+// ── P2-21 / P2-33: serialisation and alternative table sources ───────────────
+
+/**
+ * 將二維陣列序列化回 CSV/TSV 文字（存檔與「重新解析」共用同一條路徑）。
+ *
+ * @param {string[][]} rows
+ * @param {string} [delimiter]
+ * @returns {string}
+ */
+function serializeTable(rows, delimiter = ',') {
+  return rows
+    .map((row) => (row ?? [])
+      .map((cell) => {
+        const v = String(cell ?? '')
+        return (v.includes(delimiter) || v.includes('"') || v.includes('\n') || v.includes('\r'))
+          ? `"${v.replace(/"/g, '""')}"`
+          : v
+      })
+      .join(delimiter))
+    .join('\n')
+}
+
+/**
+ * 擷取 HTML 內的每個 `<table>`，各自轉為二維陣列。
+ *
+ * `colspan` 以重複同一個值展開，讓左右兩側的欄位索引仍然對得起來；`rowspan`
+ * 不展開，因為攤平後的列數必須等於原始 `<tr>` 數，否則列號會與來源對不上。
+ *
+ * @param {string} html
+ * @returns {Array<{ name: string, rows: string[][] }>}
+ */
+function parseHtmlTables(html) {
+  const doc = new DOMParser().parseFromString(String(html ?? ''), 'text/html')
+  /** @type {Array<{ name: string, rows: string[][] }>} */
+  const out = []
+  const tables = [...doc.querySelectorAll('table')]
+  for (let t = 0; t < tables.length; t++) {
+    const table = tables[t]
+    /** @type {string[][]} */
+    const rows = []
+    // A nested table's rows belong to the nested table, not to this one.
+    for (const tr of table.querySelectorAll('tr')) {
+      if (tr.closest('table') !== table) continue
+      /** @type {string[]} */
+      const cells = []
+      for (const cell of tr.querySelectorAll('th,td')) {
+        if (cell.closest('tr') !== tr) continue
+        const text = (cell.textContent ?? '').replace(/\s+/g, ' ').trim()
+        const span = Math.max(1, parseInt(cell.getAttribute('colspan') ?? '1', 10) || 1)
+        for (let i = 0; i < span; i++) cells.push(text)
+      }
+      if (cells.length) rows.push(cells)
+    }
+    const caption = table.querySelector('caption')?.textContent?.trim()
+    out.push({ name: caption || `表格 ${t + 1}`, rows })
+  }
+  return out
+}
+
+/**
+ * 換成 `.csv` 副檔名，並去掉顯示用的 `[工作表]` 後綴。
+ * @param {string} path
+ * @returns {string}
+ */
+/**
+ * 由「列物件」反查它在已解析陣列中的索引。
+ * @param {string[][]|null} parsed
+ * @returns {Map<string[], number>}
+ */
+function _buildRowIndexMap(parsed) {
+  /** @type {Map<string[], number>} */
+  const map = new Map()
+  if (!parsed) return map
+  for (let i = 0; i < parsed.length; i++) map.set(parsed[i], i)
+  return map
+}
+
+function csvPathFor(path) {
+  const base = String(path ?? '').replace(/\s*\[[^\]]*\]\s*$/, '')
+  if (!base) return 'table.csv'
+  return base.replace(/\.[^./\\]*$/, '') + '.csv'
+}
+
+/**
+ * Ceiling on the cell-edit history, in entries.
+ *
+ * Each entry keeps two cell strings, so an unbounded stack would grow with the
+ * session rather than with the document — the oldest edits are dropped instead.
+ */
+export const MAX_EDIT_HISTORY = 200
+
 /**
  * Ceiling for a dropped delimited-text file, in characters.
  *
@@ -655,6 +746,45 @@ export class TableCompare {
 
     /** @type {AlignedRow[]} */
     this._alignedRows = []
+
+    // ── P2-21: cell editing ───────────────────────────────────────────────────
+    /** @type {{ left: boolean, right: boolean }} 未儲存的編輯 */
+    this._modified = { left: false, right: false }
+
+    /** @type {{ left: string, right: string }} 解析時偵測到的分隔符，存檔時沿用 */
+    this._delimiter = { left: ',', right: ',' }
+
+    /**
+     * 由已解析的列物件反查它在 `_leftParsed` / `_rightParsed` 的索引。
+     *
+     * 編輯必須寫回「解析後的模型」而不是 DOM——這個視圖是虛擬捲動的，寫進
+     * DOM 的值捲出畫面就沒了。用物件識別做索引，是因為排序與 key 對齊都會
+     * 改變列的順序，只有列物件本身在整個比對流程中是同一個。
+     *
+     * @type {{ left: Map<string[], number>, right: Map<string[], number> }}
+     */
+    this._rowIndexMap = { left: new Map(), right: new Map() }
+
+    /** @typedef {{ side: 'left'|'right', rowIdx: number, col: number, before: string, after: string }} CellEdit */
+    /** @type {CellEdit[]} */
+    this._undoStack = []
+    /** @type {CellEdit[]} */
+    this._redoStack = []
+
+    /** @type {{ side: 'left'|'right', visibleRowIdx: number, col: number,
+     *            td: HTMLElement, input: HTMLInputElement, original: string }|null} */
+    this._editing = null
+
+    // ── P2-33: multi-sheet / multi-table sources ──────────────────────────────
+    /**
+     * @typedef {{ path: string, kind: 'excel'|'html',
+     *             parts: Array<{ name: string, text: string }>, active: string|null }} TableSource
+     * @type {{ left: TableSource|null, right: TableSource|null }}
+     */
+    this._sources = { left: null, right: null }
+
+    /** @type {{ left: 'text'|'excel'|'html', right: 'text'|'excel'|'html' }} */
+    this._sourceKind = { left: 'text', right: 'text' }
 
     /** @type {AlignedRow[]} 通過顯示篩選的列；虛擬捲動與導航都以此為座標系 */
     this._visibleRows = []
@@ -723,6 +853,11 @@ export class TableCompare {
   /** 清除 DOM、移除事件、移除注入的 style */
   destroy() {
     closeContextMenu()
+    this._cancelCellEdit()
+    if (this._beforeUnload) {
+      window.removeEventListener('beforeunload', this._beforeUnload)
+      this._beforeUnload = null
+    }
     if (this._keyHandler) {
       document.removeEventListener('keydown', this._keyHandler)
       this._keyHandler = null
@@ -743,61 +878,173 @@ export class TableCompare {
     this._styleInjected = false
   }
 
-  /** 呼叫 electronAPI.openFile()，讀取左側 CSV/TSV/XLSX */
-  async openLeft() {
-    const result = await window.electronAPI.openFile({
-      filters: [
-        { name: 'CSV / TSV', extensions: ['csv', 'tsv', 'txt'] },
-        { name: 'Excel', extensions: ['xlsx', 'xls'] },
-        { name: '所有檔案', extensions: ['*'] },
-      ]
-    })
-    if (!result) return
-    const ext = result.path.toLowerCase()
-    if (ext.endsWith('.xlsx') || ext.endsWith('.xls')) {
-      await this._openExcel('left', result.path)
-    } else {
-      this.setLeft(result.path, result.content)
-    }
+  /** @returns {Array<{ name: string, extensions: string[] }>} */
+  static get openFilters() {
+    return [
+      { name: '表格檔案', extensions: ['csv', 'tsv', 'txt', 'xlsx', 'xls', 'html', 'htm'] },
+      { name: 'CSV / TSV', extensions: ['csv', 'tsv', 'txt'] },
+      { name: 'Excel', extensions: ['xlsx', 'xls'] },
+      { name: 'HTML', extensions: ['html', 'htm'] },
+      { name: '所有檔案', extensions: ['*'] },
+    ]
   }
 
-  /** 呼叫 electronAPI.openFile()，讀取右側 CSV/TSV/XLSX */
-  async openRight() {
-    const result = await window.electronAPI.openFile({
-      filters: [
-        { name: 'CSV / TSV', extensions: ['csv', 'tsv', 'txt'] },
-        { name: 'Excel', extensions: ['xlsx', 'xls'] },
-        { name: '所有檔案', extensions: ['*'] },
-      ]
-    })
+  /** 呼叫 electronAPI.openFile()，讀取左側 CSV/TSV/XLSX/HTML */
+  async openLeft() { await this._openInto('left') }
+
+  /** 呼叫 electronAPI.openFile()，讀取右側 CSV/TSV/XLSX/HTML */
+  async openRight() { await this._openInto('right') }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {Promise<void>}
+   */
+  async _openInto(side) {
+    const result = await window.electronAPI.openFile({ filters: TableCompare.openFilters })
     if (!result) return
-    const ext = result.path.toLowerCase()
-    if (ext.endsWith('.xlsx') || ext.endsWith('.xls')) {
-      await this._openExcel('right', result.path)
+    const lower = String(result.path ?? '').toLowerCase()
+    if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
+      await this._openExcel(side, result.path)
+    } else if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      this._openHtmlContent(side, result.path, result.content)
+    } else if (side === 'left') {
+      this.setLeft(result.path, result.content)
     } else {
       this.setRight(result.path, result.content)
     }
   }
 
   /**
-   * 以 electronAPI.readExcel() 讀取 Excel 檔案，取第一個工作表轉為 CSV 後載入。
+   * P2-33: 以 electronAPI.readExcel() 讀取活頁簿的**所有**工作表，
+   * 預設載入第一個（或與對側同名的那個），其餘可從路徑列的下拉選單切換。
+   *
    * @param {'left'|'right'} side
    * @param {string} path
    * @returns {Promise<void>}
    */
   async _openExcel(side, path) {
-    const result = await window.electronAPI.readExcel(path)
+    let result
+    try {
+      result = await window.electronAPI.readExcel(path)
+    } catch (err) {
+      this._reportError(`讀取 Excel 失敗：${err instanceof Error ? err.message : String(err)}`)
+      return
+    }
     if (result?.error) {
       this._reportError(`讀取 Excel 失敗：${result.error}`)
       return
     }
-    const sheetName = result.sheetNames[0]
-    const csv = result.sheets[sheetName]
-    const displayPath = result.sheetNames.length > 1
-      ? `${path} [${sheetName}]`
-      : path
-    if (side === 'left') this.setLeft(displayPath, csv)
-    else this.setRight(displayPath, csv)
+    const names = result?.sheetNames ?? []
+    if (!names.length) {
+      this._reportError(`${path} 沒有任何工作表`)
+      return
+    }
+    this._setSource(side, path, 'excel',
+      names.map((name) => ({ name, text: result.sheets?.[name] ?? '' })))
+  }
+
+  /**
+   * P2-33: 擷取 HTML 內的所有 `<table>`，預設載入第一個。
+   *
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @param {string} html
+   * @returns {boolean} false 代表檔案裡沒有表格
+   */
+  _openHtmlContent(side, path, html) {
+    const tables = parseHtmlTables(html)
+    if (!tables.length) {
+      this._reportError(`${path} 內找不到 <table>`)
+      return false
+    }
+    this._setSource(side, path, 'html',
+      tables.map((t) => ({ name: t.name, text: serializeTable(t.rows) })))
+    return true
+  }
+
+  /**
+   * 記錄一個多分頁來源（Excel 活頁簿 / HTML 檔），並載入預設的那一頁。
+   *
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @param {'excel'|'html'} kind
+   * @param {Array<{ name: string, text: string }>} parts
+   */
+  _setSource(side, path, kind, parts) {
+    this._sources[side] = { path, kind, parts, active: null }
+    this._sourceKind[side] = kind
+
+    const other = side === 'left' ? 'right' : 'left'
+    const otherActive = this._sources[other]?.active
+    // Same-named sheets are almost always the intended pair. Differently-named
+    // ones still pair fine — each side keeps its own selector.
+    const preferred = (otherActive && parts.some((p) => p.name === otherActive))
+      ? otherActive
+      : parts[0].name
+
+    this._syncSourceSelect(side)
+    this.selectSourcePart(side, preferred)
+  }
+
+  /**
+   * 目前這一側可選的工作表 / 表格名稱（一般文字檔為空陣列）。
+   * @param {'left'|'right'} side
+   * @returns {string[]}
+   */
+  getSourceParts(side) {
+    return (this._sources[side]?.parts ?? []).map((p) => p.name)
+  }
+
+  /**
+   * 目前這一側載入中的工作表 / 表格名稱。
+   * @param {'left'|'right'} side
+   * @returns {string|null}
+   */
+  getActiveSourcePart(side) {
+    return this._sources[side]?.active ?? null
+  }
+
+  /**
+   * 切換這一側要比對的工作表 / 表格。
+   *
+   * @param {'left'|'right'} side
+   * @param {string} name
+   * @returns {boolean} false 代表找不到該名稱
+   */
+  selectSourcePart(side, name) {
+    const src = this._sources[side]
+    if (!src) return false
+    const part = src.parts.find((p) => p.name === name)
+    if (!part) {
+      this._reportError(`找不到工作表 / 表格「${name}」`)
+      return false
+    }
+    src.active = part.name
+    const sel = this._dom[side === 'left' ? 'selLeft' : 'selRight']
+    if (sel) sel.value = part.name
+    const display = src.parts.length > 1 ? `${src.path} [${part.name}]` : src.path
+    this._setSideContent(side, display, part.text)
+    return true
+  }
+
+  /**
+   * 依目前的來源重建下拉選單（只有超過一頁時才顯示）。
+   * @param {'left'|'right'} side
+   */
+  _syncSourceSelect(side) {
+    const sel = this._dom[side === 'left' ? 'selLeft' : 'selRight']
+    if (!sel) return
+    const src = this._sources[side]
+    sel.innerHTML = ''
+    if (!src || src.parts.length <= 1) {
+      sel.style.display = 'none'
+      return
+    }
+    for (const part of src.parts) {
+      sel.appendChild(el('option', { value: part.name }, part.name))
+    }
+    if (src.active) sel.value = src.active
+    sel.style.display = ''
   }
 
   /**
@@ -806,12 +1053,10 @@ export class TableCompare {
    * @param {string} content
    */
   setLeft(path, content) {
-    this._leftPath = path
-    this._leftContent = content
-    this._pendingFirstDiff = true
-    this._updatePathDisplay('left', path)
-    this._parseAndRefresh()
-    this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
+    this._sources.left = null
+    this._sourceKind.left = 'text'
+    this._syncSourceSelect('left')
+    this._setSideContent('left', path, content)
   }
 
   /**
@@ -820,10 +1065,40 @@ export class TableCompare {
    * @param {string} content
    */
   setRight(path, content) {
-    this._rightPath = path
-    this._rightContent = content
+    this._sources.right = null
+    this._sourceKind.right = 'text'
+    this._syncSourceSelect('right')
+    this._setSideContent('right', path, content)
+  }
+
+  /**
+   * 載入一側的內容。公開的 setLeft/setRight 會先清掉多分頁來源資訊再走這裡；
+   * 切換工作表則保留來源資訊。
+   *
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @param {string} content
+   */
+  _setSideContent(side, path, content) {
+    // New content replaces the parsed rows, so every history entry — which
+    // addresses rows by index into that parse — no longer refers to anything.
+    this._cancelCellEdit()
+    this._clearHistory()
+    this._modified[side] = false
+
+    if (side === 'left') {
+      this._leftPath = path
+      this._leftContent = content
+    } else {
+      this._rightPath = path
+      this._rightContent = content
+    }
     this._pendingFirstDiff = true
-    this._updatePathDisplay('right', path)
+    this._updatePathDisplay(side, path)
+    // The virtual scroller skips repaints when the row window is unchanged;
+    // a new data source must invalidate it or the panes keep the old rows.
+    this._windowFirst = null
+    this._windowLast = null
     this._parseAndRefresh()
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
   }
@@ -838,6 +1113,17 @@ export class TableCompare {
    * @returns {this}
    */
   swap() {
+    // History entries name a side, so keeping them across a swap would apply
+    // the next undo to the wrong file.
+    this._cancelCellEdit()
+    this._clearHistory()
+    ;[this._sources.left, this._sources.right] = [this._sources.right, this._sources.left]
+    ;[this._sourceKind.left, this._sourceKind.right] = [this._sourceKind.right, this._sourceKind.left]
+    ;[this._modified.left, this._modified.right] = [this._modified.right, this._modified.left]
+    ;[this._delimiter.left, this._delimiter.right] = [this._delimiter.right, this._delimiter.left]
+    ;[this._rowIndexMap.left, this._rowIndexMap.right] = [this._rowIndexMap.right, this._rowIndexMap.left]
+    this._syncSourceSelect('left')
+    this._syncSourceSelect('right')
     ;[this._leftPath, this._rightPath] = [this._rightPath, this._leftPath]
     ;[this._leftContent, this._rightContent] = [this._rightContent, this._leftContent]
     ;[this._leftParsed, this._rightParsed] = [this._rightParsed, this._leftParsed]
@@ -855,6 +1141,370 @@ export class TableCompare {
     this._recomputeFind()
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
     return this
+  }
+
+  // ── P2-21: cell editing, undo/redo, save ─────────────────────────────────────
+
+  /**
+   * 把「可見列 + 顯示欄」換算成「解析後模型的列索引 + 來源欄索引」。
+   *
+   * 兩者不是同一個座標系：可見列會被篩選、排序與 key 對齊重排，而忽略欄位
+   * 排序時右側的顯示欄也已被重排過。編輯必須寫回來源座標，否則存檔會把值
+   * 放到別的欄。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx  index into this._visibleRows
+   * @param {number} col            display column index
+   * @returns {{ parsedRowIdx: number, sourceCol: number }|null} null 代表不可編輯
+   */
+  _resolveCell(side, visibleRowIdx, col) {
+    if (!Number.isInteger(col) || col < 0) return null
+    const aligned = this._visibleRows?.[visibleRowIdx]
+    if (!aligned) return null
+    // A phantom cell has no row on this side to write into.
+    const dataIdx = side === 'left' ? aligned.leftIdx : aligned.rightIdx
+    if (dataIdx == null || dataIdx < 0) return null
+
+    const data = side === 'left' ? this._leftData : this._rightData
+    const rowRef = data?.[dataIdx]
+    if (!rowRef) return null
+    const parsedRowIdx = this._rowIndexMap[side]?.get(rowRef)
+    if (parsedRowIdx == null) return null
+
+    const sourceCol = (side === 'right' && this._rightColMap) ? this._rightColMap[col] : col
+    // Under "ignore column order" a left-hand column may have no counterpart.
+    if (sourceCol == null || sourceCol < 0) return null
+    return { parsedRowIdx, sourceCol }
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {number} rowIdx  index into _leftParsed / _rightParsed
+   * @param {number} col
+   * @returns {string}
+   */
+  _readParsedCell(side, rowIdx, col) {
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    return parsed?.[rowIdx]?.[col] ?? ''
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {number} rowIdx
+   * @param {number} col
+   * @param {string} value
+   * @returns {boolean}
+   */
+  _writeParsedCell(side, rowIdx, col, value) {
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    const row = parsed?.[rowIdx]
+    if (!row) return false
+    // A ragged row may be shorter than the widest one; pad rather than leave
+    // holes, which would serialise as `undefined`.
+    while (row.length < col) row.push('')
+    row[col] = value
+    return true
+  }
+
+  /**
+   * 讀取某個可見儲存格目前的值（測試與右鍵選單用）。
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @param {number} col
+   * @returns {string|null}
+   */
+  getCellValue(side, visibleRowIdx, col) {
+    const t = this._resolveCell(side, visibleRowIdx, col)
+    if (!t) return null
+    return this._readParsedCell(side, t.parsedRowIdx, t.sourceCol)
+  }
+
+  /**
+   * 修改一個儲存格並記入 undo 堆疊，接著重新計算該列的差異狀態。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx  index into the currently visible rows
+   * @param {number} col            display column index
+   * @param {string} value
+   * @returns {boolean} false 代表該儲存格不可編輯
+   */
+  editCell(side, visibleRowIdx, col, value) {
+    const target = this._resolveCell(side, visibleRowIdx, col)
+    if (!target) return false
+
+    const before = this._readParsedCell(side, target.parsedRowIdx, target.sourceCol)
+    const after = String(value ?? '')
+    if (before === after) return true
+
+    if (!this._writeParsedCell(side, target.parsedRowIdx, target.sourceCol, after)) return false
+    this._pushHistory({ side, rowIdx: target.parsedRowIdx, col: target.sourceCol, before, after })
+    this._afterEdit(side)
+    return true
+  }
+
+  /**
+   * @param {CellEdit} entry
+   */
+  _pushHistory(entry) {
+    this._undoStack.push(entry)
+    if (this._undoStack.length > MAX_EDIT_HISTORY) this._undoStack.shift()
+    // A new edit invalidates the redo branch.
+    this._redoStack.length = 0
+  }
+
+  _clearHistory() {
+    this._undoStack.length = 0
+    this._redoStack.length = 0
+  }
+
+  /** @returns {boolean} 是否還有可以還原的編輯 */
+  canUndo() { return this._undoStack.length > 0 }
+
+  /** @returns {boolean} 是否還有可以重做的編輯 */
+  canRedo() { return this._redoStack.length > 0 }
+
+  /**
+   * 還原上一次的儲存格編輯。
+   * @returns {boolean} false 代表堆疊已空
+   */
+  undo() {
+    this._cancelCellEdit()
+    const entry = this._undoStack.pop()
+    if (!entry) return false
+    if (!this._writeParsedCell(entry.side, entry.rowIdx, entry.col, entry.before)) return false
+    this._redoStack.push(entry)
+    if (this._redoStack.length > MAX_EDIT_HISTORY) this._redoStack.shift()
+    // The file on disk still differs from what is on screen after an undo, so
+    // the modified flag stays set rather than guessing the file is pristine.
+    this._afterEdit(entry.side)
+    return true
+  }
+
+  /**
+   * 重做上一次被還原的編輯。
+   * @returns {boolean} false 代表堆疊已空
+   */
+  redo() {
+    this._cancelCellEdit()
+    const entry = this._redoStack.pop()
+    if (!entry) return false
+    if (!this._writeParsedCell(entry.side, entry.rowIdx, entry.col, entry.after)) return false
+    this._undoStack.push(entry)
+    if (this._undoStack.length > MAX_EDIT_HISTORY) this._undoStack.shift()
+    this._afterEdit(entry.side)
+    return true
+  }
+
+  /**
+   * 編輯落地後：同步文字內容、標示未儲存、重新比對並重繪（保留捲動位置）。
+   * @param {'left'|'right'} side
+   */
+  _afterEdit(side) {
+    const parsed = (side === 'left' ? this._leftParsed : this._rightParsed) ?? []
+    const text = serializeTable(parsed, this._delimiter[side])
+    if (side === 'left') this._leftContent = text
+    else this._rightContent = text
+
+    this._modified[side] = true
+    this._updatePathDisplay(side, (side === 'left' ? this._leftPath : this._rightPath) ?? '（未選擇）')
+    this._emit('modified-changed', { left: this._modified.left, right: this._modified.right })
+
+    const keepTop = this._dom.leftScroll?.scrollTop ?? 0
+    this._compare()
+    this._renderTable()
+    // _renderTable rebuilds both panes from scratch, which drops scrollTop;
+    // an edit must not teleport the user back to the top of a 100k-row file.
+    if (this._dom.leftScroll) this._dom.leftScroll.scrollTop = keepTop
+    if (this._dom.rightScroll) this._dom.rightScroll.scrollTop = keepTop
+    this._windowFirst = null
+    this._windowLast = null
+    this._renderTableWindow()
+    this._syncEditButtons()
+  }
+
+  /** @returns {boolean} 是否有未儲存的儲存格編輯 */
+  hasUnsavedChanges() {
+    return this._modified.left || this._modified.right
+  }
+
+  /** @returns {{ left: boolean, right: boolean }} */
+  getModified() {
+    return { left: this._modified.left, right: this._modified.right }
+  }
+
+  /**
+   * 關閉分頁 / 視窗前呼叫：有未儲存的修改時詢問使用者。
+   * @returns {boolean} true 代表可以繼續關閉
+   */
+  confirmDiscardChanges() {
+    if (!this.hasUnsavedChanges()) return true
+    return window.confirm('表格比對有未儲存的修改，關閉後將遺失。確定要關閉嗎？')
+  }
+
+  /** 儲存左側（Excel / HTML 來源只能另存為 CSV） @returns {Promise<boolean>} */
+  async saveLeft() { return this._saveSide('left') }
+
+  /** 儲存右側（Excel / HTML 來源只能另存為 CSV） @returns {Promise<boolean>} */
+  async saveRight() { return this._saveSide('right') }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {Promise<boolean>} true 代表確實寫入了檔案
+   */
+  async _saveSide(side) {
+    this._commitCellEdit()
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    if (!parsed) {
+      this._reportError('這一側沒有載入資料，無法儲存')
+      return false
+    }
+
+    const src = this._sources[side]
+    const displayPath = (side === 'left' ? this._leftPath : this._rightPath) ?? ''
+    let defaultPath = src?.path ?? displayPath
+    const kind = this._sourceKind[side]
+
+    if (kind !== 'text') {
+      const label = kind === 'excel' ? 'Excel 工作表' : 'HTML 表格'
+      // There is no xlsx/html writer in this app. Writing a CSV under the
+      // original name and reporting success would tell the user their .xlsx
+      // was updated when it was not.
+      const ok = window.confirm(
+        `${label}無法原樣寫回，只能另存為 CSV（原始檔案不會被修改）。要繼續嗎？`)
+      if (!ok) return false
+      defaultPath = csvPathFor(defaultPath)
+    }
+
+    const content = serializeTable(parsed, this._delimiter[side])
+    let result
+    try {
+      result = await window.electronAPI.saveFile(
+        defaultPath || 'table.csv',
+        content,
+        [{ name: 'CSV', extensions: ['csv'] },
+         { name: 'TSV', extensions: ['tsv'] },
+         { name: '所有檔案', extensions: ['*'] }])
+    } catch (err) {
+      this._reportError(`儲存失敗：${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+
+    // Cancelling the dialog returns falsy. Clearing the flag anyway would tell
+    // the user their edits were saved and let the tab close without a prompt.
+    if (!result) return false
+
+    this._modified[side] = false
+    const savedPath = typeof result === 'object' ? result.path : null
+    if (savedPath) {
+      // What is on disk now is a plain CSV, so further saves need no warning.
+      this._sources[side] = null
+      this._sourceKind[side] = 'text'
+      this._delimiter[side] = ','
+      this._syncSourceSelect(side)
+      if (side === 'left') this._leftPath = savedPath
+      else this._rightPath = savedPath
+      this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
+    }
+    this._updatePathDisplay(side, (side === 'left' ? this._leftPath : this._rightPath) ?? '（未選擇）')
+    this._emit('modified-changed', { left: this._modified.left, right: this._modified.right })
+    this._syncEditButtons()
+    return true
+  }
+
+  // ── P2-21: inline cell editor ────────────────────────────────────────────────
+
+  /**
+   * @param {MouseEvent} e
+   * @param {'left'|'right'} side
+   */
+  _onCellDblClick(e, side) {
+    const target = e.target instanceof Element ? e.target : null
+    const td = target?.closest('td.tc-cell')
+    const tr = td?.closest('tr.tc-row')
+    const tbody = this._dom[`${side}Tbody`]
+    if (!td || !tr || !tbody || tr.parentElement !== tbody) return
+    if (tr.classList.contains('phantom')) return
+
+    const rowOffset = [...tbody.children].indexOf(tr)
+    if (rowOffset < 0) return
+    const visibleRowIdx = (this._windowFirst ?? 0) + rowOffset
+    // -1 skips the leading row-number cell.
+    const col = [...tr.children].indexOf(td) - 1
+    this._beginCellEdit(side, visibleRowIdx, col, td)
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @param {number} col
+   * @param {HTMLElement} td
+   */
+  _beginCellEdit(side, visibleRowIdx, col, td) {
+    this._commitCellEdit()
+    if (!this._resolveCell(side, visibleRowIdx, col)) {
+      this._reportError('這個儲存格沒有對應的來源資料，無法編輯')
+      return
+    }
+
+    const original = td.textContent ?? ''
+    const input = el('input', { type: 'text', className: 'tc-cell-input' })
+    input.value = original
+    td.textContent = ''
+    td.classList.add('tc-cell--editing')
+    td.appendChild(input)
+    this._editing = { side, visibleRowIdx, col, td, input, original }
+
+    input.addEventListener('keydown', (/** @type {KeyboardEvent} */ ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault()
+        ev.stopPropagation()
+        this._commitCellEdit()
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault()
+        ev.stopPropagation()
+        this._cancelCellEdit()
+      }
+    })
+    input.addEventListener('blur', () => this._commitCellEdit())
+    input.focus()
+    input.select()
+  }
+
+  /** 套用編輯中的儲存格；沒有編輯中的儲存格時為 no-op。 */
+  _commitCellEdit() {
+    const editing = this._editing
+    if (!editing) return
+    // Cleared first: editCell re-renders, which calls back into here.
+    this._editing = null
+
+    const value = editing.input.value
+    editing.td.classList.remove('tc-cell--editing')
+    if (value === editing.original) {
+      editing.td.textContent = editing.original
+      return
+    }
+    if (!this.editCell(editing.side, editing.visibleRowIdx, editing.col, value)) {
+      editing.td.textContent = editing.original
+      this._reportError('儲存格編輯失敗：找不到對應的來源資料列')
+    }
+  }
+
+  /** 放棄編輯中的儲存格，還原原本的顯示值。 */
+  _cancelCellEdit() {
+    const editing = this._editing
+    if (!editing) return
+    this._editing = null
+    editing.td.classList.remove('tc-cell--editing')
+    editing.td.textContent = editing.original
+  }
+
+  /** 讓 undo / redo / 儲存按鈕反映目前狀態。 */
+  _syncEditButtons() {
+    const { btnUndo, btnRedo, btnSaveLeft, btnSaveRight } = this._dom
+    if (btnUndo) btnUndo.disabled = !this.canUndo()
+    if (btnRedo) btnRedo.disabled = !this.canRedo()
+    if (btnSaveLeft) btnSaveLeft.classList.toggle('tc-btn--dirty', this._modified.left)
+    if (btnSaveRight) btnSaveRight.classList.toggle('tc-btn--dirty', this._modified.right)
   }
 
   // ── S16: Column handling ─────────────────────────────────────────────────────
@@ -1571,6 +2221,27 @@ export class TableCompare {
     this._dom.btnSwap = btnSwap
     toolbar.appendChild(btnSwap)
 
+    // P2-21: cell editing controls
+    toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
+
+    const btnUndo = el('button', { id: 'tc-btn-undo', className: 'tc-btn', title: '還原儲存格編輯（Ctrl+Z）' }, '↶')
+    const btnRedo = el('button', { id: 'tc-btn-redo', className: 'tc-btn', title: '重做儲存格編輯（Ctrl+Y）' }, '↷')
+    btnUndo.disabled = true
+    btnRedo.disabled = true
+    this._dom.btnUndo = btnUndo
+    this._dom.btnRedo = btnRedo
+    toolbar.appendChild(btnUndo)
+    toolbar.appendChild(btnRedo)
+
+    const btnSaveLeft = el('button',
+      { id: 'tc-btn-save-left', className: 'tc-btn', title: '儲存左側（Ctrl+S）' }, '💾 左')
+    const btnSaveRight = el('button',
+      { id: 'tc-btn-save-right', className: 'tc-btn', title: '儲存右側（Ctrl+Shift+S）' }, '💾 右')
+    this._dom.btnSaveLeft = btnSaveLeft
+    this._dom.btnSaveRight = btnSaveRight
+    toolbar.appendChild(btnSaveLeft)
+    toolbar.appendChild(btnSaveRight)
+
     // Refresh button
     const btnRefresh = el('button', { className: 'tc-btn tc-btn-refresh' }, '↺ 重新整理')
     this._dom.btnRefresh = btnRefresh
@@ -1774,19 +2445,28 @@ export class TableCompare {
     const leftCell = el('div', { className: 'tc-path-cell' })
     const btnLeft = el('button', { className: 'tc-open-btn' }, '開啟檔案…')
     const dispLeft = el('span', { className: 'tc-path-display' }, this._leftPath ?? '（未選擇）')
+    // P2-33: only shown once a source actually has more than one sheet/table.
+    const selLeft = el('select', { className: 'tc-source-select', title: '選擇工作表 / 表格' })
+    selLeft.style.display = 'none'
     this._dom.btnOpenLeft = btnLeft
     this._dom.dispLeft = dispLeft
+    this._dom.selLeft = selLeft
     leftCell.appendChild(btnLeft)
     leftCell.appendChild(dispLeft)
+    leftCell.appendChild(selLeft)
 
     // Right
     const rightCell = el('div', { className: 'tc-path-cell' })
     const btnRight = el('button', { className: 'tc-open-btn' }, '開啟檔案…')
     const dispRight = el('span', { className: 'tc-path-display' }, this._rightPath ?? '（未選擇）')
+    const selRight = el('select', { className: 'tc-source-select', title: '選擇工作表 / 表格' })
+    selRight.style.display = 'none'
     this._dom.btnOpenRight = btnRight
     this._dom.dispRight = dispRight
+    this._dom.selRight = selRight
     rightCell.appendChild(btnRight)
     rightCell.appendChild(dispRight)
+    rightCell.appendChild(selRight)
 
     row.appendChild(leftCell)
     row.appendChild(rightCell)
@@ -1877,6 +2557,30 @@ export class TableCompare {
     // Context menu
     leftScroll.addEventListener('contextmenu',  (e) => this._onTableContextMenu(e, 'left'))
     rightScroll.addEventListener('contextmenu', (e) => this._onTableContextMenu(e, 'right'))
+
+    // P2-21: double-click a cell to edit it
+    leftScroll.addEventListener('dblclick',  (e) => this._onCellDblClick(e, 'left'))
+    rightScroll.addEventListener('dblclick', (e) => this._onCellDblClick(e, 'right'))
+    this._dom.btnUndo.addEventListener('click', () => this.undo())
+    this._dom.btnRedo.addEventListener('click', () => this.redo())
+    this._dom.btnSaveLeft.addEventListener('click', () => void this.saveLeft())
+    this._dom.btnSaveRight.addEventListener('click', () => void this.saveRight())
+
+    // P2-33: sheet / table pickers
+    this._dom.selLeft.addEventListener('change', () => {
+      this.selectSourcePart('left', this._dom.selLeft.value)
+    })
+    this._dom.selRight.addEventListener('change', () => {
+      this.selectSourcePart('right', this._dom.selRight.value)
+    })
+
+    // Closing the window with unsaved cell edits must not discard them silently.
+    this._beforeUnload = (/** @type {BeforeUnloadEvent} */ e) => {
+      if (!this.hasUnsavedChanges()) return
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', this._beforeUnload)
 
     this._setupDropTargets()
     this._bindNavEvents()
@@ -2001,6 +2705,10 @@ export class TableCompare {
         this._reportError(`${path} 超過大小上限（${MAX_TABLE_CHARS} 字元），未載入`)
         return
       }
+      if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+        this._openHtmlContent(side, result.path ?? path, result.content)
+        return
+      }
       if (side === 'left') this.setLeft(result.path, result.content)
       else this.setRight(result.path, result.content)
     } catch (err) {
@@ -2040,6 +2748,23 @@ export class TableCompare {
 
     this._keyHandler = (/** @type {KeyboardEvent} */ e) => {
       if (!this._container || !isActive('table')) return
+
+      // P2-21: while a cell editor or the find box has focus, these belong to
+      // the input (native undo, text entry) rather than to the table.
+      const target = e.target instanceof HTMLElement ? e.target : null
+      const inInput = Boolean(this._editing) ||
+        target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA'
+      if ((e.ctrlKey || e.metaKey) && !inInput) {
+        const key = e.key.toLowerCase()
+        if (key === 'z' && !e.shiftKey) { e.preventDefault(); this.undo(); return }
+        if (key === 'y' || (key === 'z' && e.shiftKey)) { e.preventDefault(); this.redo(); return }
+        if (key === 's') {
+          e.preventDefault()
+          void (e.shiftKey ? this.saveRight() : this.saveLeft())
+          return
+        }
+      }
+
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault()
         this.openFind()
@@ -2072,6 +2797,20 @@ export class TableCompare {
         label: '複製儲存格',
         action: () => navigator.clipboard.writeText(cellText)
       })
+      if (!tr.classList.contains('phantom')) {
+        const tbody = this._dom[`${side}Tbody`]
+        const rowOffset = tbody ? [...tbody.children].indexOf(tr) : -1
+        if (rowOffset >= 0) {
+          items.push({
+            label: '編輯儲存格…',
+            action: () => this._beginCellEdit(
+              side,
+              (this._windowFirst ?? 0) + rowOffset,
+              [...tr.children].indexOf(td) - 1,
+              td),
+          })
+        }
+      }
     }
 
     items.push({
@@ -2229,10 +2968,14 @@ export class TableCompare {
 
   _parseAndRefresh() {
     if (this._leftContent != null) {
-      this._leftParsed = parseTable(this._leftContent)
+      this._delimiter.left = detectDelimiter(this._leftContent)
+      this._leftParsed = parseTable(this._leftContent, this._delimiter.left)
+      this._rowIndexMap.left = _buildRowIndexMap(this._leftParsed)
     }
     if (this._rightContent != null) {
-      this._rightParsed = parseTable(this._rightContent)
+      this._delimiter.right = detectDelimiter(this._rightContent)
+      this._rightParsed = parseTable(this._rightContent, this._delimiter.right)
+      this._rowIndexMap.right = _buildRowIndexMap(this._rightParsed)
     }
     this._compare()
     this._renderTable()
@@ -2258,6 +3001,9 @@ export class TableCompare {
 
     if (!leftParsed && !rightParsed) {
       this._alignedRows = []
+      this._leftData = null
+      this._rightData = null
+      this._rightColMap = null
       this._refreshRowIndex()
       return
     }
@@ -2296,6 +3042,17 @@ export class TableCompare {
       leftData  = leftData.slice().sort(sortFn)
       rightData = rightData.slice().sort(sortFn)
     }
+
+    // AlignedRow.leftIdx/rightIdx index these arrays, and their elements are the
+    // very row objects held by _leftParsed/_rightParsed (slice and sort preserve
+    // identity), which is what makes an edit reach the model.
+    this._leftData = leftData
+    this._rightData = rightData
+    // Under "ignore column order" the right pane displays left-hand columns, so
+    // a displayed column index has to be mapped back to the right file's own.
+    this._rightColMap = (this._ignoreColumnOrder && leftHeaders && rightHeaders)
+      ? leftHeaders.map((h) => rightHeaders.indexOf(h))
+      : null
 
     this._alignedRows = alignRows(
       leftData,
@@ -2428,6 +3185,10 @@ export class TableCompare {
    * Both panes share one scroll position, so one window serves both.
    */
   _renderTableWindow() {
+    // The row holding the open editor is about to be replaced, and removing an
+    // element does not fire blur — commit now or the typed value is lost.
+    this._commitCellEdit()
+
     const { leftScroll, leftTbody, rightTbody, leftTable, rightTable } = this._dom
     if (!leftScroll || !leftTbody || !rightTbody) return
 
@@ -2691,7 +3452,8 @@ export class TableCompare {
    */
   _updatePathDisplay(side, path) {
     const dom = side === 'left' ? this._dom.dispLeft : this._dom.dispRight
-    if (dom) dom.textContent = path
+    // Trailing '*' marks unsaved cell edits, matching text compare.
+    if (dom) dom.textContent = `${path}${this._modified[side] ? ' *' : ''}`
   }
 }
 
@@ -2703,4 +3465,5 @@ export {
   findCellMatches, diffRowIndices, stepIndexClamped, stepIndexWrapped,
   parseNumericValue, parseDateValue, cellsEqual, columnRuleAt,
   normaliseKeyColumns, buildRowKey, measureColumnWidths, DEFAULT_COLUMN_RULE,
+  serializeTable, parseHtmlTables, csvPathFor,
 }

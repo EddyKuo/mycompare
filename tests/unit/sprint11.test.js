@@ -133,6 +133,9 @@ describe('T61 TextCompare config snapshot', () => {
       ignorePatterns: ['^\\s*//'],
       unimportantPatterns: ['^\\s*import'],
       ignoreUnimportant: false,
+      // P2-30: manual ignore marks travel with the snapshot.
+      manualIgnoreLeft: [],
+      manualIgnoreRight: [],
     })
   })
 
@@ -150,7 +153,10 @@ describe('T61 TextCompare config snapshot', () => {
     }
     tc.applyConfig(snapshot)
     // The envelope is added by getConfig, so compare against the tagged shape.
-    expect(tc.getConfig()).toEqual({ __v: 1, __view: 'text', ...snapshot })
+    expect(tc.getConfig()).toEqual({
+      __v: 1, __view: 'text', ...snapshot,
+      manualIgnoreLeft: [], manualIgnoreRight: [],
+    })
   })
 
   it('applyConfig triggers _runDiff when content is loaded', () => {
