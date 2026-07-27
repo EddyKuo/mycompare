@@ -4584,8 +4584,9 @@ function setupPreferenceControls(setStatus) {
       // Naming what this build can actually read, rather than letting someone
       // type "rar" and wait for a folder that never opens.
       archiveHint.textContent = '本版本可讀取：zip、tar、gz、bz2、xz、7z、cab，'
-        + '以及 RAR5 的未壓縮（stored）項目——RAR 的壓縮演算法是專有的，'
-        + '壓縮過的項目會列出來但具名報錯，不會誤解碼。'
+        + '以及 RAR（RAR4／RAR5）——未壓縮（stored）項目由本程式自己解讀；'
+        + 'RAR 的壓縮演算法是專有的，壓縮過的項目若這台機器裝了 WinRAR／UnRAR '
+        + '就交給它解壓並驗證 CRC，沒有的話會列出來但具名報錯，不會誤解碼。'
         + '未列出的格式會明確報錯，不會誤判為空資料夾。'
     }
   }
