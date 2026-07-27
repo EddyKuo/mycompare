@@ -317,3 +317,121 @@
     border-bottom: none;
   }
 }
+
+/* ── Over-under layout ───────────────────────────────────────────────────────
+   Same Side / Over toggle the other views carry. Only the main axis changes;
+   the panels keep their own scroll/zoom behaviour either way. */
+
+.ic-body--over {
+  flex-direction: column;
+}
+
+.ic-btn--active {
+  border-color: var(--accent, #4a90d9);
+  background-color: var(--bg-toolbar);
+}
+
+/* ── Difference region list ─────────────────────────────────────────────────
+   The tile grid is capped at DIFF_TILE_GRID² entries, so the whole list fits
+   in the DOM and needs no windowing. */
+
+.ic-region-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: 180px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color);
+  background-color: var(--bg-secondary);
+}
+
+.ic-region-head {
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.ic-region-list {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.ic-region-item {
+  display: grid;
+  grid-template-columns: 56px 1fr 110px;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 10px;
+  border: none;
+  border-bottom: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ic-region-item:hover {
+  background-color: var(--bg-toolbar);
+}
+
+.ic-region-item--current {
+  background-color: var(--diff-change-bg, #fff5b1);
+  font-weight: 600;
+}
+
+.ic-region-idx { color: var(--text-secondary); }
+.ic-region-count-cell { text-align: right; }
+
+/* ── Image info panel ───────────────────────────────────────────────────────── */
+
+.ic-info-panel {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-secondary);
+  overflow-x: auto;
+}
+
+.ic-info-side {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.ic-info-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 3px;
+}
+
+.ic-info-table {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+  font-size: 11px;
+}
+
+.ic-info-table th,
+.ic-info-table td {
+  border: 1px solid var(--border-color);
+  padding: 2px 6px;
+  text-align: left;
+  vertical-align: top;
+  word-break: break-all;
+}
+
+.ic-info-table th {
+  width: 78px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  word-break: keep-all;
+}
+
+.ic-info-table td { font-variant-numeric: tabular-nums; }

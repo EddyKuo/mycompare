@@ -101,3 +101,93 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ── Show Context / Favor / parent folders / compare-to-output ─────────────── */
+
+.mw-toolbar { flex-wrap: wrap; }
+
+.mw-context-label,
+.mw-favor-label,
+.mw-output-cmp-label { display: inline-flex; align-items: center; gap: 4px; }
+
+.mw-context-input {
+  width: 48px;
+  padding: 1px 4px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  font-size: 12px;
+  background: transparent;
+  color: inherit;
+}
+
+/* A hand-off the host has not wired must read as unavailable, not as broken. */
+.mw-toolbar button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ── Compare-to-output preview dialog ─────────────────────────────────────── */
+
+/* Fixed rather than absolute: the host container is not a positioned ancestor,
+   so an absolute backdrop would anchor to the page and mis-size. */
+.mw-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.mw-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(900px, 90%);
+  max-height: 80%;
+  padding: 14px;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #222);
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  font-size: 13px;
+}
+
+.mw-modal-title { font-weight: 600; word-break: break-all; }
+.mw-modal-hint { font-size: 12px; color: var(--text-secondary, #666); }
+
+.mw-modal-diff {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border-color, #ddd);
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+
+.mw-modal-diff-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; }
+
+.mw-modal-diff-cell {
+  padding: 0 6px;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mw-modal-diff-row--insert { background: var(--diff-insert-bg, #e6ffed); }
+.mw-modal-diff-row--delete { background: var(--diff-delete-bg, #ffeef0); }
+.mw-modal-diff-row--replace { background: var(--diff-change-bg, #fff5b1); }
+
+.mw-modal-actions { display: flex; justify-content: flex-end; }
+
+.mw-modal-close {
+  padding: 4px 14px;
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}

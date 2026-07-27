@@ -153,6 +153,23 @@ export function segmentMatchesFilter(seg, mode) {
 const CONFLICT_CONTEXT_LINES = 2
 
 /**
+ * Ceiling for the Show Context control. Beyond this the filtered view is
+ * indistinguishable from showing everything, so the number stops being useful.
+ */
+export const MAX_CONTEXT_LINES = 100
+
+/**
+ * Coerce an arbitrary value into a usable context-line count.
+ * @param {unknown} n
+ * @returns {number}
+ */
+export function normalizeContextLines(n) {
+  const v = Math.floor(Number(n))
+  if (!Number.isFinite(v) || v < 0) return CONFLICT_CONTEXT_LINES
+  return Math.min(MAX_CONTEXT_LINES, v)
+}
+
+/**
  * @param {MergeSegment[]} segments
  * @returns {number[]} conflict ids in document order
  */
@@ -264,9 +281,10 @@ export function buildMergedText(segments, choices) {
  * @param {MergeSegment[]} segments
  * @param {number} conflictId
  * @param {ShowFilterMode} [showFilter]
+ * @param {number} [contextLines]
  * @returns {number} row index, or -1 when the conflict is not present
  */
-export function conflictPaneRow(segments, conflictId, showFilter = 'all') {
+export function conflictPaneRow(segments, conflictId, showFilter = 'all', contextLines = CONFLICT_CONTEXT_LINES) {
   const src = segments || []
 
   if (showFilter !== 'all') {
@@ -274,7 +292,7 @@ export function conflictPaneRow(segments, conflictId, showFilter = 'all') {
     // before the conflict are no longer the base lines before it. A conflict
     // the filter drops reports -1, so navigation leaves the scroll alone.
     let row = 0
-    for (const seg of filterSegments(src, showFilter)) {
+    for (const seg of filterSegments(src, showFilter, contextLines)) {
       if (seg.type === 'conflict') {
         if (seg.id === conflictId) return row
         row += seg.baseLines.length
@@ -417,17 +435,21 @@ export function diffToPaneRows(diff) {
  *   segments?: MergeSegment[],
  *   content?: string,
  *   diff?: import('../core/diff-engine.js').DiffLine[]|null,
+ *   contextLines?: number,
  * }} [opts]
  * @returns {PaneRow[]}
  */
 export function buildPaneRows(side, opts = {}) {
-  const { showFilter = 'all', segments = [], content = '', diff = null } = opts
+  const {
+    showFilter = 'all', segments = [], content = '', diff = null,
+    contextLines = CONFLICT_CONTEXT_LINES,
+  } = opts
 
   if (showFilter !== 'all') {
     const key = /** @type {'leftLines'|'baseLines'|'rightLines'} */ (`${side}Lines`)
     /** @type {PaneRow[]} */
     const rows = []
-    for (const seg of filterSegments(segments || [], showFilter)) {
+    for (const seg of filterSegments(segments || [], showFilter, contextLines)) {
       // Line numbers are omitted: filtered output is not contiguous.
       if (seg.type === 'conflict') {
         for (const text of seg[key]) rows.push({ type: 'conflict', lineNum: null, text })
@@ -466,6 +488,29 @@ const CHOICE_LABELS = {
 
 /** How much of a conflict's first line a report shows. */
 const PREVIEW_CHARS = 60
+
+/** Human labels for the three input panes. */
+const SIDE_LABELS = { left: '左側', base: '基底', right: '右側' }
+
+/** Rows the in-view "compare to output" preview renders before eliding. */
+export const OUTPUT_DIFF_MAX_ROWS = 2000
+
+/**
+ * The directory part of a path, for Merge Parent Folders.
+ *
+ * Both separators are handled because a session can carry Windows paths while
+ * the renderer runs on a POSIX build in tests.
+ *
+ * @param {string} p
+ * @returns {string} '' when the path has no directory part
+ */
+export function parentDirOf(p) {
+  const s = String(p ?? '')
+  const cut = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+  if (cut < 0) return ''
+  // Keep the root's own separator: 'C:\a' → 'C:\', '/a' → '/'.
+  return cut === 0 ? s.slice(0, 1) : s.slice(0, cut)
+}
 
 /**
  * One line, trimmed and clipped, safe to place in a table cell.
@@ -548,6 +593,16 @@ export class ThreeWayCompare {
     this._algorithm = 'myers'
     this._ignoreWhitespace = false
     this._ignoreCase = false
+
+    /** Lines of lead-in/lead-out kept around each conflict in 'conflicts' mode. */
+    this._contextLines = CONFLICT_CONTEXT_LINES
+
+    /**
+     * BC's Favor Left/Right Changes: a standing preference that resolves every
+     * conflict towards one side, including conflicts produced by later merges.
+     * @type {'none'|'left'|'right'}
+     */
+    this._favor = 'none'
   }
 
   // ---------------------------------------------------------------------------
@@ -635,6 +690,77 @@ export class ThreeWayCompare {
   }
 
   /**
+   * BC's Show Context: how many surrounding lines survive the 'conflicts'
+   * filter. Only that mode reads it, so changing it in any other mode stores
+   * the value without disturbing what is on screen.
+   *
+   * @param {unknown} n
+   * @returns {number} the value actually stored
+   */
+  setContextLines(n) {
+    const next = normalizeContextLines(n)
+    if (next === this._contextLines) return next
+    this._contextLines = next
+    this._syncContextInput()
+    if (this._showFilter === 'conflicts') this._renderSides()
+    return next
+  }
+
+  /** @returns {number} */
+  getContextLines() {
+    return this._contextLines
+  }
+
+  /**
+   * BC's Favor Left / Favor Right Changes.
+   *
+   * A standing preference rather than a one-shot batch: conflicts created by a
+   * later re-merge (a different algorithm, a reloaded file) are resolved the
+   * same way, which is the whole point of "favor". Setting it applies to the
+   * conflicts already on screen too; 'none' leaves existing choices alone
+   * because silently discarding resolved work would lose the user's edits.
+   *
+   * @param {'none'|'left'|'right'} side
+   * @returns {number} how many conflicts this call resolved
+   */
+  setFavor(side) {
+    if (side !== 'none' && side !== 'left' && side !== 'right') return 0
+    this._favor = side
+    this._syncFavorSelect()
+    if (side === 'none') return 0
+    return this._applyFavor()
+  }
+
+  /** @returns {'none'|'left'|'right'} */
+  getFavor() {
+    return this._favor
+  }
+
+  /**
+   * Resolve still-unresolved conflicts towards the favoured side.
+   * @returns {number}
+   */
+  _applyFavor() {
+    const n = this._applyFavorSilently()
+    if (n > 0) this._renderOutputPane()
+    return n
+  }
+
+  /**
+   * The same resolution without repainting, for callers that are about to
+   * render anyway.
+   * @returns {number}
+   */
+  _applyFavorSilently() {
+    if (this._favor === 'none') return 0
+    let n = 0
+    for (const [id, cur] of this._conflictChoices) {
+      if (cur == null) { this._conflictChoices.set(id, this._favor); n++ }
+    }
+    return n
+  }
+
+  /**
    * Choose the line-alignment algorithm the base→left and base→right diffs
    * use. Changing it changes which hunks overlap, so the merge is redone.
    *
@@ -681,6 +807,162 @@ export class ThreeWayCompare {
     }
     if (n > 0) this._renderOutputPane()
     return n
+  }
+
+  // ---------------------------------------------------------------------------
+  // Parent folders / compare to output
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The directory each loaded file sits in.
+   * @returns {{ left: string, base: string, right: string }}
+   */
+  getParentFolders() {
+    return {
+      left: parentDirOf(this._leftPath),
+      base: parentDirOf(this._basePath),
+      right: parentDirOf(this._rightPath),
+    }
+  }
+
+  /**
+   * Whether the host has wired the folder-compare hand-off. The button is
+   * disabled without it rather than pretending to work: this view has no
+   * folder-compare surface of its own to fall back to.
+   *
+   * @returns {boolean}
+   */
+  canMergeParentFolders() {
+    if (!this._listeners.get('open-parent-folders')?.size) return false
+    const { left, right } = this.getParentFolders()
+    return !!left && !!right
+  }
+
+  /**
+   * BC's Merge Parent Folders. Emits the three parents and lets the host decide
+   * what to open — this app has a two-sided folder compare, so the host is the
+   * only place that can choose which pair to show.
+   *
+   * @returns {boolean} whether the request was handed off
+   */
+  mergeParentFolders() {
+    if (!this.canMergeParentFolders()) return false
+    this._emit('open-parent-folders', this.getParentFolders())
+    return true
+  }
+
+  /**
+   * BC's Compare to Output: diff the merged result against one of the sources.
+   *
+   * Prefers handing the pair to the host (which can open a real text-compare
+   * tab); with no host listener it opens a self-contained read-only diff
+   * inside this view, so the command always produces something.
+   *
+   * @param {'left'|'base'|'right'} [side]
+   * @returns {boolean} false when there is nothing to compare
+   */
+  compareToOutput(side = 'left') {
+    if (side !== 'left' && side !== 'base' && side !== 'right') return false
+    const sourceText = this[`_${side}Content`] ?? ''
+    const sourcePath = this[`_${side}Path`] ?? ''
+    const outputText = this._buildOutputText()
+    if (!sourceText && !outputText) {
+      this._reportError('沒有可比對的內容：請先載入來源檔案。')
+      return false
+    }
+
+    if (this._listeners.get('compare-to-output')?.size) {
+      this._emit('compare-to-output', { side, sourcePath, sourceText, outputText })
+      return true
+    }
+    this._openOutputDiffDialog(side, sourcePath, sourceText, outputText)
+    return true
+  }
+
+  /**
+   * Read-only two-column diff of a source against the merged output.
+   *
+   * Rendered whole rather than virtualised, so the row count is capped: this is
+   * a preview, and the merge panes are where a large file is meant to be read.
+   *
+   * @param {'left'|'base'|'right'} side
+   * @param {string} sourcePath
+   * @param {string} sourceText
+   * @param {string} outputText
+   */
+  _openOutputDiffDialog(side, sourcePath, sourceText, outputText) {
+    const host = this._container ?? document.body
+    const backdrop = document.createElement('div')
+    backdrop.className = 'mw-modal-backdrop'
+    const modal = document.createElement('div')
+    modal.className = 'mw-modal'
+
+    const title = document.createElement('div')
+    title.className = 'mw-modal-title'
+    title.textContent = `${SIDE_LABELS[side]}（${sourcePath || '未命名'}）↔ 合併輸出`
+    modal.appendChild(title)
+
+    const diff = diffLines(sourceText, outputText, {
+      algorithm: this._algorithm,
+      ignoreWhitespace: this._ignoreWhitespace,
+      ignoreCase: this._ignoreCase,
+    })
+    const changed = diff.filter((d) => d.type !== 'equal').length
+
+    const summary = document.createElement('div')
+    summary.className = 'mw-modal-hint'
+    summary.textContent = changed === 0
+      ? '合併輸出與此來源完全相同。'
+      : `共 ${changed} 行不同（總計 ${diff.length} 行）。`
+    modal.appendChild(summary)
+
+    const body = document.createElement('div')
+    body.className = 'mw-modal-diff'
+    const shown = diff.slice(0, OUTPUT_DIFF_MAX_ROWS)
+    for (const dl of shown) {
+      const row = document.createElement('div')
+      row.className = `mw-modal-diff-row mw-modal-diff-row--${dl.type}`
+      const l = document.createElement('span')
+      l.className = 'mw-modal-diff-cell'
+      l.textContent = _stripEol(dl.leftText ?? '')
+      const r = document.createElement('span')
+      r.className = 'mw-modal-diff-cell'
+      r.textContent = _stripEol(dl.rightText ?? '')
+      row.append(l, r)
+      body.appendChild(row)
+    }
+    if (diff.length > shown.length) {
+      const more = document.createElement('div')
+      more.className = 'mw-modal-hint'
+      more.textContent = `… 只顯示前 ${OUTPUT_DIFF_MAX_ROWS} 行，另有 ${diff.length - shown.length} 行未顯示。`
+      body.appendChild(more)
+    }
+    modal.appendChild(body)
+
+    const actions = document.createElement('div')
+    actions.className = 'mw-modal-actions'
+    const btnClose = document.createElement('button')
+    btnClose.type = 'button'
+    btnClose.className = 'mw-modal-close'
+    btnClose.textContent = '關閉'
+    actions.appendChild(btnClose)
+    modal.appendChild(actions)
+
+    backdrop.appendChild(modal)
+    host.appendChild(backdrop)
+
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      backdrop.remove()
+      document.removeEventListener('keydown', onKey, true)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); finish() } }
+    btnClose.addEventListener('click', finish)
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish() })
+    document.addEventListener('keydown', onKey, true)
+    btnClose.focus()
   }
 
   // ---------------------------------------------------------------------------
@@ -899,6 +1181,8 @@ ${body}
       algorithm: this._algorithm,
       ignoreWhitespace: this._ignoreWhitespace,
       ignoreCase: this._ignoreCase,
+      contextLines: this._contextLines,
+      favor: this._favor,
     })
   }
 
@@ -917,6 +1201,8 @@ ${body}
     }
     if (typeof c.ignoreWhitespace === 'boolean') this._ignoreWhitespace = c.ignoreWhitespace
     if (typeof c.ignoreCase === 'boolean') this._ignoreCase = c.ignoreCase
+    if (c.contextLines != null) this._contextLines = normalizeContextLines(c.contextLines)
+    if (c.favor === 'none' || c.favor === 'left' || c.favor === 'right') this._favor = c.favor
 
     this._runMerge()
   }
@@ -974,6 +1260,9 @@ ${body}
   on(event, handler) {
     if (!this._listeners.has(event)) this._listeners.set(event, new Set())
     this._listeners.get(event).add(handler)
+    // Whether the host can take the hand-off is what decides if the parent
+    // folders button is usable, and that is only knowable once it subscribes.
+    if (event === 'open-parent-folders') this._syncParentFoldersButton()
   }
 
   /**
@@ -1004,6 +1293,9 @@ ${body}
           <select class="mw-filter-select" title="顯示篩選">
             ${SHOW_FILTER_MODES.map((m) => `<option value="${m}">${SHOW_FILTER_LABELS[m]}</option>`).join('')}
           </select>
+          <label class="mw-context-label" title="只顯示衝突時，每個衝突前後保留的行數">脈絡
+            <input class="mw-context-input" type="number" min="0" max="${MAX_CONTEXT_LINES}" step="1" />
+          </label>
           <span class="mw-toolbar-sep"></span>
           <label class="mw-algo-label">對齊
             <select class="mw-algo-select" title="對齊演算法">
@@ -1015,6 +1307,23 @@ ${body}
           <span class="mw-toolbar-sep"></span>
           <button class="mw-btn-all-left">全部採用左側</button>
           <button class="mw-btn-all-right">全部採用右側</button>
+          <label class="mw-favor-label" title="自動以某一側解決衝突，之後重新合併也照辦">偏好
+            <select class="mw-favor-select">
+              <option value="none">不偏好</option>
+              <option value="left">左側變更</option>
+              <option value="right">右側變更</option>
+            </select>
+          </label>
+          <span class="mw-toolbar-sep"></span>
+          <button class="mw-btn-parent-folders" title="以三個來源的上層資料夾開啟資料夾比對">上層資料夾</button>
+          <label class="mw-output-cmp-label" title="把合併輸出與其中一個來源做文字比對">比對輸出
+            <select class="mw-output-cmp-select">
+              <option value="left">左側</option>
+              <option value="base">基底</option>
+              <option value="right">右側</option>
+            </select>
+          </label>
+          <button class="mw-btn-compare-output">比對</button>
         </div>
         <div class="mw-top">
           <div class="mw-pane mw-pane--left" data-side="left">
@@ -1172,6 +1481,30 @@ ${body}
     this._q('.mw-btn-all-left')?.addEventListener('click', () => this.resolveAll('left'))
     this._q('.mw-btn-all-right')?.addEventListener('click', () => this.resolveAll('right'))
 
+    const contextInput = /** @type {HTMLInputElement|null} */ (this._q('.mw-context-input'))
+    if (contextInput) {
+      contextInput.value = String(this._contextLines)
+      // 'change' rather than 'input': re-flattening every pane on each keystroke
+      // is wasted work on a large merge.
+      contextInput.addEventListener('change', () => {
+        contextInput.value = String(this.setContextLines(contextInput.value))
+      })
+    }
+
+    const favorSelect = /** @type {HTMLSelectElement|null} */ (this._q('.mw-favor-select'))
+    favorSelect?.addEventListener('change', () => {
+      this.setFavor(/** @type {'none'|'left'|'right'} */ (favorSelect.value))
+    })
+
+    this._q('.mw-btn-parent-folders')?.addEventListener('click', () => this.mergeParentFolders())
+
+    const outputCmpSelect = /** @type {HTMLSelectElement|null} */ (this._q('.mw-output-cmp-select'))
+    this._q('.mw-btn-compare-output')?.addEventListener('click', () => {
+      this.compareToOutput(/** @type {'left'|'base'|'right'} */ (outputCmpSelect?.value ?? 'left'))
+    })
+
+    this._syncParentFoldersButton()
+
     // T26: Sync scroll across all three content panes
     this._setupSyncScroll()
     this._setupDropTargets()
@@ -1313,10 +1646,10 @@ ${body}
     const targetId = index >= 0 ? ids[index] : null
 
     if (targetId != null) {
-      const row = conflictPaneRow(this._segments, targetId, this._showFilter)
+      const row = conflictPaneRow(this._segments, targetId, this._showFilter, this._contextLines)
       // A couple of lines of lead-in, so the conflict is not flush against
       // the top edge of the pane.
-      if (row >= 0) this.scrollToRow(Math.max(0, row - CONFLICT_CONTEXT_LINES))
+      if (row >= 0) this.scrollToRow(Math.max(0, row - this._contextLines))
     }
 
     const pane = this._outputPaneEl
@@ -1356,6 +1689,34 @@ ${body}
   _updateAlgoSelect() {
     const select = /** @type {HTMLSelectElement|null} */ (this._q('.mw-algo-select'))
     if (select && select.value !== this._algorithm) select.value = this._algorithm
+  }
+
+  /** Keep the Show Context box in step with a change made through the API. */
+  _syncContextInput() {
+    const input = /** @type {HTMLInputElement|null} */ (this._q('.mw-context-input'))
+    if (input && input.value !== String(this._contextLines)) input.value = String(this._contextLines)
+  }
+
+  /** Keep the favour picker in step with a change made through the API. */
+  _syncFavorSelect() {
+    const select = /** @type {HTMLSelectElement|null} */ (this._q('.mw-favor-select'))
+    if (select && select.value !== this._favor) select.value = this._favor
+  }
+
+  /**
+   * Enable Merge Parent Folders only when it can actually do something.
+   *
+   * The host registers its listener after mount, so this runs again from `on()`
+   * and after every path change rather than only at render time.
+   */
+  _syncParentFoldersButton() {
+    const btn = /** @type {HTMLButtonElement|null} */ (this._q('.mw-btn-parent-folders'))
+    if (!btn) return
+    const ok = this.canMergeParentFolders()
+    btn.disabled = !ok
+    btn.title = ok
+      ? '以三個來源的上層資料夾開啟資料夾比對'
+      : '需要已載入的左右來源，且主視窗要接上 open-parent-folders 事件'
   }
 
   /**
@@ -1408,11 +1769,18 @@ ${body}
     this._rightDiff = rightDiff
     this._currentConflict = -1
 
+    // A standing favour applies before the output is drawn, so the new
+    // conflicts appear already resolved rather than flashing unresolved first.
+    this._applyFavorSilently()
+
     this._renderSides()
     this._renderOutputPane()
     this._updateConflictCounter()
     this._updateFilterButton()
     this._updateAlgoSelect()
+    this._syncContextInput()
+    this._syncFavorSelect()
+    this._syncParentFoldersButton()
     this._consumePendingFirstDiff()
 
     this._emit('ready', { hasConflicts })
@@ -1432,7 +1800,11 @@ ${body}
 
   /** Recompute the row lists for all three panes and repaint the window. */
   _renderSides() {
-    const common = { showFilter: this._showFilter, segments: this._segments }
+    const common = {
+      showFilter: this._showFilter,
+      segments: this._segments,
+      contextLines: this._contextLines,
+    }
     this._paneRows = {
       left: buildPaneRows('left', { ...common, content: this._leftContent, diff: this._leftDiff }),
       base: buildPaneRows('base', { ...common, content: this._baseContent, diff: null }),

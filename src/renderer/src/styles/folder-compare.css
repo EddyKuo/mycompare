@@ -1268,3 +1268,51 @@
 .fc-attrs-side input[type="checkbox"]:disabled {
   cursor: not-allowed;
 }
+
+/* ── File Info panel ──────────────────────────────────────────────────────── */
+
+.fc-btn-info {
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+  height: 24px;
+  white-space: nowrap;
+}
+
+.fc-btn-info:hover {
+  background: var(--bg-toolbar);
+  border-color: var(--accent);
+}
+
+.fc-info-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  /* Long paths must not stretch the dialog past its max-width. */
+  table-layout: fixed;
+}
+
+.fc-info-table th,
+.fc-info-table td {
+  border: 1px solid var(--border-color);
+  padding: 3px 8px;
+  text-align: left;
+  vertical-align: top;
+  word-break: break-all;
+}
+
+.fc-info-table th {
+  width: 110px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-weight: 600;
+  word-break: keep-all;
+}
+
+.fc-info-table td {
+  font-variant-numeric: tabular-nums;
+}

@@ -1478,6 +1478,174 @@ export function rollupStatus(row) {
   return 'same'
 }
 
+// ── File Info (statistics panel) ─────────────────────────────────────────────
+
+/**
+ * @typedef {object} FolderSideTotals
+ * @property {number} files
+ * @property {number} dirs
+ * @property {number} bytes  sum of file sizes; directories contribute nothing
+ */
+
+/**
+ * @typedef {object} FolderTreeSummary
+ * @property {FolderSideTotals} left
+ * @property {FolderSideTotals} right
+ * @property {Record<string, number>} status  counts keyed by the hyphenated status
+ * @property {number} unimportant
+ * @property {number} rows      compared rows (a matched pair counts once)
+ * @property {boolean} partial  true when some directory has not been expanded yet
+ */
+
+/**
+ * Per-side totals and status counts over the *loaded* part of the tree.
+ *
+ * `partial` is not cosmetic: the view loads a directory's children only when it
+ * is expanded, so any number here is a lower bound until every folder has been
+ * walked. Reporting a total without saying that would be a lie.
+ *
+ * @param {CompareRow[]} rows
+ * @returns {FolderTreeSummary}
+ */
+export function summarizeFolderTree(rows) {
+  /** @returns {FolderSideTotals} */
+  const blank = () => ({ files: 0, dirs: 0, bytes: 0 })
+  const summary = {
+    left: blank(),
+    right: blank(),
+    /** @type {Record<string, number>} */
+    status: {},
+    unimportant: 0,
+    rows: 0,
+    partial: false,
+  }
+
+  /** @param {CompareRow[]} list */
+  const walk = (list) => {
+    for (const row of list ?? []) {
+      summary.rows++
+      const key = String(row?.status ?? '')
+      if (key) summary.status[key] = (summary.status[key] ?? 0) + 1
+      if (row?.unimportant) summary.unimportant++
+
+      for (const side of /** @type {const} */ (['left', 'right'])) {
+        const entry = row?.[side]
+        if (!entry) continue
+        if (entry.isDirectory) summary[side].dirs++
+        else {
+          summary[side].files++
+          if (Number.isFinite(entry.size)) summary[side].bytes += entry.size
+        }
+      }
+
+      const isDir = !!(row?.left?.isDirectory || row?.right?.isDirectory)
+      if (isDir && !row.children) summary.partial = true
+      if (row?.children?.length) walk(row.children)
+    }
+  }
+  walk(rows)
+  return summary
+}
+
+/**
+ * Compare-mode labels, shared by the toolbar picker and the info panel so the
+ * two can never drift apart.
+ * @type {Record<string, string>}
+ */
+export const FOLDER_MODE_LABELS = {
+  name: '僅名稱',
+  size: '名稱+大小',
+  mtime: '名稱+修改時間',
+  both: '名稱+大小+時間',
+  content: '內容 (MD5)',
+  rules: '內容 (規則)',
+}
+
+/** Display order and labels for the status counters in the info panel. */
+const FOLDER_STATUS_LABELS = [
+  ['same', '相同'],
+  ['different', '不同'],
+  ['left-only', '僅左側'],
+  ['right-only', '僅右側'],
+  ['left-newer', '左側較新'],
+  ['right-newer', '右側較新'],
+]
+
+/**
+ * The info panel's label/value rows, as plain data so a test can assert the
+ * numbers without a DOM.
+ *
+ * @param {{
+ *   leftPath: string, rightPath: string, mode: string,
+ *   summary: FolderTreeSummary, scanMs: number|null,
+ * }} info
+ * @returns {string[][]}
+ */
+export function folderInfoRows(info) {
+  const s = info.summary
+  const side = (t) => `${t.files} 檔 / ${t.dirs} 目錄　${formatSize(t.bytes)}`
+  /** @type {string[][]} */
+  const rows = [
+    ['左側路徑', info.leftPath || '（未選擇）'],
+    ['右側路徑', info.rightPath || '（未選擇）'],
+    ['比對模式', info.mode],
+    ['左側合計', side(s.left)],
+    ['右側合計', side(s.right)],
+    ['比對列數', String(s.rows)],
+  ]
+  for (const [key, label] of FOLDER_STATUS_LABELS) {
+    rows.push([label, String(s.status[key] ?? 0)])
+  }
+  if (s.unimportant) rows.push(['不重要差異', String(s.unimportant)])
+  rows.push(['掃描耗時', info.scanMs == null ? '（尚未掃描）' : `${info.scanMs} ms`])
+  if (s.partial) {
+    rows.push(['注意', '尚有未展開的目錄，以上數字只涵蓋已載入的部分（可用 ⊞ 展開全部後再看）'])
+  }
+  return rows
+}
+
+// ── Touch (timestamp sync) ───────────────────────────────────────────────────
+
+/**
+ * @typedef {object} TouchJob
+ * @property {string} src   the file whose mtime is copied
+ * @property {string} dest  the file that receives it
+ * @property {string} mtime ISO timestamp read from `src`
+ */
+
+/**
+ * Apply each job's timestamp, collecting failures instead of stopping.
+ *
+ * @param {TouchJob[]} jobs
+ * @param {{ setMtime: (path: string, mtime: string) => Promise<unknown> }} api
+ * @returns {Promise<{ done: number, failures: Array<{ path: string, message: string }> }>}
+ */
+export async function runTouch(jobs, api) {
+  let done = 0
+  /** @type {Array<{ path: string, message: string }>} */
+  const failures = []
+  for (const job of jobs ?? []) {
+    try {
+      await api.setMtime(job.dest, job.mtime)
+      done++
+    } catch (err) {
+      failures.push({ path: job.dest, message: errText(err) })
+    }
+  }
+  return { done, failures }
+}
+
+/**
+ * @param {{ done: number, failures: Array<{ path: string, message: string }> }} outcome
+ * @returns {string}
+ */
+export function formatTouchSummary(outcome) {
+  const { done, failures } = outcome
+  if (!failures.length) return `已同步 ${done} 個檔案的修改時間。`
+  const detail = failures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
+  return `已同步 ${done} 個，${failures.length} 個失敗：\n\n${detail}`
+}
+
 // ── FolderCompare Class ───────────────────────────────────────────────────────
 
 export class FolderCompare {
@@ -1562,6 +1730,10 @@ export class FolderCompare {
     this._scanController = null
     /** Items finished since the current scan started, for the progress read-out. */
     this._scanProcessed = 0
+    /** Wall-clock ms the last completed scan took; null before the first one. */
+    /** @type {number|null} */
+    this._lastScanMs = null
+    this._scanStartedAt = 0
 
     // Event handlers map
     this._handlers = {}
@@ -1724,6 +1896,7 @@ export class FolderCompare {
     const ctrl = new AbortController()
     this._scanController = ctrl
     this._scanProcessed = 0
+    this._scanStartedAt = Date.now()
     if (this._dom.btnCancel) this._dom.btnCancel.style.display = ''
     this._setScanStatus('掃描中… 0 項')
     return ctrl
@@ -1737,7 +1910,12 @@ export class FolderCompare {
     if (this._scanController !== ctrl) return
     this._scanController = null
     if (this._dom.btnCancel) this._dom.btnCancel.style.display = 'none'
-    if (!ctrl.signal.aborted) this._setScanStatus('')
+    // A cancelled run's elapsed time says nothing about how long the comparison
+    // takes, so it is not recorded.
+    if (!ctrl.signal.aborted) {
+      this._lastScanMs = Math.max(0, Date.now() - this._scanStartedAt)
+      this._setScanStatus('')
+    }
   }
 
   /** @param {number} [n] */
@@ -1763,9 +1941,15 @@ export class FolderCompare {
    * @param {unknown} ids
    */
   setColumns(ids) {
+    const wanted = this._needsAttributes()
     this._columns = saveFolderColumns(ids)
     this._rebuildHeader()
     this._applyFilterAndRender()
+    // Attributes are only read while scanning, so switching the column on has
+    // to re-list the directories or the cells would stay blank forever.
+    if (!wanted && this._needsAttributes() && (this._leftPath || this._rightPath)) {
+      void this.refresh()
+    }
   }
 
   /** @param {string} id */
@@ -2039,8 +2223,12 @@ export class FolderCompare {
     if (next === this._compareAttributes) return next
     this._compareAttributes = next
     this._syncAttributeControl()
-    // The criterion feeds computeStatus, so every row has to be graded again.
-    if (this._leftPath || this._rightPath) void this._compareAndRender()
+    if (this._leftPath || this._rightPath) {
+      // Turning it on needs the hidden bit, which only a fresh listing carries;
+      // turning it off only changes how the existing entries are graded.
+      if (next) void this.refresh()
+      else void this._compareAndRender()
+    }
     return next
   }
 
@@ -2903,8 +3091,22 @@ export class FolderCompare {
         return window.electronAPI.remoteListDir(src.profileId, dir, src.secret)
       }
       default:
-        return window.electronAPI.readDir(path)
+        // Reading the Windows hidden bit spawns a process per directory, so it
+        // is asked for only when something on screen actually consumes it.
+        return this._needsAttributes()
+          ? window.electronAPI.readDir(path, { attributes: true })
+          : window.electronAPI.readDir(path)
     }
+  }
+
+  /**
+   * Whether the extra attribute read is worth paying for: either the attribute
+   * column is on screen, or attributes take part in the status decision.
+   *
+   * @returns {boolean}
+   */
+  _needsAttributes() {
+    return this._compareAttributes || this._columns.includes('attrs')
   }
 
   /**
@@ -3005,6 +3207,83 @@ export class FolderCompare {
     }
     stats.total = stats.same + stats.different + stats.left_only + stats.right_only + stats.left_newer + stats.right_newer
     return stats
+  }
+
+  // ── File Info ───────────────────────────────────────────────────────────────
+
+  /**
+   * Everything the info panel shows, as data.
+   *
+   * @returns {{
+   *   leftPath: string, rightPath: string, mode: string,
+   *   summary: FolderTreeSummary, scanMs: number|null, scanning: boolean
+   * }}
+   */
+  getFolderInfo() {
+    return {
+      leftPath: this._leftPath ?? '',
+      rightPath: this._rightPath ?? '',
+      mode: FOLDER_MODE_LABELS[this._mode] ?? String(this._mode),
+      summary: summarizeFolderTree(this._rows ?? []),
+      scanMs: this._lastScanMs,
+      scanning: this.isScanning(),
+    }
+  }
+
+  /**
+   * Show the per-side totals, status counts and scan time.
+   *
+   * @returns {Promise<void>}
+   */
+  openInfoDialog() {
+    const host = this._dom.root ?? document.body
+    return new Promise((resolve) => {
+      const info = this.getFolderInfo()
+      const backdrop = el('div', { className: 'fc-modal-backdrop fc-info-backdrop' })
+      const modal = el('div', { className: 'fc-modal', role: 'dialog', 'aria-modal': 'true' })
+      modal.appendChild(el('div', { className: 'fc-modal-title' }, '資料夾比對資訊'))
+
+      const table = el('table', { className: 'fc-info-table' })
+      const tbody = el('tbody')
+      for (const [label, value] of folderInfoRows(info)) {
+        const tr = el('tr')
+        tr.appendChild(el('th', {}, label))
+        tr.appendChild(el('td', {}, value))
+        tbody.appendChild(tr)
+      }
+      table.appendChild(tbody)
+      modal.appendChild(table)
+
+      if (info.scanning) {
+        modal.appendChild(el('div', { className: 'fc-modal-hint' },
+          '掃描仍在進行中，數字會隨掃描完成而改變。'))
+      }
+
+      const actions = el('div', { className: 'fc-modal-actions' })
+      const btnOk = el('button', { className: 'fc-modal-ok' }, '關閉')
+      actions.append(btnOk)
+      modal.appendChild(actions)
+
+      backdrop.appendChild(modal)
+      host.appendChild(backdrop)
+      this._dom.infoModal = backdrop
+
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        backdrop.remove()
+        this._dom.infoModal = null
+        document.removeEventListener('keydown', onKey, true)
+        resolve()
+      }
+      const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); finish() } }
+
+      btnOk.addEventListener('click', finish)
+      backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish() })
+      document.addEventListener('keydown', onKey, true)
+      btnOk.focus()
+    })
   }
 
   /**
@@ -3492,6 +3771,129 @@ ${rows}
       ? '\n\n失敗：\n' + failures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
       : ''
     alert(`複製完成：${done} 項成功${failures.length ? `，${failures.length} 項失敗` : ''}${detail}`)
+    await this.refresh()
+  }
+
+  /**
+   * BC's "Copy To…": copy the selected files into any folder, not just the
+   * other side. The tree layout below the compared root is preserved, so
+   * copying `src/a/b.js` lands at `<dest>/src/a/b.js`.
+   *
+   * @param {'left'|'right'} [source] which side's file to take; defaults to
+   *   whichever side the row actually has, preferring the left.
+   * @param {string} [destRoot] target folder; prompts when omitted
+   * @returns {Promise<void>}
+   */
+  async copySelectedToFolder(source, destRoot) {
+    return this._copyRowsToFolder(this._selectedRows(), source, destRoot)
+  }
+
+  /**
+   * @param {CompareRow[]} rows
+   * @param {'left'|'right'} [source]
+   * @param {string} [destRoot]
+   * @returns {Promise<void>}
+   */
+  async _copyRowsToFolder(rows, source, destRoot) {
+    if (!this._requireWritable(source ? [source] : ['left', 'right'])) return
+    if (!rows?.length) { alert('請先勾選要複製的項目'); return }
+
+    let dest = destRoot
+    if (!dest) {
+      const picked = await window.electronAPI.openFolder()
+      if (!picked) return
+      dest = picked.path ?? picked
+    }
+    if (!dest) return
+
+    const sep = dest.includes('\\') ? '\\' : '/'
+    const base = dest.replace(/[\\/]+$/, '')
+
+    /** @type {Array<{ src: string, dest: string, dir: string }>} */
+    const jobs = []
+    for (const row of rows) {
+      const preferred = source ?? (row.left?.path ? 'left' : 'right')
+      const entry = row[preferred] ?? row.left ?? row.right
+      if (!entry?.path || entry.isDirectory) continue
+      const rel = this._relativePathOf(row, preferred).replace(/^[\\/]+/, '')
+      const target = base + sep + rel
+      jobs.push({ src: entry.path, dest: target, dir: target.slice(0, target.length - row.name.length) })
+    }
+    if (!jobs.length) { alert('選取的項目中沒有可複製的檔案（目錄不參與）'); return }
+    if (!confirm(`確定要複製 ${jobs.length} 個檔案到：\n${base}\n？`)) return
+
+    let done = 0
+    /** @type {Array<{ path: string, message: string }>} */
+    const failures = []
+    for (const job of jobs) {
+      try {
+        // The relative layout can name folders that do not exist under the
+        // target yet; copyFile would fail with a bare ENOENT.
+        const dir = job.dir.replace(/[\\/]+$/, '')
+        if (dir && dir !== base) await window.electronAPI.mkdirFolder(dir)
+        await window.electronAPI.copyFile(job.src, job.dest)
+        done++
+      } catch (err) {
+        failures.push({ path: job.dest, message: errText(err) })
+      }
+    }
+    const detail = failures.length
+      ? '\n\n失敗：\n' + failures.map((f) => `• ${f.path}\n　${f.message}`).join('\n')
+      : ''
+    alert(`複製完成：${done} 項成功${failures.length ? `，${failures.length} 項失敗` : ''}${detail}`)
+  }
+
+  // ── Touch (timestamp sync) ──────────────────────────────────────────────────
+
+  /**
+   * BC's Touch: give one side's files the other side's modification time.
+   *
+   * Only matched pairs qualify — an orphan has nothing to copy a timestamp
+   * from — and directories are skipped because the IPC works on files.
+   *
+   * @param {'left-to-right'|'right-to-left'} direction
+   * @returns {Promise<void>}
+   */
+  async touchSelected(direction) {
+    return this._touchRows(this._selectedRows(), direction)
+  }
+
+  /**
+   * @param {CompareRow[]} rows
+   * @param {'left-to-right'|'right-to-left'} direction
+   * @returns {Promise<void>}
+   */
+  async _touchRows(rows, direction) {
+    if (!window.electronAPI?.setMtime) {
+      alert('此版本的主程序沒有提供設定修改時間的功能。')
+      return
+    }
+    const from = direction === 'right-to-left' ? 'right' : 'left'
+    const to = direction === 'right-to-left' ? 'left' : 'right'
+    if (!this._requireWritable([to])) return
+
+    /** @type {TouchJob[]} */
+    const jobs = []
+    for (const row of rows ?? []) {
+      const src = row?.[from]
+      const dst = row?.[to]
+      if (!src?.path || !dst?.path) continue
+      if (src.isDirectory || dst.isDirectory) continue
+      // An unreadable timestamp cannot be applied; skipping beats sending a
+      // value the main process would reject one call at a time.
+      if (!src.mtime) continue
+      jobs.push({ src: src.path, dest: dst.path, mtime: String(src.mtime) })
+    }
+    if (!jobs.length) {
+      alert('沒有可同步時間的項目：需要兩側都存在的檔案，且來源要有可讀的修改時間。')
+      return
+    }
+
+    const label = direction === 'right-to-left' ? '右 → 左' : '左 → 右'
+    if (!confirm(`要把 ${jobs.length} 個檔案的修改時間套用到另一側嗎？（${label}）`)) return
+
+    const outcome = await runTouch(jobs, window.electronAPI)
+    alert(formatTouchSummary(outcome))
     await this.refresh()
   }
 
@@ -4043,14 +4445,8 @@ ${rows}
 
     // Compare mode select
     const modeSelect = el('select', { className: 'fc-compare-mode' })
-    ;[
-      { value: 'name',    label: '僅名稱' },
-      { value: 'size',    label: '名稱+大小' },
-      { value: 'mtime',   label: '名稱+修改時間' },
-      { value: 'both',    label: '名稱+大小+時間' },
-      { value: 'content', label: '內容 (MD5)' },
-      { value: 'rules',   label: '內容 (規則)' },
-    ].forEach(({ value, label }) => {
+    ;Object.entries(FOLDER_MODE_LABELS).map(([value, label]) => ({ value, label }))
+      .forEach(({ value, label }) => {
       const opt = el('option', { value }, label)
       if (value === this._mode) opt.setAttribute('selected', '')
       modeSelect.appendChild(opt)
@@ -4143,6 +4539,13 @@ ${rows}
     this._dom.btnRules = btnRules
     toolbar.appendChild(btnRules)
 
+    const btnInfo = el('button', {
+      className: 'fc-btn-info',
+      title: '檔案資訊：兩側檔案數、總大小、各狀態計數與掃描耗時',
+    }, 'ℹ 資訊')
+    this._dom.btnInfo = btnInfo
+    toolbar.appendChild(btnInfo)
+
     const btnSettings = el('button', {
       className: 'fc-btn-settings',
       title: 'Session 設定：套用範圍（僅此檢視／更新為預設值）',
@@ -4219,6 +4622,9 @@ ${rows}
       { label: '移動選取到右側',             action: 'move-to-right' },
       { label: '移動選取到左側',             action: 'move-to-left' },
       { label: '互換選取（左右對調）',       action: 'exchange' },
+      { label: '複製選取到其他資料夾…',      action: 'copy-to-folder' },
+      { label: '同步時間戳（左 → 右）',      action: 'touch-to-right' },
+      { label: '同步時間戳（右 → 左）',      action: 'touch-to-left' },
     ]
     for (const item of batchItems) {
       const btn = el('button', { className: 'fc-batch-item', 'data-action': item.action }, item.label)
@@ -4637,6 +5043,10 @@ ${rows}
       void this.openSettingsDialog()
     })
     this._dom.btnCancel?.addEventListener('click', () => this.cancelScan())
+    this._dom.btnInfo?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      void this.openInfoDialog()
+    })
 
     // T56: Expand All / Collapse All
     btnExpandAll?.addEventListener('click', () => void this.expandAll())
@@ -4715,6 +5125,9 @@ ${rows}
       else if (action === 'move-to-right') await this.moveSelectedTo('right')
       else if (action === 'move-to-left') await this.moveSelectedTo('left')
       else if (action === 'exchange') await this.exchangeSelected()
+      else if (action === 'copy-to-folder') await this.copySelectedToFolder()
+      else if (action === 'touch-to-right') await this.touchSelected('left-to-right')
+      else if (action === 'touch-to-left') await this.touchSelected('right-to-left')
     })
 
     // S14-M02: store handler refs so destroy() can remove them.
@@ -5757,6 +6170,34 @@ ${rows}
         items.push({
           label: '互換左右（兩側內容對調）',
           action: () => void this._exchangeRows([modelRow]),
+        })
+        items.push({ separator: true })
+        items.push({
+          label: '同步時間戳：左 → 右',
+          disabled: !modelRow.left?.mtime,
+          action: () => void this._touchRows([modelRow], 'left-to-right'),
+        })
+        items.push({
+          label: '同步時間戳：右 → 左',
+          disabled: !modelRow.right?.mtime,
+          action: () => void this._touchRows([modelRow], 'right-to-left'),
+        })
+      }
+    }
+
+    // ── Copy To… (any folder) ──
+    if (!isDir && (leftPath || rightPath)) {
+      items.push({ separator: true })
+      if (leftPath) {
+        items.push({
+          label: '複製左側到其他資料夾…',
+          action: () => void this._copyRowsToFolder(modelRow ? [modelRow] : [], 'left'),
+        })
+      }
+      if (rightPath) {
+        items.push({
+          label: '複製右側到其他資料夾…',
+          action: () => void this._copyRowsToFolder(modelRow ? [modelRow] : [], 'right'),
         })
       }
     }

@@ -529,6 +529,70 @@ export function buildImageTextReport(info, opts = {}) {
   return `${header}${summary}\n\n${table}\n`
 }
 
+// ── Image info panel ─────────────────────────────────────────────────────────
+
+/**
+ * Byte length of a base64 payload, without materialising the bytes.
+ *
+ * The decoded image is kept but the base64 string is dropped right after load,
+ * so the size has to be taken while it is still in hand.
+ *
+ * @param {string} b64
+ * @returns {number}
+ */
+export function base64ByteLength(b64) {
+  const s = String(b64 ?? '').replace(/[\r\n]/g, '')
+  if (!s) return 0
+  const padding = s.endsWith('==') ? 2 : s.endsWith('=') ? 1 : 0
+  return Math.max(0, Math.floor(s.length * 3 / 4) - padding)
+}
+
+/**
+ * @param {number|null|undefined} n
+ * @returns {string}
+ */
+export function formatBytes(n) {
+  if (!Number.isFinite(n) || n == null) return '（未知）'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`
+}
+
+/**
+ * @typedef {object} ImageSideInfo
+ * @property {string} path
+ * @property {string} format     file extension as loaded
+ * @property {number|null} bytes file size, null when unknown
+ * @property {number} width
+ * @property {number} height
+ * @property {'rgba'|'rgb'|'unknown'} depth  see {@link imageInfoRows}
+ */
+
+/**
+ * Label/value rows for one side, as data.
+ *
+ * `depth` is derived from the *decoded* pixels, never from the file header:
+ * canvas hands back 8-bit RGBA whatever the source was, so the only honest
+ * statement is whether any pixel is actually translucent.
+ *
+ * @param {ImageSideInfo|null} side
+ * @returns {string[][]}
+ */
+export function imageInfoRows(side) {
+  if (!side) return [['狀態', '（未載入）']]
+  const depth = side.depth === 'rgba' ? '32 位元 RGBA（有透明像素）'
+    : side.depth === 'rgb' ? '24 位元 RGB（解碼後無透明像素）'
+      : '未知（無法讀取像素）'
+  return [
+    ['路徑', side.path || '（未知）'],
+    ['格式', side.format ? side.format.toUpperCase() : '（未知）'],
+    ['檔案大小', formatBytes(side.bytes)],
+    ['尺寸', `${side.width} × ${side.height}`],
+    ['總像素', (side.width * side.height).toLocaleString()],
+    ['色彩深度', depth],
+  ]
+}
+
 /**
  * @param {string} s
  * @returns {string}
@@ -830,15 +894,28 @@ export class ImageCompare {
     this._highlightColor = DEFAULT_HIGHLIGHT_COLOR
 
     /**
+     * Panel layout, matching the other views' Side-by-side / Over-under toggle.
+     * @type {'side'|'over'}
+     */
+    this._layout = 'side'
+
+    /** Whether the difference-region list is on screen. */
+    this._showRegionList = false
+
+    /** Whether the image info panel is on screen. */
+    this._showInfoPanel = false
+
+    /**
      * Mounted flag for keyboard shortcut guard.
      * @type {boolean}
      */
     this._mounted = false
 
     // 圖片資料
-    /** @type {{ path: string, base64: string, ext: string, img: HTMLImageElement } | null} */
+    /** @typedef {{ path: string, ext: string, img: HTMLImageElement, bytes: number, depth: 'rgba'|'rgb'|'unknown'|null }} LoadedImage */
+    /** @type {LoadedImage | null} */
     this._left = null
-    /** @type {{ path: string, base64: string, ext: string, img: HTMLImageElement } | null} */
+    /** @type {LoadedImage | null} */
     this._right = null
 
     // 事件 handlers map：{ eventName: Function[] }
@@ -901,6 +978,7 @@ export class ImageCompare {
       autoScale: this._autoScale,
       mismatchRange: this._mismatchRange,
       highlightColor: this._highlightColor,
+      layout: this._layout,
     })
   }
 
@@ -921,6 +999,7 @@ export class ImageCompare {
         && Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, s.highlightColor)) {
       this._highlightColor = s.highlightColor
     }
+    if (s.layout === 'side' || s.layout === 'over') this._layout = s.layout
     this._syncConfigControls()
     this.refresh()
   }
@@ -934,6 +1013,42 @@ export class ImageCompare {
     if (dom.highlightSelect) dom.highlightSelect.value = this._highlightColor
     if (dom.thresholdSlider) dom.thresholdSlider.value = String(this._threshold)
     if (dom.thresholdVal) dom.thresholdVal.textContent = this._threshold.toFixed(2)
+    this._applyLayout()
+  }
+
+  // ── Public: layout ──────────────────────────────────────────────────────────
+
+  /**
+   * Side-by-side ↔ over-under, matching the toggle every other view has.
+   * @param {'side'|'over'} mode
+   * @returns {'side'|'over'}
+   */
+  setLayout(mode) {
+    if (mode !== 'side' && mode !== 'over') return this._layout
+    this._layout = mode
+    this._applyLayout()
+    return this._layout
+  }
+
+  /** @returns {'side'|'over'} */
+  getLayout() {
+    return this._layout
+  }
+
+  /** @returns {'side'|'over'} the layout now in force */
+  toggleLayout() {
+    return this.setLayout(this._layout === 'side' ? 'over' : 'side')
+  }
+
+  /** Push the layout onto the body element and the button label. */
+  _applyLayout() {
+    const body = /** @type {HTMLElement | undefined} */ (this._dom.body)
+    body?.classList.toggle('ic-body--over', this._layout === 'over')
+    const btn = /** @type {HTMLElement | undefined} */ (this._dom.btnLayout)
+    if (btn) {
+      btn.textContent = this._layout === 'over' ? '⊟ 上下' : '⬛ 並排'
+      btn.title = this._layout === 'over' ? '切換為並排' : '切換為上下堆疊'
+    }
   }
 
   // ── Public: difference navigation ───────────────────────────────────────────
@@ -941,6 +1056,95 @@ export class ImageCompare {
   /** @returns {ImageDiffRegion[]} 目前的差異區塊（tile 網格） */
   getDiffRegions() {
     return this._diffRegions
+  }
+
+  // ── Public: difference region list ──────────────────────────────────────────
+
+  /**
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} whether the list is now visible
+   */
+  toggleRegionList(on) {
+    this._showRegionList = on == null ? !this._showRegionList : !!on
+    this._renderRegionList()
+    return this._showRegionList
+  }
+
+  /** @returns {boolean} */
+  isRegionListVisible() {
+    return this._showRegionList
+  }
+
+  // ── Public: image info panel ────────────────────────────────────────────────
+
+  /**
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} whether the panel is now visible
+   */
+  toggleInfoPanel(on) {
+    this._showInfoPanel = on == null ? !this._showInfoPanel : !!on
+    this._renderInfoPanel()
+    return this._showInfoPanel
+  }
+
+  /** @returns {boolean} */
+  isInfoPanelVisible() {
+    return this._showInfoPanel
+  }
+
+  /**
+   * Everything the info panel says about one side.
+   *
+   * @param {'left'|'right'} which
+   * @returns {ImageSideInfo|null} null when that side has no image
+   */
+  getSideInfo(which) {
+    const side = which === 'left' ? this._left : this._right
+    if (!side) return null
+    return {
+      path: side.path,
+      format: side.ext ?? '',
+      bytes: Number.isFinite(side.bytes) ? side.bytes : null,
+      width: side.img?.naturalWidth ?? 0,
+      height: side.img?.naturalHeight ?? 0,
+      depth: side.depth ?? this._detectDepth(which),
+    }
+  }
+
+  /**
+   * Whether any pixel on one side is translucent.
+   *
+   * Read from the drawn canvas in horizontal strips: a single getImageData over
+   * a large photo allocates the whole RGBA buffer at once. Cached on the side,
+   * because it is only ever asked for when the info panel is open.
+   *
+   * @param {'left'|'right'} which
+   * @returns {'rgba'|'rgb'|'unknown'}
+   */
+  _detectDepth(which) {
+    const side = which === 'left' ? this._left : this._right
+    const canvas = /** @type {HTMLCanvasElement | undefined} */ (
+      which === 'left' ? this._dom.canvasLeft : this._dom.canvasRight)
+    const ctx = which === 'left' ? this._leftCtx : this._rightCtx
+    if (!side || !canvas || !ctx || !(canvas.width > 0) || !(canvas.height > 0)) return 'unknown'
+
+    const STRIP_ROWS = 256
+    try {
+      for (let y = 0; y < canvas.height; y += STRIP_ROWS) {
+        const h = Math.min(STRIP_ROWS, canvas.height - y)
+        const { data } = ctx.getImageData(0, y, canvas.width, h)
+        for (let i = 3; i < data.length; i += 4) {
+          if (data[i] !== 255) { side.depth = 'rgba'; return 'rgba' }
+        }
+      }
+    } catch (err) {
+      // A tainted or unimplemented canvas (jsdom) cannot answer this.
+      console.error('[image-compare] depth detection failed:', err)
+      side.depth = 'unknown'
+      return 'unknown'
+    }
+    side.depth = 'rgb'
+    return 'rgb'
   }
 
   /** @returns {number} 目前選取的差異索引；-1 表示尚未選取 */
@@ -980,6 +1184,8 @@ export class ImageCompare {
     if (total === 0 || target < 0) return navResult(from, -1, total)
     this._currentDiffIdx = target
     this._centreOnRegion(this._diffRegions[target])
+    // Keyboard navigation and the list are two views of one cursor.
+    this._markCurrentRegion()
     return navResult(from, target, total)
   }
 
@@ -1239,8 +1445,9 @@ export class ImageCompare {
   async setLeft(path, base64, ext) {
     const img = await this._loadImage(base64, ext)
     // S14-M06: drop the base64 string after decode — nothing reads it later
-    // and it can double image memory for large files.
-    this._left = { path, ext, img }
+    // and it can double image memory for large files. Its length is the only
+    // record of the file size, so it is measured before being dropped.
+    this._left = { path, ext, img, bytes: base64ByteLength(base64), depth: null }
     this._pendingFirstDiff = true
     this._drawImage('left', img)
     this._updatePathDisplay('left', path, img.naturalWidth, img.naturalHeight)
@@ -1260,7 +1467,7 @@ export class ImageCompare {
   async setRight(path, base64, ext) {
     const img = await this._loadImage(base64, ext)
     // S14-M06: drop base64 after decode.
-    this._right = { path, ext, img }
+    this._right = { path, ext, img, bytes: base64ByteLength(base64), depth: null }
     this._pendingFirstDiff = true
     this._drawImage('right', img)
     this._updatePathDisplay('right', path, img.naturalWidth, img.naturalHeight)
@@ -1437,7 +1644,9 @@ export class ImageCompare {
     // S15-UX: path row first so "開啟圖片…" sits at the same row as other views.
     root.appendChild(this._buildPathRow())
     root.appendChild(this._buildToolbar())
+    root.appendChild(this._buildInfoPanel())
     root.appendChild(this._buildBody())
+    root.appendChild(this._buildRegionList())
     root.appendChild(this._buildStats())
 
     this._container.appendChild(root)
@@ -1635,12 +1844,171 @@ export class ImageCompare {
     // Separator
     toolbar.appendChild(el('span', { className: 'ic-toolbar-sep' }))
 
+    // Layout toggle — the same Side / Over control the other views carry.
+    const btnLayout = el('button', {
+      className: 'ic-btn-refresh ic-btn-layout',
+      title: '切換為上下堆疊',
+      textContent: '⬛ 並排',
+    })
+    this._dom.btnLayout = btnLayout
+    toolbar.appendChild(btnLayout)
+
+    const btnRegions = el('button', {
+      className: 'ic-btn-refresh ic-btn-regions',
+      title: '列出所有差異區塊，點選可跳至該區塊',
+      textContent: '▤ 區塊',
+    })
+    this._dom.btnRegions = btnRegions
+    toolbar.appendChild(btnRegions)
+
+    const btnInfo = el('button', {
+      className: 'ic-btn-refresh ic-btn-info',
+      title: '圖片資訊：尺寸、格式、檔案大小、色彩深度與差異統計',
+      textContent: 'ℹ 資訊',
+    })
+    this._dom.btnInfo = btnInfo
+    toolbar.appendChild(btnInfo)
+
     // Refresh button
     const btnRefresh = el('button', { className: 'ic-btn-refresh', textContent: '↺ 刷新' })
     this._dom.btnRefresh = btnRefresh
     toolbar.appendChild(btnRefresh)
 
     return toolbar
+  }
+
+  /**
+   * The clickable list of difference regions.
+   *
+   * The tile grid is capped at DIFF_TILE_GRID² entries, so the whole list fits
+   * in the DOM without windowing.
+   */
+  _buildRegionList() {
+    const panel = el('div', { className: 'ic-region-panel' })
+    panel.style.display = 'none'
+    const head = el('div', { className: 'ic-region-head' })
+    const count = el('span', { className: 'ic-region-count', textContent: '無差異區塊' })
+    head.appendChild(count)
+    const list = el('div', { className: 'ic-region-list', role: 'listbox' })
+    panel.appendChild(head)
+    panel.appendChild(list)
+    this._dom.regionPanel = panel
+    this._dom.regionCount = count
+    this._dom.regionList = list
+
+    list.addEventListener('click', (e) => {
+      const target = e.target instanceof Element ? e.target.closest('.ic-region-item') : null
+      if (!target) return
+      const idx = Number(target.getAttribute('data-index'))
+      if (Number.isInteger(idx)) this._jumpDiff(idx)
+    })
+    return panel
+  }
+
+  /** Repaint the region list from the current diff. */
+  _renderRegionList() {
+    const panel = /** @type {HTMLElement | undefined} */ (this._dom.regionPanel)
+    const list = /** @type {HTMLElement | undefined} */ (this._dom.regionList)
+    const count = /** @type {HTMLElement | undefined} */ (this._dom.regionCount)
+    if (!panel || !list || !count) return
+
+    panel.style.display = this._showRegionList ? '' : 'none'
+    this._dom.btnRegions?.classList.toggle('ic-btn--active', this._showRegionList)
+    if (!this._showRegionList) return
+
+    const regions = this._diffRegions
+    count.textContent = regions.length
+      ? `${regions.length} 個差異區塊（依左上到右下排序）`
+      : '無差異區塊'
+
+    const frag = document.createDocumentFragment()
+    regions.forEach((r, i) => {
+      const item = el('button', {
+        className: 'ic-region-item',
+        type: 'button',
+        'data-index': String(i),
+        title: `跳至區塊 ${i + 1}`,
+      })
+      item.appendChild(el('span', { className: 'ic-region-idx', textContent: `#${i + 1}` }))
+      item.appendChild(el('span', {
+        className: 'ic-region-pos', textContent: `(${r.x}, ${r.y}) ${r.w}×${r.h}`,
+      }))
+      item.appendChild(el('span', {
+        className: 'ic-region-count-cell', textContent: `${r.count.toLocaleString()} px`,
+      }))
+      frag.appendChild(item)
+    })
+    list.replaceChildren(frag)
+    this._markCurrentRegion()
+  }
+
+  /** Highlight whichever region the navigation cursor is on. */
+  _markCurrentRegion() {
+    const list = /** @type {HTMLElement | undefined} */ (this._dom.regionList)
+    if (!list) return
+    for (const item of list.querySelectorAll('.ic-region-item')) {
+      item.classList.toggle(
+        'ic-region-item--current',
+        Number(item.getAttribute('data-index')) === this._currentDiffIdx)
+    }
+  }
+
+  /** The image info panel shell; contents come from _renderInfoPanel. */
+  _buildInfoPanel() {
+    const panel = el('div', { className: 'ic-info-panel' })
+    panel.style.display = 'none'
+    this._dom.infoPanel = panel
+    return panel
+  }
+
+  /** Repaint the info panel from the loaded images and the last diff. */
+  _renderInfoPanel() {
+    const panel = /** @type {HTMLElement | undefined} */ (this._dom.infoPanel)
+    if (!panel) return
+    panel.style.display = this._showInfoPanel ? '' : 'none'
+    this._dom.btnInfo?.classList.toggle('ic-btn--active', this._showInfoPanel)
+    if (!this._showInfoPanel) return
+
+    panel.replaceChildren()
+    for (const [which, label] of /** @type {Array<['left'|'right', string]>} */ ([
+      ['left', '左側'], ['right', '右側'],
+    ])) {
+      const block = el('div', { className: 'ic-info-side' })
+      block.appendChild(el('div', { className: 'ic-info-title', textContent: label }))
+      const table = el('table', { className: 'ic-info-table' })
+      const tbody = el('tbody')
+      for (const [k, v] of imageInfoRows(this.getSideInfo(which))) {
+        const tr = el('tr')
+        tr.appendChild(el('th', {}, k))
+        tr.appendChild(el('td', {}, v))
+        tbody.appendChild(tr)
+      }
+      table.appendChild(tbody)
+      block.appendChild(table)
+      panel.appendChild(block)
+    }
+
+    const { diffCount, totalPixels, approximate } = this._stats
+    const summary = el('div', { className: 'ic-info-side' })
+    summary.appendChild(el('div', { className: 'ic-info-title', textContent: '差異' }))
+    const table = el('table', { className: 'ic-info-table' })
+    const tbody = el('tbody')
+    const pct = (diffCount != null && totalPixels) ? ((diffCount / totalPixels) * 100).toFixed(2) : null
+    const mark = approximate ? '≈' : ''
+    for (const [k, v] of [
+      ['差異像素', diffCount == null ? '（尚未比對）' : `${mark}${diffCount.toLocaleString()}`],
+      ['差異百分比', pct == null ? '（尚未比對）' : `${mark}${pct}%`],
+      ['差異區塊數', String(this._diffRegions.length)],
+      ['數值來源', approximate ? '大圖縮圖後比對，為估計值' : '全解析度實測'],
+    ]) {
+      const tr = el('tr')
+      tr.appendChild(el('th', {}, k))
+      tr.appendChild(el('td', {}, v))
+      tbody.appendChild(tr)
+    }
+    table.appendChild(tbody)
+    summary.appendChild(table)
+    panel.appendChild(summary)
   }
 
   _buildPathRow() {
@@ -1709,6 +2077,7 @@ export class ImageCompare {
     body.appendChild(right.panel)
     body.appendChild(diff.panel)
 
+    this._dom.body = body
     return body
   }
 
@@ -1780,6 +2149,10 @@ export class ImageCompare {
     btnOpenLeft?.addEventListener('click', () => this.openLeft())
     btnOpenRight?.addEventListener('click', () => this.openRight())
     btnRefresh?.addEventListener('click', () => this.refresh())
+
+    dom.btnLayout?.addEventListener('click', () => this.toggleLayout())
+    dom.btnRegions?.addEventListener('click', () => this.toggleRegionList())
+    dom.btnInfo?.addEventListener('click', () => this.toggleInfoPanel())
 
     thresholdSlider?.addEventListener('input', () => {
       this._threshold = parseFloat(thresholdSlider.value)
@@ -2094,6 +2467,8 @@ export class ImageCompare {
       this._updateStats(null, null)
       this._diffRegions = []
       this._currentDiffIdx = -1
+      this._renderRegionList()
+      this._renderInfoPanel()
       return
     }
     const diffCanvas = /** @type {HTMLCanvasElement | undefined} */ (this._dom.canvasDiff)
@@ -2165,6 +2540,8 @@ export class ImageCompare {
       ? Math.round(diffCount / (geo.scale * geo.scale))
       : diffCount
     this._updateStats(reportedDiffCount, totalPixels, approximate)
+    this._renderRegionList()
+    this._renderInfoPanel()
 
     // 若 overlay 已關閉，隱藏 diff canvas
     this._toggleDiffOverlay()
