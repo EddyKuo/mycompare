@@ -483,9 +483,10 @@
   color: var(--text-secondary);
 }
 
+/* Name · Key · 顯示 · 排除 · 模式 · 容差 · 單位 · 顯示名稱（S27） */
 .tc-col-row {
   display: grid;
-  grid-template-columns: 1fr auto auto 76px 24px;
+  grid-template-columns: minmax(70px, 1fr) auto auto auto auto 76px 24px 100px;
   align-items: center;
   gap: 8px;
   padding: 3px 4px;
@@ -534,6 +535,149 @@
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ── S27: 顯示名稱、欄位對應對話框、Session 設定對話框 ── */
+
+.tc-col-rename,
+.tc-map-name,
+.tc-map-select,
+.tc-session-select,
+.tc-session-custom,
+.tc-session-text,
+.tc-session-textarea {
+  font-size: 12px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.tc-col-rename,
+.tc-map-name,
+.tc-map-select,
+.tc-session-select,
+.tc-session-custom {
+  height: 24px;
+}
+
+.tc-map-box,
+.tc-session-box {
+  min-width: 560px;
+}
+
+.tc-map-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* #、左欄、↔、右欄、顯示名稱、▲、▼、✕ */
+.tc-map-row {
+  grid-template-columns: 40px 1fr 16px 1fr 120px auto auto auto;
+}
+
+.tc-map-arrow {
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.tc-map-select {
+  min-width: 0;
+}
+
+.tc-session-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 6px;
+}
+
+.tc-session-tab.active {
+  background: var(--bg-hover, rgba(127, 127, 127, 0.2));
+  font-weight: 600;
+}
+
+.tc-session-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 140px;
+  overflow-y: auto;
+}
+
+.tc-session-row {
+  display: grid;
+  grid-template-columns: 90px auto auto 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.tc-session-row--tall {
+  align-items: start;
+}
+
+.tc-session-label {
+  color: var(--text-secondary);
+}
+
+.tc-session-note {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.tc-session-custom {
+  width: 60px;
+}
+
+.tc-session-text {
+  grid-column: 2 / -1;
+}
+
+.tc-session-textarea {
+  grid-column: 2 / -1;
+  min-height: 90px;
+  resize: vertical;
+  font-family: inherit;
+}
+
+/* 單側獨有的欄位：畫成斜線底，明確表示「這一側沒有這一欄」，
+   而不是一個看起來與對側相同的空儲存格。 */
+.tc-cell.tc-col-unmatched {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 4px,
+    rgba(127, 127, 127, 0.22) 4px,
+    rgba(127, 127, 127, 0.22) 8px
+  );
+}
+
+.tc-table-header .tc-cell.tc-col-unmatched {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.tc-stat-specs {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.tc-stat-unmatched {
+  color: var(--text-secondary);
+}
+
+.tc-btn-show.active {
+  background: var(--bg-hover, rgba(127, 127, 127, 0.25));
+  font-weight: 600;
 }
 
 /* ── Empty / Loading / Error States ── */

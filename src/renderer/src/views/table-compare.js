@@ -12,6 +12,15 @@
  *   nextDifference()  prevDifference()  firstDifference()  lastDifference()
  *   getKeyColumns()  setKeyColumns()  getColumnRules()  setColumnRule()  setColumnRules()
  *   openColumnSettings()  closeColumnSettings()  resizeColumnsToFit()
+ *   getColumnMapping()  setColumnMapping()  resetColumnMapping()  suggestColumnMapping()
+ *   openColumnMapping()  closeColumnMapping()  applyColumnMappingDraft()
+ *   getColumnDisplayName()  setColumnDisplayName()  setColumnDisplayNames()
+ *   getShowFilter()  setShowFilter('all'|'diff'|'same'|'none')
+ *   recompareFiles()
+ *   openSessionSettings()  closeSessionSettings()
+ *   getDelimiterOverride()  setDelimiterOverride()
+ *   getEncodingOverride()  setEncodingOverride()
+ *   getSessionInfo()  setSessionInfo()
  *
  * 事件：
  *   'paths-changed' → { left: string, right: string }
@@ -295,6 +304,39 @@ function describeDelimiter(d) {
 }
 
 /**
+ * Delimiters offered by Session Settings ▸ Type.
+ *
+ * `char: null` marks the two entries that are not themselves a delimiter:
+ * "auto" defers to detection, "custom" defers to the adjacent text box.
+ *
+ * @type {ReadonlyArray<{ value: string, label: string, char: string|null }>}
+ */
+const DELIMITER_PRESETS = Object.freeze([
+  { value: 'auto', label: '自動偵測', char: null },
+  { value: ',', label: '逗號 (,)', char: ',' },
+  { value: '\t', label: 'Tab', char: '\t' },
+  { value: ';', label: '分號 (;)', char: ';' },
+  { value: '|', label: '直線 (|)', char: '|' },
+  { value: 'custom', label: '自訂字元…', char: null },
+])
+
+/**
+ * Encodings offered by Session Settings ▸ Conversion.
+ *
+ * Mirrors `src/main/encoding.js`'s COMMON_ENCODINGS. It is duplicated rather
+ * than imported because that module is main-process only (it pulls in
+ * `iconv-lite` through `createRequire`), and the renderer must not load it.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+const TABLE_ENCODINGS = Object.freeze([
+  'UTF-8', 'UTF-8-BOM', 'UTF-16LE', 'UTF-16LE-BOM', 'UTF-16BE', 'UTF-16BE-BOM',
+  'Big5', 'GBK', 'GB18030',
+  'Shift_JIS', 'EUC-JP', 'EUC-KR',
+  'windows-1252', 'ISO-8859-1',
+])
+
+/**
  * Normalise a user-supplied column list to unique, ascending, valid indices.
  *
  * @param {unknown} raw
@@ -533,6 +575,199 @@ function reorderRow(row, sourceHeaders, targetHeaders) {
     const idx = map.get(h)
     return idx != null ? (row[idx] ?? '') : ''
   })
+}
+
+// ── S27: arbitrary N:M column mapping ────────────────────────────────────────
+
+/**
+ * One displayed column and the source column it reads from on each side.
+ * @typedef {{ left: number, right: number }} ColumnPair
+ */
+
+/** "This side has no column here." Kept out of band from a real index. */
+const NO_COLUMN = -1
+
+/**
+ * One side of a pair read as a column index.
+ *
+ * `Number()` alone is not enough: null, undefined, '' and false all coerce to
+ * 0, and 0 is a perfectly valid column — so the natural JSON spelling of
+ * "unmapped" would silently pair a display column with source column 0.
+ * Only a real number, or a string that is entirely a number, names a column.
+ *
+ * @param {unknown} value
+ * @returns {number} NO_COLUMN 代表這一側沒有對應欄
+ */
+function columnIndexOf(value) {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 0 ? value : NO_COLUMN
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const n = Number(value)
+    return Number.isInteger(n) && n >= 0 ? n : NO_COLUMN
+  }
+  return NO_COLUMN
+}
+
+/**
+ * Normalise a user- or config-supplied mapping.
+ *
+ * A pair with neither side describes nothing at all; keeping it would add a
+ * permanently blank column that no later edit could give meaning to.
+ *
+ * @param {unknown} raw
+ * @returns {ColumnPair[]|null} null 代表沿用「顯示欄＝來源欄」的預設對應
+ */
+function normaliseColumnMapping(raw) {
+  if (!Array.isArray(raw)) return null
+  /** @type {ColumnPair[]} */
+  const out = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const left = columnIndexOf(/** @type {{ left?: unknown }} */ (item).left)
+    const right = columnIndexOf(/** @type {{ right?: unknown }} */ (item).right)
+    if (left === NO_COLUMN && right === NO_COLUMN) continue
+    out.push({ left, right })
+  }
+  return out.length ? out : null
+}
+
+/**
+ * The plain positional mapping, with the narrower side left unmapped past its
+ * own width rather than padded with columns it does not have.
+ *
+ * @param {number} leftCount
+ * @param {number} rightCount
+ * @returns {ColumnPair[]}
+ */
+function identityColumnMapping(leftCount, rightCount) {
+  /** @type {ColumnPair[]} */
+  const out = []
+  const n = Math.max(leftCount, rightCount)
+  for (let i = 0; i < n; i++) {
+    out.push({
+      left: i < leftCount ? i : NO_COLUMN,
+      right: i < rightCount ? i : NO_COLUMN,
+    })
+  }
+  return out
+}
+
+/**
+ * Header text reduced to the form a name match should compare.
+ * @param {unknown} name
+ * @returns {string}
+ */
+function headerMatchKey(name) {
+  return String(name ?? '').trim().toLowerCase().replace(/[\s_\-.]+/g, '')
+}
+
+/**
+ * Propose a mapping from the two header rows: exact name matches first, then
+ * containment, and finally whatever is left over as a one-sided column.
+ *
+ * Leftovers deliberately become one-sided columns rather than being dropped —
+ * a column that quietly disappears reads as "the files agree here".
+ *
+ * @param {string[]|null|undefined} leftHeaders
+ * @param {string[]|null|undefined} rightHeaders
+ * @param {number} [leftCount]  欄數（資料列可能比標題列寬）
+ * @param {number} [rightCount]
+ * @returns {ColumnPair[]}
+ */
+function suggestColumnMapping(leftHeaders, rightHeaders, leftCount = 0, rightCount = 0) {
+  const lCount = Math.max(leftCount, leftHeaders?.length ?? 0)
+  const rCount = Math.max(rightCount, rightHeaders?.length ?? 0)
+  if (!leftHeaders || !rightHeaders) return identityColumnMapping(lCount, rCount)
+
+  /** @type {string[]} */
+  const lKeys = []
+  /** @type {string[]} */
+  const rKeys = []
+  for (let i = 0; i < lCount; i++) lKeys.push(headerMatchKey(leftHeaders[i]))
+  for (let j = 0; j < rCount; j++) rKeys.push(headerMatchKey(rightHeaders[j]))
+
+  /** @type {Set<number>} */
+  const takenRight = new Set()
+  /** @type {number[]} */
+  const partner = new Array(lCount).fill(NO_COLUMN)
+
+  const claim = (/** @type {(key: string, idx: number) => boolean} */ pred) => {
+    for (let i = 0; i < lCount; i++) {
+      if (partner[i] !== NO_COLUMN || lKeys[i] === '') continue
+      for (let j = 0; j < rCount; j++) {
+        if (takenRight.has(j) || rKeys[j] === '') continue
+        if (!pred(rKeys[j], i)) continue
+        partner[i] = j
+        takenRight.add(j)
+        break
+      }
+    }
+  }
+  claim((key, i) => key === lKeys[i])
+  claim((key, i) => key.includes(lKeys[i]) || lKeys[i].includes(key))
+
+  /** @type {ColumnPair[]} */
+  const out = []
+  for (let i = 0; i < lCount; i++) out.push({ left: i, right: partner[i] })
+  for (let j = 0; j < rCount; j++) {
+    if (!takenRight.has(j)) out.push({ left: NO_COLUMN, right: j })
+  }
+  return out
+}
+
+/**
+ * Read one source row through a column map, producing display-space cells.
+ *
+ * @param {string[]|null|undefined} row
+ * @param {number[]} colMap  顯示欄 → 來源欄，-1 代表該側沒有這一欄
+ * @returns {string[]}
+ */
+function projectRow(row, colMap) {
+  const out = new Array(colMap.length)
+  for (let i = 0; i < colMap.length; i++) {
+    const src = colMap[i]
+    out[i] = src >= 0 ? (row?.[src] ?? '') : ''
+  }
+  return out
+}
+
+/**
+ * Split a mapping into the two per-side lookup arrays the view indexes by
+ * display column.
+ *
+ * @param {ColumnPair[]} mapping
+ * @returns {{ left: number[], right: number[] }}
+ */
+function columnMapSides(mapping) {
+  return {
+    left: mapping.map((p) => p.left),
+    right: mapping.map((p) => p.right),
+  }
+}
+
+/**
+ * Sort rows by the very key the alignment pass will use.
+ *
+ * Decorated rather than compared in place: a hundred-thousand-row sort would
+ * otherwise rebuild each key O(log n) times, and each key build projects a row.
+ *
+ * @param {string[][]} data
+ * @param {number[]|null} colMap
+ * @param {number[]} sortCols  display column indices
+ * @param {ColumnRuleSet} rules
+ * @returns {string[][]}
+ */
+function sortByDisplayKey(data, colMap, sortCols, rules) {
+  const decorated = data.map((row, i) => ({
+    row,
+    i,
+    key: buildRowKey(colMap ? projectRow(row, colMap) : row, sortCols, rules),
+  }))
+  // The index tie-break keeps equal keys in file order; Array#sort is only
+  // guaranteed stable for the comparator's own verdicts, not for ties we ignore.
+  decorated.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.i - b.i))
+  return decorated.map((d) => d.row)
 }
 
 /**
@@ -1159,6 +1394,36 @@ export class TableCompare {
 
     /** @type {number} 「上/下一處編輯」導航目前落在第幾筆；-1 代表尚未開始 */
     this._editNavIdx = -1
+
+    // ── S27: N:M column mapping ───────────────────────────────────────────────
+    /** @type {ColumnPair[]|null} null 代表「顯示欄＝來源欄」 */
+    this._columnMapping = normaliseColumnMapping(options.columnMapping)
+    /** @type {number[]|null} 顯示欄 → 左側來源欄；null 代表 1:1 */
+    this._leftColMap = null
+    /** @type {number[]|null} 顯示欄 → 右側來源欄；null 代表 1:1 */
+    this._rightColMap = null
+    /** @type {{ left: string[]|null, right: string[]|null }} 投影後的標題列 */
+    this._displayHeaders = { left: null, right: null }
+    /** @type {Record<number, string>} 顯示層改名，不影響比對讀到的資料 */
+    this._columnNames = {}
+    /**
+     * 只存在於單側的欄位是否計入差異。
+     * 預設 true：一欄只有一邊有，兩邊在那一欄就是不一樣。
+     * @type {boolean}
+     */
+    this._unmatchedIsDiff = options.unmatchedIsDiff ?? true
+    /** @type {ColumnPair[]|null} 對應對話框的工作副本（按「套用」才落地） */
+    this._mapDraft = null
+
+    // ── S27: session settings (Type / Conversion / Specs) ─────────────────────
+    /** @type {{ left: string|null, right: string|null }} 手動指定的分隔符，null=自動 */
+    this._delimiterOverride = { left: null, right: null }
+    /** @type {{ left: string|null, right: string|null }} 手動指定的編碼，null=自動 */
+    this._encodingOverride = { left: null, right: null }
+    /** @type {{ name: string, description: string }} Specs 分頁的 session 說明 */
+    this._sessionInfo = { name: '', description: '' }
+    /** @type {'type'|'conversion'|'specs'} 對話框上次停留的分頁 */
+    this._sessionTab = 'type'
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -1577,6 +1842,16 @@ export class TableCompare {
     ;[this._leftParsed, this._rightParsed] = [this._rightParsed, this._leftParsed]
     ;[this._leftHeaders, this._rightHeaders] = [this._rightHeaders, this._leftHeaders]
     this._colWidths = { left: this._colWidths.right, right: this._colWidths.left }
+    // S27: the per-side overrides and the column mapping name a side too; a
+    // swap that left them behind would re-parse the moved file with the other
+    // one's delimiter.
+    ;[this._delimiterOverride.left, this._delimiterOverride.right] =
+      [this._delimiterOverride.right, this._delimiterOverride.left]
+    ;[this._encodingOverride.left, this._encodingOverride.right] =
+      [this._encodingOverride.right, this._encodingOverride.left]
+    if (this._columnMapping) {
+      this._columnMapping = this._columnMapping.map((p) => ({ left: p.right, right: p.left }))
+    }
 
     this._updatePathDisplay('left', this._leftPath ?? '（未選擇）')
     this._updatePathDisplay('right', this._rightPath ?? '（未選擇）')
@@ -1619,8 +1894,8 @@ export class TableCompare {
     const parsedRowIdx = this._rowIndexMap[side]?.get(rowRef)
     if (parsedRowIdx == null) return null
 
-    const sourceCol = (side === 'right' && this._rightColMap) ? this._rightColMap[col] : col
-    // Under "ignore column order" a left-hand column may have no counterpart.
+    const sourceCol = this._sourceColFor(side, col)
+    // Under a column mapping a displayed column may have no counterpart here.
     if (sourceCol == null || sourceCol < 0) return null
     return { parsedRowIdx, sourceCol, rowRef }
   }
@@ -1882,15 +2157,30 @@ export class TableCompare {
   }
 
   /**
-   * 顯示欄索引 → 該側檔案中的來源欄索引。忽略欄位排序時右側兩者不同。
+   * 顯示欄索引 → 該側檔案中的來源欄索引。有欄位對應時兩者不同。
    *
    * @param {'left'|'right'} side
    * @param {number} displayCol
    * @returns {number} -1 代表該側沒有對應欄
    */
   _sourceColFor(side, displayCol) {
-    if (side === 'left' || !this._rightColMap) return displayCol
-    return this._rightColMap[displayCol] ?? -1
+    const map = side === 'left' ? this._leftColMap : this._rightColMap
+    if (!map) return displayCol
+    return map[displayCol] ?? NO_COLUMN
+  }
+
+  /**
+   * 這一側在某個顯示欄有沒有來源欄。沒有的欄要畫成「單側獨有」而不是空白，
+   * 否則使用者看到的是一欄相同的空格。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} displayCol
+   * @returns {boolean}
+   */
+  _hasSourceColumn(side, displayCol) {
+    const map = side === 'left' ? this._leftColMap : this._rightColMap
+    if (!map) return true
+    return (map[displayCol] ?? NO_COLUMN) >= 0
   }
 
   /**
@@ -2141,6 +2431,9 @@ export class TableCompare {
     }
 
     const content = serializeTable(parsed, this._delimiter[side])
+    // Write back in the encoding the file was read in. Writing UTF-8
+    // unconditionally turns a Big5 or Shift-JIS table into mojibake, silently.
+    const encoding = this._encodingOverride[side] ?? this._encoding[side] ?? undefined
     let result
     try {
       result = await window.electronAPI.saveFile(
@@ -2148,7 +2441,8 @@ export class TableCompare {
         content,
         [{ name: 'CSV', extensions: ['csv'] },
          { name: 'TSV', extensions: ['tsv'] },
-         { name: '所有檔案', extensions: ['*'] }])
+         { name: '所有檔案', extensions: ['*'] }],
+        encoding)
     } catch (err) {
       this._reportError(`儲存失敗：${err instanceof Error ? err.message : String(err)}`)
       return false
@@ -2400,13 +2694,295 @@ export class TableCompare {
     const leftCols = this._leftColCount ?? (this._leftParsed?.[0]?.length ?? 0)
     const rightCols = this._rightColCount ?? (this._rightParsed?.[0]?.length ?? 0)
 
+    // Display-space headers: the widths are applied to the rendered columns.
     this._colWidths = {
       left: measureColumnWidths(
-        sample.map((r) => r.leftRow), leftCols, this._hasHeader ? this._leftHeaders : null),
+        sample.map((r) => r.leftRow), leftCols,
+        this._hasHeader ? (this._displayHeaders?.left ?? null) : null),
       right: measureColumnWidths(
-        sample.map((r) => r.rightRow), rightCols, this._hasHeader ? this._rightHeaders : null),
+        sample.map((r) => r.rightRow), rightCols,
+        this._hasHeader ? (this._displayHeaders?.right ?? null) : null),
     }
     this._applyColumnWidths()
+    return this
+  }
+
+  // ── S27: N:M column mapping ─────────────────────────────────────────────────
+
+  /**
+   * 目前的欄位對應；null 代表「顯示欄＝來源欄」的預設。
+   * @returns {ColumnPair[]|null}
+   */
+  getColumnMapping() {
+    return this._columnMapping ? this._columnMapping.map((p) => ({ ...p })) : null
+  }
+
+  /**
+   * 設定欄位對應。傳 null 還原為預設 1:1。
+   *
+   * @param {ColumnPair[]|null} mapping
+   * @returns {this}
+   */
+  setColumnMapping(mapping) {
+    this._commitCellEdit()
+    this._columnMapping = normaliseColumnMapping(mapping)
+    // Every per-column setting is keyed by display column, and a new mapping
+    // just renumbered those; an index past the new width names nothing.
+    // Resetting to the default is not "no width": the default is the identity
+    // mapping, whose width is the wider side of the parsed data. Treating it as
+    // unbounded left stale indices alive — a key column past the new width kept
+    // showing in the key field, and a stale rule came back if the mapping was
+    // later widened. Nothing parsed yet has no width to measure against, and
+    // truncating to zero there would discard settings made before load.
+    const n = this._columnMapping
+      ? this._columnMapping.length
+      : this._defaultColumnWidth()
+    this._hiddenColumns = new Set([...this._hiddenColumns].filter((i) => i < n))
+    this._ignoredColumns = new Set([...this._ignoredColumns].filter((i) => i < n))
+    this._keyColumns = this._keyColumns.filter((i) => i < n)
+    for (const key of Object.keys(this._columnRules)) {
+      if (Number(key) >= n) delete this._columnRules[Number(key)]
+    }
+    for (const key of Object.keys(this._columnNames)) {
+      if (Number(key) >= n) delete this._columnNames[Number(key)]
+    }
+    this._selectedCell = null
+    this._colWidths = { left: null, right: null }
+    this._invalidateRules()
+    this._syncKeyInput()
+    this._recompare()
+    return this
+  }
+
+  /**
+   * 沒有欄位對應時的顯示欄數（＝identity mapping 的長度）。
+   * @returns {number} Infinity 代表尚未載入任何資料，無從判斷寬度
+   */
+  _defaultColumnWidth() {
+    if (!this._leftParsed && !this._rightParsed) return Infinity
+    return Math.max(
+      this._leftParsed?.[0]?.length ?? 0,
+      this._rightParsed?.[0]?.length ?? 0,
+    )
+  }
+
+  /** 還原為預設 1:1 對應。 @returns {this} */
+  resetColumnMapping() {
+    return this.setColumnMapping(null)
+  }
+
+  /**
+   * 依兩側標題名稱提出一份建議對應（不會自動套用）。
+   * @returns {ColumnPair[]}
+   */
+  suggestColumnMapping() {
+    const leftHeaders = this._hasHeader ? this._leftHeaders : null
+    const rightHeaders = this._hasHeader ? this._rightHeaders : null
+    return suggestColumnMapping(
+      leftHeaders, rightHeaders,
+      this._leftParsed?.[0]?.length ?? 0,
+      this._rightParsed?.[0]?.length ?? 0,
+    )
+  }
+
+  /** @returns {boolean} 單側獨有的欄位是否計入差異 */
+  isUnmatchedCountedAsDiff() { return this._unmatchedIsDiff }
+
+  /**
+   * @param {boolean} on
+   * @returns {this}
+   */
+  setUnmatchedCountedAsDiff(on) {
+    const next = Boolean(on)
+    if (next === this._unmatchedIsDiff) return this
+    this._unmatchedIsDiff = next
+    this._invalidateRules()
+    this._recompare()
+    return this
+  }
+
+  // ── S27: display-only column renaming ───────────────────────────────────────
+
+  /**
+   * @param {number} index  display column index
+   * @returns {string|null} null 代表沿用檔案裡的欄名
+   */
+  getColumnDisplayName(index) {
+    return this._columnNames[index] ?? null
+  }
+
+  /** @returns {Record<number, string>} */
+  getColumnDisplayNames() { return { ...this._columnNames } }
+
+  /**
+   * 只改標題列顯示的字，不動任何被比對的資料。
+   *
+   * @param {number} index
+   * @param {string|null} name  空字串或 null 還原為原本的欄名
+   * @returns {this}
+   */
+  setColumnDisplayName(index, name) {
+    if (!Number.isInteger(index) || index < 0) return this
+    const text = String(name ?? '').trim()
+    if (text) this._columnNames[index] = text
+    else delete this._columnNames[index]
+    // Display-only: the comparison reads cells, not labels — repaint, don't
+    // re-align.
+    this._renderTable()
+    return this
+  }
+
+  /**
+   * 批次設定顯示名稱（未列出的欄位還原）。
+   * @param {Record<number|string, string>|null} names
+   * @returns {this}
+   */
+  setColumnDisplayNames(names) {
+    this._columnNames = {}
+    for (const key of Object.keys(names ?? {})) {
+      const index = Number(key)
+      const text = String(names?.[key] ?? '').trim()
+      if (Number.isInteger(index) && index >= 0 && text) this._columnNames[index] = text
+    }
+    this._renderTable()
+    return this
+  }
+
+  // ── S27: Recompare Files ────────────────────────────────────────────────────
+
+  /**
+   * BC's Session ▸ Recompare Files.
+   *
+   * Distinct from 「重新整理」, which re-runs the comparison and leaves the undo
+   * history in place: this starts the session's edit history over, so it asks
+   * first when there are unsaved edits that would become unrevertable.
+   *
+   * @returns {boolean} false 代表使用者取消
+   */
+  recompareFiles() {
+    this._commitCellEdit()
+    if (this.hasUnsavedChanges()) {
+      const ok = window.confirm(
+        '重新比對會清除復原歷程，目前未儲存的修改將無法再還原（檔案內容不受影響）。要繼續嗎？')
+      if (!ok) return false
+    }
+    this._clearHistory()
+    this._selectedCell = null
+    this._selectionRange = null
+    this._editNavIdx = -1
+    this._currentDiffIdx = 0
+    this._findMatches = []
+    this._findMatchMap = new Map()
+    this._findCurrentIdx = -1
+    // The virtual scroller skips repaints when the row window is unchanged.
+    this._windowFirst = null
+    this._windowLast = null
+    this._pendingFirstDiff = true
+    this._parseAndRefresh()
+    this._syncEditButtons()
+    this._emit('status', '已重新比對，復原歷程已清除')
+    return true
+  }
+
+  // ── S27: Session Settings（Type / Conversion / Specs）────────────────────────
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {string|null} null 代表自動偵測
+   */
+  getDelimiterOverride(side) { return this._delimiterOverride[side] ?? null }
+
+  /**
+   * 手動指定分隔符，覆寫自動偵測。
+   *
+   * 重新解析會丟掉尚未儲存的儲存格編輯，所以先問過。
+   *
+   * @param {'left'|'right'} side
+   * @param {string|null} ch  單一字元；null 還原為自動偵測
+   * @returns {boolean} false 代表未套用
+   */
+  setDelimiterOverride(side, ch) {
+    const next = (typeof ch === 'string' && ch.length === 1) ? ch : null
+    if (next === (this._delimiterOverride[side] ?? null)) return true
+    if (this._modified[side]) {
+      const sideName = side === 'left' ? '左側' : '右側'
+      if (!window.confirm(
+        `更改分隔符會重新解析${sideName}，未儲存的儲存格修改會遺失。要繼續嗎？`)) return false
+    }
+    this._delimiterOverride[side] = next
+    this._commitCellEdit()
+    this._clearHistory()
+    this._parseAndRefresh()
+    this._syncEditButtons()
+    return true
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {string|null} null 代表自動偵測
+   */
+  getEncodingOverride(side) { return this._encodingOverride[side] ?? null }
+
+  /**
+   * 手動指定編碼，覆寫自動偵測；檔案會以該編碼重讀，之後存檔也用同一個編碼寫回。
+   *
+   * @param {'left'|'right'} side
+   * @param {string|null} encoding  null 還原為自動偵測
+   * @returns {Promise<boolean>} false 代表未套用
+   */
+  async setEncodingOverride(side, encoding) {
+    const sideName = side === 'left' ? '左側' : '右側'
+    const next = encoding ? String(encoding) : null
+    // Independent of whether an encoding was asked for: "還原為自動偵測" on an
+    // Excel/HTML side used to fall through and re-read the raw .xlsx bytes as
+    // text, then record chardet's guess as that side's detected encoding.
+    if (this._sourceKind[side] !== 'text') {
+      this._reportError(`${sideName}是 Excel / HTML 來源，沒有文字編碼可以指定或還原`)
+      return false
+    }
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    if (!path) {
+      this._reportError(`${sideName}沒有檔案路徑，無法以指定編碼重讀`)
+      return false
+    }
+    if (this._modified[side]) {
+      if (!window.confirm(
+        `更改編碼會重新讀取${sideName}，未儲存的儲存格修改會遺失。要繼續嗎？`)) return false
+    }
+
+    let result
+    try {
+      result = await window.electronAPI.readFile(path, next ?? undefined)
+    } catch (err) {
+      this._reportError(
+        `以 ${next ?? '自動'} 重讀${sideName}失敗：${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+    if (!result || typeof result.content !== 'string') {
+      this._reportError(`以 ${next ?? '自動'} 重讀${sideName}失敗：讀不到檔案內容`)
+      return false
+    }
+
+    this._encodingOverride[side] = next
+    // The decoder's verdict, not the request: asking for "auto" has to end up
+    // recording what it actually decided, because saving writes that back.
+    this.setEncoding(side, result.encoding ?? null)
+    await this._acceptFileInto(side, result.path ?? path, result.content)
+    return true
+  }
+
+  /** @returns {{ name: string, description: string }} */
+  getSessionInfo() { return { ...this._sessionInfo } }
+
+  /**
+   * Specs 分頁的 session 名稱與說明（只做紀錄，不影響比對）。
+   * @param {{ name?: string, description?: string }} info
+   * @returns {this}
+   */
+  setSessionInfo(info) {
+    if (typeof info?.name === 'string') this._sessionInfo.name = info.name
+    if (typeof info?.description === 'string') this._sessionInfo.description = info.description
+    this._renderStats()
     return this
   }
 
@@ -2421,7 +2997,17 @@ export class TableCompare {
     // Memoised: the per-row diff pass asks for this once per row, and a large
     // table would otherwise rebuild the same object a hundred thousand times.
     if (!this._rulesCache) {
-      this._rulesCache = mergeIgnoredColumns(this._columnRules, this._ignoredColumns)
+      const merged = mergeIgnoredColumns(this._columnRules, this._ignoredColumns)
+      if (!this._unmatchedIsDiff && this._leftColMap && this._rightColMap) {
+        // With this off, a column only one side has says nothing about whether
+        // the rows agree, so it must not turn every row red.
+        for (let i = 0; i < this._leftColMap.length; i++) {
+          if (this._leftColMap[i] < 0 || this._rightColMap[i] < 0) {
+            merged[i] = { mode: 'ignore', tolerance: 0 }
+          }
+        }
+      }
+      this._rulesCache = merged
     }
     return this._rulesCache
   }
@@ -2496,6 +3082,48 @@ export class TableCompare {
     this._invalidateRules()
     this._recompare()
     return this
+  }
+
+  // ── S27: Show All / Diff / Same / None ──────────────────────────────────────
+
+  /**
+   * 目前的顯示篩選，與 text / folder 視圖的四態同語意。
+   * @returns {'all'|'diff'|'same'|'none'}
+   */
+  getShowFilter() {
+    if (this._showSame && this._showDiff) return 'all'
+    if (this._showDiff) return 'diff'
+    if (this._showSame) return 'same'
+    return 'none'
+  }
+
+  /**
+   * @param {'all'|'diff'|'same'|'none'} mode
+   * @returns {'all'|'diff'|'same'|'none'} 實際套用的模式
+   */
+  setShowFilter(mode) {
+    switch (mode) {
+      case 'diff': this._showSame = false; this._showDiff = true; break
+      case 'same': this._showSame = true; this._showDiff = false; break
+      case 'none': this._showSame = false; this._showDiff = false; break
+      default: this._showSame = true; this._showDiff = true; break
+    }
+    this._syncShowFilterUi()
+    this._renderTable()
+    return this.getShowFilter()
+  }
+
+  /** Reflect the filter onto the four buttons and the two legacy checkboxes. */
+  _syncShowFilterUi() {
+    const mode = this.getShowFilter()
+    for (const [key, value] of /** @type {const} */ ([
+      ['btnShowAll', 'all'], ['btnShowDiff', 'diff'],
+      ['btnShowSame', 'same'], ['btnShowNone', 'none'],
+    ])) {
+      this._dom[key]?.classList.toggle('active', mode === value)
+    }
+    if (this._dom.cbSame) this._dom.cbSame.checked = this._showSame
+    if (this._dom.cbDiffOnly) this._dom.cbDiffOnly.checked = mode === 'diff'
   }
 
   // ── P2-41: whitespace, panels, cell selection ───────────────────────────────
@@ -3077,9 +3705,9 @@ export class TableCompare {
       return
     }
 
-    const header = this._hasHeader
-      ? ((sel.side === 'left' ? this._leftHeaders : this._rightHeaders)?.[sel.col] ?? '')
-      : ''
+    const header = this._columnNames[sel.col] ?? (this._hasHeader
+      ? ((sel.side === 'left' ? this._displayHeaders?.left : this._displayHeaders?.right)?.[sel.col] ?? '')
+      : '')
     const leftVal = row.leftRow?.[sel.col] ?? null
     const rightVal = row.rightRow?.[sel.col] ?? null
 
@@ -3457,12 +4085,17 @@ export class TableCompare {
       'right-only':'#ffebe6',
     }
 
-    const leftHeaders  = this._hasHeader ? (this._leftHeaders  ?? []) : null
-    const rightHeaders = this._hasHeader ? (this._rightHeaders ?? []) : null
+    // The report must show what the panes show, mapping and renames included.
+    const nameOf = (/** @type {string[]|null} */ hs, /** @type {number} */ i) =>
+      this._columnNames[i] ?? (hs?.[i] ?? '')
+    const leftHeaders  = this._hasHeader
+      ? (this._displayHeaders?.left ?? []).map((_, i, hs) => nameOf(hs, i)) : null
+    const rightHeaders = this._hasHeader
+      ? (this._displayHeaders?.right ?? []).map((_, i, hs) => nameOf(hs, i)) : null
 
     const leftColCount  = this._leftParsed  ? (this._leftParsed[0]?.length  ?? 0) : 0
     const rightColCount = this._rightParsed ? (this._rightParsed[0]?.length ?? 0) : 0
-    const colCount = Math.max(leftColCount, rightColCount)
+    const colCount = this._leftColMap?.length ?? Math.max(leftColCount, rightColCount)
 
     /**
      * Build an HTML <tr> string for one side.
@@ -3579,9 +4212,12 @@ export class TableCompare {
 
     const leftColCount  = this._leftParsed  ? (this._leftParsed[0]?.length  ?? 0) : 0
     const rightColCount = this._rightParsed ? (this._rightParsed[0]?.length ?? 0) : 0
-    const colCount = Math.max(leftColCount, rightColCount)
+    // Display space: a mapping renumbers the columns the diffs are keyed by.
+    const colCount = this._leftColMap?.length ?? Math.max(leftColCount, rightColCount)
 
-    const headers = this._hasHeader ? (this._leftHeaders ?? []) : null
+    const headers = this._hasHeader
+      ? (this._displayHeaders?.left ?? this._leftHeaders ?? [])
+      : null
 
     for (const row of this._alignedRows) {
       switch (row.status) {
@@ -3595,7 +4231,8 @@ export class TableCompare {
         const diffs = this._cellDiffsFor(row, colCount)
         for (let i = 0; i < diffs.length; i++) {
           if (!diffs[i]) continue
-          const colName = (headers && headers[i] != null) ? headers[i] : `col${i}`
+          const colName = this._columnNames[i]
+            ?? ((headers && headers[i] != null && headers[i] !== '') ? headers[i] : `col${i}`)
           columnDiffCounts[colName] = (columnDiffCounts[colName] ?? 0) + 1
         }
       }
@@ -3635,6 +4272,16 @@ export class TableCompare {
       showThumbnail: this._showThumbnail,
       showRowNumbers: this._showRowNumbers,
       fontSize: this._fontSize,
+      // S27
+      columnMapping: this.getColumnMapping(),
+      columnNames: this.getColumnDisplayNames(),
+      unmatchedIsDiff: this._unmatchedIsDiff,
+      showFilter: this.getShowFilter(),
+      delimiterOverride: { ...this._delimiterOverride },
+      // Only the override travels; the detected encoding belongs to the file
+      // that happens to be open, not to the saved settings.
+      encodingOverride: { ...this._encodingOverride },
+      sessionInfo: this.getSessionInfo(),
     })
   }
 
@@ -3647,6 +4294,43 @@ export class TableCompare {
     if (typeof settings.hasHeader === 'boolean') this._hasHeader = settings.hasHeader
     if (typeof settings.ignoreColumnOrder === 'boolean') {
       this._ignoreColumnOrder = settings.ignoreColumnOrder
+    }
+    // S27: the mapping renumbers display columns, so it must land before the
+    // settings that are keyed by display column (key columns, rules, names).
+    if (settings.columnMapping !== undefined) {
+      this._columnMapping = normaliseColumnMapping(settings.columnMapping)
+    }
+    if (typeof settings.unmatchedIsDiff === 'boolean') {
+      this._unmatchedIsDiff = settings.unmatchedIsDiff
+      this._invalidateRules()
+    }
+    if (settings.columnNames !== undefined) {
+      this._columnNames = {}
+      for (const key of Object.keys(settings.columnNames ?? {})) {
+        const index = Number(key)
+        const text = String(settings.columnNames[key] ?? '').trim()
+        if (Number.isInteger(index) && index >= 0 && text) this._columnNames[index] = text
+      }
+    }
+    if (settings.delimiterOverride && typeof settings.delimiterOverride === 'object') {
+      for (const side of /** @type {const} */ (['left', 'right'])) {
+        const ch = settings.delimiterOverride[side]
+        this._delimiterOverride[side] = (typeof ch === 'string' && ch.length === 1) ? ch : null
+      }
+    }
+    if (settings.encodingOverride && typeof settings.encodingOverride === 'object') {
+      for (const side of /** @type {const} */ (['left', 'right'])) {
+        const enc = settings.encodingOverride[side]
+        this._encodingOverride[side] = typeof enc === 'string' && enc ? enc : null
+      }
+    }
+    if (settings.sessionInfo && typeof settings.sessionInfo === 'object') {
+      this.setSessionInfo(settings.sessionInfo)
+    }
+    if (settings.showFilter !== undefined) {
+      const mode = settings.showFilter
+      this._showSame = mode === 'all' || mode === 'same'
+      this._showDiff = mode === 'all' || mode === 'diff'
     }
     if (settings.keyColumns !== undefined) this.setKeyColumns(settings.keyColumns)
     if (settings.columnRules && typeof settings.columnRules === 'object') {
@@ -3694,6 +4378,7 @@ export class TableCompare {
     if (cbHeader) cbHeader.checked = this._hasHeader
     const cbColOrder = this._dom.cbColOrder
     if (cbColOrder) cbColOrder.checked = this._ignoreColumnOrder
+    this._syncShowFilterUi()
   }
 
   /**
@@ -3824,6 +4509,19 @@ export class TableCompare {
       if (e.target === colPanel) this.closeColumnSettings()
     })
     root.appendChild(colPanel)
+
+    // S27: column mapping and session settings overlays. Same lifecycle as the
+    // column panel — built on open, because both depend on the loaded files.
+    for (const [key, className, close] of /** @type {const} */ ([
+      ['mapPanel', 'tc-col-panel tc-map-panel', () => this.closeColumnMapping()],
+      ['sessionPanel', 'tc-col-panel tc-session-panel', () => this.closeSessionSettings()],
+    ])) {
+      const panel = el('div', { className })
+      panel.style.display = 'none'
+      panel.addEventListener('click', (e) => { if (e.target === panel) close() })
+      this._dom[key] = panel
+      root.appendChild(panel)
+    }
 
     this._container.appendChild(root)
     this._dom.root = root
@@ -3977,6 +4675,18 @@ export class TableCompare {
     this._dom.btnColumns = btnColumns
     toolbar.appendChild(btnColumns)
 
+    // S27: arbitrary N:M column mapping and the multi-tab session settings
+    const btnColMap = el('button',
+      { id: 'tc-btn-colmap', className: 'tc-btn', title: '設定左右欄位的任意對應關係' }, '⇄ 欄位對應…')
+    this._dom.btnColMap = btnColMap
+    toolbar.appendChild(btnColMap)
+
+    const btnSession = el('button',
+      { id: 'tc-btn-session-settings', className: 'tc-btn', title: 'Session 設定（分隔符 / 編碼 / 說明）' },
+      '🛠 Session 設定…')
+    this._dom.btnSessionSettings = btnSession
+    toolbar.appendChild(btnSession)
+
     const btnFit = el('button', { id: 'tc-btn-fit', className: 'tc-btn' }, '↔ 自動欄寬')
     btnFit.title = '依內容調整欄寬（再按一次還原）'
     this._dom.btnFit = btnFit
@@ -4025,6 +4735,19 @@ export class TableCompare {
 
     // Separator
     toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
+
+    // S27: the four-state Show filter every other view has. The two checkboxes
+    // below stay as the pre-existing entry points and are kept in sync.
+    for (const [key, id, label, title] of /** @type {const} */ ([
+      ['btnShowAll', 'tc-btn-show-all', '全部', '顯示所有列'],
+      ['btnShowDiff', 'tc-btn-show-diff', '差異', '只顯示有差異的列'],
+      ['btnShowSame', 'tc-btn-show-same', '相同', '只顯示相同的列'],
+      ['btnShowNone', 'tc-btn-show-none', '無', '隱藏所有列'],
+    ])) {
+      const btn = el('button', { id, className: 'tc-btn tc-btn-show', title }, label)
+      this._dom[key] = btn
+      toolbar.appendChild(btn)
+    }
 
     // Show same rows
     const cbSame = this._buildCheckbox('tc-show-same', '顯示相同行', this._showSame)
@@ -4144,6 +4867,13 @@ export class TableCompare {
     const btnRefresh = el('button', { className: 'tc-btn tc-btn-refresh' }, '↺ 重新整理')
     this._dom.btnRefresh = btnRefresh
     toolbar.appendChild(btnRefresh)
+
+    // S27: BC's Recompare Files — re-runs the comparison *and* starts the edit
+    // history over, which 「重新整理」 deliberately does not.
+    const btnRecompare = el('button',
+      { id: 'tc-btn-recompare', className: 'tc-btn', title: '重新比對並清除復原歷程' }, '⟲ 重新比對')
+    this._dom.btnRecompare = btnRecompare
+    toolbar.appendChild(btnRecompare)
 
     // T14: Export HTML button
     const btnExport = el('button', { id: 'tc-btn-export', className: 'tc-btn' }, '⬇ 匯出 HTML')
@@ -4265,8 +4995,9 @@ export class TableCompare {
     if (this._dom.keyInput) this._dom.keyInput.value = this._keyColumnsText()
   }
 
-  /** @returns {number} 兩側欄數的最大值 */
+  /** @returns {number} 顯示欄數：有欄位對應時為對應表長度，否則兩側欄數的最大值 */
   _totalColumnCount() {
+    if (this._leftColMap) return this._leftColMap.length
     return Math.max(
       this._leftParsed?.[0]?.length ?? 0,
       this._rightParsed?.[0]?.length ?? 0,
@@ -4285,7 +5016,9 @@ export class TableCompare {
     box.appendChild(el('h3', { className: 'tc-col-panel-title' }, '欄位設定'))
 
     const colCount = this._totalColumnCount()
-    const headers = this._hasHeader ? (this._leftHeaders ?? this._rightHeaders) : null
+    const headers = this._hasHeader
+      ? (this._displayHeaders?.left ?? this._displayHeaders?.right ?? null)
+      : null
 
     const list = el('div', { className: 'tc-col-panel-list' })
     if (colCount === 0) {
@@ -4396,7 +5129,376 @@ export class TableCompare {
       this.setKeyColumns(next)
     })
 
+    // S27: display-only rename. Left last so the row still reads
+    // "which column · how it compares", with the label as an aside.
+    const nameInput = el('input', {
+      type: 'text', className: 'tc-col-rename',
+      value: this._columnNames[index] ?? '',
+      placeholder: '顯示名稱',
+    })
+    nameInput.title = '只改標題列顯示的字，不影響比對讀到的資料'
+    nameInput.addEventListener('change', () => this.setColumnDisplayName(index, nameInput.value))
+    row.appendChild(nameInput)
+
     return row
+  }
+
+  // ── S27: column mapping dialog ──────────────────────────────────────────────
+
+  /**
+   * @typedef {{ left: number, right: number, name: string }} ColumnPairDraft
+   */
+
+  /**
+   * 開啟欄位對應對話框。編輯的是工作副本，按「套用」才會改變比對結果。
+   * @returns {this}
+   */
+  openColumnMapping() {
+    if (!this._dom.mapPanel) return this
+    const current = this.getColumnMapping()
+      ?? identityColumnMapping(
+        this._leftParsed?.[0]?.length ?? 0,
+        this._rightParsed?.[0]?.length ?? 0)
+    // The name rides on the pair rather than on the display index so that
+    // moving or deleting a column carries its label with it.
+    this._mapDraft = current.map((p, i) => ({
+      left: p.left, right: p.right, name: this._columnNames[i] ?? '',
+    }))
+    this._buildColumnMapPanel()
+    this._dom.mapPanel.style.display = 'flex'
+    return this
+  }
+
+  /** @returns {this} */
+  closeColumnMapping() {
+    if (this._dom.mapPanel) this._dom.mapPanel.style.display = 'none'
+    this._mapDraft = null
+    return this
+  }
+
+  /**
+   * 套用對話框中的對應與顯示名稱。
+   * @returns {this}
+   */
+  applyColumnMappingDraft() {
+    const draft = /** @type {ColumnPairDraft[]} */ (this._mapDraft ?? [])
+    /** @type {Record<number, string>} */
+    const names = {}
+    draft.forEach((p, i) => { if (p.name) names[i] = p.name })
+    this.setColumnMapping(draft.map((p) => ({ left: p.left, right: p.right })))
+    this.setColumnDisplayNames(names)
+    this.closeColumnMapping()
+    return this
+  }
+
+  /** 產生欄位對應對話框的內容。每次變更都重建，欄數不大且狀態只有一份。 */
+  _buildColumnMapPanel() {
+    const panel = this._dom.mapPanel
+    if (!panel) return
+    panel.innerHTML = ''
+
+    const draft = /** @type {ColumnPairDraft[]} */ (this._mapDraft ?? [])
+    const leftCount = this._leftParsed?.[0]?.length ?? 0
+    const rightCount = this._rightParsed?.[0]?.length ?? 0
+    const leftHeaders = this._hasHeader ? this._leftHeaders : null
+    const rightHeaders = this._hasHeader ? this._rightHeaders : null
+
+    const box = el('div', { className: 'tc-col-panel-box tc-map-box' })
+    box.appendChild(el('h3', { className: 'tc-col-panel-title' }, '欄位對應'))
+    box.appendChild(el('p', { className: 'tc-map-hint' },
+      '左右欄位可任意對應。設為「（無）」的一側代表這一欄只有另一側有，'
+      + '會以單側獨有的樣式顯示，而不是靜靜消失。'))
+
+    const list = el('div', { className: 'tc-col-panel-list tc-map-list' })
+    if (draft.length === 0) {
+      list.appendChild(el('div', { className: 'tc-col-panel-empty' }, '尚未載入資料'))
+    }
+
+    /**
+     * @param {'left'|'right'} side
+     * @param {number} value
+     * @param {number} count
+     * @param {string[]|null} headers
+     * @param {number} rowIdx
+     * @returns {HTMLSelectElement}
+     */
+    const buildSideSelect = (side, value, count, headers, rowIdx) => {
+      const sel = el('select', { className: `tc-map-select tc-map-${side}` })
+      const none = el('option', { value: String(NO_COLUMN) }, '（無）')
+      sel.appendChild(none)
+      for (let c = 0; c < count; c++) {
+        const label = headers?.[c] ? `${c} · ${headers[c]}` : `第 ${c} 欄`
+        sel.appendChild(el('option', { value: String(c) }, label))
+      }
+      sel.value = String(value >= 0 && value < count ? value : NO_COLUMN)
+      sel.addEventListener('change', () => {
+        const next = Number(sel.value)
+        const pair = draft[rowIdx]
+        const other = side === 'left' ? pair.right : pair.left
+        if (next < 0 && other < 0) {
+          // Both sides "none" would be a column that reads from nothing.
+          this._reportError('左右不能同時設為「（無）」；請改用「移除」')
+          this._buildColumnMapPanel()
+          return
+        }
+        if (side === 'left') pair.left = next
+        else pair.right = next
+        this._buildColumnMapPanel()
+      })
+      return sel
+    }
+
+    draft.forEach((pair, i) => {
+      const row = el('div', { className: 'tc-col-row tc-map-row' })
+      row.appendChild(el('span', { className: 'tc-col-name' }, `#${i}`))
+      row.appendChild(buildSideSelect('left', pair.left, leftCount, leftHeaders, i))
+      row.appendChild(el('span', { className: 'tc-map-arrow' }, '↔'))
+      row.appendChild(buildSideSelect('right', pair.right, rightCount, rightHeaders, i))
+
+      const nameInput = el('input', {
+        type: 'text', className: 'tc-map-name', value: pair.name,
+        placeholder: '顯示名稱（可留空）',
+      })
+      nameInput.addEventListener('input', () => { pair.name = nameInput.value })
+      row.appendChild(nameInput)
+
+      const move = (/** @type {number} */ delta) => {
+        const to = i + delta
+        if (to < 0 || to >= draft.length) return
+        const [moved] = draft.splice(i, 1)
+        draft.splice(to, 0, moved)
+        this._buildColumnMapPanel()
+      }
+      const btnUp = el('button', { className: 'tc-btn tc-map-move', title: '上移' }, '▲')
+      const btnDown = el('button', { className: 'tc-btn tc-map-move', title: '下移' }, '▼')
+      const btnDel = el('button', { className: 'tc-btn tc-map-del', title: '移除這個顯示欄' }, '✕')
+      btnUp.disabled = i === 0
+      btnDown.disabled = i === draft.length - 1
+      btnUp.addEventListener('click', () => move(-1))
+      btnDown.addEventListener('click', () => move(1))
+      btnDel.addEventListener('click', () => {
+        draft.splice(i, 1)
+        this._buildColumnMapPanel()
+      })
+      row.appendChild(btnUp)
+      row.appendChild(btnDown)
+      row.appendChild(btnDel)
+      list.appendChild(row)
+    })
+    box.appendChild(list)
+
+    const cbUnmatched = this._buildCheckbox(
+      'tc-map-unmatched', '單側獨有的欄位計入差異', this._unmatchedIsDiff)
+    const cbUnmatchedInput = /** @type {HTMLInputElement|null} */ (cbUnmatched.querySelector('input'))
+    cbUnmatched.title = '關閉後，只有一側有的欄位會被當成「忽略」，不會讓整張表都變成差異'
+    cbUnmatchedInput?.addEventListener('change', () => {
+      this.setUnmatchedCountedAsDiff(cbUnmatchedInput.checked)
+    })
+    box.appendChild(cbUnmatched)
+
+    const footer = el('div', { className: 'tc-col-panel-footer' })
+
+    const btnAdd = el('button', { id: 'tc-map-add', className: 'tc-btn' }, '＋ 新增欄')
+    btnAdd.addEventListener('click', () => {
+      draft.push({ left: leftCount ? 0 : NO_COLUMN, right: rightCount ? 0 : NO_COLUMN, name: '' })
+      this._buildColumnMapPanel()
+    })
+
+    const btnSuggest = el('button',
+      { id: 'tc-map-suggest', className: 'tc-btn', title: '依標題名稱比對出一份建議' }, '✨ 自動建議')
+    btnSuggest.addEventListener('click', () => {
+      this._mapDraft = this.suggestColumnMapping().map((p) => ({ ...p, name: '' }))
+      this._buildColumnMapPanel()
+    })
+
+    const btnReset = el('button', { id: 'tc-map-reset', className: 'tc-btn' }, '↺ 重設為 1:1')
+    btnReset.addEventListener('click', () => {
+      this._mapDraft = identityColumnMapping(leftCount, rightCount)
+        .map((p) => ({ ...p, name: '' }))
+      this._buildColumnMapPanel()
+    })
+
+    const btnApply = el('button', { id: 'tc-map-apply', className: 'tc-btn' }, '套用')
+    btnApply.addEventListener('click', () => this.applyColumnMappingDraft())
+
+    const btnClose = el('button', { id: 'tc-map-close', className: 'tc-btn' }, '關閉')
+    btnClose.addEventListener('click', () => this.closeColumnMapping())
+
+    for (const b of [btnAdd, btnSuggest, btnReset, btnApply, btnClose]) footer.appendChild(b)
+    box.appendChild(footer)
+    panel.appendChild(box)
+  }
+
+  // ── S27: Session Settings dialog（Type / Conversion / Specs）─────────────────
+
+  /**
+   * @param {'type'|'conversion'|'specs'} [tab]
+   * @returns {this}
+   */
+  openSessionSettings(tab = 'type') {
+    if (!this._dom.sessionPanel) return this
+    this._sessionTab = tab
+    this._buildSessionPanel()
+    this._dom.sessionPanel.style.display = 'flex'
+    return this
+  }
+
+  /** @returns {this} */
+  closeSessionSettings() {
+    if (this._dom.sessionPanel) this._dom.sessionPanel.style.display = 'none'
+    return this
+  }
+
+  /** 產生 Session 設定對話框（分頁式）。 */
+  _buildSessionPanel() {
+    const panel = this._dom.sessionPanel
+    if (!panel) return
+    panel.innerHTML = ''
+
+    const active = this._sessionTab ?? 'type'
+    const box = el('div', { className: 'tc-col-panel-box tc-session-box' })
+    box.appendChild(el('h3', { className: 'tc-col-panel-title' }, 'Session 設定'))
+
+    const tabs = el('div', { className: 'tc-session-tabs' })
+    for (const [key, label] of /** @type {const} */ ([
+      ['type', 'Type（格式）'],
+      ['conversion', 'Conversion（編碼）'],
+      ['specs', 'Specs（說明）'],
+    ])) {
+      const btn = el('button',
+        { id: `tc-session-tab-${key}`, className: `tc-btn tc-session-tab${active === key ? ' active' : ''}` },
+        label)
+      btn.addEventListener('click', () => {
+        this._sessionTab = key
+        this._buildSessionPanel()
+      })
+      tabs.appendChild(btn)
+    }
+    box.appendChild(tabs)
+
+    const body = el('div', { className: 'tc-session-body' })
+    if (active === 'type') this._buildSessionTypeTab(body)
+    else if (active === 'conversion') this._buildSessionConversionTab(body)
+    else this._buildSessionSpecsTab(body)
+    box.appendChild(body)
+
+    const footer = el('div', { className: 'tc-col-panel-footer' })
+    const btnClose = el('button', { id: 'tc-session-close', className: 'tc-btn' }, '關閉')
+    btnClose.addEventListener('click', () => this.closeSessionSettings())
+    footer.appendChild(btnClose)
+    box.appendChild(footer)
+
+    panel.appendChild(box)
+  }
+
+  /**
+   * Type：手動指定分隔符，覆寫「看第一行有沒有 Tab」的自動偵測。
+   * @param {HTMLElement} body
+   */
+  _buildSessionTypeTab(body) {
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const label = side === 'left' ? '左側' : '右側'
+      const row = el('div', { className: 'tc-session-row' })
+      row.appendChild(el('span', { className: 'tc-session-label' }, `${label}分隔符`))
+
+      const current = this._delimiterOverride[side]
+      const preset = DELIMITER_PRESETS.find((p) => p.char === current)
+      const sel = el('select', { id: `tc-session-delim-${side}`, className: 'tc-session-select' })
+      for (const p of DELIMITER_PRESETS) {
+        sel.appendChild(el('option', { value: p.value }, p.label))
+      }
+      sel.value = current == null ? 'auto' : (preset?.value ?? 'custom')
+
+      const custom = el('input', {
+        type: 'text', id: `tc-session-delim-custom-${side}`, className: 'tc-session-custom',
+        maxLength: 1, value: (current != null && !preset) ? current : '',
+        placeholder: '單一字元',
+      })
+      custom.style.display = sel.value === 'custom' ? '' : 'none'
+
+      const applyDelimiter = () => {
+        if (sel.value === 'auto') { this.setDelimiterOverride(side, null); return }
+        if (sel.value === 'custom') {
+          if (custom.value.length !== 1) return
+          this.setDelimiterOverride(side, custom.value)
+          return
+        }
+        this.setDelimiterOverride(side, DELIMITER_PRESETS.find((p) => p.value === sel.value)?.char ?? null)
+      }
+      sel.addEventListener('change', () => {
+        custom.style.display = sel.value === 'custom' ? '' : 'none'
+        applyDelimiter()
+      })
+      custom.addEventListener('change', applyDelimiter)
+
+      row.appendChild(sel)
+      row.appendChild(custom)
+      row.appendChild(el('span', { className: 'tc-session-note' },
+        `目前實際使用：${describeDelimiter(this._delimiter[side])}`))
+      body.appendChild(row)
+    }
+    body.appendChild(el('p', { className: 'tc-map-hint' },
+      '更改分隔符會重新解析該側的內容；未儲存的儲存格修改會先詢問。'))
+  }
+
+  /**
+   * Conversion：手動指定編碼，並以該編碼重讀檔案。
+   * @param {HTMLElement} body
+   */
+  _buildSessionConversionTab(body) {
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const label = side === 'left' ? '左側' : '右側'
+      const row = el('div', { className: 'tc-session-row' })
+      row.appendChild(el('span', { className: 'tc-session-label' }, `${label}編碼`))
+
+      const sel = el('select', { id: `tc-session-enc-${side}`, className: 'tc-session-select' })
+      sel.appendChild(el('option', { value: '' }, '自動偵測'))
+      for (const enc of TABLE_ENCODINGS) sel.appendChild(el('option', { value: enc }, enc))
+      sel.value = this._encodingOverride[side] ?? ''
+      sel.addEventListener('change', () => {
+        void this.setEncodingOverride(side, sel.value || null).then((ok) => {
+          // A rejected change must not leave the control claiming it applied.
+          if (!ok) sel.value = this._encodingOverride[side] ?? ''
+          this._buildSessionPanel()
+        })
+      })
+      row.appendChild(sel)
+      row.appendChild(el('span', { className: 'tc-session-note' },
+        `目前解碼結果：${this._encoding[side] ?? '（未知）'}`))
+      body.appendChild(row)
+    }
+    body.appendChild(el('p', { className: 'tc-map-hint' },
+      '存檔會以同一個編碼寫回，不會把非 UTF-8 的檔案改寫成 UTF-8。'))
+  }
+
+  /**
+   * Specs：session 的名稱與說明。只做紀錄，不影響比對。
+   * @param {HTMLElement} body
+   */
+  _buildSessionSpecsTab(body) {
+    const nameRow = el('div', { className: 'tc-session-row' })
+    nameRow.appendChild(el('span', { className: 'tc-session-label' }, '名稱'))
+    const nameInput = el('input', {
+      type: 'text', id: 'tc-session-name', className: 'tc-session-text',
+      value: this._sessionInfo.name, placeholder: '這個比對的名稱',
+    })
+    nameInput.addEventListener('input', () => this.setSessionInfo({ name: nameInput.value }))
+    nameRow.appendChild(nameInput)
+    body.appendChild(nameRow)
+
+    const descRow = el('div', { className: 'tc-session-row tc-session-row--tall' })
+    descRow.appendChild(el('span', { className: 'tc-session-label' }, '說明'))
+    const desc = el('textarea', {
+      id: 'tc-session-description', className: 'tc-session-textarea',
+      placeholder: '這個比對在做什麼、資料從哪裡來、有哪些已知的差異…',
+    })
+    desc.value = this._sessionInfo.description
+    desc.addEventListener('input', () => this.setSessionInfo({ description: desc.value }))
+    descRow.appendChild(desc)
+    body.appendChild(descRow)
+
+    body.appendChild(el('p', { className: 'tc-map-hint' },
+      '說明會顯示在狀態列，並隨 Session 設定一起儲存。'))
   }
 
   _buildPathRow() {
@@ -4476,22 +5578,14 @@ export class TableCompare {
       this._parseAndRefresh()
     })
 
+    // Both checkboxes are entry points into the same four-state filter, so they
+    // route through it rather than each poking at _showSame on its own.
     cbSame.addEventListener('change', () => {
-      this._showSame = cbSame.checked
-      // cbDiffOnly is the inverse of showSame — keep them in sync
-      if (cbDiffOnly.checked === cbSame.checked) {
-        cbDiffOnly.checked = !cbSame.checked
-      }
-      this._renderTable()
+      this.setShowFilter(cbSame.checked ? 'all' : 'diff')
     })
 
     cbDiffOnly.addEventListener('change', () => {
-      // "只顯示差異" = 不顯示相同行
-      this._showSame = !cbDiffOnly.checked
-      if (cbSame.checked === cbDiffOnly.checked) {
-        cbSame.checked = !cbDiffOnly.checked
-      }
-      this._renderTable()
+      this.setShowFilter(cbDiffOnly.checked ? 'diff' : 'all')
     })
 
     cbColOrder.addEventListener('change', () => {
@@ -4505,6 +5599,16 @@ export class TableCompare {
 
     btnColumns.addEventListener('click', () => this.openColumnSettings())
     btnFit.addEventListener('click', () => this.resizeColumnsToFit())
+
+    // S27
+    this._dom.btnColMap.addEventListener('click', () => this.openColumnMapping())
+    this._dom.btnSessionSettings.addEventListener('click', () => this.openSessionSettings())
+    this._dom.btnRecompare.addEventListener('click', () => this.recompareFiles())
+    this._dom.btnShowAll.addEventListener('click', () => this.setShowFilter('all'))
+    this._dom.btnShowDiff.addEventListener('click', () => this.setShowFilter('diff'))
+    this._dom.btnShowSame.addEventListener('click', () => this.setShowFilter('same'))
+    this._dom.btnShowNone.addEventListener('click', () => this.setShowFilter('none'))
+    this._syncShowFilterUi()
 
     // Sync scroll between left and right panes, and repaint the virtual window.
     const { leftScroll, rightScroll } = this._dom
@@ -4932,6 +6036,27 @@ export class TableCompare {
       action: () => this.toggleRowNumbers(),
     })
 
+    // S27: the mapping / settings / recompare entry points, reachable without
+    // hunting along the toolbar.
+    items.push({ separator: true })
+    items.push({ label: '欄位對應…', action: () => this.openColumnMapping() })
+    if (td) {
+      const col = [...(tr.children ?? [])].indexOf(td) - 1
+      if (col >= 0) {
+        items.push({
+          label: '重新命名這一欄（顯示用）…',
+          action: () => {
+            const current = this._columnNames[col]
+              ?? (this._displayHeaders?.[side]?.[col] ?? '')
+            const next = window.prompt(`第 ${col} 欄的顯示名稱`, current)
+            if (next != null) this.setColumnDisplayName(col, next)
+          },
+        })
+      }
+    }
+    items.push({ label: 'Session 設定…', action: () => this.openSessionSettings() })
+    items.push({ label: '重新比對（清除復原歷程）', action: () => { this.recompareFiles() } })
+
     const sidePath = side === 'left' ? this._leftPath : this._rightPath
     items.push({ separator: true })
     items.push({
@@ -5081,12 +6206,14 @@ export class TableCompare {
 
   _parseAndRefresh() {
     if (this._leftContent != null) {
-      this._delimiter.left = detectDelimiter(this._leftContent)
+      // A manual delimiter overrides detection, which only ever looks at the
+      // first line and so guesses wrong on files whose header has no separator.
+      this._delimiter.left = this._delimiterOverride.left ?? detectDelimiter(this._leftContent)
       this._leftParsed = parseTable(this._leftContent, this._delimiter.left)
       this._rowIndexMap.left = _buildRowIndexMap(this._leftParsed)
     }
     if (this._rightContent != null) {
-      this._delimiter.right = detectDelimiter(this._rightContent)
+      this._delimiter.right = this._delimiterOverride.right ?? detectDelimiter(this._rightContent)
       this._rightParsed = parseTable(this._rightContent, this._delimiter.right)
       this._rowIndexMap.right = _buildRowIndexMap(this._rightParsed)
     }
@@ -5116,7 +6243,9 @@ export class TableCompare {
       this._alignedRows = []
       this._leftData = null
       this._rightData = null
+      this._leftColMap = null
       this._rightColMap = null
+      this._displayHeaders = { left: null, right: null }
       this._refreshRowIndex()
       return
     }
@@ -5142,19 +6271,32 @@ export class TableCompare {
     this._leftHeaders = leftHeaders
     this._rightHeaders = rightHeaders
 
+    // S27: resolve the column mapping first — every index below (key columns,
+    // per-column rules, sort keys) is a *display* column, and the mapping is
+    // what says which source column that is.
+    //
+    // "忽略欄位排序" is itself just the mapping derived from header names, so it
+    // is expressed as one and both features share a single comparison path.
+    /** @type {ColumnPair[]|null} */
+    let mapping = this._columnMapping
+    if (!mapping && this._ignoreColumnOrder && leftHeaders && rightHeaders) {
+      mapping = leftHeaders.map((h, i) => ({ left: i, right: rightHeaders.indexOf(h) }))
+    }
+    const sides = mapping ? columnMapSides(mapping) : null
+    this._leftColMap = sides ? sides.left : null
+    this._rightColMap = sides ? sides.right : null
+    // Which columns are one-sided is part of the rule set, so the set memoised
+    // under the previous mapping cannot be reused.
+    this._invalidateRules()
+
     // T15: sort before compare — sort each side by the key columns (or col 0
     // when aligning by position), using the same canonical form as alignment so
     // numeric/date columns group consistently.
     const rules = this._effectiveRules()
     if (this._sortBeforeCompare) {
       const sortCols = this._keyColumns.length ? this._keyColumns : [0]
-      const sortFn = (a, b) => {
-        const av = buildRowKey(a, sortCols, rules)
-        const bv = buildRowKey(b, sortCols, rules)
-        return av < bv ? -1 : av > bv ? 1 : 0
-      }
-      leftData  = leftData.slice().sort(sortFn)
-      rightData = rightData.slice().sort(sortFn)
+      leftData = sortByDisplayKey(leftData, this._leftColMap, sortCols, rules)
+      rightData = sortByDisplayKey(rightData, this._rightColMap, sortCols, rules)
     }
 
     // AlignedRow.leftIdx/rightIdx index these arrays, and their elements are the
@@ -5162,19 +6304,29 @@ export class TableCompare {
     // identity), which is what makes an edit reach the model.
     this._leftData = leftData
     this._rightData = rightData
-    // Under "ignore column order" the right pane displays left-hand columns, so
-    // a displayed column index has to be mapped back to the right file's own.
-    this._rightColMap = (this._ignoreColumnOrder && leftHeaders && rightHeaders)
-      ? leftHeaders.map((h) => rightHeaders.indexOf(h))
-      : null
+
+    // The comparison runs on display-space rows, so an N:M mapping is not a
+    // display trick: alignment, row status and cell diffs all see the paired
+    // columns. Projection preserves position, so leftIdx still indexes leftData.
+    const leftView = this._leftColMap
+      ? leftData.map((row) => projectRow(row, this._leftColMap))
+      : leftData
+    const rightView = this._rightColMap
+      ? rightData.map((row) => projectRow(row, this._rightColMap))
+      : rightData
+
+    this._displayHeaders = {
+      left: leftHeaders && this._leftColMap ? projectRow(leftHeaders, this._leftColMap) : leftHeaders,
+      right: rightHeaders && this._rightColMap ? projectRow(rightHeaders, this._rightColMap) : rightHeaders,
+    }
 
     this._alignedRows = alignRows(
-      leftData,
-      rightData,
+      leftView,
+      rightView,
       this._keyColumns,
-      leftHeaders,
-      rightHeaders,
-      this._ignoreColumnOrder,
+      null,
+      null,
+      false,
       rules,
     )
     this._refreshRowIndex()
@@ -5228,17 +6380,15 @@ export class TableCompare {
       return
     }
 
-    // Determine column headers to display
-    const leftHeaders = this._hasHeader ? (this._leftHeaders ?? []) : null
-    const rightHeaders = this._hasHeader ? (this._rightHeaders ?? []) : null
+    // Determine column headers to display (already projected through the map)
+    const leftHeaders = this._hasHeader ? (this._displayHeaders?.left ?? []) : null
+    const rightHeaders = this._hasHeader ? (this._displayHeaders?.right ?? []) : null
 
-    // Column count: maximum of left and right
-    const leftColCount = this._leftParsed
-      ? (this._leftParsed[0]?.length ?? 0)
-      : 0
-    const rightColCount = this._rightParsed
-      ? (this._rightParsed[0]?.length ?? 0)
-      : 0
+    // With a mapping both panes render the same display columns, which is what
+    // puts a pair side by side; without one each pane keeps its own width.
+    const mapLen = this._leftColMap?.length ?? null
+    const leftColCount = mapLen ?? (this._leftParsed ? (this._leftParsed[0]?.length ?? 0) : 0)
+    const rightColCount = mapLen ?? (this._rightParsed ? (this._rightParsed[0]?.length ?? 0) : 0)
 
     this._leftColCount = leftColCount
     this._rightColCount = rightColCount
@@ -5248,8 +6398,8 @@ export class TableCompare {
     this._refreshRowIndex()
 
     // Build header rows
-    this._renderPaneHeader(this._dom.leftHeader, leftHeaders, leftColCount)
-    this._renderPaneHeader(this._dom.rightHeader, rightHeaders, rightColCount)
+    this._renderPaneHeader(this._dom.leftHeader, leftHeaders, leftColCount, 'left')
+    this._renderPaneHeader(this._dom.rightHeader, rightHeaders, rightColCount, 'right')
 
     this._dom.leftScroll.innerHTML = ''
     this._dom.rightScroll.innerHTML = ''
@@ -5438,8 +6588,9 @@ export class TableCompare {
    * @param {HTMLElement} headerEl
    * @param {string[]|null} headers
    * @param {number} colCount
+   * @param {'left'|'right'} side
    */
-  _renderPaneHeader(headerEl, headers, colCount) {
+  _renderPaneHeader(headerEl, headers, colCount, side) {
     headerEl.innerHTML = ''
     if (!this._hasHeader || !headers) return
 
@@ -5449,12 +6600,20 @@ export class TableCompare {
 
     const displayCount = Math.max(headers.length, colCount)
     for (let i = 0; i < displayCount; i++) {
-      const text = headers[i] ?? ''
+      const mapped = this._hasSourceColumn(side, i)
+      const custom = this._columnNames[i]
+      const source = headers[i] ?? ''
       // Hidden columns keep their DOM node so that every index-based lookup
       // (dbl-click editing, find highlighting, colgroup) stays 1:1 with the
       // column index; only the painting is suppressed.
-      const cell = el('div',
-        { className: `tc-cell${this.isColumnHidden(i) ? ' tc-col-hidden' : ''}`, textContent: text })
+      const cell = el('div', {
+        className: 'tc-cell'
+          + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
+          + (mapped ? '' : ' tc-col-unmatched'),
+        textContent: mapped ? (custom ?? source) : '—',
+      })
+      if (!mapped) cell.title = '這一側沒有對應的欄位'
+      else if (custom != null) cell.title = `原始欄名：${source}`
       headerEl.appendChild(cell)
     }
   }
@@ -5485,7 +6644,9 @@ export class TableCompare {
       // empty cells
       for (let i = 0; i < colCount; i++) {
         const td = document.createElement('td')
-        td.className = 'tc-cell' + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
+        td.className = 'tc-cell'
+          + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
+          + (this._hasSourceColumn(side, i) ? '' : ' tc-col-unmatched')
         tr.appendChild(td)
       }
       return tr
@@ -5514,6 +6675,7 @@ export class TableCompare {
         + (isDiff ? ' cell-diff' : '')
         + (level > 0 ? ` tc-cell--sev${level}` : '')
         + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
+        + (this._hasSourceColumn(side, i) ? '' : ' tc-col-unmatched')
       const val = rowData?.[i] ?? ''
       // S14-M11: textContent avoids HTML parsing per-cell — ~30% faster on
       // 1Mx1k tables. The cell is plain text; no need for innerHTML.
@@ -5529,8 +6691,9 @@ export class TableCompare {
    * @returns {boolean}
    */
   _isRowVisible(row) {
-    if (!this._showSame && row.status === 'same') return false
-    return true
+    // 'left-only' / 'right-only' are differences too — a row that exists on one
+    // side only is the clearest difference there is.
+    return row.status === 'same' ? this._showSame : this._showDiff
   }
 
   // ── T22: Stats alert ─────────────────────────────────────────────────────────
@@ -5574,6 +6737,29 @@ export class TableCompare {
     const stats = this._dom.stats
     if (!stats) return
     stats.innerHTML = ''
+
+    // S27: the Specs description is the one place the user's own note about
+    // this comparison can be seen without reopening the dialog.
+    const { name, description } = this._sessionInfo
+    if (name || description) {
+      const note = el('span', { className: 'tc-stat-item tc-stat-specs' },
+        name ? `${name}${description ? '：' : ''}${description}` : description)
+      note.title = description || name
+      stats.appendChild(note)
+    }
+
+    // S27: a mapping with one-sided columns changes what "different" means, so
+    // say how many there are rather than leaving the reader to count blanks.
+    if (this._leftColMap && this._rightColMap) {
+      let unmatched = 0
+      for (let i = 0; i < this._leftColMap.length; i++) {
+        if (this._leftColMap[i] < 0 || this._rightColMap[i] < 0) unmatched++
+      }
+      if (unmatched > 0) {
+        stats.appendChild(el('span', { className: 'tc-stat-item tc-stat-unmatched' },
+          `單側獨有欄 ${unmatched}${this._unmatchedIsDiff ? '' : '（不計入差異）'}`))
+      }
+    }
 
     if (!this._alignedRows.length) return
 
@@ -5628,4 +6814,7 @@ export {
   serializeTable, parseHtmlTables, csvPathFor,
   visibleWhitespace, mergeIgnoredColumns, toColumnList, describeDelimiter,
   cellDiffRatio, severityLevel, computeCellLevels, thumbnailBuckets, parseGotoInput,
+  normaliseColumnMapping, identityColumnMapping, suggestColumnMapping,
+  projectRow, columnMapSides, sortByDisplayKey, headerMatchKey,
+  DELIMITER_PRESETS, TABLE_ENCODINGS, NO_COLUMN,
 }
