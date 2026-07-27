@@ -59,6 +59,13 @@ const TEXT_CONFIG_DEFAULTS = {
   syntaxHighlight: true,
   orphansAlwaysImportant: false,
   neverAlignPatterns: [],
+  // 1.7 Alignment tab + 1.9 Text options: all default to the behaviour that
+  // existed before they were switches.
+  alignMode: 'standard',
+  autoIndent: false,
+  backspaceUnindents: false,
+  allowBeyondEol: false,
+  showFilteredLineCounts: true,
   skewTolerance: 0,
   useClosenessMatching: false,
   closenessThreshold: 0.5,

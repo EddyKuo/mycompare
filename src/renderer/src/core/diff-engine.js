@@ -953,6 +953,119 @@ export function diffChars(leftStr, rightStr) {
 }
 
 // ---------------------------------------------------------------------------
+// Public API: alignment mode (BC Session Settings ▸ Alignment)
+// ---------------------------------------------------------------------------
+
+/**
+ * How hard the engine tries to pair a left line with a right line.
+ *
+ * This is orthogonal to the algorithm choice: myers/patience/histogram answer
+ * "how do we align", this answers "do we align at all".
+ *
+ *  - `standard`  — the algorithm's own pairing (everything before this existed)
+ *  - `unaligned` — no content-based alignment; row i is shown against row i
+ *  - `never`     — pairs are dissolved, so a change reads as a deleted block
+ *                  followed by an inserted block rather than a changed pair
+ *
+ * @typedef {'standard'|'unaligned'|'never'} AlignmentMode
+ */
+
+/** @type {readonly AlignmentMode[]} */
+export const ALIGNMENT_MODES = Object.freeze(['standard', 'unaligned', 'never']);
+
+/**
+ * Coerce arbitrary input to a valid mode.
+ *
+ * Anything unrecognised falls back to `standard` so a corrupt persisted config
+ * cannot leave a session in a mode with no UI to escape it.
+ *
+ * @param {unknown} mode
+ * @returns {AlignmentMode}
+ */
+export function normaliseAlignmentMode(mode) {
+  return ALIGNMENT_MODES.includes(/** @type {AlignmentMode} */ (mode))
+    ? /** @type {AlignmentMode} */ (mode)
+    : 'standard';
+}
+
+/**
+ * Ops for the "unaligned" mode: compare row i against row i, nothing else.
+ *
+ * Linear in the longer side — there is no search, which is the point: the user
+ * asked for the files to be laid out as-is rather than aligned.
+ *
+ * @param {string[]} leftKeys
+ * @param {string[]} rightKeys
+ * @returns {{ op: string, li: number, ri: number }[]}
+ */
+export function positionalOps(leftKeys, rightKeys) {
+  /** @type {{ op: string, li: number, ri: number }[]} */
+  const ops = [];
+  const shared = Math.min(leftKeys.length, rightKeys.length);
+  for (let i = 0; i < shared; i++) {
+    if (leftKeys[i] === rightKeys[i]) {
+      ops.push({ op: 'equal', li: i, ri: i });
+    } else {
+      // Emitted as a delete/insert pair so the shared collapse step downstream
+      // turns it into the `replace` row the side-by-side layout expects.
+      ops.push({ op: 'delete', li: i, ri: -1 });
+      ops.push({ op: 'insert', li: -1, ri: i });
+    }
+  }
+  for (let i = shared; i < leftKeys.length; i++) ops.push({ op: 'delete', li: i, ri: -1 });
+  for (let i = shared; i < rightKeys.length; i++) ops.push({ op: 'insert', li: -1, ri: i });
+  return ops;
+}
+
+/**
+ * Dissolve every paired row, for the "never align differences" mode.
+ *
+ * Within each run of differences the left-hand lines are emitted first as
+ * deletions, then the right-hand lines as insertions, which is what makes a
+ * change read as one removed block plus one added block.
+ *
+ * Rows carrying `alignAnchor` are passed through untouched: the user pinned
+ * those two lines together by hand, and an alignment *mode* must not silently
+ * undo an explicit per-line override.
+ *
+ * Idempotent — running it twice changes nothing — so it is safe to apply both
+ * inside `diffLines` and again after any later re-pairing pass.
+ *
+ * @param {DiffLine[]} diff
+ * @returns {DiffLine[]} a new array
+ */
+export function splitAlignedPairs(diff) {
+  const list = Array.isArray(diff) ? diff : [];
+  /** @type {DiffLine[]} */
+  const out = [];
+  /** @type {DiffLine[]} */
+  let dels = [];
+  /** @type {DiffLine[]} */
+  let ins = [];
+
+  const flush = () => {
+    if (dels.length > 0) { out.push(...dels); dels = []; }
+    if (ins.length > 0) { out.push(...ins); ins = []; }
+  };
+
+  for (const row of list) {
+    if (row.type === 'equal' || row.alignAnchor === true) {
+      flush();
+      out.push(row);
+      continue;
+    }
+    if (row.leftLine != null) {
+      dels.push({ ...row, type: 'delete', rightLine: null, rightText: '' });
+    }
+    if (row.rightLine != null) {
+      ins.push({ ...row, type: 'insert', leftLine: null, leftText: '' });
+    }
+  }
+  flush();
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Public API: diffLines
 // ---------------------------------------------------------------------------
 
@@ -971,6 +1084,7 @@ export function diffChars(leftStr, rightStr) {
  *   ignoreLineEndings?: boolean,
  *   ignoreIndent?: boolean,
  *   ignoreCrlf?: boolean,
+ *   alignMode?: AlignmentMode,
  *   leftWeights?: number[],
  *   rightWeights?: number[]
  * }} options
@@ -981,7 +1095,8 @@ export function diffChars(leftStr, rightStr) {
  *   leftLine: number|null,
  *   rightLine: number|null,
  *   leftText: string,
- *   rightText: string
+ *   rightText: string,
+ *   alignAnchor?: boolean
  * }} DiffLine
  */
 export function diffLines(leftText, rightText, options = {}) {
@@ -1003,9 +1118,13 @@ export function diffLines(leftText, rightText, options = {}) {
   const leftKeys = leftLines.map((l) => normalise(l, opts));
   const rightKeys = rightLines.map((l) => normalise(l, opts));
 
+  const alignMode = normaliseAlignmentMode(opts.alignMode);
+
   // Run chosen algorithm
   let ops;
-  if (opts.algorithm === 'patience') {
+  if (alignMode === 'unaligned') {
+    ops = positionalOps(leftKeys, rightKeys);
+  } else if (opts.algorithm === 'patience') {
     ops = _patienceDiff(leftKeys, rightKeys);
   } else if (opts.algorithm === 'histogram') {
     ops = _histogramDiff(leftKeys, rightKeys);
@@ -1013,7 +1132,9 @@ export function diffLines(leftText, rightText, options = {}) {
     ops = _myersDiff(leftKeys, rightKeys);
   }
 
-  if (_hasWeights(opts)) {
+  // Grammar weights exist to improve alignment, so they have nothing to add to
+  // a mode whose whole premise is that lines are not aligned by content.
+  if (alignMode !== 'unaligned' && _hasWeights(opts)) {
     ops = _weightAlign(ops, leftKeys, rightKeys, opts.leftWeights, opts.rightWeights);
   }
 
@@ -1049,7 +1170,7 @@ export function diffLines(leftText, rightText, options = {}) {
     }
   }
 
-  return result;
+  return alignMode === 'never' ? splitAlignedPairs(result) : result;
 }
 
 // ---------------------------------------------------------------------------

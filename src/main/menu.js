@@ -149,6 +149,27 @@ export function buildAppMenu(win, hiddenCommands = []) {
         item('以其他方式比對…', 'session.compareUsing'),
         item('合併上層資料夾', 'session.merge.parentFolders'),
         {
+          label: '三向資料夾合併',
+          submenu: [
+            item('切換三向合併模式', 'session.folder.merge.toggle'),
+            item('開啟基準資料夾…', 'session.folder.merge.openBase'),
+            item('設定輸出資料夾…', 'session.folder.merge.openOutput'),
+            { type: 'separator' },
+            item('上一個衝突', 'session.folder.merge.prevConflict'),
+            item('下一個衝突', 'session.folder.merge.nextConflict'),
+            item('只顯示衝突', 'view.folder.merge.onlyConflicts'),
+            { type: 'separator' },
+            item('未決衝突全部採用左側', 'session.folder.merge.resolveAll.left'),
+            item('未決衝突全部採用基準', 'session.folder.merge.resolveAll.base'),
+            item('未決衝突全部採用右側', 'session.folder.merge.resolveAll.right'),
+            item('未決衝突全部刪除', 'session.folder.merge.resolveAll.delete'),
+            item('清除所有手動決議', 'session.folder.merge.clearResolutions'),
+            { type: 'separator' },
+            item('預覽輸出…', 'session.folder.merge.preview'),
+            item('執行合併…', 'session.folder.merge.apply')
+          ]
+        },
+        {
           label: '與合併輸出比對',
           submenu: [
             item('左側', 'session.merge.compareOutput.left'),
@@ -159,6 +180,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
         item('文字比對資訊…', 'text.info'),
         item('不重要文字規則…', 'text.unimportantText'),
         item('對齊選項…', 'text.alignmentOptions'),
+        item('編輯器選項…', 'text.editorOptions'),
         item('單側獨有的行一律視為重要', 'text.orphansImportant'),
         item('資料夾比對資訊', 'session.folder.info'),
         { type: 'separator' },
@@ -197,6 +219,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
         },
         { type: 'separator' },
         item('從磁碟重新載入（十六進位）', 'file.hex.reload', 'CmdOrCtrl+Shift+R'),
+        item('從磁碟重新載入（表格）', 'file.table.reload', 'CmdOrCtrl+Shift+R'),
         { type: 'separator' },
         item('列印預覽…', 'file.printPreview'),
         { type: 'separator' },

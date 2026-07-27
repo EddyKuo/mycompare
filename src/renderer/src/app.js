@@ -1139,11 +1139,23 @@ function setupToolbarButtons() {
  *
  * @returns {{ view: any, html: boolean, text: boolean, htmlFallback: boolean, textFallback: boolean }}
  */
-function _activeReportSource() {
-  const view = {
+/**
+ * The view object backing the active tab, or null.
+ *
+ * One map rather than one per caller: a second copy is how a newly added view
+ * ends up supported by reports and not by reload, or the reverse.
+ *
+ * @returns {object|null}
+ */
+function _activeViewInstance() {
+  return {
     text: textCompare, folder: folderCompare, table: tableCompare,
     image: imageCompare, hex: hexCompare, merge3: mergeCompare,
   }[currentView] ?? null
+}
+
+function _activeReportSource() {
+  const view = _activeViewInstance()
   return {
     view,
     html: typeof view?.buildHtmlReport === 'function',
@@ -2425,11 +2437,17 @@ function updateToolbar() {
   const hasDiff = diffInfo.total > 0
   const hasContent = isText && textCompare != null
 
-  // 導航按鈕：text 模式且有 diff 時啟用
-  setDisabled('btn-first-diff', !hasDiff)
-  setDisabled('btn-prev-diff', !hasDiff)
-  setDisabled('btn-next-diff', !hasDiff)
-  setDisabled('btn-last-diff', !hasDiff)
+  // Navigation buttons dim per direction, not as a group: sitting on the last
+  // difference with three live-looking arrows and one that does nothing is BC
+  // behaviour this was missing. Views without the finer answer fall back to
+  // "any difference at all", which is what every one of them did before.
+  const nav = (isText && typeof textCompare?.getNavAvailability === 'function')
+    ? textCompare.getNavAvailability()
+    : { first: hasDiff, prev: hasDiff, next: hasDiff, last: hasDiff }
+  setDisabled('btn-first-diff', !nav.first)
+  setDisabled('btn-prev-diff', !nav.prev)
+  setDisabled('btn-next-diff', !nav.next)
+  setDisabled('btn-last-diff', !nav.last)
 
   // Copy 按鈕：text 模式且有 diff 時啟用
   setDisabled('btn-copy-left', !hasDiff)
@@ -2498,6 +2516,7 @@ function setupKeyboardShortcuts() {
     // P2-28: one preview for every view, instead of two hardcoded branches
     // that silently did nothing anywhere else.
     print: () => openPrintPreview(),
+    reloadFromDisk: () => reloadActiveFromDisk(),
   }
 
   document.addEventListener('keydown', (e) => {
@@ -2517,6 +2536,27 @@ function setupKeyboardShortcuts() {
       fn()
       return
     }
+  })
+}
+
+/**
+ * Re-read the active view's files from disk.
+ *
+ * The menu advertised Ctrl+Shift+R next to the hex reload command, but nothing
+ * in the renderer bound it — and since menu accelerators are display-only here
+ * (the renderer owns every keystroke), the key did nothing at all. Binding it
+ * once and routing by view is what makes the label true, and it means the
+ * table view's new reload gets the same key without a second binding to keep
+ * in sync.
+ */
+function reloadActiveFromDisk() {
+  const view = _activeViewInstance()
+  if (typeof view?.reloadAll !== 'function') {
+    showStatus('目前視圖不支援從磁碟重新載入')
+    return
+  }
+  void Promise.resolve(view.reloadAll()).catch((err) => {
+    showError(`從磁碟重新載入失敗：${err instanceof Error ? err.message : String(err)}`, err)
   })
 }
 
@@ -3225,6 +3265,15 @@ function setupMenuActions() {
     fn(hexCompare)
   }
 
+  /** @param {(view: FolderCompare) => void} fn */
+  const _folderPanel = (fn) => {
+    if (currentView !== 'folder' || !folderCompare) {
+      showStatus('此項目僅適用於資料夾比對')
+      return
+    }
+    fn(folderCompare)
+  }
+
   /** @param {(view: TableCompare) => void} fn */
   const _tablePanel = (fn) => {
     if (currentView !== 'table' || !tableCompare) { showStatus('此項目僅適用於表格比對'); return }
@@ -3526,6 +3575,29 @@ function setupMenuActions() {
     'view.hex.thumbnail': () => _hexPanel((v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),
     'view.hex.layout': () => _hexPanel((v) => showStatus(v.toggleLayout() === 'over-under' ? '上下堆疊' : '左右並排')),
     'file.hex.reload': () => _hexPanel((v) => { void v.reloadAll() }),
+    'file.table.reload': () => _tablePanel((v) => { void v.reloadAll() }),
+    'text.editorOptions': () => _textView((v) => v.openEditorOptionsDialog(), '編輯器選項'),
+
+    // Three-way folder merge. The view is fully usable from its own toolbar;
+    // these exist so the merge commands sit where BC puts them, next to the
+    // rest of the session actions.
+    'session.folder.merge.toggle': () => _folderPanel((v) => {
+      showStatus(v.toggleMergeMode() ? '已進入三向合併模式' : '已離開三向合併模式')
+    }),
+    'session.folder.merge.openBase': () => _folderPanel((v) => { void v.openBase() }),
+    'session.folder.merge.openOutput': () => _folderPanel((v) => { void v.openOutput() }),
+    'session.folder.merge.preview': () => _folderPanel((v) => { void v.previewMerge() }),
+    'session.folder.merge.apply': () => _folderPanel((v) => { void v.applyMerge() }),
+    'session.folder.merge.nextConflict': () => _folderPanel((v) => v.nextConflict()),
+    'session.folder.merge.prevConflict': () => _folderPanel((v) => v.prevConflict()),
+    'view.folder.merge.onlyConflicts': () => _folderPanel((v) => {
+      showStatus(v.toggleShowOnlyConflicts() ? '只顯示衝突' : '顯示全部')
+    }),
+    'session.folder.merge.resolveAll.left': () => _folderPanel((v) => v.resolveAllConflicts('left')),
+    'session.folder.merge.resolveAll.base': () => _folderPanel((v) => v.resolveAllConflicts('base')),
+    'session.folder.merge.resolveAll.right': () => _folderPanel((v) => v.resolveAllConflicts('right')),
+    'session.folder.merge.resolveAll.delete': () => _folderPanel((v) => v.resolveAllConflicts('delete')),
+    'session.folder.merge.clearResolutions': () => _folderPanel((v) => v.clearMergeResolutions()),
     'search.hex.replace': () => _hexPanel((v) => v.setReplaceOpen(true)),
     'view.table.severity':   () => _tablePanel((v) => showStatus(v.toggleSeverityShading() ? '已顯示差異程度色階' : '已關閉差異程度色階')),
     'view.table.thumbnail':  () => _tablePanel((v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),

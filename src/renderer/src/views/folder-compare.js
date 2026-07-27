@@ -2310,6 +2310,556 @@ export function formatTouchSummary(outcome) {
   return `已同步 ${done} 個，${failures.length} 個失敗：\n\n${detail}`
 }
 
+// ── Three-way folder merge ──────────────────────────────────────────────────
+//
+// The two-way tree answers "do these differ". A merge has to answer "who
+// changed it", which needs the common ancestor: left ≠ right says nothing about
+// whether left edited it, right edited it, or both did. Everything below is
+// written as pure functions over three `FileEntry|null` slots plus three
+// pairwise equality verdicts, because the equality verdicts are the only part
+// that needs the filesystem — and they come from the same size/time/hash/rules
+// machinery the two-way comparison already uses, not from a second one.
+
+/**
+ * @typedef {'same'
+ *   |'left-changed'|'right-changed'|'both-changed-same'
+ *   |'left-added'|'right-added'|'both-added-same'
+ *   |'left-deleted'|'right-deleted'|'both-deleted'
+ *   |'mixed'
+ *   |'conflict-changed'|'conflict-added'|'conflict-modify-delete'
+ *   |'absent'} MergeStatus
+ */
+
+/**
+ * @typedef {'left'|'base'|'right'|'delete'|'skip'} MergePick
+ *   left/base/right — that side's file is what the output gets
+ *   delete          — the output must not contain this path
+ *   skip            — leave the output alone, whatever is already there
+ */
+
+/**
+ * A row of the three-way tree.
+ *
+ * Deliberately a superset of `CompareRow`: `status` still carries the ordinary
+ * left-vs-right verdict so every existing filter, sorter, renderer, report and
+ * statistic keeps working unchanged, and the merge verdict rides alongside.
+ *
+ * @typedef {object} MergeRow
+ * @property {string} name
+ * @property {FileEntry|null} base
+ * @property {FileEntry|null} left
+ * @property {FileEntry|null} right
+ * @property {string} status              left-vs-right, for the two-way machinery
+ * @property {MergeStatus} mergeStatus
+ * @property {MergePick|null} mergeResolution  user override; null ⇒ use the automatic pick
+ * @property {MergeRow[]|null} children
+ */
+
+/** Display labels, shared by the row badge, the stats bar and the preview. */
+export const MERGE_STATUS_LABELS = {
+  'same': '三方相同',
+  'left-changed': '僅左側修改',
+  'right-changed': '僅右側修改',
+  'both-changed-same': '兩側相同修改',
+  'left-added': '僅左側新增',
+  'right-added': '僅右側新增',
+  'both-added-same': '兩側新增相同內容',
+  'left-deleted': '左側刪除',
+  'right-deleted': '右側刪除',
+  'both-deleted': '兩側都刪除',
+  'mixed': '子項有變更',
+  'conflict-changed': '衝突：兩側修改不同',
+  'conflict-added': '衝突：兩側新增不同內容',
+  'conflict-modify-delete': '衝突：一側修改、一側刪除',
+  'absent': '（不存在）',
+}
+
+/** @type {MergeStatus[]} */
+export const MERGE_CONFLICT_STATUSES = [
+  'conflict-changed', 'conflict-added', 'conflict-modify-delete',
+]
+
+/**
+ * @param {string|null|undefined} status
+ * @returns {boolean}
+ */
+export function isMergeConflict(status) {
+  return MERGE_CONFLICT_STATUSES.includes(/** @type {MergeStatus} */ (status))
+}
+
+/**
+ * The three-way verdict for one path.
+ *
+ * `eqLB` / `eqRB` / `eqLR` are only consulted where both of their sides exist;
+ * a caller that cannot compute one may pass anything for it.
+ *
+ * @param {object} facts
+ * @param {boolean} facts.hasBase
+ * @param {boolean} facts.hasLeft
+ * @param {boolean} facts.hasRight
+ * @param {boolean} [facts.eqLB] left content equals base content
+ * @param {boolean} [facts.eqRB] right content equals base content
+ * @param {boolean} [facts.eqLR] left content equals right content
+ * @returns {MergeStatus}
+ */
+export function computeMergeStatus(facts) {
+  const { hasBase, hasLeft, hasRight } = facts
+  const eqLB = !!facts.eqLB, eqRB = !!facts.eqRB, eqLR = !!facts.eqLR
+
+  if (hasBase) {
+    if (hasLeft && hasRight) {
+      if (eqLB && eqRB) return 'same'
+      if (eqLB) return 'right-changed'
+      if (eqRB) return 'left-changed'
+      // Both moved away from the ancestor. Landing on the same content is the
+      // classic "we both applied the same patch" and merges without asking.
+      return eqLR ? 'both-changed-same' : 'conflict-changed'
+    }
+    // One side deleted what the ancestor had. That only merges cleanly when
+    // the surviving side never touched it — otherwise the deletion would throw
+    // away an edit nobody reviewed.
+    if (hasLeft) return eqLB ? 'right-deleted' : 'conflict-modify-delete'
+    if (hasRight) return eqRB ? 'left-deleted' : 'conflict-modify-delete'
+    return 'both-deleted'
+  }
+
+  if (hasLeft && hasRight) return eqLR ? 'both-added-same' : 'conflict-added'
+  if (hasLeft) return 'left-added'
+  if (hasRight) return 'right-added'
+  return 'absent'
+}
+
+/**
+ * What the output gets without anyone being asked, or null when the row needs
+ * a human.
+ *
+ * `same`, `both-changed-same` and `both-added-same` resolve to the *left* copy
+ * rather than the base copy even though all candidates are equal: the output
+ * folder is very often the left folder, and picking left turns those rows into
+ * a no-op instead of a few thousand pointless overwrites.
+ *
+ * @param {MergeStatus|string|null|undefined} status
+ * @returns {MergePick|null}
+ */
+export function autoMergePick(status) {
+  switch (status) {
+    case 'same':
+    case 'both-changed-same':
+    case 'both-added-same':
+    case 'left-changed':
+    case 'left-added':
+    case 'mixed':
+      return 'left'
+    case 'right-changed':
+    case 'right-added':
+      return 'right'
+    case 'left-deleted':
+    case 'right-deleted':
+    case 'both-deleted':
+      return 'delete'
+    default:
+      return null
+  }
+}
+
+/**
+ * `mixed` is a directory rollup, so its automatic pick is about the directory
+ * itself existing, not about content. Files under it are decided on their own.
+ * @param {MergeStatus|string|null|undefined} status
+ * @returns {boolean}
+ */
+export function mergeAutoResolvable(status) {
+  return autoMergePick(status) !== null
+}
+
+/**
+ * The pick actually in force for a row: the user's override when there is one,
+ * the automatic pick otherwise.
+ *
+ * @param {{ mergeStatus?: string, mergeResolution?: MergePick|null }} row
+ * @returns {MergePick|null}
+ */
+export function effectiveMergePick(row) {
+  if (row?.mergeResolution) return row.mergeResolution
+  return autoMergePick(row?.mergeStatus)
+}
+
+/** @param {MergeRow} row */
+function isMergeDirRow(row) {
+  return !!(row?.base?.isDirectory || row?.left?.isDirectory || row?.right?.isDirectory)
+}
+
+/**
+ * Pair three directory listings into one tree level.
+ *
+ * Keyed exactly the way {@link compareEntries} keys two: the filename-case and
+ * alignment rules a user set for the comparison have to hold for all three
+ * sides, or the base would pair with one side and not the other and every row
+ * would read as a conflict.
+ *
+ * @param {FileEntry[]} baseEntries
+ * @param {FileEntry[]} leftEntries
+ * @param {FileEntry[]} rightEntries
+ * @param {CompareOpts} [opts]
+ * @returns {MergeRow[]}
+ */
+export function buildMergeRows(baseEntries, leftEntries, rightEntries, opts = {}) {
+  /** @param {FileEntry} e */
+  const keyOf = (e) => (e.isDirectory
+    ? pairKeyOf(e.name, { caseInsensitive: opts.caseInsensitive })
+    : pairKeyOf(e.name, opts))
+  /** @param {FileEntry[]} list */
+  const index = (list) => new Map((list ?? [])
+    .filter(Boolean)
+    .map((e) => [keyOf(e), e]))
+
+  const baseMap = index(baseEntries)
+  const leftMap = index(leftEntries)
+  const rightMap = index(rightEntries)
+  const keys = [...new Set([...leftMap.keys(), ...baseMap.keys(), ...rightMap.keys()])]
+
+  keys.sort((a, b) => {
+    const aDir = [leftMap, baseMap, rightMap].some((m) => m.get(a)?.isDirectory)
+    const bDir = [leftMap, baseMap, rightMap].some((m) => m.get(b)?.isDirectory)
+    if (aDir !== bDir) return aDir ? -1 : 1
+    return a.localeCompare(b, undefined, { sensitivity: 'base' })
+  })
+
+  /** @type {MergeRow[]} */
+  const rows = []
+  for (const key of keys) {
+    const base = baseMap.get(key) ?? null
+    const left = leftMap.get(key) ?? null
+    const right = rightMap.get(key) ?? null
+    rows.push({
+      // A name that exists on some side; the pairing key can be case-folded or
+      // rewritten by an alignment rule and is nobody's real filename.
+      name: left?.name ?? right?.name ?? base?.name ?? key,
+      base, left, right,
+      status: 'same',
+      mergeStatus: 'absent',
+      mergeResolution: null,
+      children: null,
+    })
+  }
+  return rows
+}
+
+/**
+ * Grade every row of a three-way tree.
+ *
+ * `equals` answers "is this pair's content the same", and is the *only* way
+ * content is ever consulted here — the caller hands in one backed by whatever
+ * compare mode is in force (size, timestamp, MD5, rules).
+ *
+ * Directories carry no content, so they are graded on presence alone and then
+ * corrected by {@link rollupMergeStatus} once their children are known.
+ *
+ * @param {MergeRow[]} rows
+ * @param {(a: FileEntry, b: FileEntry) => boolean} equals
+ * @returns {void}
+ */
+export function gradeMergeRows(rows, equals) {
+  for (const row of eachRow(/** @type {any[]} */ (rows ?? []))) {
+    const dir = isMergeDirRow(row)
+    const hasBase = !!row.base, hasLeft = !!row.left, hasRight = !!row.right
+    row.mergeStatus = computeMergeStatus({
+      hasBase, hasLeft, hasRight,
+      eqLB: dir || (hasLeft && hasBase && equals(row.left, row.base)),
+      eqRB: dir || (hasRight && hasBase && equals(row.right, row.base)),
+      eqLR: dir || (hasLeft && hasRight && equals(row.left, row.right)),
+    })
+  }
+}
+
+/**
+ * Fold a directory's merge verdict up from its children.
+ *
+ * Two things a presence-only verdict gets wrong and this fixes:
+ * a folder present on all three sides is not "三方相同" merely because it
+ * exists everywhere, and a folder one side deleted is not a clean deletion if
+ * the surviving side changed something inside it.
+ *
+ * Children that have not been loaded leave the row alone rather than being
+ * guessed at.
+ *
+ * @param {MergeRow} row
+ * @returns {MergeStatus}
+ */
+export function rollupMergeStatus(row) {
+  if (!isMergeDirRow(row) || !row.children) return row.mergeStatus
+
+  let conflict = false
+  let changed = false
+  for (const child of row.children) {
+    const s = isMergeDirRow(child) ? rollupMergeStatus(child) : child.mergeStatus
+    child.mergeStatus = s
+    if (isMergeConflict(s)) conflict = true
+    else if (s !== 'same') changed = true
+  }
+
+  if (row.mergeStatus === 'left-deleted' || row.mergeStatus === 'right-deleted') {
+    // The deleted side has no children to disagree with, so any surviving
+    // change under here is an edit the deletion would silently discard.
+    return (conflict || changed) ? 'conflict-modify-delete' : row.mergeStatus
+  }
+  if (row.mergeStatus !== 'same') return row.mergeStatus
+  if (conflict) return 'conflict-changed'
+  return changed ? 'mixed' : 'same'
+}
+
+/**
+ * Counts over a graded three-way tree.
+ *
+ * @typedef {object} MergeSummary
+ * @property {Record<string, number>} counts   keyed by MergeStatus
+ * @property {number} files      rows that are not directories
+ * @property {number} conflicts
+ * @property {number} resolved   conflicts the user has decided
+ * @property {number} unresolved conflicts still without a decision
+ * @property {number} overrides  rows whose automatic pick was overridden
+ * @property {boolean} partial   some directory has not been expanded yet
+ */
+
+/**
+ * @param {MergeRow[]} rows
+ * @returns {MergeSummary}
+ */
+export function summarizeMergeTree(rows) {
+  /** @type {MergeSummary} */
+  const out = {
+    counts: {}, files: 0, conflicts: 0, resolved: 0, unresolved: 0,
+    overrides: 0, partial: false,
+  }
+  for (const row of eachRow(/** @type {any[]} */ (rows ?? []))) {
+    const key = String(row.mergeStatus ?? 'absent')
+    out.counts[key] = (out.counts[key] ?? 0) + 1
+    const dir = isMergeDirRow(row)
+    if (!dir) out.files++
+    if (dir && !row.children) out.partial = true
+    if (isMergeConflict(key)) {
+      out.conflicts++
+      if (row.mergeResolution) out.resolved++
+      else out.unresolved++
+    } else if (row.mergeResolution
+      && row.mergeResolution !== autoMergePick(key)) {
+      out.overrides++
+    }
+  }
+  return out
+}
+
+/**
+ * Join an output root and a `/`-separated relative path using the root's own
+ * separator, so a Windows output folder does not sprout forward slashes.
+ *
+ * @param {string} root
+ * @param {string} rel
+ * @returns {string}
+ */
+export function joinOutputPath(root, rel) {
+  const sep = String(root).includes('\\') && !String(root).includes('/') ? '\\' : '/'
+  const trimmed = String(root).replace(/[\\/]+$/, '')
+  return rel ? `${trimmed}${sep}${String(rel).split('/').join(sep)}` : trimmed
+}
+
+/** Compare two paths the way the filesystem would, for "src is already dest". */
+function samePath(a, b) {
+  const norm = (p) => String(p ?? '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+  return !!a && !!b && norm(a) === norm(b)
+}
+
+/**
+ * @typedef {object} MergeOp
+ * @property {'copy'|'delete'|'mkdir'} op
+ * @property {string} rel        `/`-separated path below the output root
+ * @property {string} dest
+ * @property {string} [src]      copy only
+ * @property {MergeStatus} status
+ * @property {MergePick|null} pick
+ * @property {boolean} isDir
+ * @property {string} label      what the preview shows
+ */
+
+/**
+ * Turn a graded tree into the exact list of filesystem operations the merge
+ * would perform — and nothing else. This is what the preview shows and what
+ * the runner executes, so the two can never describe different things.
+ *
+ * `existing` is the set of relative paths the output folder already holds. It
+ * is what makes a delete honest: without it every "this path must not survive"
+ * row would emit a delete that fails with ENOENT for paths the output never
+ * had, and a preview full of operations that cannot happen is not a preview.
+ * Passing `null` means "not scanned", and then deletes are emitted blind.
+ *
+ * @param {MergeRow[]} rows
+ * @param {object} opts
+ * @param {string} opts.outPath
+ * @param {Set<string>|null} [opts.existing]
+ * @param {(root: string, rel: string) => string} [opts.join]
+ * @returns {MergeOp[]}
+ */
+export function buildMergeOps(rows, opts) {
+  const { outPath, existing = null } = opts
+  const join = opts.join ?? joinOutputPath
+  /** @type {MergeOp[]} */
+  const ops = []
+  const has = (rel) => !existing || existing.has(rel)
+
+  /**
+   * @param {MergeRow[]} list
+   * @param {string} prefix
+   */
+  const walk = (list, prefix) => {
+    for (const row of list ?? []) {
+      const rel = prefix ? `${prefix}/${row.name}` : row.name
+      const dest = join(outPath, rel)
+      const isDir = isMergeDirRow(row)
+      const pick = effectiveMergePick(row)
+      const status = /** @type {MergeStatus} */ (row.mergeStatus ?? 'absent')
+
+      if (isDir) {
+        if (pick === 'delete') {
+          // Nothing under a folder that must not survive is copied, so its
+          // children are not walked; one delete covers the subtree.
+          if (has(rel)) {
+            ops.push({ op: 'delete', rel, dest, status, pick, isDir: true, label: dest })
+          }
+          continue
+        }
+        if (pick === 'skip') continue
+        const before = ops.length
+        walk(row.children ?? [], rel)
+        // `copy` creates its destination's parents, so a folder only needs an
+        // op of its own when nothing lands inside it — an empty folder that
+        // would otherwise silently disappear from the output.
+        const filled = ops.slice(before).some((o) => o.op === 'copy' || o.op === 'mkdir')
+        if (!filled && !has(rel)) {
+          ops.push({ op: 'mkdir', rel, dest, status, pick, isDir: true, label: dest })
+        }
+        continue
+      }
+
+      if (pick === 'delete') {
+        if (has(rel)) {
+          ops.push({ op: 'delete', rel, dest, status, pick, isDir: false, label: dest })
+        }
+        continue
+      }
+      if (!pick || pick === 'skip') continue
+
+      const src = row[pick]
+      // A conflict left undecided, or a pick naming a side that has no file
+      // here, produces nothing: writing a guess is exactly what the preview
+      // exists to prevent.
+      if (!src?.path) continue
+      if (samePath(src.path, dest)) continue
+      ops.push({
+        op: 'copy', rel, dest, src: src.path, status, pick, isDir: false,
+        label: `${src.path} → ${dest}`,
+      })
+    }
+  }
+
+  walk(rows ?? [], '')
+  return ops
+}
+
+/**
+ * @typedef {'copied'|'deleted'|'created'|'absent'|'failed'} MergeOpState
+ *   copied/deleted/created — the operation did what it said
+ *   absent                 — a delete found nothing there; the output already
+ *                            matches what was asked for
+ *   failed                 — the output still holds whatever it held before,
+ *                            except for a copy, which may have written part of
+ *                            a file before giving up
+ *
+ * @typedef {object} MergeOpResult
+ * @property {MergeOp} op
+ * @property {MergeOpState} state
+ * @property {string} [message]
+ */
+
+/** Whether an error means "there was nothing there to begin with". */
+function isMissingPathError(err) {
+  const text = errText(err)
+  return /ENOENT|no such file|找不到|不存在/i.test(text)
+}
+
+/**
+ * Execute a merge plan, one operation at a time, never stopping on failure.
+ *
+ * Sequential for the same reason {@link runMove} is: a batch that stops half
+ * way is only explainable if the half that ran is the half at the top of the
+ * list the user just read.
+ *
+ * @param {MergeOp[]} ops
+ * @param {FileOpsApi & { mkdirFolder?: (path: string) => Promise<unknown> }} api
+ * @returns {Promise<MergeOpResult[]>}
+ */
+export async function runMergeOps(ops, api) {
+  /** @type {MergeOpResult[]} */
+  const results = []
+  for (const op of ops ?? []) {
+    try {
+      if (op.op === 'copy') {
+        await api.copyFile(op.src, op.dest)
+        results.push({ op, state: 'copied' })
+      } else if (op.op === 'delete') {
+        await api.deleteFile(op.dest)
+        results.push({ op, state: 'deleted' })
+      } else {
+        if (typeof api.mkdirFolder !== 'function') {
+          throw new Error('此環境沒有建立資料夾的能力')
+        }
+        await api.mkdirFolder(op.dest)
+        results.push({ op, state: 'created' })
+      }
+    } catch (err) {
+      if (op.op === 'delete' && isMissingPathError(err)) {
+        results.push({ op, state: 'absent' })
+        continue
+      }
+      results.push({
+        op, state: 'failed',
+        message: op.op === 'copy'
+          ? `複製失敗：${errText(err)}。目的地「${op.dest}」可能留下不完整的檔案，請自行確認。`
+          : `${op.op === 'delete' ? '刪除' : '建立資料夾'}失敗：${errText(err)}。`,
+      })
+    }
+  }
+  return results
+}
+
+/**
+ * @param {MergeOpResult[]} results
+ * @returns {string}
+ */
+export function formatMergeSummary(results) {
+  const list = results ?? []
+  const copied = list.filter((r) => r.state === 'copied').length
+  const deleted = list.filter((r) => r.state === 'deleted').length
+  const created = list.filter((r) => r.state === 'created').length
+  const absent = list.filter((r) => r.state === 'absent').length
+  const failed = list.filter((r) => r.state === 'failed')
+
+  const head = [`合併輸出完成：複製 ${copied} 項、刪除 ${deleted} 項、建立資料夾 ${created} 項`]
+  if (absent) head.push(`${absent} 項本來就不存在（無需刪除）`)
+  if (failed.length) head.push(`${failed.length} 項失敗`)
+  const lines = [head.join('，')]
+
+  if (failed.length) {
+    // The output folder is now neither the old state nor the merged state, and
+    // saying which operations did not happen is the only way to finish by hand.
+    lines.push('',
+      `⚠ 輸出資料夾目前是部分合併的狀態：${list.length - failed.length} 項已套用，`
+      + `下列 ${failed.length} 項未套用，其餘內容維持執行前的樣子。`,
+      '')
+    for (const r of failed) lines.push(`• ${r.op.dest}\n　${r.message}`)
+  }
+  return lines.join('\n')
+}
+
 // ── FolderCompare Class ───────────────────────────────────────────────────────
 
 export class FolderCompare {
@@ -2425,6 +2975,26 @@ export class FolderCompare {
 
     // Debounced filter handler
     this._debouncedApplyFilter = debounce(() => this._applyFilterAndRender(), 300)
+
+    // Three-way merge state. Off by default and every branch that reads it is
+    // guarded, so a two-way comparison behaves exactly as it did.
+    this._mergeMode = false
+    /** @type {string|null} common-ancestor folder */
+    this._basePath = null
+    /** @type {FolderSource|null} */
+    this._baseSource = null
+    /** @type {FileEntry[]} */
+    this._baseEntries = []
+    /** @type {string|null} where the merged result is written */
+    this._outputPath = null
+    /** @type {MergeOp[]} the previewed plan; cleared whenever it could be stale */
+    this._mergeOps = []
+    /** @type {Set<string>|null} relative paths the output folder already holds */
+    this._outputExisting = null
+    /** BC's "show only conflicts" merge filter. */
+    this._showOnlyConflicts = false
+    /** @type {number} index into getConflictIndices() */
+    this._currentConflictIdx = -1
 
     // Sync mode state
     this._syncMode = false
@@ -3881,15 +4451,30 @@ export class FolderCompare {
     }
   }
 
-  /** @param {'left'|'right'} side */
+  /** @param {'left'|'base'|'right'} side */
   _sourceOf(side) {
+    if (side === 'base') return this._baseSource
     return side === 'left' ? this._leftSource : this._rightSource
   }
 
-  /** @param {'left'|'right'} side */
+  /** @param {'left'|'base'|'right'} side */
+  _pathOf(side) {
+    if (side === 'base') return this._basePath
+    return side === 'left' ? this._leftPath : this._rightPath
+  }
+
+  /** @param {'left'|'base'|'right'} side */
   _sourceLabel(side) {
     const src = this._sourceOf(side)
-    return src?.label ?? (side === 'left' ? this._leftPath : this._rightPath) ?? ''
+    return src?.label ?? this._pathOf(side) ?? ''
+  }
+
+  /**
+   * Which panes the header, the rows and the path bar draw.
+   * @returns {Array<'left'|'base'|'right'>}
+   */
+  _sides() {
+    return this._mergeMode ? ['left', 'base', 'right'] : ['left', 'right']
   }
 
   /**
@@ -3916,7 +4501,8 @@ export class FolderCompare {
       if (this._isWritableSide(side)) continue
       const kind = this._sourceOf(side)?.kind ?? 'fs'
       const what = { archive: '壓縮檔', snapshot: '快照', remote: '遠端' }[kind] ?? '此來源'
-      alert(`${side === 'left' ? '左' : '右'}側是${what}，僅供瀏覽，無法進行檔案操作`)
+      const which = { left: '左', base: '基準', right: '右' }[side] ?? side
+      alert(`${which}側是${what}，僅供瀏覽，無法進行檔案操作`)
       return false
     }
     return true
@@ -4514,6 +5100,337 @@ ${errText(err)}`)
     return this._syncMode
   }
 
+  // ── Three-way folder merge ──────────────────────────────────────────────────
+
+  /** @returns {boolean} */
+  isMergeMode() { return this._mergeMode }
+
+  /** @returns {string|null} */
+  getBasePath() { return this._basePath }
+
+  /** @returns {string|null} */
+  getOutputPath() { return this._outputPath }
+
+  /**
+   * Enter or leave three-way merge mode.
+   *
+   * The pane count changes, so the whole view is rebuilt rather than patched;
+   * the listener teardown is what keeps that from stacking a second document
+   * key handler on every toggle.
+   *
+   * @param {boolean} on
+   * @returns {Promise<boolean>} the mode actually in force afterwards
+   */
+  async setMergeMode(on) {
+    const next = !!on
+    if (next === this._mergeMode) return this._mergeMode
+    if (next && this._syncMode) this.toggleSyncMode()
+    this._mergeMode = next
+    this._mergeOps = []
+    this._outputExisting = null
+    this._currentConflictIdx = -1
+    if (!next) this._showOnlyConflicts = false
+    this._expanded.clear()
+    this._rebuildUi()
+    this._emit('merge-mode-changed', { mergeMode: this._mergeMode })
+    if (this._leftPath || this._rightPath || this._basePath) await this._scan()
+    return this._mergeMode
+  }
+
+  /** @returns {Promise<boolean>} */
+  async toggleMergeMode() { return this.setMergeMode(!this._mergeMode) }
+
+  /**
+   * Rebuild the DOM after a change the incremental renderers cannot express.
+   *
+   * `_bindEvents` installs two document-level listeners, so re-rendering
+   * without dropping the previous pair would leave a keydown handler behind
+   * for every toggle — the leak this project has already had to fix twice.
+   */
+  _rebuildUi() {
+    if (this._onDocumentClick) {
+      document.removeEventListener('click', this._onDocumentClick)
+      this._onDocumentClick = null
+    }
+    if (this._onDocumentKeydown) {
+      document.removeEventListener('keydown', this._onDocumentKeydown)
+      this._onDocumentKeydown = null
+    }
+    this._dom.vlist = null
+    this._render()
+    this._bindEvents()
+    this._renderMergePanel()
+  }
+
+  /** 選擇基準（共同祖先）資料夾。 */
+  async openBase() {
+    const result = await window.electronAPI.openFolder()
+    if (!result) return
+    await this.setBase(result.path)
+  }
+
+  /**
+   * @param {string} path
+   * @returns {Promise<void>}
+   */
+  async setBase(path) {
+    this._basePath = path || null
+    this._baseSource = path ? { kind: 'fs', root: path } : null
+    if (this._dom.dispBase) this._dom.dispBase.textContent = this._basePath ?? '（未選擇）'
+    this._mergeOps = []
+    if (this._mergeMode) await this._scan()
+  }
+
+  /** 選擇合併輸出資料夾。 */
+  async openOutput() {
+    const result = await window.electronAPI.openFolder()
+    if (!result) return
+    await this.setOutput(result.path)
+  }
+
+  /**
+   * @param {string} path
+   * @returns {Promise<void>}
+   */
+  async setOutput(path) {
+    this._outputPath = path || null
+    // A plan built against the old output folder would name the wrong
+    // destinations, so it stops being a plan.
+    this._mergeOps = []
+    this._outputExisting = null
+    this._renderMergePanel()
+  }
+
+  /** @returns {MergeSummary} */
+  getMergeSummary() { return summarizeMergeTree(this._rows ?? []) }
+
+  /**
+   * Flattened-row indices of the conflicts currently on screen.
+   * Shares the virtual scroller's coordinate system, like getDiffIndices.
+   * @returns {number[]}
+   */
+  getConflictIndices() {
+    const out = []
+    const flat = this._visibleRows ?? []
+    for (let i = 0; i < flat.length; i++) {
+      if (isMergeConflict(flat[i]?.row?.mergeStatus)) out.push(i)
+    }
+    return out
+  }
+
+  /** @returns {number} */
+  getCurrentConflictIndex() { return this._currentConflictIdx }
+
+  /** @returns {NavResult} */
+  nextConflict() { return this._stepConflict(1) }
+
+  /** @returns {NavResult} */
+  prevConflict() { return this._stepConflict(-1) }
+
+  /**
+   * @param {number} delta
+   * @returns {NavResult}
+   */
+  _stepConflict(delta) {
+    const indices = this.getConflictIndices()
+    const total = indices.length
+    const from = this._currentConflictIdx
+    const to = stepDiffIndex(from, total, delta)
+    if (total === 0 || to < 0 || to >= total) return navResult(from, -1, total)
+    this._currentConflictIdx = to
+    this._scrollFlatIndexIntoView(indices[to])
+    this._applyCurrentDiffMark(indices[to])
+    this._syncMergePanelStatus()
+    return navResult(from, to, total)
+  }
+
+  /** @returns {boolean} */
+  getShowOnlyConflicts() { return this._showOnlyConflicts }
+
+  /** @param {boolean} on */
+  setShowOnlyConflicts(on) {
+    this._showOnlyConflicts = !!on
+    this._currentConflictIdx = -1
+    if (this._dom.cbOnlyConflicts) this._dom.cbOnlyConflicts.checked = this._showOnlyConflicts
+    this._applyFilterAndRender()
+  }
+
+  /** @returns {boolean} */
+  toggleShowOnlyConflicts() {
+    this.setShowOnlyConflicts(!this._showOnlyConflicts)
+    return this._showOnlyConflicts
+  }
+
+  /**
+   * Record a decision for one row.
+   *
+   * @param {MergeRow} row
+   * @param {MergePick|null} pick null clears the override and restores the
+   *   automatic verdict
+   */
+  resolveRow(row, pick) {
+    if (!row) return
+    row.mergeResolution = pick
+    this._mergeOps = []
+    this._applyFilterAndRender()
+    this._renderMergePanel()
+  }
+
+  /**
+   * Apply a decision to every unresolved conflict at once.
+   *
+   * @param {MergePick} pick
+   * @returns {number} how many rows were decided
+   */
+  resolveAllConflicts(pick) {
+    let n = 0
+    for (const row of eachRow(this._rows ?? [])) {
+      if (!isMergeConflict(row.mergeStatus)) continue
+      if (row.mergeResolution) continue
+      row.mergeResolution = pick
+      n++
+    }
+    if (n) {
+      this._mergeOps = []
+      this._applyFilterAndRender()
+      this._renderMergePanel()
+    }
+    return n
+  }
+
+  /**
+   * Drop every manual decision, returning the whole tree to its automatic
+   * verdict.
+   * @returns {number}
+   */
+  clearMergeResolutions() {
+    let n = 0
+    for (const row of eachRow(this._rows ?? [])) {
+      if (!row.mergeResolution) continue
+      row.mergeResolution = null
+      n++
+    }
+    if (n) {
+      this._mergeOps = []
+      this._applyFilterAndRender()
+      this._renderMergePanel()
+    }
+    return n
+  }
+
+  /**
+   * Every relative path the output folder already holds.
+   *
+   * Needed before a plan can be built: it is the difference between "delete
+   * this" and "this was never there", and between creating an empty folder and
+   * pointlessly re-creating one.
+   *
+   * @param {string} root
+   * @returns {Promise<Set<string>>}
+   */
+  async _scanOutputTree(root) {
+    /** @type {Set<string>} */
+    const seen = new Set()
+    if (typeof window.electronAPI?.readDir !== 'function') return seen
+    /** @type {Array<{ path: string, rel: string }>} */
+    const queue = [{ path: root, rel: '' }]
+    let dirs = 0
+    while (queue.length) {
+      if (dirs++ >= MAX_EXPAND_ALL_DIRS) {
+        this._setScanStatus(`輸出資料夾超過 ${MAX_EXPAND_ALL_DIRS} 個目錄，更深的層級未納入預覽`)
+        break
+      }
+      const cur = queue.shift()
+      let entries = []
+      try {
+        entries = await window.electronAPI.readDir(cur.path)
+      } catch (err) {
+        // An unreadable output subtree is not fatal, but pretending it is empty
+        // would turn "delete" rows into no-ops without telling anyone.
+        console.error('FolderCompare: could not read output folder', cur.path, err)
+        this._setScanStatus(`無法讀取輸出資料夾「${cur.path}」：${errText(err)}`)
+        continue
+      }
+      for (const entry of entries ?? []) {
+        const rel = cur.rel ? `${cur.rel}/${entry.name}` : entry.name
+        seen.add(rel)
+        if (entry.isDirectory) queue.push({ path: entry.path, rel })
+      }
+    }
+    return seen
+  }
+
+  /**
+   * Build the plan and show it. Nothing is written.
+   * @returns {Promise<MergeOp[]>}
+   */
+  async previewMerge() {
+    if (!this._mergeMode) { alert('請先切換到三向合併模式'); return [] }
+    if (!this._outputPath) { alert('請先選擇合併輸出資料夾'); return [] }
+    const summary = this.getMergeSummary()
+    if (summary.partial) {
+      this._setScanStatus('尚有未展開的目錄；請按 ⊞ 展開全部，預覽才會涵蓋整棵樹')
+    }
+    this._outputExisting = await this._scanOutputTree(this._outputPath)
+    this._mergeOps = buildMergeOps(this._rows ?? [], {
+      outPath: this._outputPath,
+      existing: this._outputExisting,
+    })
+    this._renderMergePreview()
+    this._syncMergePanelStatus()
+    return this._mergeOps
+  }
+
+  /**
+   * Execute the previewed plan.
+   *
+   * Refuses to run without a preview: the plan is the only description of what
+   * is about to happen, and a destructive run whose description was never on
+   * screen is the thing the preview exists to prevent.
+   *
+   * @returns {Promise<MergeOpResult[]>}
+   */
+  async applyMerge() {
+    if (!this._mergeOps.length) {
+      alert('請先按「預覽輸出」，確認要執行的操作後再合併')
+      return []
+    }
+    if (!this._outputPath) { alert('請先選擇合併輸出資料夾'); return [] }
+
+    const summary = this.getMergeSummary()
+    if (summary.unresolved) {
+      // An undecided conflict produces no operation at all, so the output would
+      // simply lack that path. Silently shipping a partial merge is worse than
+      // asking.
+      if (!confirm(
+        `還有 ${summary.unresolved} 個衝突沒有決定，這些項目不會寫入輸出資料夾。\n\n`
+        + '要略過它們繼續合併嗎？')) return []
+    }
+
+    const deletes = this._mergeOps.filter((op) => op.op === 'delete')
+    const copies = this._mergeOps.filter((op) => op.op === 'copy')
+    if (!confirm(
+      `即將把合併結果寫入：\n${this._outputPath}\n\n`
+      + `複製 ${copies.length} 項、刪除 ${deletes.length} 項、`
+      + `建立資料夾 ${this._mergeOps.filter((op) => op.op === 'mkdir').length} 項。\n\n`
+      + '這會直接修改輸出資料夾的內容，要繼續嗎？')) return []
+
+    const results = await runMergeOps(this._mergeOps, {
+      copyFile: (src, dest) => window.electronAPI.copyFile(src, dest),
+      deleteFile: (path) => window.electronAPI.deleteFile(path),
+      renameFile: (a, b) => window.electronAPI.renameFile(a, b),
+      mkdirFolder: (path) => window.electronAPI.mkdirFolder(path),
+    })
+    // The plan describes a state the output no longer has; keeping it would let
+    // a second click re-run operations against a folder that already moved.
+    this._mergeOps = []
+    this._outputExisting = null
+    alert(formatMergeSummary(results))
+    this._renderMergePanel()
+    await this.refresh()
+    return results
+  }
+
   /**
    * Compute folder-compare row statistics by status.
    * @returns {{ same: number, different: number, left_only: number, right_only: number, left_newer: number, right_newer: number, total: number }}
@@ -4728,6 +5645,144 @@ ${rows}
   // ── Private: Sync panel ─────────────────────────────────────────────────────
 
   /** 在比對視圖上方顯示或移除同步面板 */
+  /**
+   * The merge control strip: output folder, conflict navigation, batch
+   * resolution, preview and apply.
+   *
+   * Rebuilt wholesale on every state change rather than patched — it is one
+   * strip of a dozen controls, and a stale button here is a destructive run
+   * against the wrong plan.
+   */
+  _renderMergePanel() {
+    const root = this._dom.root
+    if (!root) return
+    root.querySelector('.merge-panel')?.remove()
+    this._dom.mergePanel = null
+    if (!this._mergeMode) return
+
+    const panel = el('div', { className: 'merge-panel' })
+
+    // ── output folder ──
+    const outRow = el('div', { className: 'merge-row' })
+    const btnOut = el('button', { className: 'merge-btn' }, '選擇輸出資料夾…')
+    const outPath = el('span', { className: 'merge-out-path' },
+      this._outputPath ?? '（未選擇）')
+    btnOut.addEventListener('click', () => void this.openOutput())
+    outRow.append(el('span', { className: 'merge-label' }, '合併輸出：'), btnOut, outPath)
+
+    // ── conflict navigation and filter ──
+    const navRow = el('div', { className: 'merge-row' })
+    const cbWrap = el('label', { className: 'merge-check' })
+    const cbOnly = el('input', { type: 'checkbox', className: 'merge-only-conflicts' })
+    cbOnly.checked = this._showOnlyConflicts
+    cbOnly.addEventListener('change', () => this.setShowOnlyConflicts(!!cbOnly.checked))
+    this._dom.cbOnlyConflicts = cbOnly
+    cbWrap.append(cbOnly, document.createTextNode(' 只顯示衝突'))
+
+    const btnPrev = el('button', { className: 'merge-btn merge-btn--nav' }, '◀ 上一個衝突')
+    const btnNext = el('button', { className: 'merge-btn merge-btn--nav' }, '下一個衝突 ▶')
+    btnPrev.addEventListener('click', () => this.prevConflict())
+    btnNext.addEventListener('click', () => this.nextConflict())
+    const status = el('span', { className: 'merge-status' })
+    this._dom.mergeStatusEl = status
+    navRow.append(cbWrap, btnPrev, btnNext, status)
+
+    // ── batch resolution ──
+    const batchRow = el('div', { className: 'merge-row' })
+    batchRow.appendChild(el('span', { className: 'merge-label' }, '未決衝突全部採用：'))
+    for (const [pick, label] of /** @type {Array<[MergePick, string]>} */ ([
+      ['left', '左側'], ['base', '基準'], ['right', '右側'], ['delete', '刪除'],
+    ])) {
+      const btn = el('button', { className: 'merge-btn' }, label)
+      btn.dataset.pick = pick
+      btn.addEventListener('click', () => {
+        const n = this.resolveAllConflicts(pick)
+        this._setScanStatus(n ? `已將 ${n} 個未決衝突設為「${label}」` : '沒有未決的衝突')
+      })
+      batchRow.appendChild(btn)
+    }
+    const btnClear = el('button', { className: 'merge-btn' }, '清除所有手動決議')
+    btnClear.addEventListener('click', () => {
+      const n = this.clearMergeResolutions()
+      this._setScanStatus(n ? `已清除 ${n} 項手動決議` : '沒有手動決議可清除')
+    })
+    batchRow.appendChild(btnClear)
+
+    // ── preview / apply ──
+    const actRow = el('div', { className: 'merge-row merge-row--actions' })
+    const btnPreview = el('button', { className: 'merge-btn' }, '預覽輸出')
+    const btnApply = el('button', { className: 'merge-btn merge-btn--primary' }, '執行合併')
+    // Apply stays shut until a plan exists, because the plan *is* the warning.
+    btnApply.disabled = !this._mergeOps.length
+    btnPreview.addEventListener('click', () => void this.previewMerge().then(() => {
+      btnApply.disabled = !this._mergeOps.length
+    }))
+    btnApply.addEventListener('click', () => void this.applyMerge())
+    this._dom.btnMergePreview = btnPreview
+    this._dom.btnMergeApply = btnApply
+    actRow.append(btnPreview, btnApply)
+
+    panel.append(outRow, navRow, batchRow, actRow)
+
+    const toolbar = root.querySelector('.fc-toolbar')
+    if (toolbar?.nextSibling) root.insertBefore(panel, toolbar.nextSibling)
+    else root.insertBefore(panel, root.firstChild)
+    this._dom.mergePanel = panel
+
+    this._syncMergePanelStatus()
+    if (this._mergeOps.length) this._renderMergePreview()
+  }
+
+  /** Refresh the counters without rebuilding the panel. */
+  _syncMergePanelStatus() {
+    const elStatus = this._dom.mergeStatusEl
+    if (!elStatus) return
+    const s = this.getMergeSummary()
+    const total = this.getConflictIndices().length
+    const at = this._currentConflictIdx >= 0 ? `${this._currentConflictIdx + 1}/${total}` : `–/${total}`
+    const parts = [
+      `衝突 ${at}`,
+      `未決 ${s.unresolved}`,
+      `已決 ${s.resolved}`,
+      `可自動合併 ${s.files - s.conflicts}`,
+    ]
+    if (s.overrides) parts.push(`手動覆寫 ${s.overrides}`)
+    if (s.partial) parts.push('（尚有未展開的目錄）')
+    elStatus.textContent = parts.join('　')
+  }
+
+  /** List the previewed operations under the panel. */
+  _renderMergePreview() {
+    const panel = this._dom.mergePanel
+    if (!panel) return
+    panel.querySelector('.merge-preview')?.remove()
+
+    const preview = el('div', { className: 'merge-preview' })
+    if (!this._mergeOps.length) {
+      preview.classList.add('merge-empty')
+      preview.textContent = '✓ 沒有需要執行的操作（輸出資料夾已經是合併後的樣子）'
+      panel.appendChild(preview)
+      return
+    }
+
+    const labels = { copy: '複製', delete: '刪除', mkdir: '建立資料夾' }
+    preview.appendChild(el('div', { className: 'merge-preview-title' },
+      `待執行操作（共 ${this._mergeOps.length} 項）：`))
+    const list = el('div', { className: 'merge-preview-list' })
+    for (const op of this._mergeOps) {
+      const row = el('div', { className: `merge-op merge-op--${op.op}` })
+      // textContent throughout: a filename holding HTML metacharacters must
+      // not become markup in the one dialog the user reads before a delete.
+      row.appendChild(el('span', { className: 'merge-op-type' }, labels[op.op] ?? op.op))
+      row.appendChild(el('span', { className: 'merge-op-status' },
+        MERGE_STATUS_LABELS[op.status] ?? String(op.status)))
+      row.appendChild(el('span', { className: 'merge-op-path' }, op.label))
+      list.appendChild(row)
+    }
+    preview.appendChild(list)
+    panel.appendChild(preview)
+  }
+
   _renderSyncPanel() {
     const root = this._dom.root
     if (!root) return
@@ -5850,7 +6905,11 @@ ${rows}
     if (!this._container) return
     this._container.innerHTML = ''
 
-    const root = el('div', { className: 'folder-compare' })
+    // The merge class widens the header/row/path grids to three panes; every
+    // track count lives in CSS so the three stay aligned by construction.
+    const root = el('div', {
+      className: `folder-compare${this._mergeMode ? ' folder-compare--merge' : ''}`,
+    })
 
     // S15-UX: path row first so the "open folder…" buttons sit at the same
     // visual row across every compare view.
@@ -6029,6 +7088,14 @@ ${rows}
     const btnSync = el('button', { className: 'fc-btn-sync', title: '資料夾同步' }, '⇔ 同步')
     this._dom.btnSync = btnSync
     toolbar.appendChild(btnSync)
+
+    // Three-way merge toggle.
+    const btnMerge = el('button', {
+      className: `fc-btn-merge${this._mergeMode ? ' fc-btn-merge--active' : ''}`,
+      title: this._mergeMode ? '退出三向合併模式' : '三向資料夾合併（左／基準／右）',
+    }, '⑃ 三向合併')
+    this._dom.btnMerge = btnMerge
+    toolbar.appendChild(btnMerge)
 
     // T56: Expand All / Collapse All buttons
     const btnExpandAll = el('button', { className: 'fc-btn-expand-all', title: '展開全部目錄' }, '⊞')
@@ -6652,6 +7719,21 @@ ${rows}
     leftCell.appendChild(btnZipLeft)
     leftCell.appendChild(dispLeft)
 
+    // Base (three-way merge only)
+    let baseCell = null
+    if (this._mergeMode) {
+      baseCell = el('div', { className: 'fc-path-cell fc-path-cell--base' })
+      const btnBase = el('button', {
+        className: 'fc-open-btn fc-open-base', 'data-side': 'base',
+        title: '共同祖先版本；三向判定「是誰改的」全靠它',
+      }, '開啟基準資料夾…')
+      const dispBase = el('span', { className: 'fc-path-display', 'data-side': 'base' },
+        this._basePath ?? '（未選擇）')
+      this._dom.btnOpenBase = btnBase
+      this._dom.dispBase = dispBase
+      baseCell.append(btnBase, dispBase)
+    }
+
     // Right
     const rightCell = el('div', { className: 'fc-path-cell' })
     const btnRight = el('button', { className: 'fc-open-btn', 'data-side': 'right' }, '開啟資料夾…')
@@ -6668,6 +7750,7 @@ ${rows}
     rightCell.appendChild(dispRight)
 
     row.appendChild(leftCell)
+    if (baseCell) row.appendChild(baseCell)
     row.appendChild(rightCell)
     return row
   }
@@ -6691,8 +7774,8 @@ ${rows}
     const template = this._sideTemplate()
 
     header.appendChild(el('div', { className: 'fc-col-cb-spacer' }))
-    for (const side of ['left', 'right']) {
-      if (side === 'right') header.appendChild(el('div', { className: 'fc-col-sep' }))
+    for (const side of this._sides()) {
+      if (side !== 'left') header.appendChild(el('div', { className: 'fc-col-sep' }))
       const sideEl = el('div', { className: `fc-header-side fc-header-side--${side}` })
       sideEl.style.gridTemplateColumns = template
       for (const def of this._columnDefs()) {
@@ -6774,6 +7857,8 @@ ${rows}
     }
 
     btnSync.addEventListener('click', () => this.toggleSyncMode())
+    this._dom.btnMerge?.addEventListener('click', () => void this.toggleMergeMode())
+    this._dom.btnOpenBase?.addEventListener('click', () => void this.openBase())
 
     // T55: Left Newer / Right Newer toggles. Each of the four below is one of
     // BC's independent View switches, so flipping one re-labels the preset
@@ -7050,7 +8135,7 @@ ${rows}
   // ── Private: Scan ───────────────────────────────────────────────────────────
 
   async _scan() {
-    if (!this._leftPath && !this._rightPath) {
+    if (!this._leftPath && !this._rightPath && !(this._mergeMode && this._basePath)) {
       this._rows = []
       this._renderList()
       return
@@ -7058,6 +8143,18 @@ ${rows}
 
     this._renderLoading()
     const ctrl = this._beginScan()
+
+    if (this._mergeMode) {
+      try {
+        await this._scanMerge(ctrl.signal)
+      } catch (err) {
+        console.error('FolderCompare._scanMerge error:', err)
+        this._renderError(err.message)
+      } finally {
+        this._endScan(ctrl)
+      }
+      return
+    }
 
     try {
       const [leftEntries, rightEntries] = await Promise.all([
@@ -7109,6 +8206,139 @@ ${rows}
     }
 
     this._applyFilterAndRender()
+  }
+
+  /**
+   * Scan all three roots and grade the tree.
+   * @param {AbortSignal} [signal]
+   */
+  async _scanMerge(signal) {
+    this._selectedNames.clear()
+    this._updateBatchButton()
+    if (this._dom.cbSelectAll) this._dom.cbSelectAll.checked = false
+
+    const [leftEntries, baseEntries, rightEntries] = await Promise.all([
+      this._leftPath  ? this._listDir('left',  this._leftPath)  : Promise.resolve([]),
+      this._basePath  ? this._listDir('base',  this._basePath)  : Promise.resolve([]),
+      this._rightPath ? this._listDir('right', this._rightPath) : Promise.resolve([]),
+    ])
+    if (signal?.aborted) { this._renderList(); return }
+
+    this._leftEntries = leftEntries
+    this._baseEntries = baseEntries
+    this._rightEntries = rightEntries
+    this._tickProgress(leftEntries.length + baseEntries.length + rightEntries.length)
+    this._expanded.clear()
+    // A plan built against the previous tree names files that may no longer be
+    // in that state.
+    this._mergeOps = []
+    this._currentConflictIdx = -1
+
+    this._rows = buildMergeRows(baseEntries, leftEntries, rightEntries, this._compareOpts())
+    await this._gradeMerge(this._rows, signal)
+    if (signal?.aborted) { this._renderList(); return }
+
+    this._applyFilterAndRender()
+    this._renderMergePanel()
+    this._emit('paths-changed', {
+      left: this._leftPath, base: this._basePath, right: this._rightPath,
+    })
+  }
+
+  /**
+   * Decide every row of a three-way level.
+   *
+   * The three pairwise verdicts come from the *same* pipeline a two-way
+   * comparison uses — `computeStatus` for metadata, then `_applyDeepCompare`
+   * for MD5 or the rules engine — by handing it three synthetic pair lists
+   * that share the very same FileEntry objects. Writing a second content
+   * comparator for merge would be a second thing to keep in step with the
+   * mode picker, the tolerances and the alignment rules.
+   *
+   * @param {MergeRow[]} rows
+   * @param {AbortSignal} [signal]
+   */
+  async _gradeMerge(rows, signal) {
+    const files = [...eachRow(rows ?? [])].filter(
+      (row) => !(row.base?.isDirectory || row.left?.isDirectory || row.right?.isDirectory))
+    const mode = this._baseMode()
+    const opts = this._compareOpts()
+
+    /**
+     * @param {'left'|'base'|'right'} a
+     * @param {'left'|'base'|'right'} b
+     */
+    const pairsOf = (a, b) => files
+      .filter((row) => row[a] && row[b])
+      .map((row) => ({
+        name: row.name,
+        left: row[a],
+        right: row[b],
+        status: computeStatus(row[a], row[b], mode, this._mtimeTolerance, opts),
+        children: null,
+      }))
+
+    const lb = pairsOf('left', 'base')
+    const rb = pairsOf('right', 'base')
+    const lr = pairsOf('left', 'right')
+    for (const list of [lb, rb, lr]) {
+      if (!list.length) continue
+      await this._applyDeepCompare(list, signal)
+      if (signal?.aborted) return
+    }
+
+    // `\u0000` cannot occur in a path on any platform this runs on, so it is
+    // the one separator that cannot make two different pairs collide.
+    /** @type {Map<string, {status: string, unimportant: boolean}>} */
+    const verdicts = new Map()
+    const keyOf = (a, b) => `${a?.path ?? ''}\u0000${b?.path ?? ''}`
+    for (const pair of [...lb, ...rb, ...lr]) {
+      verdicts.set(keyOf(pair.left, pair.right),
+        { status: pair.status, unimportant: !!pair.unimportant })
+    }
+    const verdictOf = (a, b) => verdicts.get(keyOf(a, b)) ?? verdicts.get(keyOf(b, a)) ?? null
+
+    gradeMergeRows(rows ?? [], (a, b) => verdictOf(a, b)?.status === 'same')
+
+    // The two-way status keeps every existing filter, sorter, report and
+    // statistic working; the merge verdict rides alongside rather than
+    // replacing it.
+    for (const row of eachRow(rows ?? [])) {
+      const both = !!(row.left && row.right)
+      const pair = both ? verdictOf(row.left, row.right) : null
+      row.status = both
+        ? (pair?.status ?? 'different')
+        : row.left ? 'left-only'
+          : row.right ? 'right-only'
+            // Present only in the base: both sides agreed to delete it. There
+            // is no left/right disagreement to report, so it counts as "same".
+            : 'same'
+      row.unimportant = !!pair?.unimportant
+    }
+    this._refreshRollups()
+  }
+
+  /**
+   * Load one directory row's children on all three sides.
+   * @param {MergeRow} row
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<void>}
+   */
+  async _loadMergeChildren(row, signal) {
+    if (row.children) return
+    /** @param {'left'|'base'|'right'} side */
+    const listing = (side) => (row[side]?.isDirectory
+      ? this._listDir(side, row[side].path)
+      : Promise.resolve([]))
+    const [left, base, right] = await Promise.all([
+      listing('left'), listing('base'), listing('right'),
+    ])
+    if (signal?.aborted) return
+    row.children = buildMergeRows(base, left, right, this._compareOpts())
+    this._tickProgress(row.children.length)
+    await this._gradeMerge(row.children, signal)
+    if (signal?.aborted) { row.children = null; return }
+    this._refreshRollups()
   }
 
   /** @returns {'name'|'size'|'mtime'|'both'} 內容類模式先以 metadata 粗篩 */
@@ -7365,6 +8595,14 @@ ${rows}
   }
 
   _isRowVisible(row) {
+    if (this._mergeMode && this._showOnlyConflicts) {
+      const isDir = isDirRow(row) || !!row.base?.isDirectory
+      // A folder whose children have not been read yet cannot have rolled a
+      // conflict up, so hiding it would hide the conflicts inside it.
+      const unknown = isDir && !row.children
+      if (!unknown && !isMergeConflict(row.mergeStatus)) return false
+    }
+
     // Compare Files Only: a directory is scaffolding, not a result. Hiding one
     // because its own status is filtered out would take every file under it
     // off screen with it.
@@ -7540,6 +8778,7 @@ ${rows}
    */
   async _loadChildren(row, signal) {
     if (row.children) return
+    if (this._mergeMode) { await this._loadMergeChildren(row, signal); return }
     const leftPath = row.left?.isDirectory ? row.left.path : null
     const rightPath = row.right?.isDirectory ? row.right.path : null
     if (!leftPath && !rightPath) {
@@ -7603,6 +8842,10 @@ ${rows}
   /** 由葉往根重算所有已載入目錄的狀態與「不重要差異」標記。 */
   _refreshRollups() {
     for (const row of this._rows ?? []) {
+      // Merge verdicts roll up on their own rules: a folder is not "三方相同"
+      // just because it exists on all three sides, and a folder one side
+      // deleted stops being a clean deletion once a surviving child changed.
+      if (this._mergeMode) row.mergeStatus = rollupMergeStatus(row)
       row.status = rollupStatus(row)
       if (row.children) row.unimportant = row.status === 'same' && rollupUnimportant(row)
     }
@@ -7641,6 +8884,9 @@ ${rows}
   _expandKey(depth, row) {
     const lp = row.left?.path ?? ''
     const rp = row.right?.path ?? ''
+    // Without the base path, two merge rows that exist only in the base would
+    // share the key `depth:|` and collapse into one another.
+    if (this._mergeMode) return `${depth}:${lp}|${row.base?.path ?? ''}|${rp}`
     return `${depth}:${lp}|${rp}`
   }
 
@@ -7650,10 +8896,17 @@ ${rows}
    * @param {boolean} [expanded]
    */
   _buildRow(row, depth = 0, expanded = undefined) {
-    const isDir = !!(row.left?.isDirectory || row.right?.isDirectory)
+    const merge = this._mergeMode
+    const isDir = !!(row.left?.isDirectory || row.right?.isDirectory
+      || (merge && row.base?.isDirectory))
 
+    const mergeStatus = merge ? String(row.mergeStatus ?? 'absent') : ''
     const rowEl = el('div', {
-      className: `fc-row ${row.status}${isDir ? ' is-dir' : ''}${row.unimportant ? ' fc-row--unimportant' : ''}`,
+      className: `fc-row ${row.status}${isDir ? ' is-dir' : ''}`
+        + `${row.unimportant ? ' fc-row--unimportant' : ''}`
+        + (merge ? ` fc-merge-row fc-merge--${mergeStatus}` : '')
+        + (merge && isMergeConflict(mergeStatus) ? ' fc-merge-row--conflict' : '')
+        + (merge && row.mergeResolution ? ' fc-merge-row--resolved' : ''),
       'data-name': row.name,
       'data-left-path': row.left?.path ?? '',
       'data-right-path': row.right?.path ?? '',
@@ -7671,24 +8924,27 @@ ${rows}
       'data-left-path': row.left?.path ?? '',
       'data-right-path': row.right?.path ?? '',
     })
-    const key = row.left?.path || row.right?.path
+    const key = row.left?.path || row.right?.path || (merge ? row.base?.path : '')
     if (key && this._selectedNames.has(key)) cb.checked = true
     if (key && key === this._focusedKey) rowEl.classList.add('fc-row--focused')
     rowEl.appendChild(cb)
 
-    // Left cell
     const isExpanded = expanded ?? (isDir && this._expanded.has(this._expandKey(depth, row)))
-    const leftCell = this._buildCell(row.left, row, isDir, depth,
-      row.status === 'right-only', 'left', isExpanded)
-    // Separator
-    const sep = el('div', { className: 'fc-row-sep' })
-    // Right cell
-    const rightCell = this._buildCell(row.right, row, isDir, depth,
-      row.status === 'left-only', 'right', isExpanded)
+    for (const side of this._sides()) {
+      if (side !== 'left') rowEl.appendChild(el('div', { className: 'fc-row-sep' }))
+      // In merge mode a pane is empty exactly when that side has no entry;
+      // the two-way `status` cannot express "missing from the base".
+      const isEmpty = merge ? !row[side] : row.status === (side === 'left' ? 'right-only' : 'left-only')
+      rowEl.appendChild(this._buildCell(row[side], row, isDir, depth, isEmpty, side, isExpanded))
+    }
 
-    rowEl.appendChild(leftCell)
-    rowEl.appendChild(sep)
-    rowEl.appendChild(rightCell)
+    if (merge) {
+      rowEl.dataset.mergeStatus = mergeStatus
+      rowEl.dataset.mergeResolution = row.mergeResolution ?? ''
+      rowEl.dataset.basePath = row.base?.path ?? ''
+      rowEl.dataset.mergePick = effectiveMergePick(row) ?? ''
+      rowEl.title = MERGE_STATUS_LABELS[mergeStatus] ?? mergeStatus
+    }
 
     return rowEl
   }
@@ -7699,7 +8955,7 @@ ${rows}
    * @param {boolean} isDir
    * @param {number} depth
    * @param {boolean} isEmpty - 孤兒側（對側沒有此檔案）
-   * @param {'left'|'right'} side
+   * @param {'left'|'base'|'right'} side
    * @param {boolean} [expanded] - 目錄是否已展開（決定 ▶ / ▼）
    */
   _buildCell(entry, row, isDir, depth, isEmpty, side, expanded = false) {
@@ -8106,6 +9362,47 @@ ${rows}
       : '')
   }
 
+  /**
+   * The merge status bar. Different numbers from the two-way one: what matters
+   * here is how much of the tree merges by itself and how much still needs a
+   * decision.
+   */
+  _renderMergeStats() {
+    const stats = this._dom.stats
+    if (!stats) return
+    const s = this.getMergeSummary()
+    /** @type {Array<[string, string]>} */
+    const order = [
+      ['same', 'same'],
+      ['left-changed', 'left-newer'],
+      ['right-changed', 'right-newer'],
+      ['both-changed-same', 'same'],
+      ['left-added', 'left-only'],
+      ['right-added', 'right-only'],
+      ['both-added-same', 'same'],
+      ['left-deleted', 'right-only'],
+      ['right-deleted', 'left-only'],
+      ['both-deleted', 'different'],
+      ['conflict-changed', 'different'],
+      ['conflict-added', 'different'],
+      ['conflict-modify-delete', 'different'],
+    ]
+    for (const [key, dot] of order) {
+      const count = s.counts[key]
+      if (!count) continue
+      const item = el('span', { className: 'fc-stat-item' })
+      item.appendChild(el('span', { className: `fc-stat-dot ${dot}` }))
+      item.appendChild(document.createTextNode(`${MERGE_STATUS_LABELS[key]}: ${count}`))
+      stats.appendChild(item)
+    }
+    const tail = el('span', { className: 'fc-stat-item' },
+      `衝突 ${s.conflicts}（未決 ${s.unresolved}）　共 ${s.files} 個檔案`
+      + (s.partial ? '　※ 尚有未展開的目錄' : ''))
+    tail.style.marginLeft = 'auto'
+    stats.appendChild(tail)
+    this._syncMergePanelStatus()
+  }
+
   _renderStats(rows) {
     if (!this._dom.stats) return
     const stats = this._dom.stats
@@ -8115,6 +9412,8 @@ ${rows}
       stats.appendChild(el('span', { className: 'fc-stat-item fc-stat-note' }, this._modeNote))
     }
     if (!rows.length) return
+
+    if (this._mergeMode) { this._renderMergeStats(); return }
 
     const counts = {}
     let unimportant = 0
@@ -8159,7 +9458,8 @@ ${rows}
   _onRowClick(e) {
     const rowEl = e.target.closest('.fc-row')
     if (!rowEl) return
-    this._setFocusedKey(rowEl.dataset.leftPath || rowEl.dataset.rightPath || null)
+    this._setFocusedKey(rowEl.dataset.leftPath || rowEl.dataset.rightPath
+      || rowEl.dataset.basePath || null)
 
     const isDir = rowEl.dataset.isDir === 'true'
     if (!isDir) return
@@ -8168,11 +9468,16 @@ ${rows}
     const leftPath = rowEl.dataset.leftPath
     const rightPath = rowEl.dataset.rightPath
     const name = rowEl.dataset.name
-    const expandKey = this._expandKey(depth, {
-      name,
-      left:  leftPath  ? { path: leftPath }  : null,
-      right: rightPath ? { path: rightPath } : null,
-    })
+    // The model row is the only thing that knows the base path, and a stub
+    // rebuilt from the dataset would key a base-only folder as if it had none.
+    const flat = this._flatEntryOf(rowEl)
+    const expandKey = flat
+      ? this._expandKey(flat.depth, flat.row)
+      : this._expandKey(depth, {
+        name,
+        left:  leftPath  ? { path: leftPath }  : null,
+        right: rightPath ? { path: rightPath } : null,
+      })
 
     if (this._expanded.has(expandKey)) {
       this._collapseDir(expandKey)
@@ -8225,6 +9530,36 @@ ${rows}
     // handlers; a virtual side offers browsing and comparison only.
     const leftIsFs = this._isWritableSide('left')
     const rightIsFs = this._isWritableSide('right')
+
+    // ── 三向合併：這一列要用哪一份 ──
+    if (this._mergeMode && modelRow) {
+      const current = effectiveMergePick(modelRow)
+      const auto = autoMergePick(modelRow.mergeStatus)
+      items.push({
+        label: `狀態：${MERGE_STATUS_LABELS[modelRow.mergeStatus] ?? modelRow.mergeStatus}`,
+        disabled: true,
+        action: () => {},
+      })
+      for (const [pick, label] of /** @type {Array<[MergePick, string]>} */ ([
+        ['left', '採用左側'], ['base', '採用基準'], ['right', '採用右側'],
+        ['delete', '不放入輸出（刪除）'], ['skip', '略過此列'],
+      ])) {
+        // Naming a side that has no file here would produce no operation and
+        // look like the decision was ignored.
+        if ((pick === 'left' || pick === 'base' || pick === 'right') && !modelRow[pick]) continue
+        items.push({
+          label: `${current === pick ? '✓ ' : '　'}${label}`,
+          action: () => this.resolveRow(modelRow, pick),
+        })
+      }
+      if (modelRow.mergeResolution) {
+        items.push({
+          label: `恢復自動判定${auto ? `（${auto}）` : '（無法自動合併）'}`,
+          action: () => this.resolveRow(modelRow, null),
+        })
+      }
+      items.push({ separator: true })
+    }
 
     // ── 開啟比對（檔案）──
     if (!isDir && leftPath && rightPath &&

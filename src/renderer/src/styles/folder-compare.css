@@ -1522,3 +1522,141 @@
   color: var(--text-secondary);
   cursor: default;
 }
+
+/* ── Three-way folder merge ──────────────────────────────────────────────── */
+/* Every three-pane track count lives here, so the header, the rows and the
+   path bar cannot drift out of alignment one at a time. */
+.folder-compare--merge .fc-path-row {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.folder-compare--merge .fc-header,
+.folder-compare--merge .fc-row {
+  grid-template-columns: 22px 1fr 1px 1fr 1px 1fr;
+}
+
+.fc-cell-base {
+  padding-left: 4px;
+}
+
+.fc-path-cell--base,
+.fc-header-side--base {
+  background: rgb(128 128 128 / 6%);
+}
+
+.fc-btn-merge--active {
+  background: var(--accent-color, #4a90d9);
+  color: #fff;
+}
+
+/* Conflicts are the only rows that cannot be written without a decision, so
+   they get the one colour reserved for "stop" in this view. */
+.fc-row.fc-merge-row--conflict {
+  background: rgb(220 53 69 / 16%);
+}
+
+[data-theme="dark"] .fc-row.fc-merge-row--conflict {
+  background: rgb(220 53 69 / 26%);
+}
+
+.fc-row.fc-merge-row--resolved {
+  box-shadow: inset 3px 0 0 var(--accent-color, #4a90d9);
+}
+
+.merge-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.merge-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.merge-label {
+  color: var(--text-secondary);
+}
+
+.merge-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.merge-btn {
+  padding: 3px 10px;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.merge-btn:hover:not(:disabled) {
+  background: var(--bg-hover, rgb(128 128 128 / 18%));
+}
+
+.merge-btn:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+  opacity: 0.6;
+}
+
+.merge-btn--primary {
+  color: #fff;
+  background: var(--accent-color, #4a90d9);
+  border-color: var(--accent-color, #4a90d9);
+}
+
+.merge-out-path,
+.merge-status {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-preview {
+  max-height: 220px;
+  overflow: auto;
+  padding: 6px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+}
+
+.merge-preview-title {
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.merge-op {
+  display: grid;
+  grid-template-columns: 72px 150px 1fr;
+  gap: 8px;
+  padding: 1px 0;
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.merge-op-status {
+  color: var(--text-secondary);
+}
+
+.merge-op--delete .merge-op-type {
+  color: #dc3545;
+  font-weight: 600;
+}
+
+.merge-op-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

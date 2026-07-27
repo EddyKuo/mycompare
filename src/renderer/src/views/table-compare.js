@@ -1194,16 +1194,107 @@ export class TableCompare {
     // otherwise have to guess, and guessing an encoding is how files get
     // silently corrupted on save.
     this.setEncoding(side, result.encoding ?? null)
-    const lower = String(result.path ?? '').toLowerCase()
+    await this._acceptFileInto(side, result.path, result.content)
+  }
+
+  /**
+   * Route a file's contents into one side by its format.
+   *
+   * Shared by opening and reloading so the two cannot drift: reloading an
+   * .xlsx through the CSV path would fill the grid with the raw zip container
+   * and report success.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @param {string} content
+   * @returns {Promise<void>}
+   */
+  async _acceptFileInto(side, path, content) {
+    const lower = String(path ?? '').toLowerCase()
     if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
-      await this._openExcel(side, result.path)
+      await this._openExcel(side, path)
     } else if (lower.endsWith('.html') || lower.endsWith('.htm')) {
-      this._openHtmlContent(side, result.path, result.content)
+      this._openHtmlContent(side, path, content)
     } else if (side === 'left') {
-      this.setLeft(result.path, result.content)
+      this.setLeft(path, content)
     } else {
-      this.setRight(result.path, result.content)
+      this.setRight(path, content)
     }
+  }
+
+  /**
+   * Re-read one side from disk, discarding the in-memory copy.
+   *
+   * "重新整理" only re-runs the comparison over what is already loaded. This is
+   * the separate BC action for picking up a file another program has changed —
+   * without it the only way to see an external edit was to close the session
+   * and open the file again. Hex Compare has had this; the table view did not.
+   *
+   * Unsaved cell edits are confirmed first, because reloading destroys them
+   * exactly as closing would.
+   *
+   * @param {'left'|'right'} side
+   * @param {{ confirmed?: boolean }} [opts] `confirmed` skips the prompt when
+   *   the caller already asked (reloading both sides asks once)
+   * @returns {Promise<boolean>} true when the side was re-read
+   */
+  async reloadSide(side, opts = {}) {
+    const sideName = side === 'left' ? '左側' : '右側'
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    if (!path) {
+      this._reportError(`${sideName}沒有檔案路徑，無法重新載入`)
+      return false
+    }
+    if (!opts.confirmed && this._modified[side]) {
+      const ok = window.confirm(
+        `${sideName}有未儲存的儲存格修改。\n` +
+        '重新載入會從磁碟讀回檔案，這些修改會遺失。要繼續嗎？')
+      if (!ok) return false
+    }
+
+    let result
+    try {
+      result = await window.electronAPI.readFile(path)
+    } catch (err) {
+      this._reportError(
+        `重新載入${sideName}失敗：${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+    if (!result || typeof result.content !== 'string') {
+      this._reportError(`重新載入${sideName}失敗：讀不到檔案內容`)
+      return false
+    }
+
+    this.setEncoding(side, result.encoding ?? null)
+    await this._acceptFileInto(side, result.path ?? path, result.content)
+    // setLeft/setRight rebuild the parsed table, which is what clears the
+    // modified flag and the edit history for that side.
+    return true
+  }
+
+  /**
+   * Re-read whichever sides have a path.
+   * @returns {Promise<boolean>} true when at least one side was re-read
+   */
+  async reloadAll() {
+    /** @type {Array<'left'|'right'>} */
+    const sides = []
+    if (this._leftPath) sides.push('left')
+    if (this._rightPath) sides.push('right')
+    if (sides.length === 0) {
+      this._reportError('尚未載入任何檔案，無法重新載入')
+      return false
+    }
+    if (this.hasUnsavedChanges()) {
+      const ok = window.confirm(
+        '有尚未儲存的修改。重新載入會從磁碟讀回檔案，這些修改會遺失。要繼續嗎？')
+      if (!ok) return false
+    }
+    let any = false
+    for (const side of sides) {
+      if (await this.reloadSide(side, { confirmed: true })) any = true
+    }
+    return any
   }
 
   /**

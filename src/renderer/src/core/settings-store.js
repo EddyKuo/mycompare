@@ -326,6 +326,7 @@ export const DEFAULT_SHORTCUTS = {
   find:          'Ctrl+F',
   gotoLine:      'Ctrl+G',
   refresh:       'F5',
+  reloadFromDisk: 'Ctrl+Shift+R',
   newSession:    'Ctrl+N',
   closeTab:      'Ctrl+W',
   fullscreen:    'F11',

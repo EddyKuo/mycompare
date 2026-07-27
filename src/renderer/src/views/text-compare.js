@@ -15,7 +15,9 @@
  *  - Event system: 'diff-count', 'ready', 'paths-changed'
  */
 
-import { diffLines, diffChars } from '../core/diff-engine.js';
+import {
+  diffLines, diffChars, normaliseAlignmentMode, splitAlignedPairs,
+} from '../core/diff-engine.js';
 import { showContextMenu } from '../core/context-menu.js';
 import { SettingsStore, keyComboMatches } from '../core/settings-store.js';
 import { renderTextTable, reportHeader, reportSummary } from '../core/report.js';
@@ -1460,6 +1462,141 @@ function realignRun(run, cfg) {
 }
 
 // ---------------------------------------------------------------------------
+// 1.9 Global Text options — editor behaviour (pure)
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {{ text: string, caret: number }} EditResult
+ */
+
+/**
+ * Offsets of the line containing `caret`, both ends exclusive of the newline.
+ * @param {string} text
+ * @param {number} caret
+ * @returns {{ start: number, end: number }}
+ */
+export function lineBoundsAt(text, caret) {
+  const pos = Math.max(0, Math.min(text.length, Math.trunc(caret) || 0));
+  const start = text.lastIndexOf('\n', pos - 1) + 1;
+  const nl = text.indexOf('\n', pos);
+  return { start, end: nl === -1 ? text.length : nl };
+}
+
+/**
+ * Visual column of `prefix`, expanding tabs to the next multiple of `tabWidth`.
+ * @param {string} prefix
+ * @param {number} tabWidth
+ * @returns {number}
+ */
+export function visualColumn(prefix, tabWidth) {
+  const w = Number.isInteger(tabWidth) && tabWidth > 0 ? tabWidth : 4;
+  let col = 0;
+  for (const ch of prefix) col = ch === '\t' ? (Math.floor(col / w) + 1) * w : col + 1;
+  return col;
+}
+
+/**
+ * Auto indent: Enter carries the current line's leading whitespace to the new
+ * line. Only the whitespace *before* the caret is copied, so splitting a line
+ * in the middle of its indentation does not invent indentation that was not
+ * yet typed.
+ *
+ * @param {string} text
+ * @param {number} caret
+ * @returns {EditResult}
+ */
+export function computeAutoIndent(text, caret) {
+  const pos = Math.max(0, Math.min(text.length, Math.trunc(caret) || 0));
+  const { start } = lineBoundsAt(text, pos);
+  const indent = (/^[ \t]*/.exec(text.slice(start, pos)) ?? [''])[0];
+  const insert = '\n' + indent;
+  return { text: text.slice(0, pos) + insert + text.slice(pos), caret: pos + insert.length };
+}
+
+/**
+ * Backspace unindents: inside a line's leading whitespace, Backspace falls back
+ * to the previous tab stop instead of eating one character.
+ *
+ * Returns null when the rule does not apply, which is the signal to let the
+ * browser handle the key normally rather than guessing at a replacement.
+ *
+ * @param {string} text
+ * @param {number} caret
+ * @param {number} tabWidth
+ * @returns {EditResult|null}
+ */
+export function computeBackspaceUnindent(text, caret, tabWidth) {
+  const pos = Math.max(0, Math.min(text.length, Math.trunc(caret) || 0));
+  const { start } = lineBoundsAt(text, pos);
+  if (pos <= start) return null;
+  const prefix = text.slice(start, pos);
+  if (!/^[ \t]+$/.test(prefix)) return null;
+
+  const w = Number.isInteger(tabWidth) && tabWidth > 0 ? tabWidth : 4;
+  const col = visualColumn(prefix, w);
+  const target = col % w === 0 ? col - w : Math.floor(col / w) * w;
+
+  let cut = pos;
+  while (cut > start && visualColumn(text.slice(start, cut), w) > target) cut--;
+  if (cut === pos) return null;
+  return { text: text.slice(0, cut) + text.slice(pos), caret: cut };
+}
+
+/**
+ * Allow positioning beyond end of line.
+ *
+ * A <textarea> has no virtual space, so the caret cannot simply sit past the
+ * last character. What it can do is what BC's setting amounts to the instant
+ * the user types there: extend the line. Right-arrow at end of line therefore
+ * appends one space and stays put instead of wrapping to the next line.
+ *
+ * @param {string} text
+ * @param {number} caret
+ * @returns {EditResult|null} null when the caret is not at end of line
+ */
+export function computeBeyondEolPad(text, caret) {
+  const pos = Math.max(0, Math.min(text.length, Math.trunc(caret) || 0));
+  const { end } = lineBoundsAt(text, pos);
+  if (pos !== end) return null;
+  return { text: text.slice(0, pos) + ' ' + text.slice(pos), caret: pos + 1 };
+}
+
+// ---------------------------------------------------------------------------
+// 1.9 / navigation — which arrows have anywhere to go (pure)
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {{ first: boolean, prev: boolean, next: boolean, last: boolean }} NavAvailability
+ */
+
+/**
+ * Which of the four difference-navigation commands can still move.
+ *
+ * With wrap-around on every command can always move as long as there is more
+ * than one difference to move between — dimming them there would be wrong.
+ *
+ * @param {number} index 0-based current difference, -1 when none is selected
+ * @param {number} total
+ * @param {boolean} wrap
+ * @returns {NavAvailability}
+ */
+export function navAvailability(index, total, wrap) {
+  const n = Number.isFinite(total) ? Math.max(0, Math.trunc(total)) : 0;
+  if (n === 0) return { first: false, prev: false, next: false, last: false };
+  const i = Number.isFinite(index) ? Math.trunc(index) : -1;
+  if (wrap) {
+    const movable = n > 1;
+    return { first: i !== 0, prev: movable, next: movable, last: i !== n - 1 };
+  }
+  return {
+    first: i !== 0,
+    prev: i > 0,
+    next: i < n - 1,
+    last: i !== n - 1,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // TextCompare class
 // ---------------------------------------------------------------------------
 
@@ -1471,6 +1608,11 @@ function realignRun(run, cfg) {
  *   ignoreLineEndings?: boolean,
  *   contextLines?: number,
  *   alignByGrammar?: boolean,
+ *   alignMode?: import('../core/diff-engine.js').AlignmentMode,
+ *   autoIndent?: boolean,
+ *   backspaceUnindents?: boolean,
+ *   allowBeyondEol?: boolean,
+ *   showFilteredLineCounts?: boolean,
  * }} TextCompareOptions
  */
 
@@ -1526,7 +1668,28 @@ export class TextCompare {
       skewTolerance: options.skewTolerance ?? 0,
       useClosenessMatching: options.useClosenessMatching ?? false,
       closenessThreshold: options.closenessThreshold ?? 0.5,
+      // 1.7 Alignment: 'standard' is what every existing session and test
+      // assumes, so it stays the default.
+      alignMode: normaliseAlignmentMode(options.alignMode),
     };
+
+    /**
+     * 1.9 Global Text options. All three default off, which is the behaviour
+     * the edit-mode textarea had before they existed.
+     * @type {{ autoIndent: boolean, backspaceUnindents: boolean, allowBeyondEol: boolean }}
+     */
+    this._editorOpts = {
+      autoIndent: options.autoIndent === true,
+      backspaceUnindents: options.backspaceUnindents === true,
+      allowBeyondEol: options.allowBeyondEol === true,
+    };
+
+    /**
+     * 1.9 Show filtered line counts. Defaults on because the status bar has
+     * always reported the hidden count; the switch is what is new.
+     * @type {boolean}
+     */
+    this._showFilteredLineCounts = options.showFilteredLineCounts !== false;
 
     /** P2-53: whitespace mode, derived from / synced with the legacy flags. */
     this._whitespaceMode = /** @type {WhitespaceMode} */ (
@@ -2650,6 +2813,8 @@ export class TextCompare {
     pane.style.position = 'relative';
     pane.appendChild(ta);
 
+    this._on(ta, 'keydown', (e) => this._handleEditorKey(/** @type {KeyboardEvent} */ (e), ta, side));
+
     this._on(ta, 'input', () => {
       // A locked side keeps its textarea readOnly, but a paste through the
       // native menu can still land here; drop the change and say why.
@@ -2679,6 +2844,138 @@ export class TextCompare {
     });
 
     return ta;
+  }
+
+  /**
+   * 1.9 Global Text options, applied to the edit-mode textarea.
+   *
+   * Each rule replaces the browser's default only when it actually applies;
+   * otherwise the key falls through untouched, so nothing here can make normal
+   * typing behave unexpectedly when the options are off.
+   *
+   * @param {KeyboardEvent} e
+   * @param {HTMLTextAreaElement} ta
+   * @param {'left'|'right'} side
+   */
+  _handleEditorKey(e, ta, side) {
+    if (ta.readOnly || this.isSideReadOnly(side)) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // Every rule below rewrites a single caret position; with a selection the
+    // native behaviour (replace the selection) is the right one.
+    if (ta.selectionStart !== ta.selectionEnd) return;
+
+    const caret = ta.selectionStart;
+    /** @type {EditResult|null} */
+    let out = null;
+    if (e.key === 'Enter' && this._editorOpts.autoIndent && !e.shiftKey) {
+      out = computeAutoIndent(ta.value, caret);
+    } else if (e.key === 'Backspace' && this._editorOpts.backspaceUnindents) {
+      out = computeBackspaceUnindent(ta.value, caret, this._tabWidth);
+    } else if (e.key === 'ArrowRight' && this._editorOpts.allowBeyondEol && !e.shiftKey) {
+      out = computeBeyondEolPad(ta.value, caret);
+    }
+    if (!out) return;
+
+    e.preventDefault();
+    ta.value = out.text;
+    ta.selectionStart = ta.selectionEnd = out.caret;
+    // Assigning `value` does not fire `input`, and that listener owns the
+    // debounce, the undo snapshot and the re-diff.
+    ta.dispatchEvent(new Event('input'));
+  }
+
+  /**
+   * 1.9 Global Text options.
+   * @returns {{ autoIndent: boolean, backspaceUnindents: boolean, allowBeyondEol: boolean }}
+   */
+  getEditorOptions() { return { ...this._editorOpts }; }
+
+  /**
+   * @param {'autoIndent'|'backspaceUnindents'|'allowBeyondEol'} name
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean} the value now in force
+   */
+  setEditorOption(name, on) {
+    if (!Object.prototype.hasOwnProperty.call(this._editorOpts, name)) {
+      toast(`未知的編輯器選項「${String(name)}」`, { type: 'error' });
+      return false;
+    }
+    this._editorOpts[name] = on ?? !this._editorOpts[name];
+    return this._editorOpts[name];
+  }
+
+  /**
+   * 1.9 Show filtered line counts.
+   * @param {boolean} [on] omit to toggle
+   * @returns {boolean}
+   */
+  setShowFilteredLineCounts(on) {
+    this._showFilteredLineCounts = on ?? !this._showFilteredLineCounts;
+    this._updateStatusBar();
+    return this._showFilteredLineCounts;
+  }
+
+  /** @returns {boolean} */
+  getShowFilteredLineCounts() { return this._showFilteredLineCounts; }
+
+  /**
+   * Which difference-navigation arrows still have somewhere to go, so the host
+   * toolbar can dim the rest.
+   * @returns {NavAvailability}
+   */
+  getNavAvailability() {
+    return navAvailability(
+      this._currentDiff, this._diffBlocks.length, getNavOptions().wrapAround);
+  }
+
+  /**
+   * BC's Text page options and the filtered-count switch, in one dialog.
+   */
+  openEditorOptionsDialog() {
+    /** @type {HTMLInputElement|null} */ let autoEl = null;
+    /** @type {HTMLInputElement|null} */ let backEl = null;
+    /** @type {HTMLInputElement|null} */ let eolEl = null;
+    /** @type {HTMLInputElement|null} */ let countsEl = null;
+
+    /**
+     * @param {HTMLElement} body
+     * @param {boolean} checked
+     * @param {string} label
+     * @returns {HTMLInputElement}
+     */
+    const check = (body, checked, label) => {
+      const row = document.createElement('label');
+      row.style.display = 'block';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = checked;
+      row.append(box, document.createTextNode(' ' + label));
+      body.appendChild(row);
+      return box;
+    };
+
+    this._openDialog({
+      title: '編輯器選項',
+      hint: '這些選項只影響編輯模式（Ctrl+E）下的輸入行為，不影響比對結果。',
+      build: (body) => {
+        autoEl = check(body, this._editorOpts.autoIndent,
+          '自動縮排：換行時沿用目前行的前置空白');
+        backEl = check(body, this._editorOpts.backspaceUnindents,
+          `Backspace 反縮排：在前置空白中退回上一個定位點（每 ${this._tabWidth} 欄）`);
+        eolEl = check(body, this._editorOpts.allowBeyondEol,
+          '允許游標超過行尾：在行尾按 → 時補一個空格留在本行，而非跳到下一行');
+        countsEl = check(body, this._showFilteredLineCounts,
+          '在狀態列顯示被篩選隱藏的行數');
+      },
+      onConfirm: () => {
+        this.setEditorOption('autoIndent', autoEl?.checked === true);
+        this.setEditorOption('backspaceUnindents', backEl?.checked === true);
+        this.setEditorOption('allowBeyondEol', eolEl?.checked === true);
+        this.setShowFilteredLineCounts(countsEl?.checked === true);
+        toast('已套用編輯器選項', { type: 'success' });
+        return true;
+      },
+    });
   }
 
   /**
@@ -2903,6 +3200,11 @@ export class TextCompare {
     this._currentDiff = target;
     this._scrollToDiff(target);
     this._updateStatusBar();
+    // The host dims the arrows from this event, so it has to fire on every
+    // move and not only when a fresh diff changes the count.
+    this._emit('diff-count', {
+      total, currentIndex: target, availability: this.getNavAvailability(),
+    });
     return navResult(from, target, total);
   }
 
@@ -3404,6 +3706,7 @@ ${rows}
         ignoreLineEndings: this._opts.ignoreLineEndings,
         ignoreIndent: this._opts.ignoreIndent,
         ignoreCrlf: this._opts.ignoreCrlf,
+        alignMode: this._opts.alignMode,
         leftWeights: weights?.left,
         rightWeights: weights?.right,
       };
@@ -3438,7 +3741,15 @@ ${rows}
 
       // P2-59 / P2-60: never-align, skew tolerance and closeness matching all
       // re-pair lines the engine already decided on, so they run after it.
-      this._diffResult = applyAlignmentOptions(this._diffResult, this._alignmentOptions());
+      // Skipped outside 'standard': re-pairing is exactly what the other two
+      // modes were chosen to avoid, so honouring both at once is incoherent.
+      if (this._opts.alignMode === 'standard') {
+        this._diffResult = applyAlignmentOptions(this._diffResult, this._alignmentOptions());
+      } else if (this._opts.alignMode === 'never') {
+        // diffLines already split its own output, but the anchor path builds
+        // paired rows of its own afterwards.
+        this._diffResult = splitAlignedPairs(this._diffResult);
+      }
     }
 
     // Apply ignore / unimportant patterns
@@ -3464,7 +3775,11 @@ ${rows}
     if (resetScroll && this._currentDiff >= 0 && getNavOptions().firstDiffOnLoad) {
       this._scrollToDiff(0);
     }
-    this._emit('diff-count', { total: this._diffBlocks.length, currentIndex: this._currentDiff });
+    this._emit('diff-count', {
+      total: this._diffBlocks.length,
+      currentIndex: this._currentDiff,
+      availability: this.getNavAvailability(),
+    });
     this._emit('ready');
   }
 
@@ -3576,6 +3891,26 @@ ${rows}
       closenessThreshold: this._opts.closenessThreshold,
     };
   }
+
+  /**
+   * 1.7 Alignment tab: whether the two sides are aligned by content at all.
+   *
+   * @param {unknown} mode 'standard' | 'unaligned' | 'never'
+   * @returns {import('../core/diff-engine.js').AlignmentMode} the mode in force
+   */
+  setAlignmentMode(mode) {
+    const next = normaliseAlignmentMode(mode);
+    if (next !== mode) {
+      toast(`未知的對齊模式「${String(mode)}」，已改用「標準對齊」`, { type: 'error' });
+    }
+    if (next === this._opts.alignMode) return next;
+    this._opts.alignMode = next;
+    if (this._leftContent || this._rightContent) this._runDiff();
+    return next;
+  }
+
+  /** @returns {import('../core/diff-engine.js').AlignmentMode} */
+  getAlignmentMode() { return this._opts.alignMode; }
 
   /**
    * Lines matching any of these patterns never become half of a paired
@@ -4433,12 +4768,41 @@ ${rows}
     /** @type {HTMLInputElement|null} */ let closeEl = null;
     /** @type {HTMLInputElement|null} */ let thresholdEl = null;
     /** @type {HTMLElement|null} */ let errorBox = null;
+    /** @type {HTMLInputElement[]} */ const modeEls = [];
 
     this._openDialog({
       title: '對齊選項',
       hint: '「永不對齊」的行只會以單側形式出現，不會與另一側配成一列。'
         + '偏移上限為 0 時不限制。相似度配對以相似度而非位置決定配對對象。',
       build: (body) => {
+        const modeSet = document.createElement('fieldset');
+        const legend = document.createElement('legend');
+        legend.textContent = '對齊模式';
+        modeSet.appendChild(legend);
+        /** @type {Array<[import('../core/diff-engine.js').AlignmentMode, string]>} */
+        const modes = [
+          ['standard', '標準對齊（依演算法配對兩側的行）'],
+          ['unaligned', '不對齊（左右各第 N 行直接並排，不做內容比對配對）'],
+          ['never', '永不對齊差異（差異一律顯示為刪除區塊 + 新增區塊）'],
+        ];
+        for (const [value, label] of modes) {
+          const row = document.createElement('label');
+          row.style.display = 'block';
+          const radio = document.createElement('input');
+          radio.type = 'radio';
+          radio.name = 'tc-align-mode';
+          radio.value = value;
+          radio.checked = this._opts.alignMode === value;
+          modeEls.push(radio);
+          row.append(radio, document.createTextNode(' ' + label));
+          modeSet.appendChild(row);
+        }
+        body.appendChild(modeSet);
+
+        const note = document.createElement('div');
+        note.textContent = '下列選項只在「標準對齊」下生效。';
+        body.appendChild(note);
+
         const counts = this.getUnalignedLineCounts();
         const summary = document.createElement('div');
         summary.textContent = `目前有 ${counts.left} 行（左）／${counts.right} 行（右）被排除在對齊之外。`;
@@ -4490,6 +4854,7 @@ ${rows}
       onConfirm: () => {
         const patterns = (patternsEl?.value ?? '').split('\n')
           .map((s) => s.trim()).filter((s) => s.length > 0);
+        this.setAlignmentMode(modeEls.find((r) => r.checked)?.value ?? 'standard');
         this.setSkewTolerance(Number(skewEl?.value ?? 0));
         this.setClosenessMatching(closeEl?.checked === true, Number(thresholdEl?.value));
         const bad = this.setNeverAlignPatterns(patterns);
@@ -4693,6 +5058,12 @@ ${rows}
       syntaxHighlight:     this._syntaxHighlight,
       orphansAlwaysImportant: this._opts.orphansAlwaysImportant,
       neverAlignPatterns:  [...this._opts.neverAlignPatterns],
+      // 1.7 Alignment tab + 1.9 Text options page.
+      alignMode:           this._opts.alignMode,
+      autoIndent:          this._editorOpts.autoIndent,
+      backspaceUnindents:  this._editorOpts.backspaceUnindents,
+      allowBeyondEol:      this._editorOpts.allowBeyondEol,
+      showFilteredLineCounts: this._showFilteredLineCounts,
       skewTolerance:       this._opts.skewTolerance,
       useClosenessMatching:this._opts.useClosenessMatching,
       closenessThreshold:  this._opts.closenessThreshold,
@@ -4776,6 +5147,16 @@ ${rows}
     if (typeof settings.syntaxHighlight === 'boolean') this._syntaxHighlight = settings.syntaxHighlight
     if (typeof settings.orphansAlwaysImportant === 'boolean') {
       this._opts.orphansAlwaysImportant = settings.orphansAlwaysImportant
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, 'alignMode')) {
+      this._opts.alignMode = normaliseAlignmentMode(settings.alignMode)
+    }
+    for (const key of /** @type {Array<'autoIndent'|'backspaceUnindents'|'allowBeyondEol'>} */ (
+      ['autoIndent', 'backspaceUnindents', 'allowBeyondEol'])) {
+      if (typeof settings[key] === 'boolean') this._editorOpts[key] = settings[key]
+    }
+    if (typeof settings.showFilteredLineCounts === 'boolean') {
+      this._showFilteredLineCounts = settings.showFilteredLineCounts
     }
     if (Number.isFinite(settings.skewTolerance)) {
       this._opts.skewTolerance = Math.max(0, Math.min(1000, Math.round(Number(settings.skewTolerance))))
@@ -5486,7 +5867,9 @@ ${rows}
     if (this._statusLines) {
       // Say so when the Show filter is hiding rows; otherwise a filtered view
       // reads as a file that simply has fewer lines than it does.
-      const { hidden } = this.getFilterCounts();
+      const { hidden } = this._showFilteredLineCounts
+        ? this.getFilterCounts()
+        : { hidden: 0 };
       this._statusLines.textContent = hidden > 0
         ? `${totalLines} 行（已隱藏 ${hidden}）`
         : `${totalLines} 行`;
@@ -5845,6 +6228,7 @@ ${rows}
     items.push({ label: '檔案格式… (Ctrl+Shift+F)', action: () => this.openFileFormatDialog() });
     items.push({ label: '不重要文字規則…', action: () => this.openUnimportantTextDialog() });
     items.push({ label: '對齊選項… (Ctrl+Shift+L)', action: () => this.openAlignmentDialog() });
+    items.push({ label: '編輯器選項…', action: () => this.openEditorOptionsDialog() });
     items.push({
       label: (this._syntaxHighlight ? '✓ ' : '　') + '語法高亮',
       action: () => {
