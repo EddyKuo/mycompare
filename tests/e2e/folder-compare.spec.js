@@ -277,12 +277,24 @@ test('S26: 欄位選單列出建立時間 / 完整路徑 / 檢查碼', async () 
   await win.keyboard.press('Escape')
 })
 
-test('S26: 欄位選單可切換「檢查碼」欄並顯示在表頭', async () => {
+test('S26: 欄位選單可切換檢查碼欄，表頭標出實際的演算法', async () => {
   await goToFolderCompare(win)
   await win.locator('.fc-btn-columns').click()
   await win.locator('.ctx-item', { hasText: '檢查碼' }).first().click()
-  await expect(win.locator('.fc-header')).toContainText('檢查碼', { timeout: 2000 })
-  // Restore, so later tests see the default column set.
+
+  // 表頭寫的是實際演算法，不是籠統的「檢查碼」。這一欄的值會被拿去跟
+  // unzip 或 7z 的輸出對照，沒有標明是哪一種就等於給了一個無法解讀的數字。
+  await expect(win.locator('.fc-header')).toContainText('CRC-32', { timeout: 2000 })
+
+  // 切成 MD5，表頭要跟著改；不改的話兩種演算法會共用同一個標題。
+  await win.locator('.fc-btn-columns').click()
+  await win.locator('.ctx-item', { hasText: '檢查碼：MD5' }).first().click()
+  await expect(win.locator('.fc-header')).toContainText('MD5', { timeout: 2000 })
+  await expect(win.locator('.fc-header')).not.toContainText('CRC-32')
+
+  // 還原，讓後面的測試看到預設狀態。
+  await win.locator('.fc-btn-columns').click()
+  await win.locator('.ctx-item', { hasText: '檢查碼：CRC-32' }).first().click()
   await win.locator('.fc-btn-columns').click()
   await win.locator('.ctx-item', { hasText: '檢查碼' }).first().click()
 })

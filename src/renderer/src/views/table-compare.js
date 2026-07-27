@@ -28,11 +28,51 @@ import '../styles/table-compare.css'
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
-/** Fixed row height, mirroring `.tc-row { height: 24px }` in the stylesheet. */
-const TABLE_ROW_HEIGHT = 24
-
 /** Extra rows rendered above and below the viewport to hide scroll seams. */
 const TABLE_OVERSCAN = 10
+
+/** Display font size, in px, matching text compare's range. */
+const MIN_TABLE_FONT_SIZE = 10
+const MAX_TABLE_FONT_SIZE = 24
+const DEFAULT_TABLE_FONT_SIZE = 12
+
+/**
+ * @param {unknown} size
+ * @returns {number}
+ */
+function clampTableFontSize(size) {
+  const n = Math.round(Number(size))
+  if (!Number.isFinite(n)) return DEFAULT_TABLE_FONT_SIZE
+  return Math.max(MIN_TABLE_FONT_SIZE, Math.min(MAX_TABLE_FONT_SIZE, n))
+}
+
+/**
+ * Row height for a given display font size.
+ *
+ * Virtual scrolling positions rows arithmetically, so this must stay the single
+ * source of truth for both the stylesheet variable and the scroll maths — a
+ * disagreement of even one pixel accumulates into rows landing off-viewport.
+ *
+ * @param {number} fontSize
+ * @returns {number}
+ */
+function rowHeightForFont(fontSize) {
+  return fontSize + 12
+}
+
+/**
+ * Whether a path names a file the OS file manager could actually reveal.
+ *
+ * Archive entries, snapshots and remote objects have no folder to open, and
+ * the main process's path validator would refuse the call regardless.
+ *
+ * @param {string|null|undefined} path
+ * @returns {boolean}
+ */
+function isRealFilePath(path) {
+  if (!path) return false
+  return !path.includes('::') && !/^[a-z][a-z0-9+.-]*:\/\//i.test(path)
+}
 
 /**
  * Ceiling on the thumbnail's segment count.
@@ -996,7 +1036,8 @@ export class TableCompare {
      *             before: string, after: string, rowRef?: string[]|null }} CellEdit
      * @typedef {{ kind: 'row', op: 'replace'|'insert', side: 'left'|'right', rowIdx: number,
      *             before: string[]|null, after: string[]|null, rowRef: string[] }} RowEdit
-     * @typedef {CellEdit|RowEdit} EditEntry
+     * @typedef {{ kind: 'batch', side: 'left'|'right', edits: CellEdit[] }} BatchEdit
+     * @typedef {CellEdit|RowEdit|BatchEdit} EditEntry
      */
     /** @type {EditEntry[]} */
     this._undoStack = []
@@ -1098,6 +1139,26 @@ export class TableCompare {
     this._showThumbnail = options.showThumbnail ?? false
     /** @type {ThumbBucket[]} 目前繪出的縮圖區段，供點擊換算成列號 */
     this._thumbBuckets = []
+
+    // ── S25: row numbers, range selection, display font ───────────────────────
+    /** @type {boolean} 列號欄的顯示開關（比照 text compare 的 T48） */
+    this._showRowNumbers = options.showRowNumbers ?? true
+
+    /**
+     * @typedef {{ side: 'left'|'right', top: number, bottom: number,
+     *             leftCol: number, rightCol: number }} SelectionRange
+     * 以可見列索引與顯示欄索引表示，兩端皆含。
+     * @type {SelectionRange|null}
+     */
+    this._selectionRange = null
+
+    /** @type {number} 顯示字級（px）；列高由 rowHeightForFont 導出 */
+    this._fontSize = clampTableFontSize(options.fontSize ?? DEFAULT_TABLE_FONT_SIZE)
+    /** @type {number} */
+    this._rowHeight = rowHeightForFont(this._fontSize)
+
+    /** @type {number} 「上/下一處編輯」導航目前落在第幾筆；-1 代表尚未開始 */
+    this._editNavIdx = -1
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -1725,6 +1786,18 @@ export class TableCompare {
    * @returns {boolean}
    */
   _applyHistory(entry, direction) {
+    if (entry.kind === 'batch') {
+      // All-or-nothing: a batch that applied to only some of its cells would
+      // leave the table in a state no further undo could describe.
+      const applied = []
+      for (const sub of entry.edits) {
+        if (this._applyHistory(sub, direction)) { applied.push(sub); continue }
+        const back = direction === 'undo' ? 'redo' : 'undo'
+        for (const done of applied) this._applyHistory(done, back)
+        return false
+      }
+      return true
+    }
     if (entry.kind === 'row') {
       if (entry.op === 'insert') {
         return direction === 'undo'
@@ -2132,6 +2205,7 @@ export class TableCompare {
   _onCellClick(e, side) {
     const hit = this._cellFromEvent(e, side)
     if (!hit) return
+    if (e.shiftKey && this.extendSelectionTo(side, hit.visibleRowIdx, hit.col)) return
     this.selectCell(side, hit.visibleRowIdx, hit.col)
   }
 
@@ -2217,9 +2291,14 @@ export class TableCompare {
 
   /** 讓 undo / redo / 儲存按鈕反映目前狀態。 */
   _syncEditButtons() {
-    const { btnUndo, btnRedo, btnSaveLeft, btnSaveRight } = this._dom
+    const { btnUndo, btnRedo, btnSaveLeft, btnSaveRight, btnPrevEdit, btnNextEdit } = this._dom
     if (btnUndo) btnUndo.disabled = !this.canUndo()
     if (btnRedo) btnRedo.disabled = !this.canRedo()
+    // Cheaper than getEditedRows(): whether any edit exists at all does not
+    // need the visible-row scan, and this runs after every keystroke commit.
+    const hasEdits = this._undoStack.length > 0 || this._redoStack.length > 0
+    if (btnPrevEdit) btnPrevEdit.disabled = !hasEdits
+    if (btnNextEdit) btnNextEdit.disabled = !hasEdits
     if (btnSaveLeft) btnSaveLeft.classList.toggle('tc-btn--dirty', this._modified.left)
     if (btnSaveRight) btnSaveRight.classList.toggle('tc-btn--dirty', this._modified.right)
   }
@@ -2520,6 +2599,381 @@ export class TableCompare {
   /** @returns {boolean} */
   toggleFileInfo() { return this.setFileInfoVisible(!this._showFileInfo) }
 
+  // ── S25-T1: Row Numbers（比照 text compare 的 T48） ──────────────────────────
+
+  /** @returns {boolean} */
+  isRowNumbersVisible() { return this._showRowNumbers }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} 套用後的狀態
+   */
+  setRowNumbersVisible(on) {
+    this._showRowNumbers = Boolean(on)
+    this._applyRowNumbers()
+    return this._showRowNumbers
+  }
+
+  /** @returns {boolean} */
+  toggleRowNumbers() { return this.setRowNumbersVisible(!this._showRowNumbers) }
+
+  /**
+   * Hide the row-number column with a class rather than by skipping the cell.
+   *
+   * Every index-based lookup in this view (cell editing, find highlighting,
+   * context menus) assumes `td[0]` is the row number and data starts at `td[1]`.
+   * Removing the node would shift all of them by one.
+   */
+  _applyRowNumbers() {
+    this._dom.root?.classList.toggle('tc-hide-row-numbers', !this._showRowNumbers)
+    this._dom.btnRowNums?.classList.toggle('active', this._showRowNumbers)
+  }
+
+  // ── S25-T2: 顯示字級 ────────────────────────────────────────────────────────
+
+  /** @returns {number} */
+  getFontSize() { return this._fontSize }
+
+  /**
+   * @param {number} size  px，鉗制於 [10, 24]
+   * @returns {number} 套用後的字級
+   */
+  setFontSize(size) {
+    const clamped = clampTableFontSize(size)
+    if (clamped === this._fontSize) return this._fontSize
+    this._fontSize = clamped
+    this._rowHeight = rowHeightForFont(clamped)
+    this._applyFontSize()
+    // The spacer's height is rowCount × rowHeight, so this is not a repaint of
+    // the current window — the whole scroll geometry changed.
+    this._renderTable()
+    return this._fontSize
+  }
+
+  /** @returns {number} */
+  increaseFontSize() { return this.setFontSize(this._fontSize + 1) }
+
+  /** @returns {number} */
+  decreaseFontSize() { return this.setFontSize(this._fontSize - 1) }
+
+  /** @returns {number} */
+  resetFontSize() { return this.setFontSize(DEFAULT_TABLE_FONT_SIZE) }
+
+  _applyFontSize() {
+    const root = this._dom.root
+    if (!root) return
+    root.style.setProperty('--tc-font-size', `${this._fontSize}px`)
+    root.style.setProperty('--tc-row-height', `${this._rowHeight}px`)
+  }
+
+  // ── S25-T3: Explorer ───────────────────────────────────────────────────────
+
+  /**
+   * Reveal one side's file in the OS file manager.
+   *
+   * @param {'left'|'right'} side
+   * @returns {Promise<boolean>}
+   */
+  async revealInExplorer(side) {
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    if (!path) {
+      this._reportError(`${side === 'left' ? '左' : '右'}側還沒有開啟檔案`)
+      return false
+    }
+    if (!isRealFilePath(path)) {
+      this._reportError('這是壓縮檔內容 / 快照 / 遠端檔案，磁碟上沒有對應位置')
+      return false
+    }
+    try {
+      await window.electronAPI.showInExplorer(path)
+      return true
+    } catch (err) {
+      this._reportError(`無法顯示檔案位置：${err?.message ?? err}`)
+      return false
+    }
+  }
+
+  // ── S25-T4: Select All + 範圍選取 ──────────────────────────────────────────
+
+  /** @returns {SelectionRange|null} */
+  getSelectionRange() {
+    return this._selectionRange ? { ...this._selectionRange } : null
+  }
+
+  /** 清除範圍選取（單一儲存格的選取不受影響）。 */
+  clearSelectionRange() {
+    if (!this._selectionRange) return
+    this._selectionRange = null
+    this._applySelectionHighlight()
+  }
+
+  /**
+   * BC Edit ▸ Select All：選取該側目前可見的所有列與所有顯示欄。
+   *
+   * 只記四個數字，不逐列標記 DOM——十萬列的表格若在選取時就替每個儲存格加上
+   * class，這個指令本身就會凍住畫面。實際上色只發生在虛擬捲動視窗內。
+   *
+   * @param {'left'|'right'} [side] 預設沿用目前選取的儲存格所在側
+   * @returns {{ rows: number, cols: number }|null} null 代表沒有可選的內容
+   */
+  selectAll(side) {
+    const target = side ?? this._selectedCell?.side ?? 'left'
+    const rows = this._visibleRows?.length ?? 0
+    const cols = target === 'left' ? (this._leftColCount ?? 0) : (this._rightColCount ?? 0)
+    if (rows === 0 || cols === 0) {
+      this._reportError('目前沒有可選取的表格內容')
+      return null
+    }
+    this._selectionRange = {
+      side: target, top: 0, bottom: rows - 1, leftCol: 0, rightCol: cols - 1,
+    }
+    this._applySelectionHighlight()
+    return { rows, cols }
+  }
+
+  /**
+   * Shift-click / programmatic range extension from the selected cell.
+   *
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @param {number} col
+   * @returns {boolean}
+   */
+  extendSelectionTo(side, visibleRowIdx, col) {
+    const anchor = this._selectedCell
+    if (!anchor || anchor.side !== side) return false
+    this._selectionRange = {
+      side,
+      top: Math.min(anchor.visibleRowIdx, visibleRowIdx),
+      bottom: Math.max(anchor.visibleRowIdx, visibleRowIdx),
+      leftCol: Math.min(anchor.col, col),
+      rightCol: Math.max(anchor.col, col),
+    }
+    this._applySelectionHighlight()
+    return true
+  }
+
+  /**
+   * The selected range as tab-separated text, read from the parsed model.
+   *
+   * Reading the DOM instead would return only the rows that happen to be inside
+   * the virtual window, and would carry the `·`/`→` whitespace glyphs as data.
+   *
+   * @returns {string}
+   */
+  getSelectionText() {
+    const range = this._selectionRange
+    if (!range) return ''
+    const { side, top, bottom, leftCol, rightCol } = range
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    const colMap = (side === 'right') ? this._rightColMap : null
+    /** @type {string[]} */
+    const lines = []
+    for (let r = top; r <= bottom; r++) {
+      // One row lookup instead of one per cell: a 100k × 20 selection would
+      // otherwise do two million Map lookups.
+      const located = this._resolveRow(side, r)
+      const row = located ? parsed?.[located.parsedRowIdx] : null
+      /** @type {string[]} */
+      const cells = []
+      for (let c = leftCol; c <= rightCol; c++) {
+        const sourceCol = colMap ? colMap[c] : c
+        cells.push((sourceCol == null || sourceCol < 0) ? '' : (row?.[sourceCol] ?? ''))
+      }
+      lines.push(cells.join('\t'))
+    }
+    return lines.join('\n')
+  }
+
+  /**
+   * Copy the selected range — or, with no range, the selected cell.
+   * @returns {Promise<boolean>}
+   */
+  async copySelection() {
+    const text = this._selectionRange
+      ? this.getSelectionText()
+      : (this._selectedCell
+          ? this.getCellValue(
+              this._selectedCell.side, this._selectedCell.visibleRowIdx, this._selectedCell.col)
+          : null)
+    if (text == null) {
+      this._reportError('沒有選取任何儲存格')
+      return false
+    }
+    return this._writeClipboard(text)
+  }
+
+  // ── S25-T5: 儲存格 Cut / Copy / Paste / Delete ─────────────────────────────
+
+  /**
+   * @param {string} text
+   * @returns {Promise<boolean>}
+   */
+  async _writeClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch (err) {
+      this._reportError(`無法寫入剪貼簿：${err?.message ?? err}`)
+      return false
+    }
+  }
+
+  /**
+   * 剪下目前的儲存格：先複製，成功後才清空——複製失敗還照清的話，資料就沒了。
+   * @returns {Promise<boolean>}
+   */
+  async cutCell() {
+    const sel = this._selectedCell
+    if (!sel) { this._reportError('沒有選取任何儲存格'); return false }
+    const value = this.getCellValue(sel.side, sel.visibleRowIdx, sel.col)
+    if (value == null) { this._reportError('這個儲存格沒有對應的來源資料'); return false }
+    if (!await this._writeClipboard(value)) return false
+    return this.deleteCell()
+  }
+
+  /**
+   * 把剪貼簿內容貼入目前的儲存格。
+   * @returns {Promise<boolean>}
+   */
+  async pasteCell() {
+    const sel = this._selectedCell
+    if (!sel) { this._reportError('沒有選取任何儲存格'); return false }
+    let text
+    try {
+      text = await navigator.clipboard.readText()
+    } catch (err) {
+      this._reportError(`無法讀取剪貼簿：${err?.message ?? err}`)
+      return false
+    }
+    if (!this.editCell(sel.side, sel.visibleRowIdx, sel.col, text)) {
+      this._reportError('這個儲存格沒有對應的來源資料，無法貼上')
+      return false
+    }
+    return true
+  }
+
+  /**
+   * 清空選取範圍內的儲存格；沒有範圍時只清目前的儲存格。
+   *
+   * 整個範圍記成一筆歷史，所以一次 Ctrl+Z 就能全部復原。每一格仍各自帶著
+   * 自己的列物件參照，插入列造成的索引位移不會讓復原寫到別的列。
+   *
+   * @returns {boolean}
+   */
+  deleteCell() {
+    const range = this._selectionRange
+    if (!range) {
+      const sel = this._selectedCell
+      if (!sel) { this._reportError('沒有選取任何儲存格'); return false }
+      if (!this.editCell(sel.side, sel.visibleRowIdx, sel.col, '')) {
+        this._reportError('這個儲存格沒有對應的來源資料，無法清除')
+        return false
+      }
+      return true
+    }
+
+    const { side, top, bottom, leftCol, rightCol } = range
+    /** @type {CellEdit[]} */
+    const edits = []
+    for (let r = top; r <= bottom; r++) {
+      for (let c = leftCol; c <= rightCol; c++) {
+        const target = this._resolveCell(side, r, c)
+        if (!target) continue
+        const before = this._readParsedCell(side, target.parsedRowIdx, target.sourceCol)
+        if (before === '') continue
+        if (!this._writeParsedCell(side, target.parsedRowIdx, target.sourceCol, '')) continue
+        edits.push({
+          kind: 'cell', side, rowIdx: target.parsedRowIdx, col: target.sourceCol,
+          before, after: '', rowRef: target.rowRef,
+        })
+      }
+    }
+    if (edits.length === 0) {
+      this._reportError('選取範圍內沒有可清除的儲存格')
+      return false
+    }
+    this._pushHistory({ kind: 'batch', side, edits })
+    this._afterEdit(side)
+    return true
+  }
+
+  // ── S25-T6: Next / Previous Edit ───────────────────────────────────────────
+
+  /**
+   * 目前可見列之中，哪幾列被編輯過（依可見順序排序）。
+   *
+   * 來源是 undo 堆疊記下的**列物件**而非列索引：插入列會讓索引位移，用索引
+   * 找回來的會是別人的列。
+   *
+   * @returns {number[]} indices into this._visibleRows
+   */
+  getEditedRows() {
+    /** @type {{ left: Set<string[]>, right: Set<string[]> }} */
+    const touched = { left: new Set(), right: new Set() }
+    /** @param {EditEntry} entry */
+    const collect = (entry) => {
+      if (entry.kind === 'batch') { for (const e of entry.edits) collect(e); return }
+      if (entry.rowRef) touched[entry.side].add(entry.rowRef)
+    }
+    for (const entry of this._undoStack) collect(entry)
+    for (const entry of this._redoStack) collect(entry)
+    if (touched.left.size === 0 && touched.right.size === 0) return []
+
+    /** @type {number[]} */
+    const rows = []
+    const visible = this._visibleRows ?? []
+    for (let i = 0; i < visible.length; i++) {
+      const aligned = visible[i]
+      const leftRef = aligned.leftIdx != null && aligned.leftIdx >= 0
+        ? this._leftData?.[aligned.leftIdx] : null
+      const rightRef = aligned.rightIdx != null && aligned.rightIdx >= 0
+        ? this._rightData?.[aligned.rightIdx] : null
+      if ((leftRef && touched.left.has(leftRef)) || (rightRef && touched.right.has(rightRef))) {
+        rows.push(i)
+      }
+    }
+    return rows
+  }
+
+  /** @returns {boolean} */
+  nextEdit() { return this._stepEdit(1) }
+
+  /** @returns {boolean} */
+  prevEdit() { return this._stepEdit(-1) }
+
+  /**
+   * @param {1|-1} delta
+   * @returns {boolean}
+   */
+  _stepEdit(delta) {
+    const rows = this.getEditedRows()
+    if (rows.length === 0) {
+      this._reportError('這個 session 還沒有任何編輯過的列')
+      return false
+    }
+    // Re-anchor on the current position rather than on the last visit: filters
+    // and re-alignment move rows, so a stored index can point anywhere.
+    const from = this._selectedCell?.visibleRowIdx ?? -1
+    let idx
+    if (delta > 0) {
+      idx = rows.findIndex(r => r > from)
+      if (idx < 0) idx = 0
+    } else {
+      idx = -1
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i] < from || from < 0) { idx = i; break }
+      }
+      if (idx < 0) idx = rows.length - 1
+    }
+    this._editNavIdx = idx
+    const rowIndex = rows[idx]
+    this._scrollToVisibleRow(rowIndex)
+    this.selectCell(this._selectedCell?.side ?? 'left', rowIndex, this._selectedCell?.col ?? 0)
+    this._emit('status', { message: `編輯 ${idx + 1} / ${rows.length}（第 ${rowIndex + 1} 列）` })
+    return true
+  }
+
   _applyPanelVisibility() {
     const { detailsPanel, fileInfoPanel, panels, btnDetails, btnFileInfo, btnWhitespace } = this._dom
     if (detailsPanel) detailsPanel.style.display = this._showDetails ? '' : 'none'
@@ -2553,6 +3007,10 @@ export class TableCompare {
    */
   selectCell(side, visibleRowIdx, col) {
     this._selectedCell = { side, visibleRowIdx, col }
+    // Picking a single cell replaces whatever range was active; leaving the old
+    // range painted would make a following Delete act on cells the user can no
+    // longer see they selected.
+    this._selectionRange = null
     this._applySelectionHighlight()
     this._updateDetailsPanel()
     return this
@@ -2568,18 +3026,37 @@ export class TableCompare {
     for (const side of /** @type {const} */ (['left', 'right'])) {
       const tbody = this._dom[`${side}Tbody`]
       if (!tbody) continue
-      for (const td of tbody.querySelectorAll('.tc-cell--selected')) {
+      for (const td of tbody.querySelectorAll('.tc-cell--selected, .tc-cell--in-range')) {
         td.classList.remove('tc-cell--selected')
+        td.classList.remove('tc-cell--in-range')
       }
     }
-    const sel = this._selectedCell
     const first = this._windowFirst
     const last = this._windowLast
-    if (!sel || first == null || last == null) return
+    if (first == null || last == null) return
+
+    // The range may span the whole table; only the rows inside the virtual
+    // window exist as DOM, so the loop is bounded by the viewport, not the data.
+    const range = this._selectionRange
+    if (range) {
+      const tbody = this._dom[`${range.side}Tbody`]
+      const from = Math.max(range.top, first)
+      const to = Math.min(range.bottom, last - 1)
+      for (let r = from; r <= to; r++) {
+        const tr = tbody?.children[r - first]
+        if (!tr) continue
+        for (let c = range.leftCol; c <= range.rightCol; c++) {
+          // +1 skips the row-number cell.
+          tr.children[c + 1]?.classList.add('tc-cell--in-range')
+        }
+      }
+    }
+
+    const sel = this._selectedCell
+    if (!sel) return
     if (sel.visibleRowIdx < first || sel.visibleRowIdx >= last) return
     const tbody = this._dom[`${sel.side}Tbody`]
     const tr = tbody?.children[sel.visibleRowIdx - first]
-    // +1 skips the row-number cell.
     tr?.children[sel.col + 1]?.classList.add('tc-cell--selected')
   }
 
@@ -3156,6 +3633,8 @@ export class TableCompare {
       showFileInfo: this._showFileInfo,
       showSeverity: this._showSeverity,
       showThumbnail: this._showThumbnail,
+      showRowNumbers: this._showRowNumbers,
+      fontSize: this._fontSize,
     })
   }
 
@@ -3188,6 +3667,16 @@ export class TableCompare {
     if (typeof settings.showFileInfo === 'boolean') this._showFileInfo = settings.showFileInfo
     if (typeof settings.showSeverity === 'boolean') this.setSeverityShading(settings.showSeverity)
     if (typeof settings.showThumbnail === 'boolean') this.setThumbnailVisible(settings.showThumbnail)
+    if (typeof settings.showRowNumbers === 'boolean') {
+      this.setRowNumbersVisible(settings.showRowNumbers)
+    }
+    if (settings.fontSize !== undefined) {
+      // Assigned rather than routed through setFontSize: the refresh() below
+      // already rebuilds the table, and setFontSize would render it twice.
+      this._fontSize = clampTableFontSize(settings.fontSize)
+      this._rowHeight = rowHeightForFont(this._fontSize)
+      this._applyFontSize()
+    }
     this._applyPanelVisibility()
     this._applyLayout()
     this._syncConfigControls()
@@ -3344,6 +3833,8 @@ export class TableCompare {
     this._applyPanelVisibility()
     this.setThumbnailVisible(this._showThumbnail)
     this._dom.btnSeverity?.classList.toggle('active', this._showSeverity)
+    this._applyRowNumbers()
+    this._applyFontSize()
   }
 
   /**
@@ -3405,7 +3896,7 @@ export class TableCompare {
     const viewport = this._dom.thumbViewport
     const scroll = this._dom.leftScroll
     if (!viewport || !scroll || !this._showThumbnail) return
-    const total = (this._visibleRows?.length ?? 0) * TABLE_ROW_HEIGHT
+    const total = (this._visibleRows?.length ?? 0) * this._rowHeight
     if (total <= 0) {
       viewport.style.top = '0%'
       viewport.style.height = '100%'
@@ -3505,6 +3996,25 @@ export class TableCompare {
     toolbar.appendChild(btnFileInfo)
     toolbar.appendChild(btnWhitespace)
 
+    // S25-T1 / S25-T2: row numbers and display font size
+    const btnRowNums = el('button',
+      { id: 'tc-btn-row-numbers', className: 'tc-btn', title: '顯示 / 隱藏列號欄' }, '№ 列號')
+    this._dom.btnRowNums = btnRowNums
+    toolbar.appendChild(btnRowNums)
+
+    const btnFontSmaller = el('button',
+      { id: 'tc-btn-font-smaller', className: 'tc-btn', title: '縮小字級（Ctrl+-）' }, 'A-')
+    const btnFontLarger = el('button',
+      { id: 'tc-btn-font-larger', className: 'tc-btn', title: '放大字級（Ctrl+=）' }, 'A+')
+    const btnFontReset = el('button',
+      { id: 'tc-btn-font-reset', className: 'tc-btn', title: '還原預設字級（Ctrl+0）' }, 'A0')
+    this._dom.btnFontSmaller = btnFontSmaller
+    this._dom.btnFontLarger = btnFontLarger
+    this._dom.btnFontReset = btnFontReset
+    toolbar.appendChild(btnFontSmaller)
+    toolbar.appendChild(btnFontLarger)
+    toolbar.appendChild(btnFontReset)
+
     // Separator
     toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
 
@@ -3570,6 +4080,24 @@ export class TableCompare {
     this._dom.btnRedo = btnRedo
     toolbar.appendChild(btnUndo)
     toolbar.appendChild(btnRedo)
+
+    // S25-T6: navigate between the rows this session has edited
+    const btnPrevEdit = el('button',
+      { id: 'tc-btn-prev-edit', className: 'tc-btn', title: '上一處編輯過的列' }, '✎▲')
+    const btnNextEdit = el('button',
+      { id: 'tc-btn-next-edit', className: 'tc-btn', title: '下一處編輯過的列' }, '✎▼')
+    btnPrevEdit.disabled = true
+    btnNextEdit.disabled = true
+    this._dom.btnPrevEdit = btnPrevEdit
+    this._dom.btnNextEdit = btnNextEdit
+    toolbar.appendChild(btnPrevEdit)
+    toolbar.appendChild(btnNextEdit)
+
+    // S25-T4: Select All
+    const btnSelectAll = el('button',
+      { id: 'tc-btn-select-all', className: 'tc-btn', title: '全選這一側的表格內容（Ctrl+A）' }, '⬚ 全選')
+    this._dom.btnSelectAll = btnSelectAll
+    toolbar.appendChild(btnSelectAll)
 
     // P2-44: row-level edit commands
     const btnCopyRight = el('button',
@@ -3884,9 +4412,15 @@ export class TableCompare {
     this._dom.btnOpenLeft = btnLeft
     this._dom.dispLeft = dispLeft
     this._dom.selLeft = selLeft
+    // S25-T3: BC's File ▸ Explorer, per side — the path it acts on is the one
+    // shown right next to it, so there is nothing to guess.
+    const btnExpLeft = el('button',
+      { id: 'tc-btn-explorer-left', className: 'tc-open-btn', title: '在檔案總管中顯示左側檔案' }, '📁')
+    this._dom.btnExplorerLeft = btnExpLeft
     leftCell.appendChild(btnLeft)
     leftCell.appendChild(dispLeft)
     leftCell.appendChild(selLeft)
+    leftCell.appendChild(btnExpLeft)
 
     // Right
     const rightCell = el('div', { className: 'tc-path-cell' })
@@ -3897,9 +4431,13 @@ export class TableCompare {
     this._dom.btnOpenRight = btnRight
     this._dom.dispRight = dispRight
     this._dom.selRight = selRight
+    const btnExpRight = el('button',
+      { id: 'tc-btn-explorer-right', className: 'tc-open-btn', title: '在檔案總管中顯示右側檔案' }, '📁')
+    this._dom.btnExplorerRight = btnExpRight
     rightCell.appendChild(btnRight)
     rightCell.appendChild(dispRight)
     rightCell.appendChild(selRight)
+    rightCell.appendChild(btnExpRight)
 
     row.appendChild(leftCell)
     row.appendChild(rightCell)
@@ -4006,6 +4544,18 @@ export class TableCompare {
     btnDetails.addEventListener('click', () => this.toggleDetails())
     btnFileInfo.addEventListener('click', () => this.toggleFileInfo())
     btnWhitespace.addEventListener('click', () => this.toggleWhitespace())
+
+    // S25: row numbers / font size / select all / edit navigation / explorer
+    this._dom.btnRowNums.addEventListener('click', () => this.toggleRowNumbers())
+    this._dom.btnFontSmaller.addEventListener('click', () => this.decreaseFontSize())
+    this._dom.btnFontLarger.addEventListener('click', () => this.increaseFontSize())
+    this._dom.btnFontReset.addEventListener('click', () => this.resetFontSize())
+    this._dom.btnSelectAll.addEventListener('click', () => this.selectAll())
+    this._dom.btnPrevEdit.addEventListener('click', () => this.prevEdit())
+    this._dom.btnNextEdit.addEventListener('click', () => this.nextEdit())
+    this._dom.btnExplorerLeft.addEventListener('click', () => void this.revealInExplorer('left'))
+    this._dom.btnExplorerRight.addEventListener('click', () => void this.revealInExplorer('right'))
+
     this._dom.btnUndo.addEventListener('click', () => this.undo())
     this._dom.btnRedo.addEventListener('click', () => this.redo())
     this._dom.btnSaveLeft.addEventListener('click', () => void this.saveLeft())
@@ -4237,6 +4787,24 @@ export class TableCompare {
           this.insertRow(this._selectedCell?.side ?? 'left')
           return
         }
+        // S25: Select All / clipboard / font size
+        if (key === 'a') { e.preventDefault(); this.selectAll(); return }
+        if (key === 'c') { e.preventDefault(); void this.copySelection(); return }
+        if (key === 'x') { e.preventDefault(); void this.cutCell(); return }
+        if (key === 'v') { e.preventDefault(); void this.pasteCell(); return }
+        if (key === '=' || key === '+') { e.preventDefault(); this.increaseFontSize(); return }
+        if (key === '-') { e.preventDefault(); this.decreaseFontSize(); return }
+        if (key === '0') { e.preventDefault(); this.resetFontSize(); return }
+      }
+
+      // Delete clears the selection; no modifier, so it must not fire while an
+      // input has focus, which the inInput guard above already establishes.
+      if (e.key === 'Delete' && !inInput && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (this._selectionRange || this._selectedCell) {
+          e.preventDefault()
+          this.deleteCell()
+          return
+        }
       }
 
       // Alt+←/→ mirrors text compare's Copy Block Left / Right.
@@ -4281,17 +4849,42 @@ export class TableCompare {
         const tbody = this._dom[`${side}Tbody`]
         const rowOffset = tbody ? [...tbody.children].indexOf(tr) : -1
         if (rowOffset >= 0) {
+          const visibleRowIdx = (this._windowFirst ?? 0) + rowOffset
+          const col = [...tr.children].indexOf(td) - 1
           items.push({
             label: '編輯儲存格…',
-            action: () => this._beginCellEdit(
-              side,
-              (this._windowFirst ?? 0) + rowOffset,
-              [...tr.children].indexOf(td) - 1,
-              td),
+            action: () => this._beginCellEdit(side, visibleRowIdx, col, td),
+          })
+          // S25-T5: the clipboard commands act on the cell under the cursor, so
+          // select it first — otherwise they would silently target whatever was
+          // selected before the right-click.
+          items.push({
+            label: '剪下儲存格',
+            action: () => { this.selectCell(side, visibleRowIdx, col); void this.cutCell() },
+          })
+          items.push({
+            label: '貼上到儲存格',
+            action: () => { this.selectCell(side, visibleRowIdx, col); void this.pasteCell() },
+          })
+          items.push({
+            label: '清除儲存格',
+            action: () => { this.selectCell(side, visibleRowIdx, col); this.deleteCell() },
           })
         }
       }
     }
+
+    // S25-T4: Select All + copy the range
+    items.push({ separator: true })
+    items.push({
+      label: side === 'left' ? '全選（左側）' : '全選（右側）',
+      action: () => this.selectAll(side),
+    })
+    items.push({
+      label: '複製選取範圍',
+      disabled: !this._selectionRange && !this._selectedCell,
+      action: () => { void this.copySelection() },
+    })
 
     items.push({
       label: '複製整列（CSV）',
@@ -4328,6 +4921,24 @@ export class TableCompare {
       })
       items.push({ label: '跳至列 / 欄…', action: () => this.openGoto() })
     }
+
+    // S25-T6 / S25-T1 / S25-T3
+    const hasEdits = this._undoStack.length > 0 || this._redoStack.length > 0
+    items.push({ separator: true })
+    items.push({ label: '上一處編輯', disabled: !hasEdits, action: () => this.prevEdit() })
+    items.push({ label: '下一處編輯', disabled: !hasEdits, action: () => this.nextEdit() })
+    items.push({
+      label: this._showRowNumbers ? '隱藏列號' : '顯示列號',
+      action: () => this.toggleRowNumbers(),
+    })
+
+    const sidePath = side === 'left' ? this._leftPath : this._rightPath
+    items.push({ separator: true })
+    items.push({
+      label: '在檔案總管中顯示',
+      disabled: !isRealFilePath(sidePath),
+      action: () => { void this.revealInExplorer(side) },
+    })
 
     const rowNum = tr.querySelector('.tc-row-num')?.textContent?.trim() ?? ''
     if (rowNum) {
@@ -4439,7 +5050,7 @@ export class TableCompare {
     const { leftScroll, rightScroll } = this._dom
     if (!leftScroll) return
     const viewport = leftScroll.clientHeight || 0
-    const target = Math.max(0, rowIndex * TABLE_ROW_HEIGHT - Math.floor(viewport / 2))
+    const target = Math.max(0, rowIndex * this._rowHeight - Math.floor(viewport / 2))
     leftScroll.scrollTop = target
     if (rightScroll) rightScroll.scrollTop = target
     this._renderTableWindow()
@@ -4574,6 +5185,10 @@ export class TableCompare {
    * 否則跳轉會落在錯誤的 scrollTop。
    */
   _refreshRowIndex() {
+    // A range is a pair of row indices into the *previous* visible set. Filters,
+    // sorting and re-alignment renumber those rows, so keeping the range would
+    // aim a later Delete at rows the user never selected.
+    this._selectionRange = null
     this._visibleRows = this._alignedRows.filter((r) => this._isRowVisible(r))
     this._diffRows = diffRowIndices(this._visibleRows)
     if (this._currentDiffIdx >= this._diffRows.length) {
@@ -4657,7 +5272,7 @@ export class TableCompare {
     // Virtual scrolling: a spacer establishes the true scroll height while
     // only the rows in view are built. Without this a 100k-row CSV produced
     // 100k <tr> per side on every filter or checkbox change.
-    const totalHeight = this._visibleRows.length * TABLE_ROW_HEIGHT
+    const totalHeight = this._visibleRows.length * this._rowHeight
     for (const side of ['left', 'right']) {
       const scroll = this._dom[`${side}Scroll`]
       const spacer = el('div', { className: 'tc-vs-spacer' })
@@ -4703,15 +5318,15 @@ export class TableCompare {
 
     const rows = this._visibleRows ?? []
     const viewport = leftScroll.clientHeight || 600
-    const first = Math.max(0, Math.floor(leftScroll.scrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN)
-    const count = Math.ceil(viewport / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN * 2
+    const first = Math.max(0, Math.floor(leftScroll.scrollTop / this._rowHeight) - TABLE_OVERSCAN)
+    const count = Math.ceil(viewport / this._rowHeight) + TABLE_OVERSCAN * 2
     const last = Math.min(rows.length, first + count)
 
     if (this._windowFirst === first && this._windowLast === last) return
     this._windowFirst = first
     this._windowLast = last
 
-    const offset = first * TABLE_ROW_HEIGHT
+    const offset = first * this._rowHeight
     if (leftTable) leftTable.style.top = `${offset}px`
     if (rightTable) rightTable.style.top = `${offset}px`
 

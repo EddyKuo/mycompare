@@ -177,6 +177,9 @@ describe('P2-1 檢查碼欄位的效能約束', () => {
     const api = stubApi()
     const { fc } = mounted({ columns: ['name', 'crc'] })
     fc.setColumns(['name', 'crc'])
+    // 這幾條釘的是 hashFile 的排隊行為；欄位預設演算法是 CRC-32，
+    // 所以先切到 MD5，否則走的是 crc32File 那條路。
+    fc.setChecksumAlgorithm('md5')
 
     const rows = []
     for (let i = 0; i < 30_000; i++) {
@@ -203,6 +206,9 @@ describe('P2-1 檢查碼欄位的效能約束', () => {
     const api = stubApi()
     const { fc } = mounted()
     fc.setColumns(['name', 'crc'])
+    // 這幾條釘的是 hashFile 的排隊行為；欄位預設演算法是 CRC-32，
+    // 所以先切到 MD5，否則走的是 crc32File 那條路。
+    fc.setChecksumAlgorithm('md5')
     fc._rows = [{
       name: 'a.bin', status: 'same',
       left: entry({ name: 'a.bin', path: '/l/a.bin' }),
@@ -222,6 +228,9 @@ describe('P2-1 檢查碼欄位的效能約束', () => {
     const api = stubApi()
     const { fc, host } = mounted()
     fc.setColumns(['name', 'crc'])
+    // 這幾條釘的是 hashFile 的排隊行為；欄位預設演算法是 CRC-32，
+    // 所以先切到 MD5，否則走的是 crc32File 那條路。
+    fc.setChecksumAlgorithm('md5')
     fc._rows = [{
       name: 'huge.bin', status: 'same',
       left: entry({ name: 'huge.bin', path: '/l/huge.bin', size: 512 * 1024 * 1024 }),
@@ -241,6 +250,9 @@ describe('P2-1 檢查碼欄位的效能約束', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { fc, host } = mounted()
     fc.setColumns(['name', 'crc'])
+    // 這幾條釘的是 hashFile 的排隊行為；欄位預設演算法是 CRC-32，
+    // 所以先切到 MD5，否則走的是 crc32File 那條路。
+    fc.setChecksumAlgorithm('md5')
     fc._rows = [{
       name: 'a.bin', status: 'same',
       left: entry({ name: 'a.bin', path: '/l/a.bin' }), right: null, children: null,

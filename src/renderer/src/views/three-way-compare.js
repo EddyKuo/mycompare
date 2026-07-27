@@ -307,6 +307,28 @@ export function isConflictChoice(c) {
 }
 
 /**
+ * Which half of the view is given the whole window.
+ *
+ * `sources` and `output` are one field rather than two booleans because they
+ * are mutually exclusive by construction — collapsing both would leave nothing
+ * on screen — and a single enum makes that unrepresentable instead of merely
+ * discouraged.
+ *
+ * @typedef {'none'|'output'|'sources'} MaximizeMode
+ */
+
+/** @type {MaximizeMode[]} */
+export const MAXIMIZE_MODES = ['none', 'output', 'sources']
+
+/**
+ * @param {unknown} m
+ * @returns {m is MaximizeMode}
+ */
+export function isMaximizeMode(m) {
+  return typeof m === 'string' && MAXIMIZE_MODES.includes(/** @type {MaximizeMode} */ (m))
+}
+
+/**
  * How a segment relates to the base, which is the only thing the display
  * filters below need to know about it.
  *
@@ -839,6 +861,36 @@ export class ThreeWayCompare {
     /** Last rendered window, kept so redundant scroll events cost nothing. */
     this._renderedRange = { start: -1, end: -1 }
 
+    /**
+     * The offset the three panes share, tracked rather than read back.
+     *
+     * A pane hidden by a layout change reports 0 and ignores writes, so once
+     * one is collapsed the DOM can no longer say where the user was. Every
+     * scroll goes through here, and every layout change pushes it back out.
+     */
+    this._scrollTop = 0
+
+    /** BC's hide-centre: the ancestor is only needed while judging a conflict. */
+    this._showBase = true
+
+    /**
+     * The project denies `setWindowOpenHandler` on purpose, so BC's detached
+     * output window is expressed as "the output takes the whole view" instead.
+     * @type {MaximizeMode}
+     */
+    this._maximize = 'none'
+
+    /** Line-number gutter, matching the toggle the text view already has. */
+    this._showLineNumbers = true
+
+    /**
+     * The inline height the drag handle left on the output pane, parked while
+     * a maximise mode overrides it. Null means "not currently overridden";
+     * an empty string is a real saved value (the pane was never dragged).
+     * @type {string|null}
+     */
+    this._savedOutputHeight = null
+
     /** @type {'myers'|'patience'|'histogram'} */
     this._algorithm = 'myers'
     /** Whether grammar line weights feed the alignment (BC line weights). */
@@ -984,6 +1036,104 @@ export class ThreeWayCompare {
   /** @returns {ShowFilterMode} */
   getShowFilter() {
     return this._showFilter
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pane layout
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Show or hide the base (centre) pane.
+   *
+   * @param {boolean} on
+   * @returns {boolean} the state after the call
+   */
+  setBaseVisible(on) {
+    const next = Boolean(on)
+    if (next === this._showBase) return this._showBase
+    this._showBase = next
+    this._applyLayout()
+    this._emit('status', { message: next ? '已顯示基準窗格' : '已隱藏基準窗格' })
+    return this._showBase
+  }
+
+  /** @returns {boolean} */
+  isBaseVisible() {
+    return this._showBase
+  }
+
+  /** @returns {boolean} the state after the call */
+  toggleBaseVisible() {
+    return this.setBaseVisible(!this._showBase)
+  }
+
+  /**
+   * Give the whole view to the output, to the three sources, or to neither.
+   *
+   * @param {MaximizeMode} mode
+   * @returns {MaximizeMode} the mode actually in force
+   */
+  setMaximize(mode) {
+    if (!isMaximizeMode(mode) || mode === this._maximize) return this._maximize
+    this._maximize = mode
+    this._applyLayout()
+    this._emit('status', {
+      message: mode === 'output' ? '合併輸出已放大'
+        : mode === 'sources' ? '來源窗格已放大'
+          : '版面已回到四窗格',
+    })
+    return this._maximize
+  }
+
+  /** @returns {MaximizeMode} */
+  getMaximize() {
+    return this._maximize
+  }
+
+  /**
+   * BC's "open the output in its own window", expressed as a maximise because
+   * this app denies `setWindowOpenHandler`. Pressing it again restores.
+   *
+   * @returns {MaximizeMode}
+   */
+  toggleMaximizeOutput() {
+    return this.setMaximize(this._maximize === 'output' ? 'none' : 'output')
+  }
+
+  /** @returns {MaximizeMode} */
+  toggleMaximizeSources() {
+    return this.setMaximize(this._maximize === 'sources' ? 'none' : 'sources')
+  }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state after the call
+   */
+  setLineNumbers(on) {
+    const next = Boolean(on)
+    if (next === this._showLineNumbers) return this._showLineNumbers
+    this._showLineNumbers = next
+    this._applyLayout()
+    return this._showLineNumbers
+  }
+
+  /** @returns {boolean} */
+  getLineNumbers() {
+    return this._showLineNumbers
+  }
+
+  /** @returns {boolean} the state after the call */
+  toggleLineNumbers() {
+    return this.setLineNumbers(!this._showLineNumbers)
+  }
+
+  /** Put every layout control back to the shipped default. */
+  resetLayout() {
+    this._showBase = true
+    this._maximize = 'none'
+    this._showLineNumbers = true
+    this._applyLayout()
+    this._emit('status', { message: '版面已重設' })
   }
 
   /**
@@ -1795,6 +1945,12 @@ ${body}
       // Base line ranges, so a snapshot taken on the same ancestor restores
       // the same marks; they are re-clamped on the way back in.
       manualConflicts: this.getManualConflicts(),
+      // Pane layout: which panes are on screen is a view preference, so it
+      // belongs in the same snapshot as the filters rather than being reset
+      // every time a session is reopened.
+      showBase: this._showBase,
+      maximize: this._maximize,
+      showLineNumbers: this._showLineNumbers,
     })
   }
 
@@ -1827,7 +1983,11 @@ ${body}
       this._manualConflicts = normalizeForcedRanges(
         c.manualConflicts, (this._baseContent || '').split('\n').length)
     }
+    if (typeof c.showBase === 'boolean') this._showBase = c.showBase
+    if (isMaximizeMode(c.maximize)) this._maximize = c.maximize
+    if (typeof c.showLineNumbers === 'boolean') this._showLineNumbers = c.showLineNumbers
 
+    this._applyLayout()
     this._runMerge()
   }
 
@@ -1842,6 +2002,7 @@ ${body}
    */
   scrollToRow(rowIndex) {
     const top = Math.max(0, Math.floor(Number(rowIndex) || 0)) * ROW_HEIGHT
+    this._scrollTop = top
     for (const pane of this._panes()) pane.scrollTop = top
     this._renderPaneWindows(top)
   }
@@ -1876,6 +2037,9 @@ ${body}
     this._outputEl = null
     this._outputPaneEl = null
     this._outputEditing = false
+    // The pane it referred to is gone; keeping it would make the next mount
+    // restore a height measured against a discarded DOM.
+    this._savedOutputHeight = null
   }
 
   /**
@@ -1961,6 +2125,12 @@ ${body}
             </select>
           </label>
           <span class="mw-toolbar-sep"></span>
+          <button class="mw-btn-toggle-base" title="隱藏或顯示中間的基準窗格，把空間讓給左右兩側">隱藏基準</button>
+          <button class="mw-btn-max-output" title="把合併輸出放大到整個視圖（來源窗格收起）">放大輸出</button>
+          <button class="mw-btn-max-sources" title="把三個來源窗格放大到整個視圖（輸出只留標題列）">放大來源</button>
+          <button class="mw-btn-toggle-linenum" title="顯示或隱藏行號欄">行號</button>
+          <button class="mw-btn-reset-layout" title="回到預設的四窗格版面">重設版面</button>
+          <span class="mw-toolbar-sep"></span>
           <button class="mw-btn-parent-folders" title="以三個來源的上層資料夾開啟資料夾比對">上層資料夾</button>
           <label class="mw-output-cmp-label" title="把合併輸出與其中一個來源做文字比對">比對輸出
             <select class="mw-output-cmp-select">
@@ -1979,7 +2149,7 @@ ${body}
             </div>
             <div class="mw-content mw-content-left" data-side="left"></div>
           </div>
-          <div class="mw-pane-divider"></div>
+          <div class="mw-pane-divider mw-pane-divider--lb"></div>
           <div class="mw-pane mw-pane--base" data-side="base">
             <div class="mw-path-bar">
               <button class="mw-open-btn" data-side="base">開啟基底…</button>
@@ -2022,6 +2192,9 @@ ${body}
 
     // Setup resizable output pane
     this._setupDividerDrag()
+    // The markup above is always the default four-pane layout, so a view that
+    // was configured before it mounted has to have that state re-applied.
+    this._applyLayout()
   }
 
   /**
@@ -2046,6 +2219,76 @@ ${body}
   /** @returns {HTMLElement[]} the three scrollable side panes that exist */
   _panes() {
     return [this._contentEls.left, this._contentEls.base, this._contentEls.right].filter(Boolean)
+  }
+
+  /**
+   * Push `_showBase` / `_maximize` / `_showLineNumbers` onto the DOM.
+   *
+   * Everything is expressed as a class on `.mw-layout` so the panes keep their
+   * boxes and their content: a collapsed pane is hidden, never rebuilt, which
+   * is what lets the scroll offset and the painted window survive the round
+   * trip. The one thing that cannot be done in CSS is the inline height the
+   * drag handle writes on the output pane, so it is parked and restored here.
+   */
+  _applyLayout() {
+    const layout = this._q('.mw-layout')
+    if (!layout) return
+
+    layout.classList.toggle('mw-layout--no-base', !this._showBase)
+    layout.classList.toggle('mw-layout--max-output', this._maximize === 'output')
+    layout.classList.toggle('mw-layout--max-sources', this._maximize === 'sources')
+    layout.classList.toggle('mw-layout--no-linenum', !this._showLineNumbers)
+
+    const outputPane = this._q('.mw-output-pane')
+    if (outputPane) {
+      if (this._maximize !== 'none') {
+        if (this._savedOutputHeight == null) this._savedOutputHeight = outputPane.style.height
+        outputPane.style.height = ''
+      } else if (this._savedOutputHeight != null) {
+        outputPane.style.height = this._savedOutputHeight
+        this._savedOutputHeight = null
+      }
+    }
+
+    this._syncLayoutButtons()
+    this._restoreScroll()
+  }
+
+  /**
+   * Put every pane back on the tracked offset and repaint the window.
+   *
+   * Called after any layout change because both inputs to the window have
+   * moved: a pane that was hidden reports scrollTop 0 (and silently drops
+   * writes while hidden), and the viewport height differs once a neighbour
+   * collapses, so the previously painted range says nothing about what should
+   * be on screen now.
+   */
+  _restoreScroll() {
+    const top = this._scrollTop
+    for (const pane of this._panes()) pane.scrollTop = top
+    this._renderedRange = { start: -1, end: -1 }
+    this._renderPaneWindows(top)
+  }
+
+  /** Mirror the layout state onto the toolbar toggles. */
+  _syncLayoutButtons() {
+    /** @type {Array<[string, boolean]>} */
+    const states = [
+      ['.mw-btn-toggle-base', !this._showBase],
+      ['.mw-btn-max-output', this._maximize === 'output'],
+      ['.mw-btn-max-sources', this._maximize === 'sources'],
+      ['.mw-btn-toggle-linenum', !this._showLineNumbers],
+    ]
+    for (const [selector, active] of states) {
+      this._q(selector)?.classList.toggle('active', active)
+    }
+
+    const baseBtn = this._q('.mw-btn-toggle-base')
+    if (baseBtn) baseBtn.textContent = this._showBase ? '隱藏基準' : '顯示基準'
+    const outBtn = this._q('.mw-btn-max-output')
+    if (outBtn) outBtn.textContent = this._maximize === 'output' ? '還原輸出' : '放大輸出'
+    const srcBtn = this._q('.mw-btn-max-sources')
+    if (srcBtn) srcBtn.textContent = this._maximize === 'sources' ? '還原來源' : '放大來源'
   }
 
   _setupDividerDrag() {
@@ -2193,6 +2436,12 @@ ${body}
       if (n === 0) toast('沒有手動衝突標記')
     })
     this._q('.mw-btn-info')?.addEventListener('click', () => this.showInfo())
+
+    this._q('.mw-btn-toggle-base')?.addEventListener('click', () => this.toggleBaseVisible())
+    this._q('.mw-btn-max-output')?.addEventListener('click', () => this.toggleMaximizeOutput())
+    this._q('.mw-btn-max-sources')?.addEventListener('click', () => this.toggleMaximizeSources())
+    this._q('.mw-btn-toggle-linenum')?.addEventListener('click', () => this.toggleLineNumbers())
+    this._q('.mw-btn-reset-layout')?.addEventListener('click', () => this.resetLayout())
 
     this._q('.mw-btn-parent-folders')?.addEventListener('click', () => this.mergeParentFolders())
 
@@ -2476,6 +2725,13 @@ ${body}
 
   /** Toolbar entry point for the manual conflict mark. */
   _markConflictFromSelection() {
+    // A hidden pane holds no selection, so without this the user would get the
+    // "select some lines first" message while looking at a layout that makes
+    // selecting them impossible.
+    if (!this._showBase || this._maximize === 'output') {
+      this._reportError('基準窗格目前是隱藏的，請先顯示它再標記衝突。')
+      return
+    }
     if (this._showFilter !== 'all') {
       this._reportError('請先把「顯示」切回全部：篩選後的列沒有基準行號可對應。')
       return
@@ -2687,6 +2943,10 @@ ${body}
         if (syncing) return
         syncing = true
         const scrollTop = pane.scrollTop
+        // The one place the user's position is recorded. A pane hidden by a
+        // layout toggle ignores the write below and reports 0 afterwards, so
+        // the DOM alone cannot be trusted to remember it.
+        this._scrollTop = scrollTop
         for (const other of panes) {
           if (other !== pane) other.scrollTop = scrollTop
         }
@@ -2769,7 +3029,10 @@ ${body}
     // Row lists changed, so the previously painted window says nothing about
     // what is on screen now.
     this._renderedRange = { start: -1, end: -1 }
-    this._renderPaneWindows(this._panes()[0]?.scrollTop ?? 0)
+    // The tracked offset, not the DOM's: with the sources collapsed every pane
+    // reports 0, which would silently jump the user to the top of the file
+    // every time a merge option changed.
+    this._renderPaneWindows(this._scrollTop)
   }
 
   /**

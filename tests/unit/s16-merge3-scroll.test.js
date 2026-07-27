@@ -536,6 +536,10 @@ describe('S16 merge3 — getConfig / applyConfig', () => {
       ignoreUnimportant: false,
       unimportantPatterns: [],
       manualConflicts: [],
+      // S25: the pane layout travels with the snapshot too.
+      showBase: true,
+      maximize: 'none',
+      showLineNumbers: true,
     })
   })
 

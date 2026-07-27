@@ -103,7 +103,7 @@ test('相同圖片：差異像素為 0', async () => {
   }, { timeout: 5000 })
 
   const stats = await win.evaluate(() => window.__testAPI?.imageGetStats())
-  expect(stats).toMatch(/(^|\D)0(\D|$)/)
+  expect(stats).toMatch(/差異像素\s*0\b/)
 })
 
 test('全黑 vs 全白：每個像素都是差異', async () => {
@@ -118,8 +118,9 @@ test('全黑 vs 全白：每個像素都是差異', async () => {
   }, { timeout: 5000 })
 
   const stats = await win.evaluate(() => window.__testAPI?.imageGetStats())
-  // 16x16 = 256 pixels, all differing.
-  expect(stats).toContain('256')
+  // 訊息長「差異像素 N / 總像素 256」——256 是總數，每一則訊息都有。
+  // 原本只斷言 toContain('256')，即使一個像素都沒差也會通過。
+  expect(stats).toMatch(/差異像素\s*256\b/)
 })
 
 test('尺寸不同時 diff canvas 取兩者聯集，內容不被裁掉', async () => {
@@ -135,4 +136,72 @@ test('尺寸不同時 diff canvas 取兩者聯集，內容不被裁掉', async (
 
   const size = await win.evaluate(() => window.__testAPI?.imageGetDiffCanvasSize())
   expect(size).toEqual({ w: 16, h: 8 })
+})
+
+test('單一像素的差異不會被無視', async () => {
+  // 只比對尺寸、或把差異四捨五入掉的實作，會通過上面每一條測試而漏掉這條。
+  await goToImageCompare(win)
+  const plain = await makePng(win, 16, 16, '#000000')
+  const oneOff = await win.evaluate(([base]) => {
+    const img = new Image()
+    return new Promise((resolve) => {
+      img.onload = () => {
+        const c = document.createElement('canvas')
+        c.width = 16; c.height = 16
+        const ctx = c.getContext('2d')
+        ctx.drawImage(img, 0, 0)
+        ctx.fillStyle = '#ffffff'
+        ctx.fillRect(0, 0, 1, 1)
+        resolve(c.toDataURL('image/png').split(',')[1])
+      }
+      img.src = `data:image/png;base64,${base}`
+    })
+  }, [plain])
+
+  await inject(win, plain, oneOff)
+  await win.waitForFunction(() => {
+    const s = window.__testAPI?.imageGetDiffCanvasSize()
+    return s && s.w === 16
+  }, { timeout: 5000 })
+
+  const stats = await win.evaluate(() => window.__testAPI?.imageGetStats())
+  expect(stats).toMatch(/差異像素\s*1\b/)
+})
+
+test('統計文字會隨結果改變，不是固定字串', async () => {
+  await goToImageCompare(win)
+  const black = await makePng(win, 16, 16, '#000000')
+  const white = await makePng(win, 16, 16, '#ffffff')
+
+  await inject(win, black, black)
+  await win.waitForFunction(() => (window.__testAPI?.imageGetStats() ?? '').length > 0,
+    { timeout: 5000 })
+  const same = await win.evaluate(() => window.__testAPI?.imageGetStats())
+
+  await inject(win, black, white)
+  await win.waitForFunction((prev) => {
+    const s = window.__testAPI?.imageGetStats() ?? ''
+    return s.length > 0 && s !== prev
+  }, same, { timeout: 5000 })
+  const differ = await win.evaluate(() => window.__testAPI?.imageGetStats())
+
+  expect(differ).not.toBe(same)
+})
+
+test('工具列每個控制項都留在視窗內', async () => {
+  // 本專案中過兩次的缺陷：工具列換行後渲染到畫布下方，按鈕存在但點不到。
+  // 這種問題單元測試抓不到。
+  await goToImageCompare(win)
+  const offscreen = await win.evaluate(() => {
+    const bad = []
+    for (const ctl of document.querySelectorAll('#view-image button, #view-image select')) {
+      const r = ctl.getBoundingClientRect()
+      if (r.width === 0 && r.height === 0) continue
+      if (r.bottom > window.innerHeight || r.right > window.innerWidth || r.top < 0) {
+        bad.push(ctl.textContent?.trim() || ctl.className)
+      }
+    }
+    return bad
+  })
+  expect(offscreen).toEqual([])
 })

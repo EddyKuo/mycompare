@@ -187,6 +187,8 @@ export function buildAppMenu(win, hiddenCommands = []) {
         item('交換兩側', 'session.swap'),
         item('重新比對', 'session.recompare', 'F5'),
         { type: 'separator' },
+        item('比對內容（選取項目）', 'view.folder.compareContentsSelected'),
+        item('比對內容（全部）', 'view.folder.compareContentsAll'),
         item('快速比對選取項目', 'folder.quickCompare'),
         item('快速比對全部', 'folder.quickCompareAll'),
         item('左側比對至…', 'folder.compareToLeft'),
@@ -218,8 +220,13 @@ export function buildAppMenu(win, hiddenCommands = []) {
           ]
         },
         { type: 'separator' },
-        item('從磁碟重新載入（十六進位）', 'file.hex.reload', 'CmdOrCtrl+Shift+R'),
-        item('從磁碟重新載入（表格）', 'file.table.reload', 'CmdOrCtrl+Shift+R'),
+        // One item, not one per view. The key is bound once in the renderer
+        // and routed to whichever view is active, so three entries all showing
+        // the same accelerator would suggest three different commands.
+        item('從磁碟重新載入檔案', 'file.reload', 'CmdOrCtrl+Shift+R'),
+        { type: 'separator' },
+        item('在檔案總管顯示左側（表格）', 'file.table.explorerLeft'),
+        item('在檔案總管顯示右側（表格）', 'file.table.explorerRight'),
         { type: 'separator' },
         item('列印預覽…', 'file.printPreview'),
         { type: 'separator' },
@@ -317,6 +324,13 @@ export function buildAppMenu(win, hiddenCommands = []) {
           label: '表格編輯',
           submenu: [
             item('跳至列／欄…', 'edit.table.goto', 'CmdOrCtrl+G'),
+            item('全選（表格）', 'edit.table.selectAll', 'CmdOrCtrl+A'),
+            item('複製選取（表格）', 'edit.table.copy', 'CmdOrCtrl+C'),
+            item('剪下儲存格', 'edit.table.cut', 'CmdOrCtrl+X'),
+            item('貼上儲存格', 'edit.table.paste', 'CmdOrCtrl+V'),
+            item('刪除選取內容', 'edit.table.delete', 'Delete'),
+            item('下一個編輯位置（表格）', 'search.table.nextEdit'),
+            item('上一個編輯位置（表格）', 'search.table.prevEdit'),
             item('複製整列到右側', 'edit.table.copyToRight', 'Alt+Right'),
             item('複製整列到左側', 'edit.table.copyToLeft', 'Alt+Left'),
             item('插入空白列', 'edit.table.insertRow', 'CmdOrCtrl+I')
@@ -433,6 +447,23 @@ export function buildAppMenu(win, hiddenCommands = []) {
             item('詳細資料', 'view.hex.details'),
             item('檔案資訊', 'view.hex.fileInfo'),
             item('標尺', 'view.hex.ruler'),
+            item('一律顯示資料夾', 'view.folder.alwaysShowFolders'),
+            item('暫停所有篩選', 'view.folder.suppressFilters'),
+            item('快速篩選使用正規表示式', 'view.folder.filterRegex'),
+            item('圖例', 'view.folder.legend'),
+            item('記錄面板', 'view.folder.log'),
+            { type: 'separator' },
+            item('顯示列號（表格）', 'view.table.rowNumbers'),
+            item('放大字型（表格）', 'view.table.fontLarger'),
+            item('縮小字型（表格）', 'view.table.fontSmaller'),
+            item('重設字型（表格）', 'view.table.fontReset'),
+            item('整檔差異縮圖（文字）', 'view.text.thumbnail'),
+            { type: 'separator' },
+            item('顯示基準窗格（三向）', 'view.merge.toggleBasePane'),
+            item('放大輸出窗格', 'view.merge.maximizeOutput'),
+            item('放大來源窗格', 'view.merge.maximizeSources'),
+            item('顯示行號（三向）', 'view.merge.lineNumbers'),
+            item('重設窗格版面', 'view.merge.resetLayout'),
             item('整檔差異縮圖', 'view.hex.thumbnail'),
             item('上下堆疊佈局', 'view.hex.layout')
           ]

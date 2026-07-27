@@ -1660,3 +1660,84 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ── Legend panel ── */
+.fc-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.fc-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.fc-legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.fc-legend-dot--same        { background: var(--bg-primary); }
+.fc-legend-dot--different   { background: var(--diff-replace-border); }
+.fc-legend-dot--unimportant { background: var(--diff-unimportant-border); }
+.fc-legend-dot--left-only   { background: var(--diff-insert-border); }
+.fc-legend-dot--right-only  { background: var(--diff-delete-border); }
+.fc-legend-dot--left-newer,
+.fc-legend-dot--right-newer { background: var(--diff-unimportant-bg); }
+.fc-legend-dot--conflict    { background: var(--diff-delete-border); border-style: dashed; }
+
+/* ── Message log panel ── */
+.fc-log {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.fc-log-lines {
+  flex: 1;
+  max-height: 120px;
+  overflow-y: auto;
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-primary);
+}
+
+.fc-log-line {
+  padding: 1px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.fc-log-clear {
+  font-size: 11px;
+  padding: 1px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+/* A switch the current comparison mode cannot honour. Dimmed rather than
+   hidden, so the mode's own tooltip can explain why. */
+.fc-toolbar label.fc-cb--unavailable {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

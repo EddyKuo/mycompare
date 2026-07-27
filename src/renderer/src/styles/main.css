@@ -383,6 +383,15 @@ body {
   right: 2px;
   min-height: 2px;
 }
+/* Thumbnail hidden: zero the custom property rather than rewrite the grid,
+   because the splitter drag builds its inline template from the same var. */
+.compare-area.hide-minimap {
+  --minimap-width: 0px;
+}
+.compare-area.hide-minimap .minimap {
+  display: none;
+}
+
 .minimap-mark.insert { background: var(--diff-insert-border); opacity: 0.7; }
 .minimap-mark.delete { background: var(--diff-delete-border); opacity: 0.7; }
 .minimap-mark.replace { background: var(--diff-replace-border); opacity: 0.7; }

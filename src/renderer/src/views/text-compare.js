@@ -102,6 +102,24 @@ const VS_OVERSCAN = 5;
 const SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
 /**
+ * Hard ceiling on thumbnail bands.
+ *
+ * Sampling per line is what makes a single changed line in a 50k-line file
+ * visible at all, but one node per line is the "hundred thousand DOM nodes"
+ * mistake this project has already made once. Bands are therefore capped at
+ * the strip's own pixel height and again at this constant, so the node count
+ * is bounded by the display and not by the file.
+ */
+const MINIMAP_MAX_BANDS = 1000;
+
+/**
+ * @typedef {object} MinimapBand
+ * @property {number} start first band index covered
+ * @property {number} end   last band index covered (inclusive)
+ * @property {'insert'|'delete'|'replace'} type
+ */
+
+/**
  * Display Font choices (BC View | Display Font). Monospace only — the diff
  * panes, the ruler and the gutter all assume a fixed advance width.
  * @type {Array<{ label: string, value: string }>}
@@ -1760,6 +1778,23 @@ export class TextCompare {
     this._encodingLeft = 'UTF-8';
     this._encodingRight = 'UTF-8';
 
+    /**
+     * Encoding the user picked by hand, per side. A reload honours it instead
+     * of re-running detection, which would silently revert the override on a
+     * file chardet guesses wrong.
+     * @type {{ left: string|null, right: string|null }}
+     */
+    this._manualEncoding = { left: null, right: null };
+
+    /**
+     * Whether the difference thumbnail column is shown. Named to match
+     * hex/table so the same menu command reaches all three.
+     */
+    this._showMinimap = options.showThumbnail ?? true;
+
+    /** Bands last painted into the thumbnail, exposed for tests. @type {MinimapBand[]} */
+    this._minimapBands = [];
+
     // Virtual scroll state
     this._totalRows = 0;
     this._maxLineChars = 0;
@@ -2055,6 +2090,8 @@ export class TextCompare {
 
     // Minimap click-to-jump
     this._on(this._minimap, 'click', this._onMinimapClick);
+    // A config applied before mount() only set the flag; the DOM has to catch up.
+    this._compareArea?.classList.toggle('hide-minimap', !this._showMinimap);
 
     // Collapsed-section expand (event delegation)
     this._on(this._contentLeft, 'click', this._onContentClick);
@@ -3270,9 +3307,93 @@ export class TextCompare {
     if (!path) return false;
     const result = await window.electronAPI.readFile(path, encoding);
     if (!result) return false;
+    // Remembered so a later reload does not re-run detection and quietly undo
+    // the choice the user made here.
+    this._manualEncoding[side] = encoding;
     if (side === 'left') this.setLeft(result.path, result.content, result.encoding);
     else this.setRight(result.path, result.content, result.encoding);
     return true;
+  }
+
+  /**
+   * Re-read one side from disk, discarding the in-memory copy.
+   *
+   * `refresh()` only re-runs the comparison over what is already loaded, so an
+   * edit another program made was invisible unless the file watcher happened to
+   * see it. Watching misses network drives and the write-temp-then-rename dance
+   * several editors use, which left no manual fallback at all.
+   *
+   * @param {'left'|'right'} side
+   * @param {{ confirmed?: boolean }} [opts] `confirmed` skips the prompt when
+   *   the caller has already asked (reloading both sides asks once)
+   * @returns {Promise<boolean>} true when the side was re-read
+   */
+  async reloadSide(side, opts = {}) {
+    const sideName = side === 'left' ? '左側' : '右側';
+    const path = side === 'left' ? this._leftPath : this._rightPath;
+    if (!path) {
+      toast(`${sideName}沒有檔案路徑，無法重新載入`, { type: 'error' });
+      return false;
+    }
+    if (!opts.confirmed && this._modified[side]) {
+      const ok = window.confirm(
+        `${sideName}有未儲存的編輯。\n` +
+        '重新載入會從磁碟讀回檔案，這些編輯會遺失。要繼續嗎？');
+      if (!ok) return false;
+    }
+
+    const encoding = this._manualEncoding[side];
+    let result;
+    try {
+      result = encoding
+        ? await window.electronAPI.readFile(path, encoding)
+        : await window.electronAPI.readFile(path);
+    } catch (err) {
+      toast(`重新載入${sideName}失敗：${err instanceof Error ? err.message : String(err)}`,
+        { type: 'error', durationMs: 6000 });
+      return false;
+    }
+    // A transient read failure must leave the panes alone; blanking them would
+    // look exactly like the file having been emptied on disk.
+    if (!result || typeof result.content !== 'string') {
+      toast(`重新載入${sideName}失敗：讀不到檔案內容`, { type: 'error', durationMs: 6000 });
+      return false;
+    }
+
+    if (side === 'left') this.setLeft(result.path ?? path, result.content, result.encoding);
+    else this.setRight(result.path ?? path, result.content, result.encoding);
+    // setLeft/setRight replace the content but know nothing about edits; the
+    // dirty flag has to be cleared here or the tab still claims unsaved work.
+    this._modified[side] = false;
+    this._updateModifiedIndicator();
+    this._syncEditTextareas();
+    toast(`已重新載入${sideName}`, { type: 'success' });
+    return true;
+  }
+
+  /**
+   * Re-read whichever sides have a path.
+   * @returns {Promise<boolean>} true when at least one side was re-read
+   */
+  async reloadAll() {
+    /** @type {Array<'left'|'right'>} */
+    const sides = [];
+    if (this._leftPath) sides.push('left');
+    if (this._rightPath) sides.push('right');
+    if (sides.length === 0) {
+      toast('尚未載入任何檔案，無法重新載入', { type: 'error' });
+      return false;
+    }
+    if (sides.some((s) => this._modified[s])) {
+      const ok = window.confirm(
+        '有尚未儲存的編輯。重新載入會從磁碟讀回檔案，這些編輯會遺失。要繼續嗎？');
+      if (!ok) return false;
+    }
+    let any = false;
+    for (const side of sides) {
+      if (await this.reloadSide(side, { confirmed: true })) any = true;
+    }
+    return any;
   }
 
   /**
@@ -5082,6 +5203,7 @@ ${rows}
       showFileInfo:       this._showFileInfo,
       showDescription:    this._showDescription,
       detailsMode:        this._detailsMode,
+      showThumbnail:      this._showMinimap,
       readOnlyLeft:       this._readOnly.left,
       readOnlyRight:      this._readOnly.right,
       // 1.4: manual alignment and the indent step are per-session choices.
@@ -5207,6 +5329,7 @@ ${rows}
       this.toggleDescription(settings.showDescription)
       this.setDescription(this._description)
     }
+    if (typeof settings.showThumbnail === 'boolean') this.setThumbnailVisible(settings.showThumbnail)
     if (settings.detailsMode === null || typeof settings.detailsMode === 'string') {
       this.setDetailsMode(/** @type {'text'|'hex'|'alignment'|null} */ (settings.detailsMode ?? null))
     }
@@ -5647,57 +5770,94 @@ ${rows}
   // Private: minimap
   // -------------------------------------------------------------------------
 
+  /**
+   * Repaint the difference thumbnail.
+   *
+   * Rows are sampled individually into fixed-count bands rather than grouped
+   * into contiguous diff blocks. Block grouping lost every isolated change:
+   * one altered line in a long file drew a sliver clamped to 2px, and two
+   * changes a thousand lines apart drew at the same size as one. Sampling per
+   * row keeps that detail; the band count keeps the cost bounded.
+   */
   _buildMinimap() {
     if (!this._minimap) return;
 
     // Remove all marks (keep only the viewport indicator)
     const viewport = this._minimapViewport;
     this._minimap.replaceChildren(viewport);
+    this._minimapBands = [];
+
+    if (!this._showMinimap) return;
 
     const totalRows = this._rows.length;
     if (totalRows === 0) return;
 
     const mmHeight = this._minimap.clientHeight || 400;
+    const bandCount = Math.max(1, Math.min(
+      Math.round(mmHeight), MINIMAP_MAX_BANDS, totalRows));
 
-    // Group consecutive diff rows into minimap marks
-    let i = 0;
-    while (i < this._rows.length) {
+    // 0 = equal, 1 = insert, 2 = delete, 3 = replace. Highest wins within a
+    // band so a lone replace is never hidden by the inserts around it.
+    const severity = new Uint8Array(bandCount);
+    for (let i = 0; i < totalRows; i++) {
       const row = this._rows[i];
-      if (row.kind === 'collapsed' || row.diffLine?.type === 'equal') {
-        i++;
-        continue;
-      }
+      if (row.kind !== 'line') continue;
+      const t = row.diffLine?.type;
+      const rank = t === 'replace' ? 3 : t === 'delete' ? 2 : t === 'insert' ? 1 : 0;
+      if (rank === 0) continue;
+      const band = Math.min(bandCount - 1, Math.floor((i * bandCount) / totalRows));
+      if (rank > severity[band]) severity[band] = rank;
+    }
 
-      const blockStart = i;
-      let blockType = row.diffLine.type;
-      while (
-        i < this._rows.length &&
-        this._rows[i].kind === 'line' &&
-        this._rows[i].diffLine.type !== 'equal'
-      ) {
-        // Upgrade type priority: replace > delete > insert
-        const t = this._rows[i].diffLine.type;
-        if (t === 'replace') blockType = 'replace';
-        else if (t === 'delete' && blockType !== 'replace') blockType = 'delete';
-        i++;
-      }
-      const blockEnd = i - 1;
-
-      const topFrac  = blockStart / totalRows;
-      const heightFrac = Math.max(2 / mmHeight, (blockEnd - blockStart + 1) / totalRows);
+    const NAMES = ['', 'insert', 'delete', 'replace'];
+    const bandPx = mmHeight / bandCount;
+    let b = 0;
+    while (b < bandCount) {
+      const rank = severity[b];
+      if (rank === 0) { b++; continue; }
+      const start = b;
+      while (b < bandCount && severity[b] === rank) b++;
+      const type = /** @type {'insert'|'delete'|'replace'} */ (NAMES[rank]);
+      this._minimapBands.push({ start, end: b - 1, type });
 
       const mark = document.createElement('div');
-      mark.className = `minimap-mark ${blockType}`;
-      mark.style.top    = `${topFrac * mmHeight}px`;
-      mark.style.height = `${heightFrac * mmHeight}px`;
+      mark.className = `minimap-mark ${type}`;
+      mark.style.top    = `${start * bandPx}px`;
+      mark.style.height = `${Math.max(2, (b - start) * bandPx)}px`;
       this._minimap.appendChild(mark);
     }
 
     this._updateMinimapViewport();
   }
 
+  // -------------------------------------------------------------------------
+  // Public: thumbnail (minimap) visibility
+  // -------------------------------------------------------------------------
+
+  /** @returns {boolean} */
+  isThumbnailVisible() { return this._showMinimap; }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setThumbnailVisible(on) {
+    this._showMinimap = Boolean(on);
+    // Zeroing the custom property rather than the track keeps the splitter
+    // drag handler correct: it composes its inline grid from var(--minimap-width).
+    this._compareArea?.classList.toggle('hide-minimap', !this._showMinimap);
+    this._buildMinimap();
+    return this._showMinimap;
+  }
+
+  /** @returns {boolean} */
+  toggleThumbnail() { return this.setThumbnailVisible(!this._showMinimap); }
+
+  /** @returns {MinimapBand[]} the bands last painted (read only) */
+  getMinimapBands() { return this._minimapBands; }
+
   _updateMinimapViewport() {
-    if (!this._minimapViewport || !this._contentLeft) return;
+    if (!this._minimapViewport || !this._contentLeft || !this._showMinimap) return;
 
     const scrollEl   = this._contentLeft;
     const scrollTop  = scrollEl.scrollTop;
@@ -6036,7 +6196,9 @@ ${rows}
 
   /** @param {MouseEvent} e */
   _handleMinimapClick(e) {
-    const mmHeight = this._minimap.clientHeight;
+    const mmHeight = this._minimap?.clientHeight ?? 0;
+    // A hidden strip has no height; dividing by it would scroll both panes to NaN.
+    if (!this._showMinimap || mmHeight <= 0 || !this._contentLeft || !this._contentRight) return;
     const clickFrac = e.offsetY / mmHeight;
     const scrollH = this._contentLeft.scrollHeight;
     const newScrollTop = clickFrac * scrollH;
@@ -6198,7 +6360,7 @@ ${rows}
     // 1.7 Replacements / 1.2 Merge Files
     items.push({ separator: true });
     items.push({
-      label: `文字取代規則…（${this._replacements.length}） (Ctrl+Shift+R)`,
+      label: `文字取代規則…（${this._replacements.length}） (Ctrl+Alt+R)`,
       action: () => this.openReplacementsDialog(),
     });
     items.push({
@@ -6302,6 +6464,13 @@ ${rows}
       action: () => this.setDetailsMode(this._detailsMode === 'hex' ? null : 'hex') });
     items.push({ label: (this._detailsMode === 'alignment' ? '✓ ' : '　') + '詳細資料：對齊決策',
       action: () => this.setDetailsMode(this._detailsMode === 'alignment' ? null : 'alignment') });
+    items.push({
+      label: (this._showMinimap ? '✓ ' : '　') + '整檔差異縮圖',
+      action: () => {
+        const on = this.toggleThumbnail();
+        toast(on ? '已顯示差異縮圖' : '已隱藏差異縮圖');
+      },
+    });
     items.push({ label: (this._showRuler ? '✓ ' : '　') + '欄位標尺', action: () => this.toggleRuler() });
     items.push({ label: (this._showFileInfo ? '✓ ' : '　') + '檔案資訊', action: () => this.toggleFileInfo() });
     items.push({ label: (this._showDescription ? '✓ ' : '　') + '說明欄', action: () => this.toggleDescription() });
@@ -6332,6 +6501,21 @@ ${rows}
     // left out, which is why the audit kept flagging it as the last capability
     // in the app with no entry point.
     const filePath = side === 'left' ? this._leftPath : this._rightPath;
+
+    // The file watcher misses network drives and editors that save by writing a
+    // temp file and renaming it, so a manual re-read is the only fallback.
+    items.push({ separator: true });
+    items.push({
+      label: `從磁碟重新載入${side === 'left' ? '左' : '右'}側`,
+      disabled: !filePath,
+      action: () => { void this.reloadSide(side); },
+    });
+    items.push({
+      label: '從磁碟重新載入雙側 (Ctrl+Shift+R)',
+      disabled: !this._leftPath && !this._rightPath,
+      action: () => { void this.reloadAll(); },
+    });
+
     const isReal = filePath && !filePath.includes('::') && !SCHEME_RE.test(filePath);
     if (isReal) {
       items.push({ separator: true });
@@ -6490,7 +6674,10 @@ ${rows}
     } else if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p')) {
       e.preventDefault();
       void this.openPatchFile();
-    } else if (e.ctrlKey && e.shiftKey && (e.key === 'R' || e.key === 'r')) {
+    } else if (e.ctrlKey && e.altKey && (e.key === 'R' || e.key === 'r')) {
+      // Moved off Ctrl+Shift+R: app.js dispatches that combo to reloadAll() for
+      // every view that has one, so leaving it here would fire both — opening a
+      // dialog and prompting to discard edits from a single keystroke.
       e.preventDefault();
       this.openReplacementsDialog();
     } else if (e.ctrlKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) {

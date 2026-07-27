@@ -3265,6 +3265,15 @@ function setupMenuActions() {
     fn(hexCompare)
   }
 
+  /** @param {(view: ThreeWayCompare) => void} fn */
+  const _mergePanel = (fn) => {
+    if (currentView !== 'merge3' || !mergeCompare) {
+      showStatus('此項目僅適用於三向合併')
+      return
+    }
+    fn(mergeCompare)
+  }
+
   /** @param {(view: FolderCompare) => void} fn */
   const _folderPanel = (fn) => {
     if (currentView !== 'folder' || !folderCompare) {
@@ -3574,8 +3583,60 @@ function setupMenuActions() {
     'edit.table.insertRow':  () => _tablePanel((v) => { v.insertRow('left') }),
     'view.hex.thumbnail': () => _hexPanel((v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),
     'view.hex.layout': () => _hexPanel((v) => showStatus(v.toggleLayout() === 'over-under' ? '上下堆疊' : '左右並排')),
-    'file.hex.reload': () => _hexPanel((v) => { void v.reloadAll() }),
-    'file.table.reload': () => _tablePanel((v) => { void v.reloadAll() }),
+    'file.reload': () => reloadActiveFromDisk(),
+
+    'view.folder.compareContentsSelected': () => _folderPanel((v) => {
+      void v.compareContentsSelected()
+    }),
+    'view.folder.compareContentsAll': () => _folderPanel((v) => { void v.compareContentsAll() }),
+    'view.folder.alwaysShowFolders': () => _folderPanel((v) => {
+      showStatus(v.toggleAlwaysShowFolders() ? '一律顯示資料夾' : '資料夾依篩選顯示')
+    }),
+    'view.folder.suppressFilters': () => _folderPanel((v) => {
+      showStatus(v.toggleSuppressFilters() ? '已暫停所有篩選' : '已恢復篩選')
+    }),
+    'view.folder.filterRegex': () => _folderPanel((v) => {
+      showStatus(v.toggleFilterRegex() ? '快速篩選：正規表示式' : '快速篩選：一般文字')
+    }),
+    'view.folder.legend': () => _folderPanel((v) => {
+      showStatus(v.toggleLegend() ? '已顯示圖例' : '已隱藏圖例')
+    }),
+    'view.folder.log': () => _folderPanel((v) => {
+      showStatus(v.toggleLogPanel() ? '已顯示記錄' : '已隱藏記錄')
+    }),
+
+    // Table gained the commands every other view already had. The keys are
+    // bound inside the view's own handler, so these menu entries are additive
+    // and the accelerators stay hint-only as everywhere else here.
+    'view.table.rowNumbers': () => _tablePanel((v) => {
+      showStatus(v.toggleRowNumbers() ? '已顯示列號' : '已隱藏列號')
+    }),
+    'view.table.fontLarger':  () => _tablePanel((v) => v.increaseFontSize()),
+    'view.table.fontSmaller': () => _tablePanel((v) => v.decreaseFontSize()),
+    'view.table.fontReset':   () => _tablePanel((v) => v.resetFontSize()),
+    'edit.table.selectAll':   () => _tablePanel((v) => v.selectAll()),
+    'edit.table.copy':        () => _tablePanel((v) => { void v.copySelection() }),
+    'edit.table.cut':         () => _tablePanel((v) => { void v.cutCell() }),
+    'edit.table.paste':       () => _tablePanel((v) => { void v.pasteCell() }),
+    'edit.table.delete':      () => _tablePanel((v) => v.deleteCell()),
+    'search.table.nextEdit':  () => _tablePanel((v) => v.nextEdit()),
+    'search.table.prevEdit':  () => _tablePanel((v) => v.prevEdit()),
+    'file.table.explorerLeft':  () => _tablePanel((v) => { void v.revealInExplorer('left') }),
+    'file.table.explorerRight': () => _tablePanel((v) => { void v.revealInExplorer('right') }),
+
+    // Pane layout for three-way merge. Four panes on a small screen leaves the
+    // output — where the actual work happens — with a quarter of the width.
+    'view.merge.toggleBasePane': () => _mergePanel((v) => {
+      showStatus(v.toggleBaseVisible() ? '已顯示基準窗格' : '已隱藏基準窗格')
+    }),
+    'view.merge.maximizeOutput': () => _mergePanel((v) => { v.toggleMaximizeOutput() }),
+    'view.merge.maximizeSources': () => _mergePanel((v) => { v.toggleMaximizeSources() }),
+    'view.merge.lineNumbers': () => _mergePanel((v) => {
+      showStatus(v.toggleLineNumbers() ? '已顯示行號' : '已隱藏行號')
+    }),
+    'view.merge.resetLayout': () => _mergePanel((v) => { v.resetLayout() }),
+    'view.text.thumbnail': () => _textPanel(
+      (v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),
     'text.editorOptions': () => _textView((v) => v.openEditorOptionsDialog(), '編輯器選項'),
 
     // Three-way folder merge. The view is fully usable from its own toolbar;

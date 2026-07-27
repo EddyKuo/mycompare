@@ -45,6 +45,9 @@ const TEXT_CONFIG_DEFAULTS = {
   showFileInfo: false,
   showDescription: false,
   detailsMode: null,
+  // The thumbnail defaults to shown, which is how it behaved before it could
+  // be hidden at all.
+  showThumbnail: true,
   readOnlyLeft: false,
   readOnlyRight: false,
   // 1.4: Align With anchors and the indent step travel with the snapshot too.

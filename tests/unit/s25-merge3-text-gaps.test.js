@@ -819,7 +819,9 @@ describe('text — every new command has a way in', () => {
 
   it('names the shortcut it is bound to, so the menu cannot advertise a dead key', () => {
     const labels = contextLabels(makeText())
-    expect(labels.find((l) => l.includes('文字取代規則'))).toContain('Ctrl+Shift+R')
+    // Ctrl+Shift+R now belongs to the shared reload-from-disk dispatch in
+    // app.js; replacements moved to Ctrl+Alt+R so one keystroke cannot do both.
+    expect(labels.find((l) => l.includes('文字取代規則'))).toContain('Ctrl+Alt+R')
     expect(labels.find((l) => l.includes('轉為三向合併（選擇基準檔）'))).toContain('Ctrl+Shift+M')
     expect(labels.find((l) => l.includes('從封存檔載入'))).toContain('Ctrl+Shift+A')
   })

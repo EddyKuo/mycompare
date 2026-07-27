@@ -284,3 +284,53 @@
 .mw-modal-primary { border-color: #2563eb; background: #dbeafe; }
 
 .mw-output-pane--editing .mw-output-content { display: none; }
+
+/* ── Pane layout ───────────────────────────────────────────────────────────
+ *
+ * Every rule below is written with two classes on purpose. The base layout
+ * (.mw-layout, .mw-pane, .mw-output-pane …) lives in main.css, which this
+ * file does not own and whose position in the emitted bundle is not
+ * guaranteed; a single-class override would win or lose depending on that
+ * order. Two classes beats one whatever the order turns out to be.
+ *
+ * Panes are hidden, never removed: the scroll offset and the painted virtual
+ * window belong to elements that have to still be there when they come back.
+ */
+
+.mw-layout--no-base .mw-pane--base,
+.mw-layout--no-base .mw-pane-divider--lb { display: none; }
+
+/* Maximising the output hides the sources outright rather than shrinking
+   them — a one-pixel pane still costs a border and a scrollbar, and the whole
+   point of the mode is to hand the window over. */
+.mw-layout--max-output .mw-top,
+.mw-layout--max-output .mw-divider { display: none; }
+
+.mw-layout--max-output .mw-output-pane {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+}
+
+/* The mirror image, except the output *header* stays: it carries Save and the
+   button that leaves this mode. A control the user cannot reach is a worse
+   outcome than a pane they cannot see. */
+.mw-layout--max-sources .mw-output-content,
+.mw-layout--max-sources .mw-output-textarea,
+.mw-layout--max-sources .mw-divider { display: none; }
+
+.mw-layout--max-sources .mw-output-pane {
+  flex: 0 0 auto;
+  height: auto;
+  min-height: 0;
+}
+
+.mw-layout--no-linenum .mw-linenum { display: none; }
+
+/* The toolbar wraps, and a wrapped toolbar that keeps growing would push the
+   panes off the bottom of the view instead of scrolling itself. */
+.mw-layout .mw-toolbar {
+  flex-shrink: 0;
+  max-height: 30vh;
+  overflow-y: auto;
+}

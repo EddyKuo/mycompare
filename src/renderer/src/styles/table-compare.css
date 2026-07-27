@@ -1,6 +1,11 @@
 /* ── Table Compare View ── */
 
 .table-compare {
+  /* S25: display font size. The row height must stay in lockstep with
+     rowHeightForFont() in table-compare.js — virtual scrolling positions rows
+     arithmetically, so a disagreement accumulates down the table. */
+  --tc-font-size: 12px;
+  --tc-row-height: 24px;
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -322,14 +327,14 @@
 .tc-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--tc-font-size);
   table-layout: auto;
 }
 
 /* ── Rows ── */
 .tc-row {
-  height: 24px;
-  line-height: 24px;
+  height: var(--tc-row-height);
+  line-height: var(--tc-row-height);
 }
 
 .tc-row:hover {
@@ -365,7 +370,7 @@
     rgba(128, 128, 128, 0.05) 4px,
     rgba(128, 128, 128, 0.05) 8px
   );
-  height: 24px;
+  height: var(--tc-row-height);
 }
 
 /* ── Cells ── */
@@ -653,6 +658,24 @@
 .tc-cell--selected {
   outline: 2px solid #007acc;
   outline-offset: -2px;
+}
+
+/* ── S25-T4: Select All / range selection ──
+   A tint rather than an outline: an outline on every cell of a full-table
+   selection reads as a grid, not as a selection. */
+.tc-cell--in-range {
+  background: rgba(0, 122, 204, 0.18);
+}
+
+[data-theme="dark"] .tc-cell--in-range {
+  background: rgba(64, 156, 255, 0.24);
+}
+
+/* ── S25-T1: Row Numbers ──
+   The cell keeps its DOM node so that every index-based lookup (cell editing,
+   find highlighting, context menus) stays 1:1 with the column index. */
+.table-compare.tc-hide-row-numbers .tc-row-num {
+  display: none;
 }
 
 /* ── P2-41: Text Details / File Info panels ── */

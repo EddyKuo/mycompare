@@ -238,6 +238,9 @@ function errText(err) {
  */
 const MAX_EXPAND_ALL_DIRS = 2000
 
+/** Bound on the log panel, which otherwise grows for the life of the tab. */
+const MAX_LOG_LINES = 500
+
 /**
  * @typedef {object} ViewFlags
  * @property {boolean} showSame
@@ -2119,9 +2122,10 @@ export function flattenRows(rows, depth = 0) {
  * 子項尚未載入（children === null）時維持原狀態，不臆測。
  *
  * @param {CompareRow} row
+ * @param {{ ignoreUnimportant?: boolean }} [opts]
  * @returns {CompareRow['status']}
  */
-export function rollupStatus(row) {
+export function rollupStatus(row, opts = {}) {
   if (row.status === 'left-only' || row.status === 'right-only') return row.status
   if (!row.children) return row.status
 
@@ -2129,7 +2133,11 @@ export function rollupStatus(row) {
   let sawRightNewer = false
   let sawOther = false
   for (const child of row.children) {
-    const s = child.children ? rollupStatus(child) : child.status
+    // With the master switch on, a child the mode graded unimportant is not a
+    // difference, so it must not colour its parent either — otherwise the
+    // folder still reads "左較新" with nothing differing inside it.
+    if (opts.ignoreUnimportant && child.unimportant && !child.children) continue
+    const s = child.children ? rollupStatus(child, opts) : child.status
     if (s === 'same') continue
     if (s === 'left-newer') sawLeftNewer = true
     else if (s === 'right-newer') sawRightNewer = true
@@ -2223,6 +2231,103 @@ export const FOLDER_MODE_LABELS = {
   both: '名稱+大小+時間',
   content: '內容 (MD5)',
   rules: '內容 (規則)',
+}
+
+/**
+ * What "不重要差異" means under each comparison mode.
+ *
+ * The switch used to be graded only by the rules mode, so in the other five it
+ * was a checkbox that did nothing — the user could not tell the difference
+ * between "no unimportant differences here" and "this control is inert".
+ * Every mode now either produces the grading or says, on the control itself,
+ * why it cannot.
+ *
+ * @typedef {object} UnimportantSupport
+ * @property {boolean} supported whether this mode can grade a row as unimportant
+ * @property {string} note user-facing explanation, shown as the checkbox title
+ */
+/** @type {Record<string, UnimportantSupport>} */
+export const FOLDER_UNIMPORTANT_SEMANTICS = {
+  name: {
+    supported: false,
+    note: '「僅名稱」不讀取大小、時間或內容，沒有可以分級為「不重要」的差異',
+  },
+  size: {
+    supported: false,
+    note: '「名稱+大小」的唯一判準是大小，大小不同一律是重要差異',
+  },
+  mtime: {
+    supported: false,
+    note: '「名稱+修改時間」的唯一判準就是時間；忽略後所有項目都會變成相同，等於關閉比對',
+  },
+  both: {
+    supported: true,
+    note: '大小相同、只有修改時間不同 → 視為不重要差異',
+  },
+  content: {
+    supported: true,
+    note: '內容雜湊相同、只有時間或屬性不同 → 視為不重要差異',
+  },
+  rules: {
+    supported: true,
+    note: '比對規則判定只有次要差異（空白、行尾、自訂樣式）→ 視為不重要差異',
+  },
+}
+
+/**
+ * @param {string} mode
+ * @returns {UnimportantSupport}
+ */
+export function unimportantSupportFor(mode) {
+  return FOLDER_UNIMPORTANT_SEMANTICS[mode]
+    ?? { supported: false, note: '此比對模式不會產生「不重要差異」' }
+}
+
+/**
+ * Grade timestamp-only differences as unimportant.
+ *
+ * Only meaningful under 'both': there `left-newer` / `right-newer` can only
+ * arise when the sizes match, so the pair differs by its timestamp alone.
+ * Writes through {@link eachRow} — a copy from `flattenRows` would drop the
+ * grading on the floor.
+ *
+ * @param {CompareRow[]} rows
+ * @returns {number} rows graded
+ */
+export function markTimestampOnlyUnimportant(rows) {
+  let graded = 0
+  for (const row of eachRow(rows ?? [])) {
+    if (row.left?.isDirectory || row.right?.isDirectory) continue
+    if (!row.left || !row.right) continue
+    if (row.status !== 'left-newer' && row.status !== 'right-newer') continue
+    row.unimportant = true
+    graded++
+  }
+  return graded
+}
+
+/**
+ * Progress chatter that must not fill the log panel.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isProgressMessage(text) {
+  return /^(掃描中…|計算檢查碼…|讀取版本資訊…)/.test(text ?? '')
+}
+
+/**
+ * Compile the quick-filter box for regex mode.
+ *
+ * @param {string} pattern
+ * @returns {{ re: RegExp|null, error: string }}
+ */
+export function compileQuickFilterRegex(pattern) {
+  try {
+    return { re: new RegExp(pattern, 'i'), error: '' }
+  } catch (err) {
+    return { re: null, error: err instanceof Error ? err.message : String(err) }
+  }
 }
 
 /** Display order and labels for the status counters in the info panel. */
@@ -2903,8 +3008,27 @@ export class FolderCompare {
     // BC's "Ignore Folder Structure": every file in the tree at one level,
     // paired by base name rather than by relative path.
     this._flatMode = false
-    // Folder-level master switch for rules-mode unimportant differences.
+    // Folder-level master switch for unimportant differences. What counts as
+    // unimportant is mode-dependent; see FOLDER_UNIMPORTANT_SEMANTICS.
     this._ignoreUnimportant = false
+
+    // BC's "Always Show Folders": folders stay on screen whatever the name
+    // masks say, so a filtered file set is still reachable through its tree.
+    this._alwaysShowFolders = false
+    // BC's "Suppress Filters": show everything the scan found, without
+    // discarding the mask text the user typed.
+    this._suppressFilters = false
+    // Quick-filter box reads as a regular expression instead of a BC mask.
+    this._filterRegex = false
+    /** @type {string|null} pattern the cached regex below was compiled from */
+    this._quickRegexSource = null
+    /** @type {RegExp|null} */
+    this._quickRegex = null
+    this._quickRegexError = ''
+    /** @type {string[]} status-line messages worth keeping, newest last */
+    this._log = []
+    this._legendVisible = false
+    this._logVisible = false
 
     // Navigation history of {left,right} source pairs, for Back/Forward.
     /** @type {Array<{ left: FolderSource|null, right: FolderSource|null }>} */
@@ -3238,6 +3362,129 @@ export class FolderCompare {
     return graded
   }
 
+  // ── Compare Contents ────────────────────────────────────────────────────────
+
+  /**
+   * Beyond Compare's Compare Contents: read both files and grade the pair by
+   * their bytes, without switching the session's comparison mode.
+   *
+   * The counterpart to Quick Compare — that one downgrades a row to metadata,
+   * this one upgrades it to content — and the reason it is a command rather
+   * than a mode: hashing a whole tree to settle three files is the slow way to
+   * answer the question the user actually asked.
+   *
+   * @param {(row: CompareRow) => boolean} predicate
+   * @param {AbortSignal} [signal]
+   * @returns {Promise<{ graded: number, failed: number }>}
+   */
+  async _compareContents(predicate, signal) {
+    if (typeof window.electronAPI?.hashFile !== 'function') {
+      alert('此環境沒有提供檔案雜湊功能，無法比對內容。')
+      return { graded: 0, failed: 0 }
+    }
+    const targets = [...eachRow(this._rows ?? [])].filter((row) =>
+      !isDirRow(row) && row.left?.path && row.right?.path
+      && sourceKindOf(row.left.path) === 'fs' && sourceKindOf(row.right.path) === 'fs'
+      && predicate(row))
+    if (!targets.length) return { graded: 0, failed: 0 }
+
+    let graded = 0
+    let failed = 0
+    await _runWithConcurrency(targets, RULES_CONCURRENCY, async (row) => {
+      if (signal?.aborted) return
+      try {
+        const [lHash, rHash] = await Promise.all([
+          window.electronAPI.hashFile(row.left.path),
+          window.electronAPI.hashFile(row.right.path),
+        ])
+        if (signal?.aborted) return
+        if (!lHash || !rHash) { failed++; return }
+        const wasDifferent = row.status !== 'same'
+        row.status = lHash === rHash ? 'same' : 'different'
+        // Equal bytes on a pair the metadata pass called different means the
+        // remaining difference is the timestamp — unimportant by definition.
+        row.unimportant = lHash === rHash && wasDifferent
+        graded++
+      } catch (err) {
+        // One unreadable file must not silently pass as "same".
+        failed++
+        console.error('FolderCompare.compareContents:', row.left.path, err)
+      }
+    })
+    if (graded || failed) {
+      this._refreshRollups()
+      this._applyFilterAndRender()
+    }
+    return { graded, failed }
+  }
+
+  /**
+   * Report a finished Compare Contents run.
+   *
+   * Written by the callers rather than by `_compareContents`, because the ones
+   * that open a scan generation have their status line cleared when the
+   * generation ends — a message written before that is wiped before it is read.
+   *
+   * @param {{ graded: number, failed: number }} result
+   * @returns {number} rows re-graded
+   */
+  _reportCompareContents({ graded, failed }) {
+    if (failed) {
+      this._setScanStatus(`比對內容：已判定 ${graded} 列，${failed} 列無法讀取`)
+    } else if (graded) {
+      this._setScanStatus(`比對內容：已依實際內容判定 ${graded} 列`)
+    } else {
+      this._setScanStatus('比對內容：沒有兩側都存在、且可讀取的檔案列')
+    }
+    return graded
+  }
+
+  /**
+   * Compare the checked rows' contents, or the focused row's when nothing is
+   * checked.
+   * @returns {Promise<number>} rows re-graded
+   */
+  async compareContentsSelected() {
+    const keys = this._selectedNames.size
+      ? new Set(this._selectedNames)
+      : new Set(this._focusedKey ? [this._focusedKey] : [])
+    if (!keys.size) {
+      alert('請先勾選或選取要比對內容的項目。')
+      return 0
+    }
+    return this._reportCompareContents(await this._compareContents((row) => {
+      const key = row.left?.path || row.right?.path
+      return !!key && keys.has(key)
+    }))
+  }
+
+  /**
+   * Compare every loaded pair by content.
+   * @returns {Promise<number>} rows re-graded
+   */
+  async compareContentsAll() {
+    const ctrl = this._beginScan()
+    /** @type {{ graded: number, failed: number }} */
+    let result = { graded: 0, failed: 0 }
+    try {
+      result = await this._compareContents(() => true, ctrl.signal)
+    } finally {
+      this._endScan(ctrl)
+    }
+    return this._reportCompareContents(result)
+  }
+
+  /**
+   * Compare one row's contents — the right-click entry point.
+   * @param {CompareRow} row
+   * @returns {Promise<number>}
+   */
+  async compareContentsOfRow(row) {
+    if (!row) return 0
+    return this._reportCompareContents(
+      await this._compareContents((candidate) => candidate === row))
+  }
+
   // ── Compare To ──────────────────────────────────────────────────────────────
 
   /**
@@ -3412,6 +3659,23 @@ export class FolderCompare {
   /** @param {string} text */
   _setScanStatus(text) {
     if (this._dom.scanStatus) this._dom.scanStatus.textContent = text
+    // The status line is where every scan error is reported, and it is
+    // overwritten by the next message before most users have read it.
+    if (!text || isProgressMessage(text)) return
+    if (this._log.at(-1) === text) return
+    this._log.push(text)
+    if (this._log.length > MAX_LOG_LINES) this._log.shift()
+    if (this._logVisible) this._renderLogPanel()
+  }
+
+  /** @returns {string[]} the log panel's lines, oldest first */
+  getLog() {
+    return [...this._log]
+  }
+
+  clearLog() {
+    this._log = []
+    if (this._logVisible) this._renderLogPanel()
   }
 
   // ── Columns & sorting ───────────────────────────────────────────────────────
@@ -3576,6 +3840,9 @@ export class FolderCompare {
     this._container = containerEl
     this._render()
     this._bindEvents()
+    // The ignore-unimportant checkbox has to arrive in the state the starting
+    // mode allows, not in the state the markup happened to be built with.
+    this._syncViewModeControls()
     // Auto-scan if paths were provided via constructor options
     if (this._leftPath || this._rightPath) {
       this._recordNav()
@@ -3617,6 +3884,9 @@ export class FolderCompare {
       filesOnly: this._filesOnly,
       flatMode: this._flatMode,
       ignoreUnimportant: this._ignoreUnimportant,
+      alwaysShowFolders: this._alwaysShowFolders,
+      suppressFilters: this._suppressFilters,
+      filterRegex: this._filterRegex,
       archiveOptions: this.getArchiveOptions(),
       filterStr: this._filterStr,
       filterFields: { ...this._filterFields },
@@ -3675,6 +3945,13 @@ export class FolderCompare {
     if (typeof settings.ignoreUnimportant === 'boolean') {
       this._ignoreUnimportant = settings.ignoreUnimportant
     }
+    if (typeof settings.alwaysShowFolders === 'boolean') {
+      this._alwaysShowFolders = settings.alwaysShowFolders
+    }
+    if (typeof settings.suppressFilters === 'boolean') {
+      this._suppressFilters = settings.suppressFilters
+    }
+    if (typeof settings.filterRegex === 'boolean') this._filterRegex = settings.filterRegex
     if (settings.archiveOptions) {
       this._archiveOptions = normalizeArchiveOptions({
         ...this._archiveOptions, ...settings.archiveOptions })
@@ -3933,7 +4210,11 @@ export class FolderCompare {
   }
 
   /**
-   * Folder-level master switch for the rules mode's unimportant differences.
+   * Folder-level master switch for unimportant differences.
+   *
+   * The switch is global, but what each mode grades as unimportant differs;
+   * {@link unimportantSupportFor} is the single source for both the semantics
+   * and the sentence the disabled checkbox shows.
    *
    * @param {boolean} on
    * @returns {boolean}
@@ -3941,6 +4222,9 @@ export class FolderCompare {
   setIgnoreUnimportant(on) {
     this._ignoreUnimportant = !!on
     this._syncViewModeControls()
+    // Directory verdicts depend on the switch, so they have to be recomputed
+    // before the filter runs over them.
+    this._refreshRollups()
     this._applyFilterAndRender()
     return this._ignoreUnimportant
   }
@@ -3950,12 +4234,103 @@ export class FolderCompare {
     return this.setIgnoreUnimportant(!this._ignoreUnimportant)
   }
 
-  /** Push the three view-mode flags back onto their toolbar controls. */
+  /** @returns {UnimportantSupport} what the switch means under the current mode */
+  ignoreUnimportantSupport() {
+    return unimportantSupportFor(this._mode)
+  }
+
+  /** @returns {boolean} */
+  getAlwaysShowFolders() {
+    return this._alwaysShowFolders
+  }
+
+  /**
+   * BC's "Always Show Folders": name masks stop hiding directories.
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setAlwaysShowFolders(on) {
+    this._alwaysShowFolders = !!on
+    this._syncViewModeControls()
+    this._applyFilterAndRender()
+    return this._alwaysShowFolders
+  }
+
+  /** @returns {boolean} the new state */
+  toggleAlwaysShowFolders() {
+    return this.setAlwaysShowFolders(!this._alwaysShowFolders)
+  }
+
+  /** @returns {boolean} */
+  getSuppressFilters() {
+    return this._suppressFilters
+  }
+
+  /**
+   * BC's "Suppress Filters": ignore every name mask without clearing it, so
+   * the user can look at everything and then go straight back to the filtered
+   * view.
+   *
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setSuppressFilters(on) {
+    this._suppressFilters = !!on
+    this._syncViewModeControls()
+    this._applyFilterAndRender()
+    return this._suppressFilters
+  }
+
+  /** @returns {boolean} the new state */
+  toggleSuppressFilters() {
+    return this.setSuppressFilters(!this._suppressFilters)
+  }
+
+  /** @returns {boolean} */
+  getFilterRegex() {
+    return this._filterRegex
+  }
+
+  /**
+   * Read the quick-filter box as a regular expression rather than a BC mask.
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setFilterRegex(on) {
+    this._filterRegex = !!on
+    this._syncViewModeControls()
+    this._applyFilterAndRender()
+    return this._filterRegex
+  }
+
+  /** @returns {boolean} the new state */
+  toggleFilterRegex() {
+    return this.setFilterRegex(!this._filterRegex)
+  }
+
+  /** Push the view-mode flags back onto their toolbar controls. */
   _syncViewModeControls() {
-    const { cbFilesOnly, cbFlatMode, cbIgnoreUnimportant } = this._dom
+    const { cbFilesOnly, cbFlatMode, cbIgnoreUnimportant, cbAlwaysFolders,
+      cbSuppressFilters, cbFilterRegex } = this._dom
     if (cbFilesOnly) cbFilesOnly.checked = this._filesOnly
     if (cbFlatMode) cbFlatMode.checked = this._flatMode
-    if (cbIgnoreUnimportant) cbIgnoreUnimportant.checked = this._ignoreUnimportant
+    if (cbAlwaysFolders) cbAlwaysFolders.checked = this._alwaysShowFolders
+    if (cbSuppressFilters) cbSuppressFilters.checked = this._suppressFilters
+    if (cbFilterRegex) cbFilterRegex.checked = this._filterRegex
+    if (cbIgnoreUnimportant) {
+      const support = this.ignoreUnimportantSupport()
+      cbIgnoreUnimportant.checked = this._ignoreUnimportant
+      // A control the current mode cannot honour is disabled and says why,
+      // rather than silently doing nothing when clicked.
+      cbIgnoreUnimportant.disabled = !support.supported
+      const label = cbIgnoreUnimportant.closest('label')
+      if (label) {
+        label.title = support.supported
+          ? `忽略不重要差異：${support.note}`
+          : `此模式無法使用：${support.note}`
+        label.classList.toggle('fc-cb--unavailable', !support.supported)
+      }
+    }
   }
 
   /**
@@ -4451,6 +4826,8 @@ export class FolderCompare {
     } else if (available) {
       this._modeNote = ''
     }
+    // The forced mode change also changes what 忽略不重要 can mean.
+    this._syncViewModeControls()
   }
 
   /** @param {'left'|'base'|'right'} side */
@@ -6683,6 +7060,62 @@ ${rows}
     this._applyFilterAndRender()
   }
 
+  /**
+   * Expand one directory and everything under it.
+   *
+   * Expand All is the wrong tool for reviewing a large project file by file:
+   * it loads the whole tree to answer a question about one folder.
+   *
+   * @param {CompareRow} row
+   * @param {number} depth the row's depth in the visible tree
+   * @returns {Promise<number>} directories loaded
+   */
+  async expandNode(row, depth = 0) {
+    if (!row || !isDirRow(row)) return 0
+    const budget = { loaded: 0 }
+    const ctrl = this._beginScan()
+    const before = new Set(this._expanded)
+    try {
+      await this._expandSubtree([row], depth, budget, ctrl.signal)
+    } finally {
+      if (ctrl.signal.aborted) this._expanded = before
+      this._endScan(ctrl)
+    }
+    if (budget.loaded >= MAX_EXPAND_ALL_DIRS) {
+      this._setScanStatus(`展開節點：已達 ${MAX_EXPAND_ALL_DIRS} 個目錄上限，更深的層級未展開`)
+    }
+    this._rerenderPreservingScroll()
+    return budget.loaded
+  }
+
+  /**
+   * Collapse one directory and every directory under it.
+   *
+   * Children stay in the model, so the report, the statistics and a later
+   * re-expansion all still see them.
+   *
+   * @param {CompareRow} row
+   * @param {number} depth
+   * @returns {number} keys removed
+   */
+  collapseNode(row, depth = 0) {
+    if (!row || !isDirRow(row)) return 0
+    let removed = 0
+    /**
+     * @param {CompareRow} node
+     * @param {number} d
+     */
+    const walk = (node, d) => {
+      if (this._expanded.delete(this._expandKey(d, node))) removed++
+      for (const child of node.children ?? []) {
+        if (isDirRow(child)) walk(child, d + 1)
+      }
+    }
+    walk(row, depth)
+    this._rerenderPreservingScroll()
+    return removed
+  }
+
   // ── T54: Find bar ────────────────────────────────────────────────────────────
 
   /**
@@ -6929,6 +7362,10 @@ ${rows}
     // T54: Find bar (hidden by default)
     root.appendChild(this._buildFindBar())
 
+    // Colour legend and message log (both hidden by default)
+    root.appendChild(this._buildLegendPanel())
+    root.appendChild(this._buildLogPanel())
+
     // Column header
     root.appendChild(this._buildHeader())
 
@@ -7059,9 +7496,20 @@ ${rows}
 
     const cbIgnoreUnimportant = this._buildCheckbox(
       'fc-ignore-unimportant', '忽略不重要', this._ignoreUnimportant)
-    cbIgnoreUnimportant.title = '「內容(規則)」模式判定為不重要的差異，視同相同'
     this._dom.cbIgnoreUnimportant = cbIgnoreUnimportant.querySelector('input')
     toolbar.appendChild(cbIgnoreUnimportant)
+
+    const cbAlwaysFolders = this._buildCheckbox(
+      'fc-always-folders', '一律顯示資料夾', this._alwaysShowFolders)
+    cbAlwaysFolders.title = '篩選遮罩不套用於資料夾：被遮罩排除的資料夾仍然顯示，底下的檔案才進得去'
+    this._dom.cbAlwaysFolders = cbAlwaysFolders.querySelector('input')
+    toolbar.appendChild(cbAlwaysFolders)
+
+    const cbSuppressFilters = this._buildCheckbox(
+      'fc-suppress-filters', '暫停篩選', this._suppressFilters)
+    cbSuppressFilters.title = '暫時停用所有名稱遮罩（保留輸入內容），再次取消勾選即恢復'
+    this._dom.cbSuppressFilters = cbSuppressFilters.querySelector('input')
+    toolbar.appendChild(cbSuppressFilters)
 
     // Quick filter input: one mask string over files and folders alike.
     const filter = el('input', {
@@ -7073,6 +7521,11 @@ ${rows}
     filter.value = this._filterStr
     this._dom.filter = filter
     toolbar.appendChild(filter)
+
+    const cbFilterRegex = this._buildCheckbox('fc-filter-regex', 'Regex', this._filterRegex)
+    cbFilterRegex.title = '快速篩選改以正規表示式解讀（比對檔名與相對路徑，不分大小寫）'
+    this._dom.cbFilterRegex = cbFilterRegex.querySelector('input')
+    toolbar.appendChild(cbFilterRegex)
 
     const btnFilter = el('button', {
       className: 'fc-btn-filter',
@@ -7129,6 +7582,8 @@ ${rows}
       { label: '保留右側，與其他資料夾比對…', action: 'compare-to-right' },
       { label: '快速比對選取（僅大小與時間）', action: 'quick-compare-selected' },
       { label: '快速比對全部（僅大小與時間）', action: 'quick-compare-all' },
+      { label: '比對內容：選取（實際讀檔）', action: 'compare-contents-selected' },
+      { label: '比對內容：全部（實際讀檔）', action: 'compare-contents-all' },
     ]) {
       compareMenu.appendChild(
         el('button', { className: 'fc-compare-item', 'data-action': item.action }, item.label))
@@ -7147,6 +7602,20 @@ ${rows}
     }, 'ℹ 資訊')
     this._dom.btnInfo = btnInfo
     toolbar.appendChild(btnInfo)
+
+    const btnLegend = el('button', {
+      className: 'fc-btn-legend',
+      title: '色彩圖例：每個顏色代表什麼狀態',
+    }, '🎨 圖例')
+    this._dom.btnLegend = btnLegend
+    toolbar.appendChild(btnLegend)
+
+    const btnLog = el('button', {
+      className: 'fc-btn-log',
+      title: '記錄：掃描與檔案操作的訊息（狀態列一閃即逝的那些）',
+    }, '📜 記錄')
+    this._dom.btnLog = btnLog
+    toolbar.appendChild(btnLog)
 
     const btnSettings = el('button', {
       className: 'fc-btn-settings',
@@ -7640,6 +8109,78 @@ ${rows}
     panel.style.display = panel.style.display === 'none' ? 'flex' : 'none'
   }
 
+  /**
+   * Colour legend. The row colours carry meaning that appears nowhere else on
+   * screen, and "what does blue mean" has no other answer in the UI.
+   *
+   * @returns {HTMLElement}
+   */
+  _buildLegendPanel() {
+    const panel = el('div', { className: 'fc-legend', style: 'display:none' })
+    for (const [cls, label] of /** @type {Array<[string, string]>} */ ([
+      ['same', '相同'],
+      ['different', '不同（重要差異）'],
+      ['unimportant', '不重要差異（規則或僅時間不同）'],
+      ['left-only', '僅左側存在'],
+      ['right-only', '僅右側存在'],
+      ['left-newer', '左側較新'],
+      ['right-newer', '右側較新'],
+      ['conflict', '三向合併衝突'],
+    ])) {
+      const item = el('span', { className: 'fc-legend-item' })
+      item.appendChild(el('span', { className: `fc-legend-dot fc-legend-dot--${cls}` }))
+      item.appendChild(document.createTextNode(` ${label}`))
+      panel.appendChild(item)
+    }
+    this._dom.legendPanel = panel
+    return panel
+  }
+
+  /** @returns {boolean} the new state */
+  toggleLegend() {
+    this._legendVisible = !this._legendVisible
+    const panel = this._dom.legendPanel
+    if (panel) panel.style.display = this._legendVisible ? 'flex' : 'none'
+    return this._legendVisible
+  }
+
+  /**
+   * Message log. Scan errors are reported on the status line and then
+   * overwritten by the next message, so the only record of "this folder could
+   * not be read" used to last a few hundred milliseconds.
+   *
+   * @returns {HTMLElement}
+   */
+  _buildLogPanel() {
+    const panel = el('div', { className: 'fc-log', style: 'display:none' })
+    const lines = el('div', { className: 'fc-log-lines' })
+    const btnClear = el('button', { className: 'fc-log-clear', title: '清空記錄' }, '清空')
+    btnClear.addEventListener('click', () => this.clearLog())
+    panel.append(lines, btnClear)
+    this._dom.logPanel = panel
+    this._dom.logLines = lines
+    return panel
+  }
+
+  /** @returns {boolean} the new state */
+  toggleLogPanel() {
+    this._logVisible = !this._logVisible
+    const panel = this._dom.logPanel
+    if (panel) panel.style.display = this._logVisible ? 'flex' : 'none'
+    if (this._logVisible) this._renderLogPanel()
+    return this._logVisible
+  }
+
+  _renderLogPanel() {
+    const lines = this._dom.logLines
+    if (!lines) return
+    lines.textContent = ''
+    for (const text of this._log) {
+      lines.appendChild(el('div', { className: 'fc-log-line' }, text))
+    }
+    lines.scrollTop = lines.scrollHeight
+  }
+
   /** 建立 find bar（T54），由 _render() 呼叫，預設隱藏 */
   _buildFindBar() {
     const bar = el('div', { className: 'fc-find-bar', style: 'display:none' })
@@ -7923,6 +8464,23 @@ ${rows}
     this._dom.cbIgnoreUnimportant?.addEventListener('change', () => {
       this.setIgnoreUnimportant(!!this._dom.cbIgnoreUnimportant.checked)
     })
+    this._dom.cbAlwaysFolders?.addEventListener('change', () => {
+      this.setAlwaysShowFolders(!!this._dom.cbAlwaysFolders.checked)
+    })
+    this._dom.cbSuppressFilters?.addEventListener('change', () => {
+      this.setSuppressFilters(!!this._dom.cbSuppressFilters.checked)
+    })
+    this._dom.cbFilterRegex?.addEventListener('change', () => {
+      this.setFilterRegex(!!this._dom.cbFilterRegex.checked)
+    })
+    this._dom.btnLegend?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this.toggleLegend()
+    })
+    this._dom.btnLog?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this.toggleLogPanel()
+    })
     this._dom.filterTabs?.addEventListener('click', (e) => {
       const btn = e.target.closest('.fc-filter-tab')
       if (btn) this._selectFilterTab(btn.dataset.tab === 'other' ? 'other' : 'masks')
@@ -7980,6 +8538,8 @@ ${rows}
       else if (action === 'compare-to-right') void this.compareTo('right')
       else if (action === 'quick-compare-selected') this.quickCompareSelected()
       else if (action === 'quick-compare-all') this.quickCompareAll()
+      else if (action === 'compare-contents-selected') void this.compareContentsSelected()
+      else if (action === 'compare-contents-all') void this.compareContentsAll()
     })
 
     // ── Batch selection ───────────────────────────────────────────────────────
@@ -8050,6 +8610,9 @@ ${rows}
 
     modeSelect.addEventListener('change', () => {
       this._mode = modeSelect.value
+      // What "不重要" means changed with the mode, and so may whether the
+      // switch can be honoured at all.
+      this._syncViewModeControls()
       this._compareAndRender()
     })
 
@@ -8371,6 +8934,11 @@ ${rows}
    * @param {AbortSignal} [signal]
    */
   async _applyDeepCompare(rows, signal) {
+    // Under 'both' the only thing that can make a pair "newer" is its
+    // timestamp — the sizes matched — which is exactly what the master switch
+    // offers to ignore. Graded first so archive and version verdicts, which
+    // are real content differences, can still overwrite it.
+    if (this._mode === 'both') markTimestampOnlyUnimportant(rows)
     if (this._mode === 'content' && window.electronAPI?.hashFile) {
       await this._applyContentHash(rows, signal)
     } else if (this._mode === 'rules') {
@@ -8582,8 +9150,13 @@ ${rows}
         ])
         if (signal?.aborted) return
         if (lHash && rHash && lHash === rHash) {
+          // Identical bytes, yet the metadata pass called this pair a
+          // difference: what differs is the timestamp (or an attribute), which
+          // is precisely the "unimportant difference" the master switch hides.
+          // Keeping the flag lets the row stay visible, in blue, while the
+          // switch is off.
           row.status = 'same'
-          row.unimportant = false
+          row.unimportant = true
         }
         this._tickProgress()
       } catch {
@@ -8625,13 +9198,19 @@ ${rows}
     // Compare Files Only: a directory is scaffolding, not a result. Hiding one
     // because its own status is filtered out would take every file under it
     // off screen with it.
-    const structural = this._filesOnly && isDirRow(row)
+    // Always Show Folders makes every directory scaffolding, not just under
+    // Compare Files Only.
+    const structural = (this._filesOnly || this._alwaysShowFolders) && isDirRow(row)
 
-    if (this._ignoreUnimportant && row.unimportant) {
+    // With the switch on, an unimportant row is a "same" row for every purpose
+    // below, whatever status the mode's criteria gave it.
+    const asSame = this._ignoreUnimportant && !!row.unimportant
+
+    if (asSame) {
       // The master switch says these are not differences, so they follow the
       // same rule "same" rows do.
       if (!structural && !this._showSame) return false
-    } else if (row.unimportant) {
+    } else if (row.unimportant && row.status === 'same') {
       // A rules-graded row with only unimportant differences sits between the
       // two buckets: it is "same" for counting, but hiding it while the user is
       // hunting for differences would lose the one hint that it changed at all.
@@ -8642,22 +9221,53 @@ ${rows}
 
     // The "顯示差異" master toggle also suppresses the newer-on-one-side
     // statuses, which are differences too.
-    if (!structural && !this._showDiff
+    if (!structural && !asSame && !this._showDiff
         && (row.status === 'left-newer' || row.status === 'right-newer')) {
       return false
     }
+
+    // Suppress Filters keeps the typed masks intact but stops applying them.
+    if (this._suppressFilters) return true
 
     const opts = {
       isDirectory: !!(row.left?.isDirectory || row.right?.isDirectory),
       relativePath: this._relativePathOf(row),
     }
 
+    // Always Show Folders: the name masks are about files, and hiding a folder
+    // by them hides everything under it too.
+    if (this._alwaysShowFolders && opts.isDirectory) return true
+
     // Quick filter: one mask string over both files and folders.
-    if (this._filterStr.trim() && !matchesFilter(row.name, this._filterStr, opts)) {
+    if (this._filterStr.trim() && !this._matchesQuickFilter(row.name, opts)) {
       return false
     }
     if (!matchesFolderFilters(row.name, this._filterFields, opts)) return false
     return matchesOtherFilters(row, this._otherFilters)
+  }
+
+  /**
+   * The quick-filter box, as a BC mask or as a regular expression.
+   *
+   * An unusable regex reports itself on the status line and matches nothing
+   * further — silently showing every row would look like the filter was
+   * accepted and matched everything.
+   *
+   * @param {string} name
+   * @param {{ isDirectory: boolean, relativePath: string }} opts
+   * @returns {boolean}
+   */
+  _matchesQuickFilter(name, opts) {
+    if (!this._filterRegex) return matchesFilter(name, this._filterStr, opts)
+    if (this._quickRegexSource !== this._filterStr) {
+      const { re, error } = compileQuickFilterRegex(this._filterStr)
+      this._quickRegexSource = this._filterStr
+      this._quickRegex = re
+      this._quickRegexError = error
+      if (error) this._setScanStatus(`Regex 篩選無效：${error}`)
+    }
+    if (!this._quickRegex) return false
+    return this._quickRegex.test(name) || this._quickRegex.test(opts.relativePath ?? '')
   }
 
   /**
@@ -8865,7 +9475,7 @@ ${rows}
       // just because it exists on all three sides, and a folder one side
       // deleted stops being a clean deletion once a surviving child changed.
       if (this._mergeMode) row.mergeStatus = rollupMergeStatus(row)
-      row.status = rollupStatus(row)
+      row.status = rollupStatus(row, { ignoreUnimportant: this._ignoreUnimportant })
       if (row.children) row.unimportant = row.status === 'same' && rollupUnimportant(row)
     }
   }
@@ -9325,6 +9935,10 @@ ${rows}
         if (entry) delete entry.crc
       }
     }
+    // The heading carries the algorithm name, so it has to be rebuilt too.
+    // Re-rendering rows alone left the column showing MD5 values under a
+    // CRC-32 heading — the exact confusion this feature exists to remove.
+    this._rebuildHeader()
     this._applyFilterAndRender()
     return this._checksumAlgo
   }
@@ -9654,6 +10268,24 @@ ${rows}
           this._setFocusedKey(leftPath || rightPath)
           this.quickCompareSelected()
         },
+      })
+      items.push({
+        label: '比對此列的內容（實際讀檔）',
+        action: () => void this.compareContentsOfRow(modelRow),
+        disabled: !modelRow,
+      })
+    }
+    // Single-node expand / collapse: reviewing one folder of a large project
+    // should not mean loading the whole tree.
+    if (isDir && modelRow) {
+      const depth = this._flatEntryOf(rowEl)?.depth ?? 0
+      items.push({
+        label: '展開此節點（含所有子層）',
+        action: () => void this.expandNode(modelRow, depth),
+      })
+      items.push({
+        label: '收合此節點（含所有子層）',
+        action: () => this.collapseNode(modelRow, depth),
       })
     }
     if (isDir) {
