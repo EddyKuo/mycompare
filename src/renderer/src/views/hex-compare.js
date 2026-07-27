@@ -560,12 +560,146 @@ function formatOffset(offset) {
   return offset.toString(16).toUpperCase().padStart(8, '0')
 }
 
+// ── Hex Details: numeric interpretations of the bytes under the cursor ────────
+
+/**
+ * @typedef {object} HexDetailRow
+ * @property {string} key        stable identifier, used by tests and by the DOM
+ * @property {string} label      display label
+ * @property {string} value      formatted value, or the reason it is unreadable
+ * @property {boolean} available false when the file ends before the type fits
+ */
+
+/**
+ * Describe one byte as a character without pretending an unprintable byte is
+ * one: BC shows a dot in the grid, but the details panel is where the user
+ * comes precisely to find out *what* that dot is.
+ *
+ * @param {number} b
+ * @returns {string}
+ */
+function describeChar(b) {
+  if (b >= 0x20 && b <= 0x7e) return `'${String.fromCharCode(b)}'`
+  if (b === 0x7f) return '控制字元 DEL (0x7F)'
+  if (b < 0x20) return `控制字元 (0x${toHex(b)})`
+  return `非 ASCII 位元組 (0x${toHex(b)})`
+}
+
+/**
+ * @param {number} v
+ * @returns {string}
+ */
+function formatFloat(v) {
+  if (Number.isNaN(v)) return 'NaN'
+  if (!Number.isFinite(v)) return v > 0 ? '+Infinity' : '-Infinity'
+  // Object.is separates -0 from 0; String() would print both as "0" and hide
+  // the sign bit, which is exactly the bit a hex editor user is inspecting.
+  if (Object.is(v, -0)) return '-0'
+  return String(v)
+}
+
+/**
+ * Every numeric reading of the bytes starting at `offset`.
+ *
+ * A type that runs past the end of the data is reported as unavailable with
+ * the shortfall spelled out — reading it from a zero-padded buffer would show
+ * a number that is not in the file.
+ *
+ * @param {Uint8Array|null} bytes
+ * @param {number} offset
+ * @returns {HexDetailRow[]} empty when the offset is outside the data
+ */
+export function hexDetailRows(bytes, offset) {
+  const len = bytes ? bytes.length : 0
+  const idx = Math.trunc(offset)
+  if (!bytes || len === 0 || !Number.isFinite(idx) || idx < 0 || idx >= len) return []
+
+  const avail = Math.min(8, len - idx)
+  // A fixed 8-byte window copied out of the source: DataView over the original
+  // buffer would need byteOffset arithmetic and would happily read past the
+  // logical end of a truncated view.
+  const view = new DataView(new ArrayBuffer(8))
+  for (let i = 0; i < avail; i++) view.setUint8(i, bytes[idx + i])
+
+  /** @type {HexDetailRow[]} */
+  const rows = []
+  /**
+   * @param {string} key
+   * @param {string} label
+   * @param {number} size
+   * @param {() => string} read
+   */
+  const push = (key, label, size, read) => {
+    rows.push(avail >= size
+      ? { key, label, value: read(), available: true }
+      : { key, label, value: `需要 ${size} 位元組，此位置只剩 ${avail}`, available: false })
+  }
+
+  const b = bytes[idx]
+  rows.push({ key: 'hex', label: '位元組 (hex)', value: `0x${toHex(b)}`, available: true })
+  rows.push({
+    key: 'binary',
+    label: '二進位',
+    value: b.toString(2).padStart(8, '0').replace(/^(\d{4})(\d{4})$/, '$1 $2'),
+    available: true,
+  })
+  rows.push({ key: 'octal', label: '八進位', value: `0o${b.toString(8).padStart(3, '0')}`, available: true })
+  rows.push({ key: 'char', label: '字元', value: describeChar(b), available: true })
+
+  push('int8', 'int8', 1, () => String(view.getInt8(0)))
+  push('uint8', 'uint8', 1, () => String(view.getUint8(0)))
+  push('int16le', 'int16 (LE)', 2, () => String(view.getInt16(0, true)))
+  push('int16be', 'int16 (BE)', 2, () => String(view.getInt16(0, false)))
+  push('uint16le', 'uint16 (LE)', 2, () => String(view.getUint16(0, true)))
+  push('uint16be', 'uint16 (BE)', 2, () => String(view.getUint16(0, false)))
+  push('int32le', 'int32 (LE)', 4, () => String(view.getInt32(0, true)))
+  push('int32be', 'int32 (BE)', 4, () => String(view.getInt32(0, false)))
+  push('uint32le', 'uint32 (LE)', 4, () => String(view.getUint32(0, true)))
+  push('uint32be', 'uint32 (BE)', 4, () => String(view.getUint32(0, false)))
+  push('int64le', 'int64 (LE)', 8, () => view.getBigInt64(0, true).toString())
+  push('int64be', 'int64 (BE)', 8, () => view.getBigInt64(0, false).toString())
+  push('uint64le', 'uint64 (LE)', 8, () => view.getBigUint64(0, true).toString())
+  push('uint64be', 'uint64 (BE)', 8, () => view.getBigUint64(0, false).toString())
+  push('float32le', 'float32 (LE)', 4, () => formatFloat(view.getFloat32(0, true)))
+  push('float32be', 'float32 (BE)', 4, () => formatFloat(view.getFloat32(0, false)))
+  push('float64le', 'float64 (LE)', 8, () => formatFloat(view.getFloat64(0, true)))
+  push('float64be', 'float64 (BE)', 8, () => formatFloat(view.getFloat64(0, false)))
+
+  return rows
+}
+
+/**
+ * Column labels for the ruler above each pane.
+ *
+ * The hex side carries the full column index so a 32-byte row stays readable;
+ * the ASCII side only has one character of width per byte, so it wraps at 16.
+ *
+ * @param {number} bytesPerRow
+ * @returns {{ hex: string[], ascii: string[] }}
+ */
+export function rulerCells(bytesPerRow) {
+  const bpr = Math.max(0, Math.trunc(bytesPerRow) || 0)
+  /** @type {string[]} */
+  const hex = []
+  /** @type {string[]} */
+  const ascii = []
+  for (let i = 0; i < bpr; i++) {
+    hex.push(i.toString(16).toUpperCase().padStart(2, '0'))
+    ascii.push((i % 16).toString(16).toUpperCase())
+  }
+  return { hex, ascii }
+}
+
 // ── HexCompare Class ──────────────────────────────────────────────────────────
 
 export class HexCompare {
   /**
    * @param {object} [options]
    * @param {number} [options.bytesPerRow=16]
+   * @param {'fast'|'complete'} [options.diffAlgorithm='fast']
+   * @param {boolean} [options.showDetails=false]   顯示 Hex Details 面板
+   * @param {boolean} [options.showFileInfo=false]  顯示 File Info 面板
+   * @param {boolean} [options.showRuler=false]     顯示欄位標尺
    */
   constructor(options = {}) {
     /** @type {number} */
@@ -692,6 +826,21 @@ export class HexCompare {
     this._closeGuard = null
     /** @type {((e: KeyboardEvent) => void)|null} */
     this._closeKeyGuard = null
+
+    // ── P2-40: side panels ────────────────────────────────────────────────────
+    /** @type {boolean} Hex Details（游標位元組的多種解讀） */
+    this._showDetails = options.showDetails ?? false
+    /** @type {boolean} File Info（路徑/大小/差異位元組數/是否截斷） */
+    this._showFileInfo = options.showFileInfo ?? false
+    /** @type {boolean} 欄位標尺 */
+    this._showRuler = options.showRuler ?? false
+    /**
+     * mtime per path, filled in lazily from read-dir. Cached because the panel
+     * repaints on every cursor move and re-listing the folder each time would
+     * be an IPC round trip per keystroke.
+     * @type {Map<string, string>}
+     */
+    this._mtimeCache = new Map()
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -830,6 +979,9 @@ export class HexCompare {
   refresh() {
     this._recomputeCompleteIfNeeded()
     this._recomputeDiffRegions()
+    if (this._showRuler) this._renderRulers()
+    this._updateDetailsPanel()
+    this._updateFileInfoPanel()
     requestAnimationFrame(() => {
       this._renderPaneContent('left')
       this._renderPaneContent('right')
@@ -850,6 +1002,9 @@ export class HexCompare {
       bytesPerRow: this._bytesPerRow,
       diffAlgorithm: this._diffAlgorithm,
       showFilter: this._showFilter,
+      showDetails: this._showDetails,
+      showFileInfo: this._showFileInfo,
+      showRuler: this._showRuler,
     })
   }
 
@@ -866,6 +1021,10 @@ export class HexCompare {
     if (['all', 'diff', 'same'].includes(settings.showFilter)) {
       this._showFilter = settings.showFilter
     }
+    if (typeof settings.showDetails === 'boolean') this._showDetails = settings.showDetails
+    if (typeof settings.showFileInfo === 'boolean') this._showFileInfo = settings.showFileInfo
+    if (typeof settings.showRuler === 'boolean') this._showRuler = settings.showRuler
+    this._applyPanelVisibility()
     this._syncConfigControls()
     this.refresh()
   }
@@ -1546,6 +1705,7 @@ ${body}
       field: field ?? this._cursor?.field ?? 'hex',
       nibble: 0,
     }
+    this._updateDetailsPanel()
   }
 
   /**
@@ -1824,6 +1984,7 @@ ${body}
 
     root.appendChild(this._buildToolbar())
     root.appendChild(this._buildBody())
+    root.appendChild(this._buildPanels())
 
     this._container.appendChild(root)
     this._dom.root = root
@@ -1831,6 +1992,39 @@ ${body}
     // 初始空狀態
     this._showEmptyState('left')
     this._showEmptyState('right')
+    this._applyPanelVisibility()
+  }
+
+  /**
+   * The Details / File Info drawer.
+   *
+   * It sits below `.hx-body` as a sibling, never inside `.hx-scroll`, so the
+   * virtual scroller's row arithmetic is untouched — only the viewport gets
+   * shorter, which it already handles on window resize.
+   *
+   * @returns {HTMLElement}
+   */
+  _buildPanels() {
+    const panels = el('div', { className: 'hx-panels' })
+
+    const details = el('div', { className: 'hx-details' })
+    details.appendChild(el('div', { className: 'hx-panel-title' }, 'Hex Details'))
+    const detailsBody = el('div', { className: 'hx-details-body' })
+    this._dom.detailsBody = detailsBody
+    details.appendChild(detailsBody)
+    this._dom.detailsPanel = details
+
+    const info = el('div', { className: 'hx-fileinfo' })
+    info.appendChild(el('div', { className: 'hx-panel-title' }, 'File Info'))
+    const infoBody = el('div', { className: 'hx-fileinfo-body' })
+    this._dom.fileInfoBody = infoBody
+    info.appendChild(infoBody)
+    this._dom.fileInfoPanel = info
+
+    panels.appendChild(details)
+    panels.appendChild(info)
+    this._dom.panels = panels
+    return panels
   }
 
   _buildToolbar() {
@@ -1927,6 +2121,22 @@ ${body}
     editBar.appendChild(btnSaveRight)
     editBar.appendChild(dirtyInfo)
     toolbar.appendChild(editBar)
+
+    // ── P2-40: view panels ─────────────────────────────────────────────────────
+    const panelBar = el('div', { className: 'hx-panel-bar' })
+    const btnDetails = el('button',
+      { className: 'hx-panel-btn', id: 'hx-btn-details', title: '顯示 / 隱藏 Hex Details 面板' }, '🔢 詳細')
+    const btnFileInfo = el('button',
+      { className: 'hx-panel-btn', id: 'hx-btn-fileinfo', title: '顯示 / 隱藏檔案資訊面板' }, 'ℹ 檔案資訊')
+    const btnRuler = el('button',
+      { className: 'hx-panel-btn', id: 'hx-btn-ruler', title: '顯示 / 隱藏欄位標尺' }, '📏 標尺')
+    this._dom.btnDetails = btnDetails
+    this._dom.btnFileInfo = btnFileInfo
+    this._dom.btnRuler = btnRuler
+    panelBar.appendChild(btnDetails)
+    panelBar.appendChild(btnFileInfo)
+    panelBar.appendChild(btnRuler)
+    toolbar.appendChild(panelBar)
 
     // S16: Swap sides
     const btnSwap = el('button', { className: 'hx-btn-swap', title: '交換左右兩側' }, '⇄ 交換')
@@ -2058,6 +2268,13 @@ ${body}
     header.appendChild(el('div', { className: 'hx-header-ascii',  textContent: 'ASCII' }))
     pane.appendChild(header)
 
+    // P2-40: column ruler. Static (one per pane) rather than per row, and laid
+    // out with the same grid + monospace metrics as .hx-row so the labels line
+    // up with the byte columns beneath them.
+    const ruler = el('div', { className: 'hx-ruler' })
+    this._dom[`ruler_${side}`] = ruler
+    pane.appendChild(ruler)
+
     // Virtual scroll 容器
     // tabindex: editing needs key events, and the rows themselves are recycled
     // by the virtual scroller, so the scroller is the stable focus holder.
@@ -2086,6 +2303,7 @@ ${body}
 
     bprSelect.addEventListener('change', () => {
       this._bytesPerRow = parseInt(bprSelect.value, 10)
+      if (this._showRuler) this._renderRulers()
       // Row boundaries moved, so which rows are "all same" moved with them.
       this._recomputeRowFilter()
       // Re-run search with new layout
@@ -2249,6 +2467,11 @@ ${body}
     btnCopyLeft.addEventListener('click',  () => void this.copyToLeft())
     btnReport.addEventListener('click', () => void this.exportHtml())
     btnPrint.addEventListener('click',  () => void this.exportHtml({ print: true }))
+
+    const { btnDetails, btnFileInfo, btnRuler } = this._dom
+    btnDetails.addEventListener('click', () => this.toggleDetails())
+    btnFileInfo.addEventListener('click', () => this.toggleFileInfo())
+    btnRuler.addEventListener('click', () => this.toggleRuler())
 
     // Diff-navigation keys are owned solely by app.js's SettingsStore binding,
     // which routes to whichever view is active. Binding them here as well made
@@ -3220,6 +3443,236 @@ ${body}
     }
   }
 
+  // ── P2-40: Details / File Info / Ruler ──────────────────────────────────────
+
+  /** @returns {boolean} */
+  isDetailsVisible() { return this._showDetails }
+
+  /** @returns {boolean} */
+  isFileInfoVisible() { return this._showFileInfo }
+
+  /** @returns {boolean} */
+  isRulerVisible() { return this._showRuler }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setDetailsVisible(on) {
+    this._showDetails = Boolean(on)
+    this._applyPanelVisibility()
+    return this._showDetails
+  }
+
+  /** @returns {boolean} */
+  toggleDetails() { return this.setDetailsVisible(!this._showDetails) }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setFileInfoVisible(on) {
+    this._showFileInfo = Boolean(on)
+    this._applyPanelVisibility()
+    return this._showFileInfo
+  }
+
+  /** @returns {boolean} */
+  toggleFileInfo() { return this.setFileInfoVisible(!this._showFileInfo) }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setRulerVisible(on) {
+    this._showRuler = Boolean(on)
+    this._applyPanelVisibility()
+    return this._showRuler
+  }
+
+  /** @returns {boolean} */
+  toggleRuler() { return this.setRulerVisible(!this._showRuler) }
+
+  /** Push the three panel flags onto the DOM and repaint whatever became visible. */
+  _applyPanelVisibility() {
+    const { detailsPanel, fileInfoPanel, panels, btnDetails, btnFileInfo, btnRuler } = this._dom
+    if (detailsPanel) detailsPanel.style.display = this._showDetails ? '' : 'none'
+    if (fileInfoPanel) fileInfoPanel.style.display = this._showFileInfo ? '' : 'none'
+    if (panels) panels.style.display = (this._showDetails || this._showFileInfo) ? '' : 'none'
+    btnDetails?.classList.toggle('active', this._showDetails)
+    btnFileInfo?.classList.toggle('active', this._showFileInfo)
+    btnRuler?.classList.toggle('active', this._showRuler)
+
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const ruler = this._dom[`ruler_${side}`]
+      if (ruler) ruler.style.display = this._showRuler ? '' : 'none'
+    }
+    if (this._showRuler) this._renderRulers()
+    if (this._showDetails) this._updateDetailsPanel()
+    if (this._showFileInfo) this._updateFileInfoPanel()
+  }
+
+  /** Rebuild both rulers for the current bytes-per-row. */
+  _renderRulers() {
+    const { hex, ascii } = rulerCells(this._bytesPerRow)
+    const bpr = this._bytesPerRow
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const ruler = this._dom[`ruler_${side}`]
+      if (!ruler) continue
+      ruler.innerHTML = ''
+      ruler.appendChild(el('div', { className: 'hx-offset', textContent: '欄' }))
+      const hexCol = el('div', { className: 'hx-hex' })
+      const asciiCol = el('div', { className: 'hx-ascii' })
+      for (let i = 0; i < bpr; i++) {
+        // Mirrors _buildHexRow's mid-row gap, or the labels drift by one space
+        // from the middle of the row onwards.
+        if (i === Math.floor(bpr / 2)) hexCol.appendChild(document.createTextNode(' '))
+        hexCol.appendChild(el('span', { className: 'hx-ruler-cell' },
+          hex[i] + (i < bpr - 1 ? ' ' : '')))
+        asciiCol.appendChild(el('span', { className: 'hx-ruler-cell' }, ascii[i]))
+      }
+      ruler.appendChild(hexCol)
+      ruler.appendChild(asciiCol)
+    }
+  }
+
+  /** Repaint the Details panel from the current cursor. */
+  _updateDetailsPanel() {
+    const body = this._dom.detailsBody
+    if (!body || !this._showDetails) return
+    body.innerHTML = ''
+
+    const cursor = this._cursor
+    if (!cursor) {
+      body.appendChild(el('div', { className: 'hx-panel-empty' }, '點選任一位元組以檢視解讀值'))
+      return
+    }
+    const bytes = cursor.side === 'left' ? this._leftBytes : this._rightBytes
+    const rows = hexDetailRows(bytes, cursor.offset)
+    if (rows.length === 0) {
+      body.appendChild(el('div', { className: 'hx-panel-empty' }, '游標位置已超出檔案範圍'))
+      return
+    }
+
+    body.appendChild(el('div', { className: 'hx-detail-head' },
+      `${cursor.side === 'left' ? '左側' : '右側'} · offset 0x${formatOffset(cursor.offset)}`))
+
+    const grid = el('div', { className: 'hx-detail-grid' })
+    for (const row of rows) {
+      grid.appendChild(el('span', { className: 'hx-detail-label' }, row.label))
+      grid.appendChild(el('span',
+        { className: `hx-detail-value${row.available ? '' : ' hx-detail-value--na'}` }, row.value))
+    }
+    body.appendChild(grid)
+  }
+
+  /**
+   * Repaint the File Info panel.
+   *
+   * Modified time is not part of the binary payload the view is handed, so it
+   * is fetched separately and cached; a failure is shown in the panel rather
+   * than swallowed, because "no date" and "could not read the folder" are
+   * different answers.
+   */
+  _updateFileInfoPanel() {
+    const body = this._dom.fileInfoBody
+    if (!body || !this._showFileInfo) return
+    body.innerHTML = ''
+
+    const stats = this.getStats()
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const path = side === 'left' ? this._leftPath : this._rightPath
+      const bytes = side === 'left' ? this._leftBytes : this._rightBytes
+      const truncated = side === 'left' ? this._leftTruncated : this._rightTruncated
+      const original = side === 'left' ? this._leftOriginalSize : this._rightOriginalSize
+
+      const box = el('div', { className: 'hx-fileinfo-side' })
+      box.appendChild(el('div', { className: 'hx-fileinfo-head' }, side === 'left' ? '左側' : '右側'))
+      const grid = el('div', { className: 'hx-detail-grid' })
+      /**
+       * @param {string} label
+       * @param {string} value
+       */
+      const add = (label, value) => {
+        grid.appendChild(el('span', { className: 'hx-detail-label' }, label))
+        grid.appendChild(el('span', { className: 'hx-detail-value' }, value))
+      }
+      add('路徑', path ?? '（未選擇）')
+      add('大小', bytes ? formatSize(original || bytes.byteLength) : '—')
+      add('已載入', bytes ? `${formatSize(bytes.byteLength)}（${bytes.byteLength} 位元組）` : '—')
+      add('截斷', truncated ? `是（僅前 ${formatSize(MAX_BYTES)}）` : '否')
+      add('差異位元組', String(stats.diffBytes))
+      add('差異區塊', String(stats.regions))
+      add('修改中位元組', String(this._modifiedCount[side]))
+      add('修改時間', path ? (this._mtimeCache.get(path) ?? '讀取中…') : '—')
+      box.appendChild(grid)
+      this._dom[`fileInfoGrid_${side}`] = grid
+      body.appendChild(box)
+    }
+
+    void this._loadMtimes()
+  }
+
+  /**
+   * Fill `_mtimeCache` for the loaded paths by listing their parent folders.
+   *
+   * There is no per-file stat IPC; `read-dir` is the narrowest existing channel
+   * that carries mtime. One listing per folder, cached by path.
+   *
+   * @returns {Promise<void>}
+   */
+  async _loadMtimes() {
+    const readDir = window.electronAPI?.readDir
+    if (typeof readDir !== 'function') {
+      this._setMtimeText('（此環境無法讀取修改時間）')
+      return
+    }
+    /** @type {string[]} */
+    const wanted = [this._leftPath, this._rightPath]
+      .filter((p) => typeof p === 'string' && p && !this._mtimeCache.has(p))
+    if (wanted.length === 0) {
+      this._paintMtimes()
+      return
+    }
+
+    for (const path of wanted) {
+      const dir = path.replace(/[\\/][^\\/]*$/, '')
+      if (!dir || dir === path) {
+        this._mtimeCache.set(path, '（無法判斷所在資料夾）')
+        continue
+      }
+      try {
+        const entries = await readDir(dir)
+        const hit = (entries ?? []).find((entry) => entry?.path === path || entry?.name === path.slice(dir.length + 1))
+        this._mtimeCache.set(path, hit?.mtime ? new Date(hit.mtime).toLocaleString() : '（找不到此檔案）')
+      } catch (err) {
+        this._mtimeCache.set(path, `（讀取失敗：${err instanceof Error ? err.message : String(err)}）`)
+      }
+    }
+    this._paintMtimes()
+  }
+
+  /**
+   * @param {string} text
+   */
+  _setMtimeText(text) {
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const grid = this._dom[`fileInfoGrid_${side}`]
+      const value = grid?.lastElementChild
+      if (value) value.textContent = text
+    }
+  }
+
+  /** Write the cached mtimes into the already-rendered panel. */
+  _paintMtimes() {
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const grid = this._dom[`fileInfoGrid_${side}`]
+      const value = grid?.lastElementChild
+      const path = side === 'left' ? this._leftPath : this._rightPath
+      if (value) value.textContent = path ? (this._mtimeCache.get(path) ?? '—') : '—'
+    }
+  }
+
   // ── Private: UI helpers ───────────────────────────────────────────────────────
 
   /**
@@ -3248,6 +3701,11 @@ ${body}
         warning.textContent = `⚠ ${sides.join('、')}超過 10 MB，已截斷顯示`
       }
     }
+
+    // Sizes, modified counts and diff totals all live in the File Info panel,
+    // and every caller of this method has just changed one of them.
+    this._updateFileInfoPanel()
+    this._updateDetailsPanel()
   }
 
   /**

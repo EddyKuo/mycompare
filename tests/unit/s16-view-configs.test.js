@@ -30,6 +30,8 @@ describe('HexCompare config', () => {
     b.applyConfig(a.getConfig())
     expect(b.getConfig()).toEqual({
       __v: 1, __view: 'hex', bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff',
+      // P2-40: panel visibility travels with the config too.
+      showDetails: false, showFileInfo: false, showRuler: false,
     })
   })
 

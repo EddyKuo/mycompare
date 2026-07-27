@@ -640,3 +640,113 @@
 .tc-source-select:focus {
   border-color: #007acc;
 }
+
+/* ── P2-41: hidden / excluded columns ── */
+
+/* The cell keeps its DOM node so every index-based lookup stays 1:1 with the
+   column index; display:none removes it from the table layout. */
+.tc-cell.tc-col-hidden {
+  display: none;
+}
+
+/* ── P2-41: selected cell (Text Details source) ── */
+.tc-cell--selected {
+  outline: 2px solid #007acc;
+  outline-offset: -2px;
+}
+
+/* ── P2-41: Text Details / File Info panels ── */
+
+.tc-panels {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  max-height: 34%;
+  flex-shrink: 0;
+  background: var(--border-color);
+  border-top: 1px solid var(--border-color);
+}
+
+.tc-details,
+.tc-fileinfo {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.tc-panel-title {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.tc-details-body,
+.tc-fileinfo-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 8px;
+}
+
+.tc-fileinfo-body {
+  display: flex;
+  gap: 16px;
+}
+
+.tc-fileinfo-side {
+  flex: 1;
+  min-width: 0;
+}
+
+.tc-detail-head,
+.tc-fileinfo-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.tc-detail-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 10px;
+  row-gap: 1px;
+  font-size: 12px;
+}
+
+.tc-detail-label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* Long cell values are the reason this panel exists — wrap, never clip. */
+.tc-detail-value {
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tc-detail-value--na {
+  font-family: inherit;
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.tc-panel-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tc-btn.active {
+  background: var(--accent-color, #4a90d9);
+  color: #fff;
+  border-color: var(--accent-color, #4a90d9);
+}

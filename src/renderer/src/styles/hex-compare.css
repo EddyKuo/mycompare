@@ -475,3 +475,145 @@
   outline: 1px solid #007acc;
   background: rgba(0, 122, 204, 0.25);
 }
+
+/* ── P2-40: Ruler ───────────────────────────────────────────────────────────── */
+
+/* Same grid + monospace metrics as .hx-row, so the column labels sit directly
+   above the bytes they name. */
+.hx-ruler {
+  display: grid;
+  grid-template-columns: 80px 1fr 120px;
+  height: 18px;
+  line-height: 18px;
+  flex-shrink: 0;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  user-select: none;
+}
+
+.hx-ruler .hx-hex,
+.hx-ruler .hx-ascii {
+  overflow: hidden;
+}
+
+.hx-ruler-cell {
+  display: inline-block;
+}
+
+/* ── P2-40: Details / File Info panels ──────────────────────────────────────── */
+
+.hx-panels {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  max-height: 34%;
+  flex-shrink: 0;
+  background: var(--border-color);
+  border-top: 1px solid var(--border-color);
+}
+
+.hx-details,
+.hx-fileinfo {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.hx-panel-title {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.hx-details-body,
+.hx-fileinfo-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 8px;
+}
+
+.hx-fileinfo-body {
+  display: flex;
+  gap: 16px;
+}
+
+.hx-fileinfo-side {
+  flex: 1;
+  min-width: 0;
+}
+
+.hx-fileinfo-head,
+.hx-detail-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.hx-detail-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 10px;
+  row-gap: 1px;
+  font-size: 12px;
+}
+
+.hx-detail-label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.hx-detail-value {
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* A type that does not fit in the remaining bytes reads as an explanation, not
+   as a number — style it so it cannot be mistaken for a value. */
+.hx-detail-value--na {
+  font-family: inherit;
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.hx-panel-empty {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.hx-panel-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.hx-panel-btn {
+  padding: 2px 6px;
+  font-size: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hx-panel-btn.active {
+  background: var(--accent-color, #4a90d9);
+  color: #fff;
+  border-color: var(--accent-color, #4a90d9);
+}

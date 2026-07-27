@@ -20,7 +20,7 @@
 import { isActive } from '../core/active-view.js'
 import { renderTextTable, reportHeader, reportSummary } from '../core/report.js'
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
-import { el } from '../core/utils.js'
+import { el, formatSize } from '../core/utils.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import { toast } from '../core/toast.js'
@@ -181,6 +181,83 @@ function columnRuleAt(rules, index) {
   if (!raw || !COLUMN_MODES.has(raw.mode)) return DEFAULT_COLUMN_RULE
   const tolerance = Number(raw.tolerance)
   return { mode: raw.mode, tolerance: Number.isFinite(tolerance) ? Math.abs(tolerance) : 0 }
+}
+
+/**
+ * Make whitespace inside a cell visible: space → `·`, tab → `→`.
+ *
+ * Deliberately a local copy of text-compare's helper rather than an import:
+ * pulling that module in would drag the whole text view (and its lazy syntax
+ * highlighter) into this view's bundle for two `replace` calls.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function visibleWhitespace(str) {
+  // Tabs first: replacing spaces first would then hit the arrow glyph's own
+  // surroundings on some inputs.
+  return String(str ?? '').replace(/\t/g, '→').replace(/ /g, '·')
+}
+
+/**
+ * Fold "excluded" columns into a rule set as `ignore`.
+ *
+ * Excluding a column is a display decision *and* a comparison decision, and
+ * the comparison half is already expressible as an ignore rule — so rather
+ * than teaching `cellsEqual` about a second concept, the exclusion set is
+ * projected onto the rules the compare pass already consumes.
+ *
+ * @param {ColumnRuleSet} rules
+ * @param {Iterable<number>|null|undefined} excluded
+ * @returns {Record<number, ColumnRule>}
+ */
+function mergeIgnoredColumns(rules, excluded) {
+  /** @type {Record<number, ColumnRule>} */
+  const out = {}
+  if (rules) {
+    for (const key of Object.keys(rules)) {
+      const index = Number(key)
+      if (!Number.isInteger(index) || index < 0) continue
+      out[index] = columnRuleAt(rules, index)
+    }
+  }
+  for (const raw of excluded ?? []) {
+    const index = Number(raw)
+    if (!Number.isInteger(index) || index < 0) continue
+    out[index] = { mode: 'ignore', tolerance: 0 }
+  }
+  return out
+}
+
+/**
+ * Human-readable name for a delimiter character.
+ * @param {string} d
+ * @returns {string}
+ */
+function describeDelimiter(d) {
+  if (d === '	') return 'Tab'
+  if (d === ',') return '逗號 (,)'
+  if (d === ';') return '分號 (;)'
+  if (d === '|') return '直線 (|)'
+  return d ? `「${d}」` : '（未知）'
+}
+
+/**
+ * Normalise a user-supplied column list to unique, ascending, valid indices.
+ *
+ * @param {unknown} raw
+ * @returns {number[]}
+ */
+function toColumnList(raw) {
+  const list = Array.isArray(raw) ? raw : (raw == null ? [] : [raw])
+  /** @type {number[]} */
+  const out = []
+  for (const v of list) {
+    const n = Number(v)
+    if (!Number.isInteger(n) || n < 0 || out.includes(n)) continue
+    out.push(n)
+  }
+  return out.sort((a, b) => a - b)
 }
 
 /** Reject anything that `Number()` would coerce loosely (''、'0x10'、'  12abc'). */
@@ -836,6 +913,28 @@ export class TableCompare {
 
     // Style injected flag
     this._styleInjected = false
+
+    // ── P2-41: column visibility, whitespace, side panels ─────────────────────
+    /** @type {Set<number>} 只隱藏顯示，仍參與比對 */
+    this._hiddenColumns = new Set(toColumnList(options.hiddenColumns))
+    /** @type {Set<number>} 完全排除：不比對也不顯示 */
+    this._ignoredColumns = new Set(toColumnList(options.ignoredColumns))
+    /** @type {boolean} 儲存格內的空白字元可視化 */
+    this._showWhitespace = options.showWhitespace ?? false
+    /** @type {boolean} Text Details 面板 */
+    this._showDetails = options.showDetails ?? false
+    /** @type {boolean} File Info 面板 */
+    this._showFileInfo = options.showFileInfo ?? false
+    /** @type {{ side: 'left'|'right', visibleRowIdx: number, col: number }|null} */
+    this._selectedCell = null
+    /** @type {{ left: string|null, right: string|null }} 開檔時 IPC 回報的編碼 */
+    this._encoding = { left: null, right: null }
+    /** @type {Map<string, { size: number, mtime: string }>} 由 read-dir 補齊，見 _loadFileStats */
+    this._statCache = new Map()
+    /** @type {Set<string>} paths already looked up, successfully or not */
+    this._statAttempted = new Set()
+    /** @type {Record<number, ColumnRule>|null} memoised _effectiveRules() result */
+    this._rulesCache = null
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -889,6 +988,32 @@ export class TableCompare {
     ]
   }
 
+  /**
+   * Record the encoding a file was decoded with, for the File Info panel.
+   *
+   * Public because most files reach this view through the host's smart routing
+   * rather than through `openLeft`/`openRight`, and only the caller that did
+   * the decoding knows the answer.
+   *
+   * @param {'left'|'right'} side
+   * @param {string|null} encoding
+   * @returns {this}
+   */
+  setEncoding(side, encoding) {
+    if (side !== 'left' && side !== 'right') return this
+    this._encoding[side] = encoding ? String(encoding) : null
+    this._updateFileInfoPanel()
+    return this
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @returns {string|null}
+   */
+  getEncoding(side) {
+    return this._encoding[side] ?? null
+  }
+
   /** 呼叫 electronAPI.openFile()，讀取左側 CSV/TSV/XLSX/HTML */
   async openLeft() { await this._openInto('left') }
 
@@ -902,6 +1027,10 @@ export class TableCompare {
   async _openInto(side) {
     const result = await window.electronAPI.openFile({ filters: TableCompare.openFilters })
     if (!result) return
+    // The only place the decoder's verdict reaches this view; File Info would
+    // otherwise have to guess, and guessing an encoding is how files get
+    // silently corrupted on save.
+    this.setEncoding(side, result.encoding ?? null)
     const lower = String(result.path ?? '').toLowerCase()
     if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
       await this._openExcel(side, result.path)
@@ -1085,6 +1214,9 @@ export class TableCompare {
     this._cancelCellEdit()
     this._clearHistory()
     this._modified[side] = false
+    // A selection names a row index in the old data; keeping it would point the
+    // details panel at an unrelated row.
+    this._selectedCell = null
 
     if (side === 'left') {
       this._leftPath = path
@@ -1121,6 +1253,7 @@ export class TableCompare {
     ;[this._sourceKind.left, this._sourceKind.right] = [this._sourceKind.right, this._sourceKind.left]
     ;[this._modified.left, this._modified.right] = [this._modified.right, this._modified.left]
     ;[this._delimiter.left, this._delimiter.right] = [this._delimiter.right, this._delimiter.left]
+    ;[this._encoding.left, this._encoding.right] = [this._encoding.right, this._encoding.left]
     ;[this._rowIndexMap.left, this._rowIndexMap.right] = [this._rowIndexMap.right, this._rowIndexMap.left]
     this._syncSourceSelect('left')
     this._syncSourceSelect('right')
@@ -1414,23 +1547,44 @@ export class TableCompare {
   // ── P2-21: inline cell editor ────────────────────────────────────────────────
 
   /**
+   * Resolve the cell under a mouse event to (visible row, display column).
    * @param {MouseEvent} e
    * @param {'left'|'right'} side
+   * @returns {{ visibleRowIdx: number, col: number, td: HTMLElement }|null}
    */
-  _onCellDblClick(e, side) {
+  _cellFromEvent(e, side) {
     const target = e.target instanceof Element ? e.target : null
     const td = target?.closest('td.tc-cell')
     const tr = td?.closest('tr.tc-row')
     const tbody = this._dom[`${side}Tbody`]
-    if (!td || !tr || !tbody || tr.parentElement !== tbody) return
-    if (tr.classList.contains('phantom')) return
-
+    if (!td || !tr || !tbody || tr.parentElement !== tbody) return null
     const rowOffset = [...tbody.children].indexOf(tr)
-    if (rowOffset < 0) return
-    const visibleRowIdx = (this._windowFirst ?? 0) + rowOffset
+    if (rowOffset < 0) return null
     // -1 skips the leading row-number cell.
     const col = [...tr.children].indexOf(td) - 1
-    this._beginCellEdit(side, visibleRowIdx, col, td)
+    if (col < 0) return null
+    return { visibleRowIdx: (this._windowFirst ?? 0) + rowOffset, col, td }
+  }
+
+  /**
+   * @param {MouseEvent} e
+   * @param {'left'|'right'} side
+   */
+  _onCellClick(e, side) {
+    const hit = this._cellFromEvent(e, side)
+    if (!hit) return
+    this.selectCell(side, hit.visibleRowIdx, hit.col)
+  }
+
+  /**
+   * @param {MouseEvent} e
+   * @param {'left'|'right'} side
+   */
+  _onCellDblClick(e, side) {
+    const hit = this._cellFromEvent(e, side)
+    if (!hit) return
+    if (hit.td.closest('tr.tc-row')?.classList.contains('phantom')) return
+    this._beginCellEdit(side, hit.visibleRowIdx, hit.col, hit.td)
   }
 
   /**
@@ -1446,7 +1600,9 @@ export class TableCompare {
       return
     }
 
-    const original = td.textContent ?? ''
+    // Read the model, not the cell: with visible whitespace on, td.textContent
+    // holds `·` and `→` glyphs that must never be written back as data.
+    const original = this.getCellValue(side, visibleRowIdx, col) ?? td.textContent ?? ''
     const input = el('input', { type: 'text', className: 'tc-cell-input' })
     input.value = original
     td.textContent = ''
@@ -1479,12 +1635,13 @@ export class TableCompare {
 
     const value = editing.input.value
     editing.td.classList.remove('tc-cell--editing')
+    const restore = this._showWhitespace ? visibleWhitespace(editing.original) : editing.original
     if (value === editing.original) {
-      editing.td.textContent = editing.original
+      editing.td.textContent = restore
       return
     }
     if (!this.editCell(editing.side, editing.visibleRowIdx, editing.col, value)) {
-      editing.td.textContent = editing.original
+      editing.td.textContent = restore
       this._reportError('儲存格編輯失敗：找不到對應的來源資料列')
     }
   }
@@ -1495,7 +1652,8 @@ export class TableCompare {
     if (!editing) return
     this._editing = null
     editing.td.classList.remove('tc-cell--editing')
-    editing.td.textContent = editing.original
+    editing.td.textContent =
+      this._showWhitespace ? visibleWhitespace(editing.original) : editing.original
   }
 
   /** 讓 undo / redo / 儲存按鈕反映目前狀態。 */
@@ -1551,6 +1709,7 @@ export class TableCompare {
     } else {
       this._columnRules[index] = columnRuleAt({ [index]: rule }, index)
     }
+    this._invalidateRules()
     this._recompare()
     return this
   }
@@ -1563,6 +1722,7 @@ export class TableCompare {
   setColumnRules(rules) {
     this._columnRules = {}
     this._applyColumnRuleSet(rules)
+    this._invalidateRules()
     this._recompare()
     return this
   }
@@ -1610,6 +1770,343 @@ export class TableCompare {
     }
     this._applyColumnWidths()
     return this
+  }
+
+  // ── P2-41: column visibility ────────────────────────────────────────────────
+
+  /**
+   * The rule set the comparison actually runs on: the user's per-column rules
+   * with every excluded column forced to `ignore`.
+   * @returns {Record<number, ColumnRule>}
+   */
+  _effectiveRules() {
+    // Memoised: the per-row diff pass asks for this once per row, and a large
+    // table would otherwise rebuild the same object a hundred thousand times.
+    if (!this._rulesCache) {
+      this._rulesCache = mergeIgnoredColumns(this._columnRules, this._ignoredColumns)
+    }
+    return this._rulesCache
+  }
+
+  /** Drop the memoised rule set after the rules or the exclusion set change. */
+  _invalidateRules() {
+    this._rulesCache = null
+  }
+
+  /** @returns {number[]} 只隱藏顯示的欄位 */
+  getHiddenColumns() { return [...this._hiddenColumns].sort((a, b) => a - b) }
+
+  /** @returns {number[]} 完全排除（不比對也不顯示）的欄位 */
+  getIgnoredColumns() { return [...this._ignoredColumns].sort((a, b) => a - b) }
+
+  /**
+   * Columns that must not be painted — hidden plus excluded.
+   * @param {number} index
+   * @returns {boolean}
+   */
+  isColumnHidden(index) {
+    return this._hiddenColumns.has(index) || this._ignoredColumns.has(index)
+  }
+
+  /**
+   * @param {Iterable<number>|null} cols
+   * @returns {this}
+   */
+  setHiddenColumns(cols) {
+    this._hiddenColumns = new Set(toColumnList(cols ? [...cols] : []))
+    // Display-only: nothing about the comparison changed, so repaint rather
+    // than re-align.
+    this._renderTable()
+    return this
+  }
+
+  /**
+   * @param {number} index
+   * @param {boolean} hidden
+   * @returns {this}
+   */
+  setColumnHidden(index, hidden) {
+    if (!Number.isInteger(index) || index < 0) return this
+    if (hidden) this._hiddenColumns.add(index)
+    else this._hiddenColumns.delete(index)
+    this._renderTable()
+    return this
+  }
+
+  /**
+   * @param {Iterable<number>|null} cols
+   * @returns {this}
+   */
+  setIgnoredColumns(cols) {
+    this._ignoredColumns = new Set(toColumnList(cols ? [...cols] : []))
+    this._invalidateRules()
+    // Excluding changes what "different" means, so the rows have to be
+    // re-classified, not just repainted.
+    this._recompare()
+    return this
+  }
+
+  /**
+   * @param {number} index
+   * @param {boolean} ignored
+   * @returns {this}
+   */
+  setColumnIgnored(index, ignored) {
+    if (!Number.isInteger(index) || index < 0) return this
+    if (ignored) this._ignoredColumns.add(index)
+    else this._ignoredColumns.delete(index)
+    this._invalidateRules()
+    this._recompare()
+    return this
+  }
+
+  // ── P2-41: whitespace, panels, cell selection ───────────────────────────────
+
+  /** @returns {boolean} */
+  isWhitespaceVisible() { return this._showWhitespace }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setWhitespaceVisible(on) {
+    this._showWhitespace = Boolean(on)
+    this._dom.btnWhitespace?.classList.toggle('active', this._showWhitespace)
+    // Purely presentational: repaint the window, do not re-align.
+    this._windowFirst = null
+    this._windowLast = null
+    this._renderTableWindow()
+    this._updateDetailsPanel()
+    return this._showWhitespace
+  }
+
+  /** @returns {boolean} */
+  toggleWhitespace() { return this.setWhitespaceVisible(!this._showWhitespace) }
+
+  /** @returns {boolean} */
+  isDetailsVisible() { return this._showDetails }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setDetailsVisible(on) {
+    this._showDetails = Boolean(on)
+    this._applyPanelVisibility()
+    return this._showDetails
+  }
+
+  /** @returns {boolean} */
+  toggleDetails() { return this.setDetailsVisible(!this._showDetails) }
+
+  /** @returns {boolean} */
+  isFileInfoVisible() { return this._showFileInfo }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setFileInfoVisible(on) {
+    this._showFileInfo = Boolean(on)
+    this._applyPanelVisibility()
+    return this._showFileInfo
+  }
+
+  /** @returns {boolean} */
+  toggleFileInfo() { return this.setFileInfoVisible(!this._showFileInfo) }
+
+  _applyPanelVisibility() {
+    const { detailsPanel, fileInfoPanel, panels, btnDetails, btnFileInfo, btnWhitespace } = this._dom
+    if (detailsPanel) detailsPanel.style.display = this._showDetails ? '' : 'none'
+    if (fileInfoPanel) fileInfoPanel.style.display = this._showFileInfo ? '' : 'none'
+    if (panels) panels.style.display = (this._showDetails || this._showFileInfo) ? '' : 'none'
+    btnDetails?.classList.toggle('active', this._showDetails)
+    btnFileInfo?.classList.toggle('active', this._showFileInfo)
+    btnWhitespace?.classList.toggle('active', this._showWhitespace)
+    // The panes just changed height, so the number of rows that fit changed.
+    this._windowFirst = null
+    this._windowLast = null
+    this._renderTableWindow()
+    this._updateDetailsPanel()
+    this._updateFileInfoPanel()
+  }
+
+  /**
+   * @returns {{ side: 'left'|'right', visibleRowIdx: number, col: number }|null}
+   */
+  getSelectedCell() {
+    return this._selectedCell ? { ...this._selectedCell } : null
+  }
+
+  /**
+   * Select a cell and show it in the Text Details panel.
+   *
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @param {number} col
+   * @returns {this}
+   */
+  selectCell(side, visibleRowIdx, col) {
+    this._selectedCell = { side, visibleRowIdx, col }
+    this._applySelectionHighlight()
+    this._updateDetailsPanel()
+    return this
+  }
+
+  /**
+   * Re-apply the selection mark after a virtual repaint.
+   *
+   * The selected row may be outside the current window, in which case there is
+   * nothing to mark — the selection itself survives in `_selectedCell`.
+   */
+  _applySelectionHighlight() {
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const tbody = this._dom[`${side}Tbody`]
+      if (!tbody) continue
+      for (const td of tbody.querySelectorAll('.tc-cell--selected')) {
+        td.classList.remove('tc-cell--selected')
+      }
+    }
+    const sel = this._selectedCell
+    const first = this._windowFirst
+    const last = this._windowLast
+    if (!sel || first == null || last == null) return
+    if (sel.visibleRowIdx < first || sel.visibleRowIdx >= last) return
+    const tbody = this._dom[`${sel.side}Tbody`]
+    const tr = tbody?.children[sel.visibleRowIdx - first]
+    // +1 skips the row-number cell.
+    tr?.children[sel.col + 1]?.classList.add('tc-cell--selected')
+  }
+
+  /** Repaint the Text Details panel from the current selection. */
+  _updateDetailsPanel() {
+    const body = this._dom.detailsBody
+    if (!body || !this._showDetails) return
+    body.innerHTML = ''
+
+    const sel = this._selectedCell
+    if (!sel) {
+      body.appendChild(el('div', { className: 'tc-panel-empty' }, '點選任一儲存格以檢視完整內容'))
+      return
+    }
+    const row = this._visibleRows?.[sel.visibleRowIdx]
+    if (!row) {
+      body.appendChild(el('div', { className: 'tc-panel-empty' }, '選取的列已不在目前的篩選結果中'))
+      return
+    }
+
+    const header = this._hasHeader
+      ? ((sel.side === 'left' ? this._leftHeaders : this._rightHeaders)?.[sel.col] ?? '')
+      : ''
+    const leftVal = row.leftRow?.[sel.col] ?? null
+    const rightVal = row.rightRow?.[sel.col] ?? null
+
+    body.appendChild(el('div', { className: 'tc-detail-head' },
+      `第 ${sel.visibleRowIdx + 1} 列 · 第 ${sel.col} 欄${header ? ` (${header})` : ''}`
+      + ` · ${sel.side === 'left' ? '左側' : '右側'}`))
+
+    const grid = el('div', { className: 'tc-detail-grid' })
+    /**
+     * @param {string} label
+     * @param {string|null} value
+     */
+    const add = (label, value) => {
+      grid.appendChild(el('span', { className: 'tc-detail-label' }, label))
+      const box = el('span', { className: 'tc-detail-value' })
+      if (value == null) {
+        box.classList.add('tc-detail-value--na')
+        box.textContent = '（此側無此列）'
+      } else {
+        box.textContent = this._showWhitespace ? visibleWhitespace(value) : value
+      }
+      grid.appendChild(box)
+    }
+    add('左側', leftVal)
+    add('右側', rightVal)
+    add('長度', `左 ${leftVal?.length ?? 0} / 右 ${rightVal?.length ?? 0} 字元`)
+    add('比對規則', columnRuleAt(this._effectiveRules(), sel.col).mode)
+    body.appendChild(grid)
+  }
+
+  /** Repaint the File Info panel. */
+  _updateFileInfoPanel() {
+    const body = this._dom.fileInfoBody
+    if (!body || !this._showFileInfo) return
+    body.innerHTML = ''
+
+    for (const side of /** @type {const} */ (['left', 'right'])) {
+      const path = side === 'left' ? this._leftPath : this._rightPath
+      const content = side === 'left' ? this._leftContent : this._rightContent
+      const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+      const dataRows = parsed ? Math.max(0, parsed.length - (this._hasHeader ? 1 : 0)) : 0
+      const cols = side === 'left' ? (this._leftColCount ?? 0) : (this._rightColCount ?? 0)
+
+      const box = el('div', { className: 'tc-fileinfo-side' })
+      box.appendChild(el('div', { className: 'tc-fileinfo-head' }, side === 'left' ? '左側' : '右側'))
+      const grid = el('div', { className: 'tc-detail-grid' })
+      /**
+       * @param {string} label
+       * @param {string} value
+       */
+      const add = (label, value) => {
+        grid.appendChild(el('span', { className: 'tc-detail-label' }, label))
+        grid.appendChild(el('span', { className: 'tc-detail-value' }, value))
+      }
+      const stat = path ? this._statCache.get(path) : null
+      add('路徑', path ?? '（未選擇）')
+      add('大小', stat
+        ? formatSize(stat.size)
+        : (content != null ? `${content.length} 字元（尚未取得磁碟大小）` : '—'))
+      add('修改時間', path ? (stat ? new Date(stat.mtime).toLocaleString() : '讀取中…') : '—')
+      add('列數', parsed ? `${dataRows}${this._hasHeader ? '（不含標題）' : ''}` : '—')
+      add('欄數', parsed ? String(cols) : '—')
+      add('編碼', this._encoding[side] ?? '（未提供）')
+      add('分隔符', parsed ? describeDelimiter(this._delimiter[side]) : '—')
+      add('未儲存變更', this._modified[side] ? '是' : '否')
+      box.appendChild(grid)
+      this._dom[`fileInfoGrid_${side}`] = grid
+      body.appendChild(box)
+    }
+
+    void this._loadFileStats()
+  }
+
+  /**
+   * Fill `_statCache` from `read-dir` on the containing folders.
+   *
+   * There is no per-file stat channel; listing the parent folder is the
+   * narrowest existing one. Failures are written into the panel rather than
+   * swallowed — "unknown" and "permission denied" are different answers.
+   *
+   * @returns {Promise<void>}
+   */
+  async _loadFileStats() {
+    const readDir = window.electronAPI?.readDir
+    if (typeof readDir !== 'function') return
+    // `_statAttempted` and not just `_statCache`: a path whose folder cannot be
+    // listed never lands in the cache, and repainting the panel calls back into
+    // here — without this the pair would loop.
+    const wanted = [this._leftPath, this._rightPath]
+      .filter((p) => typeof p === 'string' && p && !this._statAttempted.has(p))
+    if (wanted.length === 0) return
+    for (const path of wanted) this._statAttempted.add(String(path))
+
+    /** @type {string[]} */
+    const failures = []
+    for (const path of wanted) {
+      const dir = String(path).replace(/[\\/][^\\/]*$/, '')
+      if (!dir || dir === path) continue
+      try {
+        const entries = await readDir(dir)
+        const hit = (entries ?? []).find((entry) => entry?.path === path)
+        if (hit) this._statCache.set(String(path), { size: hit.size, mtime: hit.mtime })
+      } catch (err) {
+        failures.push(`${path}：${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    if (failures.length) this._reportError(`無法讀取檔案資訊 — ${failures.join('；')}`)
+    // Values arrived after the panel was painted; repaint with what we have.
+    if (this._showFileInfo) this._updateFileInfoPanel()
   }
 
   /**
@@ -1965,6 +2462,11 @@ export class TableCompare {
       // applyConfig re-measures against whatever table is loaded.
       fitColumns: Boolean(this._colWidths.left || this._colWidths.right),
       layoutMode: this._layoutMode,
+      hiddenColumns: this.getHiddenColumns(),
+      ignoredColumns: this.getIgnoredColumns(),
+      showWhitespace: this._showWhitespace,
+      showDetails: this._showDetails,
+      showFileInfo: this._showFileInfo,
     })
   }
 
@@ -1985,6 +2487,17 @@ export class TableCompare {
     if (settings.layoutMode === 'side-by-side' || settings.layoutMode === 'over-under') {
       this._layoutMode = settings.layoutMode
     }
+    if (settings.hiddenColumns !== undefined) {
+      this._hiddenColumns = new Set(toColumnList(settings.hiddenColumns))
+    }
+    if (settings.ignoredColumns !== undefined) {
+      this._ignoredColumns = new Set(toColumnList(settings.ignoredColumns))
+      this._invalidateRules()
+    }
+    if (typeof settings.showWhitespace === 'boolean') this._showWhitespace = settings.showWhitespace
+    if (typeof settings.showDetails === 'boolean') this._showDetails = settings.showDetails
+    if (typeof settings.showFileInfo === 'boolean') this._showFileInfo = settings.showFileInfo
+    this._applyPanelVisibility()
     this._applyLayout()
     this._syncConfigControls()
     this.refresh()
@@ -2110,6 +2623,11 @@ export class TableCompare {
     body.appendChild(rightPane)
     root.appendChild(body)
 
+    // P2-41: Text Details / File Info drawer. A sibling of .tc-body, never
+    // inside a scroller, so the virtual row window is unaffected — the panes
+    // just get shorter, which the window recomputation already handles.
+    root.appendChild(this._buildPanels())
+
     // Stats bar
     const stats = el('div', { className: 'tc-stats' })
     this._dom.stats = stats
@@ -2130,6 +2648,31 @@ export class TableCompare {
 
     this._applyLayout()
     this._renderEmptyState()
+    this._applyPanelVisibility()
+  }
+
+  /** @returns {HTMLElement} */
+  _buildPanels() {
+    const panels = el('div', { className: 'tc-panels' })
+
+    const details = el('div', { className: 'tc-details' })
+    details.appendChild(el('div', { className: 'tc-panel-title' }, 'Text Details'))
+    const detailsBody = el('div', { className: 'tc-details-body' })
+    this._dom.detailsBody = detailsBody
+    details.appendChild(detailsBody)
+    this._dom.detailsPanel = details
+
+    const info = el('div', { className: 'tc-fileinfo' })
+    info.appendChild(el('div', { className: 'tc-panel-title' }, 'File Info'))
+    const infoBody = el('div', { className: 'tc-fileinfo-body' })
+    this._dom.fileInfoBody = infoBody
+    info.appendChild(infoBody)
+    this._dom.fileInfoPanel = info
+
+    panels.appendChild(details)
+    panels.appendChild(info)
+    this._dom.panels = panels
+    return panels
   }
 
   _buildToolbar() {
@@ -2166,6 +2709,20 @@ export class TableCompare {
     btnFit.title = '依內容調整欄寬（再按一次還原）'
     this._dom.btnFit = btnFit
     toolbar.appendChild(btnFit)
+
+    // P2-41: view panels + visible whitespace
+    const btnDetails = el('button',
+      { id: 'tc-btn-details', className: 'tc-btn', title: '顯示 / 隱藏 Text Details 面板' }, '📄 內容')
+    const btnFileInfo = el('button',
+      { id: 'tc-btn-fileinfo', className: 'tc-btn', title: '顯示 / 隱藏檔案資訊面板' }, 'ℹ 檔案資訊')
+    const btnWhitespace = el('button',
+      { id: 'tc-btn-whitespace', className: 'tc-btn', title: '顯示儲存格內的空白與 Tab' }, '␣ 空白')
+    this._dom.btnDetails = btnDetails
+    this._dom.btnFileInfo = btnFileInfo
+    this._dom.btnWhitespace = btnWhitespace
+    toolbar.appendChild(btnDetails)
+    toolbar.appendChild(btnFileInfo)
+    toolbar.appendChild(btnWhitespace)
 
     // Separator
     toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
@@ -2397,6 +2954,33 @@ export class TableCompare {
     keyLabel.appendChild(document.createTextNode(' Key'))
     row.appendChild(keyLabel)
 
+    // P2-41: per-column show / exclude. "顯示" only hides the column; "排除"
+    // additionally takes it out of the comparison, so a row that differs only
+    // in an excluded column counts as identical.
+    const showBox = el('input', { type: 'checkbox', className: 'tc-col-show' })
+    showBox.checked = !this._hiddenColumns.has(index)
+    const showLabel = el('label', { className: 'tc-col-key-label', title: '在兩側表格中顯示此欄' })
+    showLabel.appendChild(showBox)
+    showLabel.appendChild(document.createTextNode(' 顯示'))
+    row.appendChild(showLabel)
+
+    const skipBox = el('input', { type: 'checkbox', className: 'tc-col-skip' })
+    skipBox.checked = this._ignoredColumns.has(index)
+    const skipLabel = el('label',
+      { className: 'tc-col-key-label', title: '完全排除：不參與比對，也不顯示' })
+    skipLabel.appendChild(skipBox)
+    skipLabel.appendChild(document.createTextNode(' 排除'))
+    row.appendChild(skipLabel)
+
+    showBox.addEventListener('change', () => this.setColumnHidden(index, !showBox.checked))
+    skipBox.addEventListener('change', () => {
+      this.setColumnIgnored(index, skipBox.checked)
+      // Excluding overrides "顯示", so reflect that rather than leaving a
+      // ticked box next to an invisible column.
+      showBox.disabled = skipBox.checked
+    })
+    showBox.disabled = skipBox.checked
+
     const modeSel = el('select', { className: 'tc-col-mode' })
     for (const [value, label] of [
       ['text', '文字'], ['numeric', '數值'], ['date', '日期'], ['ignore', '忽略'],
@@ -2561,6 +3145,15 @@ export class TableCompare {
     // P2-21: double-click a cell to edit it
     leftScroll.addEventListener('dblclick',  (e) => this._onCellDblClick(e, 'left'))
     rightScroll.addEventListener('dblclick', (e) => this._onCellDblClick(e, 'right'))
+
+    // P2-41: single click selects the cell shown in the Text Details panel.
+    leftScroll.addEventListener('click',  (e) => this._onCellClick(e, 'left'))
+    rightScroll.addEventListener('click', (e) => this._onCellClick(e, 'right'))
+
+    const { btnDetails, btnFileInfo, btnWhitespace } = this._dom
+    btnDetails.addEventListener('click', () => this.toggleDetails())
+    btnFileInfo.addEventListener('click', () => this.toggleFileInfo())
+    btnWhitespace.addEventListener('click', () => this.toggleWhitespace())
     this._dom.btnUndo.addEventListener('click', () => this.undo())
     this._dom.btnRedo.addEventListener('click', () => this.redo())
     this._dom.btnSaveLeft.addEventListener('click', () => void this.saveLeft())
@@ -3032,11 +3625,12 @@ export class TableCompare {
     // T15: sort before compare — sort each side by the key columns (or col 0
     // when aligning by position), using the same canonical form as alignment so
     // numeric/date columns group consistently.
+    const rules = this._effectiveRules()
     if (this._sortBeforeCompare) {
       const sortCols = this._keyColumns.length ? this._keyColumns : [0]
       const sortFn = (a, b) => {
-        const av = buildRowKey(a, sortCols, this._columnRules)
-        const bv = buildRowKey(b, sortCols, this._columnRules)
+        const av = buildRowKey(a, sortCols, rules)
+        const bv = buildRowKey(b, sortCols, rules)
         return av < bv ? -1 : av > bv ? 1 : 0
       }
       leftData  = leftData.slice().sort(sortFn)
@@ -3061,7 +3655,7 @@ export class TableCompare {
       leftHeaders,
       rightHeaders,
       this._ignoreColumnOrder,
-      this._columnRules,
+      rules,
     )
     this._refreshRowIndex()
   }
@@ -3145,6 +3739,8 @@ export class TableCompare {
       this._dom.rightScroll.appendChild(msg.cloneNode(true))
       this._renderStats()
       this._recomputeFind()
+      this._updateDetailsPanel()
+      this._updateFileInfoPanel()
       return
     }
 
@@ -3178,6 +3774,8 @@ export class TableCompare {
     // Match positions are expressed as _visibleRows indices, which the filter
     // pass above may have just shifted.
     this._recomputeFind()
+    this._updateDetailsPanel()
+    this._updateFileInfoPanel()
   }
 
   /**
@@ -3224,6 +3822,7 @@ export class TableCompare {
     leftTbody.replaceChildren(leftFrag)
     rightTbody.replaceChildren(rightFrag)
     this._applyFindHighlights()
+    this._applySelectionHighlight()
   }
 
   /**
@@ -3239,7 +3838,7 @@ export class TableCompare {
     const cols = colCount ?? this._colCount ?? 0
     if (!alignedRow._cellDiffs || alignedRow._cellDiffs.length !== cols) {
       alignedRow._cellDiffs = computeCellDiffs(
-        alignedRow.leftRow, alignedRow.rightRow, cols, this._columnRules)
+        alignedRow.leftRow, alignedRow.rightRow, cols, this._effectiveRules())
     }
     return alignedRow._cellDiffs
   }
@@ -3265,9 +3864,11 @@ export class TableCompare {
           const numCol = document.createElement('col')
           numCol.style.width = '36px'
           cg.appendChild(numCol)
-          for (const w of widths) {
+          for (let i = 0; i < widths.length; i++) {
             const col = document.createElement('col')
-            col.style.width = `${w}px`
+            // A fixed-layout table reserves the track even when every cell in
+            // it is display:none, so a hidden column has to be zeroed here too.
+            col.style.width = this.isColumnHidden(i) ? '0px' : `${widths[i]}px`
             cg.appendChild(col)
           }
           table.insertBefore(cg, table.firstChild)
@@ -3304,7 +3905,11 @@ export class TableCompare {
     const displayCount = Math.max(headers.length, colCount)
     for (let i = 0; i < displayCount; i++) {
       const text = headers[i] ?? ''
-      const cell = el('div', { className: 'tc-cell', textContent: text })
+      // Hidden columns keep their DOM node so that every index-based lookup
+      // (dbl-click editing, find highlighting, colgroup) stays 1:1 with the
+      // column index; only the painting is suppressed.
+      const cell = el('div',
+        { className: `tc-cell${this.isColumnHidden(i) ? ' tc-col-hidden' : ''}`, textContent: text })
       headerEl.appendChild(cell)
     }
   }
@@ -3334,7 +3939,7 @@ export class TableCompare {
       // empty cells
       for (let i = 0; i < colCount; i++) {
         const td = document.createElement('td')
-        td.className = 'tc-cell'
+        td.className = 'tc-cell' + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
         tr.appendChild(td)
       }
       return tr
@@ -3353,11 +3958,13 @@ export class TableCompare {
     for (let i = 0; i < displayCount; i++) {
       const td = document.createElement('td')
       const isDiff = cellDiffs ? (cellDiffs[i] ?? false) : false
-      td.className = 'tc-cell' + (isDiff ? ' cell-diff' : '')
+      td.className = 'tc-cell'
+        + (isDiff ? ' cell-diff' : '')
+        + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
       const val = rowData?.[i] ?? ''
       // S14-M11: textContent avoids HTML parsing per-cell — ~30% faster on
       // 1Mx1k tables. The cell is plain text; no need for innerHTML.
-      td.textContent = val
+      td.textContent = this._showWhitespace ? visibleWhitespace(val) : val
       tr.appendChild(td)
     }
 
@@ -3466,4 +4073,5 @@ export {
   parseNumericValue, parseDateValue, cellsEqual, columnRuleAt,
   normaliseKeyColumns, buildRowKey, measureColumnWidths, DEFAULT_COLUMN_RULE,
   serializeTable, parseHtmlTables, csvPathFor,
+  visibleWhitespace, mergeIgnoredColumns, toColumnList, describeDelimiter,
 }
