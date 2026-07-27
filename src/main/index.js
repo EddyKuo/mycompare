@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electron'
 import { join, extname, dirname, basename } from 'path'
-import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod } from 'fs/promises'
+import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod, utimes } from 'fs/promises'
 import { watch } from 'fs'
 import { execFile } from 'child_process'
 import { decodeBuffer, encodeContent } from './encoding.js'
@@ -558,6 +558,74 @@ function fileAttributes(name, s) {
 }
 
 /**
+ * Names carrying the Windows hidden attribute in one directory.
+ *
+ * Node's Stats has no attribute bits on any platform, so the only way to read
+ * this is to ask the OS. `attrib` answers for a whole directory in one process
+ * — per-file would be unusable on a tree — and takes its argument through
+ * execFile, so a directory name containing `&` stays a name.
+ *
+ * The path is located by searching for the directory we asked about rather
+ * than by column offset, since the flag field's width is an implementation
+ * detail of attrib's output.
+ *
+ * @param {string} dir absolute, already validated
+ * @returns {Promise<Set<string>>} basenames; empty when the platform has no
+ *   such attribute or the query fails, since "unknown" must not read as "yes"
+ */
+async function hiddenNamesIn(dir) {
+  if (process.platform !== 'win32') return new Set()
+  /** @type {string} */
+  let out
+  try {
+    out = await new Promise((resolve, reject) => {
+      execFile('attrib', [join(dir, '*')], { windowsHide: true },
+        (err, stdout) => (err ? reject(err) : resolve(String(stdout))))
+    })
+  } catch {
+    return new Set()
+  }
+
+  const hidden = new Set()
+  for (const line of out.split(/\r?\n/)) {
+    const at = line.indexOf(dir)
+    if (at <= 0) continue
+    const flags = line.slice(0, at)
+    if (!/\bH\b/.test(flags)) continue
+    const name = basename(line.slice(at).trim())
+    if (name) hidden.add(name)
+  }
+  return hidden
+}
+
+// IPC: 設定或清除 Windows 隱藏屬性
+ipcMain.handle('set-hidden', async (_event, filePath, hidden) => {
+  const safe = validatePath(filePath)
+  if (process.platform !== 'win32') {
+    throw new Error('此平台沒有隱藏屬性可設定')
+  }
+  await new Promise((resolve, reject) => {
+    execFile('attrib', [hidden === false ? '-h' : '+h', safe], { windowsHide: true },
+      (err) => (err ? reject(err) : resolve(undefined)))
+  })
+  return { path: safe, hidden: hidden !== false }
+})
+
+// IPC: 把一個檔案的修改時間套到另一個檔案（BC 的 Touch）
+ipcMain.handle('set-mtime', async (_event, filePath, mtime) => {
+  const safe = validatePath(filePath)
+  const when = mtime == null ? new Date() : new Date(mtime)
+  if (Number.isNaN(when.getTime())) {
+    throw new Error(`無法解析的時間：${mtime}`)
+  }
+  // atime is preserved rather than stamped with "now": the point is to make
+  // one file look like another's mtime, not to record that we touched it.
+  const info = await stat(safe)
+  await utimes(safe, info.atime, when)
+  return { path: safe, mtime: when.toISOString() }
+})
+
+/**
  * Open a file in the OS's associated application, or let the user pick one.
  *
  * `withPicker` shells out to the Windows "Open with" dialog, which Electron
@@ -700,9 +768,13 @@ ipcMain.handle('read-reg-file', async (_event, filePath) => {
 })
 
 // IPC: 讀取資料夾內容（一層）
-ipcMain.handle('read-dir', async (_event, dirPath) => {
+ipcMain.handle('read-dir', async (_event, dirPath, options) => {
   const safe = validatePath(dirPath)
   const entries = await readdir(safe, { withFileTypes: true })
+  // Reading the hidden attribute costs a process per directory, so it is only
+  // paid for when the caller says it needs it — a recursive scan asking for it
+  // everywhere would spawn one per level.
+  const hidden = options?.attributes === true ? await hiddenNamesIn(safe) : null
   const result = await Promise.all(
     entries.map(async (entry) => {
       const fullPath = join(safe, entry.name)
@@ -719,7 +791,8 @@ ipcMain.handle('read-dir', async (_event, dirPath) => {
           size: s.size,
           mtime: s.mtime.toISOString(),
           ctime: s.ctime.toISOString(),
-          ...fileAttributes(entry.name, s)
+          ...fileAttributes(entry.name, s),
+          ...(hidden ? { hidden: hidden.has(entry.name) } : {})
         }
       } catch {
         // Permission denied / broken symlink — skip

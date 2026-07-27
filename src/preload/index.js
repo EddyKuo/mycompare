@@ -24,7 +24,7 @@ function _onChannel(channel, cb) {
 contextBridge.exposeInMainWorld('electronAPI', {
   openFile: (options) => ipcRenderer.invoke('open-file', options),
   openFolder: () => ipcRenderer.invoke('open-folder'),
-  readDir: (path) => ipcRenderer.invoke('read-dir', path),
+  readDir: (path, options) => ipcRenderer.invoke('read-dir', path, options),
   createSnapshot: (folderPath, crc) => ipcRenderer.invoke('create-snapshot', { folderPath, crc }),
   loadSnapshot: () => ipcRenderer.invoke('load-snapshot'),
   readSnapshotDir: (snapshotPath, relDir) =>
@@ -42,6 +42,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteFile: (path, options) => ipcRenderer.invoke('delete-file', path, options),
   setReadOnly: (path, readOnly) => ipcRenderer.invoke('set-read-only', path, readOnly),
   openWith: (path, options) => ipcRenderer.invoke('open-with', path, options),
+  setHidden: (path, hidden) => ipcRenderer.invoke('set-hidden', path, hidden),
+  setMtime: (path, mtime) => ipcRenderer.invoke('set-mtime', path, mtime),
   saveFile: (defaultPath, content, filters, encoding, backup) =>
     ipcRenderer.invoke('save-file', { defaultPath, content, filters, encoding, backup }),
   openZip: () => ipcRenderer.invoke('open-zip'),
