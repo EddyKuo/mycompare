@@ -33,6 +33,40 @@ const SEARCH = [
   'C:\\Windows\\SoftwareDistribution\\SLS',
 ]
 
+/**
+ * Cabinets on this machine matching a predicate on their header bytes.
+ *
+ * @param {(buf: Buffer) => boolean} accept
+ * @param {number} limit
+ * @param {string[]} roots
+ * @returns {string[]}
+ */
+function findCabsWhere(accept, limit, roots) {
+  /** @type {string[]} */
+  const out = []
+  /** @param {string} dir @param {number} depth */
+  const walk = (dir, depth) => {
+    if (out.length >= limit || depth > 3) return
+    let names = []
+    try { names = readdirSync(dir) } catch { return }
+    for (const n of names) {
+      if (out.length >= limit) return
+      const full = join(dir, n)
+      let st
+      try { st = statSync(full) } catch { continue }
+      if (st.isDirectory()) { walk(full, depth + 1); continue }
+      if (!/\.cab$/i.test(n)) continue
+      try {
+        const buf = readFileSync(full)
+        if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'MSCF') continue
+        if (accept(buf)) out.push(full)
+      } catch { /* unreadable system file */ }
+    }
+  }
+  for (const dir of roots) walk(dir, 0)
+  return out
+}
+
 /** @returns {string[]} cabinets whose header declares a reserved area */
 function findReservedCabs(limit = 4) {
   /** @type {string[]} */
@@ -167,6 +201,47 @@ describe('cabinets with a reserved area', () => {
         expect(Buffer.compare(ours, readFileSync(refPath)), `differs from 7-Zip: ${name}`).toBe(0)
         compared++
       }
+    }
+    expect(compared, 'no entry was actually compared').toBeGreaterThan(0)
+  }, 120000)
+
+  it('reads an uncompressed folder, if the machine has one', async () => {
+    // Compression type 0 is a real variant that no fixture here produced —
+    // makecab always compresses — and the disk sweep found five of them, all
+    // shipped by Visual Studio. A folder whose "decompressor" is a copy is
+    // exactly the sort of path that is assumed to work and never exercised.
+    if (!sevenZip) return
+
+    const plain = findCabsWhere((buf) => {
+      const flags = buf.readUInt16LE(30)
+      let off = 36
+      if (flags & 0x0004) off = 36 + 4 + buf.readUInt16LE(36)
+      if (flags & 0x0001) { while (buf[off]) off++; off++; while (buf[off]) off++; off++ }
+      if (flags & 0x0002) { while (buf[off]) off++; off++; while (buf[off]) off++; off++ }
+      return (buf.readUInt16LE(off + 6) & 0x0f) === 0
+    }, 1, ['C:\\ProgramData\\Microsoft\\VisualStudio\\Packages'])
+
+    if (!plain.length) {
+      console.warn('no uncompressed cabinet on this machine; test skipped')
+      return
+    }
+
+    const dir = mkdtempSync(join(tmpdir(), 'cab-none-'))
+    const cab = join(dir, 'in.cab')
+    copyFileSync(plain[0], cab)
+    const refDir = join(dir, 'ref')
+    execFileSync(SEVENZIP, ['x', '-y', cab, '-o' + refDir], { stdio: 'ignore' })
+
+    const r = await readArchive(cab)
+    let compared = 0
+    for (const e of (r.entries ?? r).slice(0, 8)) {
+      const full = String(e.path ?? e.name)
+      const name = full.includes('::') ? full.split('::').pop() : full
+      const refPath = join(refDir, ...name.split('/'))
+      if (!existsSync(refPath)) continue
+      const ours = await readArchiveEntry(cab, name)
+      expect(Buffer.compare(ours, readFileSync(refPath)), `differs from 7-Zip: ${name}`).toBe(0)
+      compared++
     }
     expect(compared, 'no entry was actually compared').toBeGreaterThan(0)
   }, 120000)
