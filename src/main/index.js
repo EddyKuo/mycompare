@@ -383,9 +383,26 @@ ipcMain.handle('copy-file', async (_event, { src, dest, backup }) => {
 })
 
 // IPC: 刪除檔案
-ipcMain.handle('delete-file', async (_event, filePath) => {
+ipcMain.handle('delete-file', async (_event, filePath, options) => {
   const safe = validatePath(filePath)
+  // The recycle bin is the default because a folder comparison deletes in
+  // bulk, from a list the user skimmed. unlink() on the wrong side of a
+  // two-pane view has no undo; the bin does.
+  if (options?.permanent !== true) {
+    try {
+      await shell.trashItem(safe)
+      return { deleted: true, path: safe, permanent: false }
+    } catch (err) {
+      // No bin on this platform or filesystem (a network share, a container).
+      // Falling through silently would delete permanently while the user
+      // believed otherwise, so say which one happened.
+      if (options?.fallbackToPermanent !== true) {
+        throw new Error(`無法移至資源回收桶：${err instanceof Error ? err.message : err}`)
+      }
+    }
+  }
   await unlink(safe)
+  return { deleted: true, path: safe, permanent: true }
 })
 
 // IPC: 儲存檔案（顯示 Save 對話框）
