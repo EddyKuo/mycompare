@@ -132,6 +132,20 @@ test('衝突導航把遠處的衝突捲進可見範圍', async () => {
     [...document.querySelectorAll('#view-merge3 .mw-content-left .mw-linetext')]
       .some((el) => el.textContent === 'L5000'))
 
+  /**
+   * Wait for the row to be present or absent.
+   *
+   * The virtual list re-renders on an animation frame, so asserting straight
+   * after dispatching a scroll event is a race — it passed almost always and
+   * failed occasionally, which is the worst way for a test to be wrong.
+   * @param {boolean} want
+   */
+  const waitVisible = (want) => win.waitForFunction((expected) => {
+    const seen = [...document.querySelectorAll('#view-merge3 .mw-content-left .mw-linetext')]
+      .some((el) => el.textContent === 'L5000')
+    return seen === expected
+  }, want, { timeout: 5000 })
+
   // "When loading new files, go to first difference" is on by default (as in
   // Beyond Compare), so the only conflict is already scrolled into the window.
   expect(await visible()).toBe(true)
@@ -144,9 +158,11 @@ test('衝突導航把遠處的衝突捲進可見範圍', async () => {
         .dispatchEvent(new Event('scroll'))
     }
   })
+  await waitVisible(false)
   expect(await visible()).toBe(false)
 
   await win.locator('#view-merge3 .mw-btn-next').click()
+  await waitVisible(true)
   expect(await visible()).toBe(true)
 })
 

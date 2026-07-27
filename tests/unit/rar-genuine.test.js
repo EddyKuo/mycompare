@@ -81,6 +81,47 @@ describe('archives written by RARLAB Rar.exe', () => {
     })
   }
 
+  describe('the refusals, against archives the real packer produced', () => {
+    // Hand-built fixtures can only prove a refusal fires on what we thought to
+    // construct. These are the awkward cases as RARLAB's packer actually emits
+    // them, which is the only way to know the refusal triggers on the real
+    // shape rather than on our approximation of it.
+    it('verifies a BLAKE2sp record the packer itself wrote (-htb)', () => {
+      const raw = bytes('g_blake')
+      const parsed = parseRar(raw)
+      const got = extractRarEntry(raw, parsed, 'note.txt')
+      expect(Buffer.compare(got, CONTENTS['note.txt'])).toBe(0)
+    })
+
+    it('refuses per-file encryption by name (-p)', () => {
+      expect(() => parseRar(bytes('g_enc'))).toThrow(/加密/)
+    })
+
+    it('refuses an encrypted header by name (-hp)', () => {
+      // The whole block table is ciphertext here, so this must be recognised
+      // rather than parsed as garbage — the failure mode is a confident list
+      // of nonsense entry names.
+      expect(() => parseRar(bytes('g_hdrenc'))).toThrow(/標頭|加密/)
+    })
+
+    it('refuses a solid block by name (-s)', () => {
+      // A solid entry cannot be decoded without the entries before it.
+      // Returning its bytes alone would be a wrong answer, not a partial one.
+      expect(() => parseRar(bytes('g_solid'))).toThrow(/solid/i)
+    })
+
+    it('names what it refused rather than failing generically', () => {
+      for (const [key, pattern] of [
+        ['g_enc', /note\.txt/],
+        ['g_solid', /note\.txt/],
+      ]) {
+        let message = ''
+        try { parseRar(bytes(key)) } catch (err) { message = String(err.message) }
+        expect(message, key).toMatch(pattern)
+      }
+    })
+  })
+
   for (const [label, key] of [['RAR5', 'fx5comp'], ['RAR4', 'fx4comp']]) {
     describe(`${label}, compressed`, () => {
       it('still lists the contents rather than failing to parse', () => {
