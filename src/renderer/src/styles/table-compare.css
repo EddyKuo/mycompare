@@ -750,3 +750,96 @@
   color: #fff;
   border-color: var(--accent-color, #4a90d9);
 }
+
+/* ── P2-43: Go To bar ── */
+.tc-goto-bar {
+  gap: 6px;
+}
+
+.tc-goto-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.tc-goto-input {
+  max-width: 160px;
+}
+
+.tc-goto-error {
+  font-size: 12px;
+  color: var(--diff-replace-border);
+  white-space: nowrap;
+}
+
+/* ── P2-45: difference magnitude grading ──
+   Three depths of one hue. Red keeps meaning "important difference"; the
+   shade only says how much of the cell changed, so the project's fixed
+   colour semantics are unchanged — this subdivides them, it does not
+   reassign them. */
+.table-compare .tc-cell--sev1 { background-color: rgba(211, 47, 47, 0.10); }
+.table-compare .tc-cell--sev2 { background-color: rgba(211, 47, 47, 0.22); }
+.table-compare .tc-cell--sev3 { background-color: rgba(211, 47, 47, 0.38); }
+
+[data-theme="dark"] .table-compare .tc-cell--sev1 { background-color: rgba(244, 67, 54, 0.14); }
+[data-theme="dark"] .table-compare .tc-cell--sev2 { background-color: rgba(244, 67, 54, 0.26); }
+[data-theme="dark"] .table-compare .tc-cell--sev3 { background-color: rgba(244, 67, 54, 0.42); }
+
+/* The row's own grade rides on the row-number gutter, so it is readable even
+   when every differing cell is scrolled out horizontally. */
+.table-compare .tc-row--sev1 .tc-row-num { box-shadow: inset 2px 0 0 rgba(211, 47, 47, 0.35); }
+.table-compare .tc-row--sev2 .tc-row-num { box-shadow: inset 3px 0 0 rgba(211, 47, 47, 0.6); }
+.table-compare .tc-row--sev3 .tc-row-num { box-shadow: inset 4px 0 0 rgba(211, 47, 47, 0.9); }
+
+/* ── P2-46: thumbnail ── */
+.tc-thumb {
+  width: var(--tc-thumb-width, 14px);
+  min-width: var(--tc-thumb-width, 14px);
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border-color);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.tc-body.with-thumb {
+  grid-template-columns: 1fr 1fr var(--tc-thumb-width, 14px);
+}
+
+.tc-body.over-under.with-thumb {
+  grid-template-columns: 1fr var(--tc-thumb-width, 14px);
+  grid-template-rows: 1fr 1fr;
+}
+
+/* Stacked panes put the thumbnail beside both of them, not below one. */
+.tc-body.over-under.with-thumb > .tc-thumb {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  border-bottom: none;
+}
+
+.tc-thumb-strip {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.tc-thumb-mark {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  min-height: 1px;
+}
+
+.tc-thumb-mark.different  { background: var(--diff-replace-border); }
+.tc-thumb-mark.left-only  { background: var(--diff-insert-border); }
+.tc-thumb-mark.right-only { background: var(--diff-delete-border); }
+
+.tc-thumb-viewport {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: rgba(0, 122, 204, 0.18);
+  border: 1px solid rgba(0, 122, 204, 0.45);
+  pointer-events: none;
+  box-sizing: border-box;
+}

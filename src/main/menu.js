@@ -226,6 +226,15 @@ export function buildAppMenu(win) {
           ]
         },
         {
+          label: '表格編輯',
+          submenu: [
+            item('跳至列／欄…', 'edit.table.goto', 'CmdOrCtrl+G'),
+            item('複製整列到右側', 'edit.table.copyToRight', 'Alt+Right'),
+            item('複製整列到左側', 'edit.table.copyToLeft', 'Alt+Left'),
+            item('插入空白列', 'edit.table.insertRow', 'CmdOrCtrl+I')
+          ]
+        },
+        {
           label: '選取與對齊',
           submenu: [
             item('選取目前差異區塊', 'text.selectSection', 'Alt+S'),
@@ -314,7 +323,9 @@ export function buildAppMenu(win) {
           submenu: [
             item('詳細資料', 'view.table.details'),
             item('檔案資訊', 'view.table.fileInfo'),
-            item('顯示空白字元', 'view.table.whitespace')
+            item('顯示空白字元', 'view.table.whitespace'),
+            item('差異程度色階', 'view.table.severity'),
+            item('縮圖', 'view.table.thumbnail')
           ]
         },
         item('圖片資訊', 'view.image.info'),

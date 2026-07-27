@@ -3288,6 +3288,12 @@ function setupMenuActions() {
     'view.hex.fileInfo': () => _hexPanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
     'view.hex.ruler':    () => _hexPanel((v) => showStatus(v.toggleRuler() ? '已顯示位移標尺' : '已隱藏位移標尺')),
 
+    'edit.table.goto':       () => _tablePanel((v) => v.openGoto()),
+    'edit.table.copyToRight': () => _tablePanel((v) => { void v.copyRowToRight() }),
+    'edit.table.copyToLeft':  () => _tablePanel((v) => { void v.copyRowToLeft() }),
+    'edit.table.insertRow':  () => _tablePanel((v) => { v.insertRow('left') }),
+    'view.table.severity':   () => _tablePanel((v) => showStatus(v.toggleSeverityShading() ? '已顯示差異程度色階' : '已關閉差異程度色階')),
+    'view.table.thumbnail':  () => _tablePanel((v) => showStatus(v.toggleThumbnail() ? '已顯示縮圖' : '已隱藏縮圖')),
     'view.table.details':    () => _tablePanel((v) => showStatus(v.toggleDetails() ? '已顯示詳細資料' : '已隱藏詳細資料')),
     'view.table.fileInfo':   () => _tablePanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
     'view.table.whitespace': () => _tablePanel((v) => showStatus(v.toggleWhitespace() ? '已顯示空白字元' : '已隱藏空白字元')),

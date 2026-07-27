@@ -34,6 +34,18 @@ const TABLE_ROW_HEIGHT = 24
 /** Extra rows rendered above and below the viewport to hide scroll seams. */
 const TABLE_OVERSCAN = 10
 
+/**
+ * Ceiling on the thumbnail's segment count.
+ *
+ * The thumbnail is an overview of the whole table, so its cost must depend on
+ * its own height rather than on the row count — one node per row would make a
+ * 100k-row overview more expensive than the table it summarises.
+ */
+const THUMB_MAX_MARKS = 400
+
+/** Assumed thumbnail height where the environment reports none (jsdom, hidden). */
+const THUMB_FALLBACK_HEIGHT = 300
+
 /** Coalesce scroll-driven re-renders onto the next frame. */
 function _rafThrottle(fn) {
   let scheduled = false
@@ -684,6 +696,143 @@ function stepIndexWrapped(current, total, delta) {
   return ((current + delta) % total + total) % total
 }
 
+// ── P2-45: difference magnitude grading ──────────────────────────────────────
+
+/**
+ * 兩個儲存格的「差異程度」，0 = 相同，1 = 完全不同。
+ *
+ * 不用編輯距離：那是 O(n·m)，而這個值要對整個視窗內的每一格算一次。共同前綴
+ * 與共同後綴的裁剪是 O(n) 且單調——改一個字元恆得到小值，整格換掉恆得到 1。
+ *
+ * 數字欄另外處理：`1000` 與 `1001` 只差一個字元，但字串量測會說它們差 25%，
+ * 而實際的量值差距是 0.1%。分級是給人看差多少，不是差幾個字元。
+ *
+ * @param {string|null|undefined} left
+ * @param {string|null|undefined} right
+ * @returns {number} 0..1
+ */
+function cellDiffRatio(left, right) {
+  const a = String(left ?? '')
+  const b = String(right ?? '')
+  if (a === b) return 0
+
+  const na = parseNumericValue(a)
+  const nb = parseNumericValue(b)
+  if (na != null && nb != null) {
+    const scale = Math.max(Math.abs(na), Math.abs(nb))
+    // 0 → 非 0 沒有可用的相對尺度，只能算完全不同。
+    if (scale === 0) return 1
+    return Math.min(1, Math.abs(na - nb) / scale)
+  }
+
+  const max = Math.max(a.length, b.length)
+  if (max === 0) return 0
+  const min = Math.min(a.length, b.length)
+  let prefix = 0
+  while (prefix < min && a[prefix] === b[prefix]) prefix++
+  let suffix = 0
+  while (suffix < min - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++
+  return Math.min(1, (max - prefix - suffix) / max)
+}
+
+/** 分級門檻。落在「差異」這個語意內，只改深淺，不改色相。 */
+const SEVERITY_THRESHOLDS = Object.freeze([0.25, 0.6])
+
+/**
+ * 把差異程度換成 0（相同）/ 1（輕微）/ 2（中等）/ 3（大量）。
+ *
+ * @param {number} ratio
+ * @returns {0|1|2|3}
+ */
+function severityLevel(ratio) {
+  if (!(ratio > 0)) return 0
+  if (ratio <= SEVERITY_THRESHOLDS[0]) return 1
+  if (ratio <= SEVERITY_THRESHOLDS[1]) return 2
+  return 3
+}
+
+/**
+ * 逐欄的差異等級。已判定相同的欄（含 ignore 規則）一律 0，因為分級只是把
+ * 既有的「不同」再細分，不能讓一個被規則判為相同的欄變成有顏色。
+ *
+ * @param {string[]|null} leftRow
+ * @param {string[]|null} rightRow
+ * @param {boolean[]} cellDiffs  computeCellDiffs 的結果
+ * @returns {number[]}
+ */
+function computeCellLevels(leftRow, rightRow, cellDiffs) {
+  /** @type {number[]} */
+  const out = []
+  for (let i = 0; i < cellDiffs.length; i++) {
+    out.push(cellDiffs[i] ? severityLevel(cellDiffRatio(leftRow?.[i], rightRow?.[i])) : 0)
+  }
+  return out
+}
+
+// ── P2-46: thumbnail (whole-table difference overview) ───────────────────────
+
+/**
+ * @typedef {{ status: 'same'|'different'|'left-only'|'right-only',
+ *             start: number, end: number }} ThumbBucket
+ */
+
+/**
+ * 把整張表壓成固定數量的區段，供縮圖繪製。
+ *
+ * 一個像素高的區段可能涵蓋數百列，取「數量最多的非相同狀態」而不是取多數：
+ * 十萬列裡的三列差異若被多數決吃掉，縮圖就失去存在的理由。
+ *
+ * @param {Array<{ status: string }>} rows
+ * @param {number} bucketCount
+ * @returns {ThumbBucket[]}
+ */
+function thumbnailBuckets(rows, bucketCount) {
+  const total = rows?.length ?? 0
+  const n = Math.min(Math.floor(bucketCount), total)
+  if (total === 0 || n <= 0) return []
+
+  /** @type {ThumbBucket[]} */
+  const out = []
+  for (let i = 0; i < n; i++) {
+    const start = Math.floor((i * total) / n)
+    const end = Math.max(start + 1, Math.floor(((i + 1) * total) / n))
+    /** @type {Record<string, number>} */
+    const counts = { different: 0, 'left-only': 0, 'right-only': 0 }
+    for (let r = start; r < end && r < total; r++) {
+      const st = rows[r]?.status
+      if (st && st !== 'same') counts[st] = (counts[st] ?? 0) + 1
+    }
+    /** @type {ThumbBucket['status']} */
+    let status = 'same'
+    let best = 0
+    for (const st of /** @type {Array<ThumbBucket['status']>} */ (['different', 'left-only', 'right-only'])) {
+      if (counts[st] > best) { best = counts[st]; status = st }
+    }
+    out.push({ status, start, end })
+  }
+  return out
+}
+
+// ── P2-43: Go To ─────────────────────────────────────────────────────────────
+
+/**
+ * 解析「跳至」輸入。接受 `12`、`12,3`、`12:3`（列, 欄），空白忽略。
+ *
+ * @param {string|null|undefined} text
+ * @returns {{ row: number, col: number|null }|null} null 代表格式不合法
+ */
+function parseGotoInput(text) {
+  const s = String(text ?? '').trim()
+  if (s === '') return null
+  const m = /^(\d+)\s*(?:[,:]\s*(\d+))?$/.exec(s)
+  if (!m) return null
+  const row = Number(m[1])
+  if (!Number.isInteger(row) || row < 1) return null
+  const col = m[2] == null ? null : Number(m[2])
+  if (col != null && (!Number.isInteger(col) || col < 0)) return null
+  return { row, col }
+}
+
 // ── P2-21 / P2-33: serialisation and alternative table sources ───────────────
 
 /**
@@ -842,10 +991,16 @@ export class TableCompare {
      */
     this._rowIndexMap = { left: new Map(), right: new Map() }
 
-    /** @typedef {{ side: 'left'|'right', rowIdx: number, col: number, before: string, after: string }} CellEdit */
-    /** @type {CellEdit[]} */
+    /**
+     * @typedef {{ kind?: 'cell', side: 'left'|'right', rowIdx: number, col: number,
+     *             before: string, after: string, rowRef?: string[]|null }} CellEdit
+     * @typedef {{ kind: 'row', op: 'replace'|'insert', side: 'left'|'right', rowIdx: number,
+     *             before: string[]|null, after: string[]|null, rowRef: string[] }} RowEdit
+     * @typedef {CellEdit|RowEdit} EditEntry
+     */
+    /** @type {EditEntry[]} */
     this._undoStack = []
-    /** @type {CellEdit[]} */
+    /** @type {EditEntry[]} */
     this._redoStack = []
 
     /** @type {{ side: 'left'|'right', visibleRowIdx: number, col: number,
@@ -935,6 +1090,14 @@ export class TableCompare {
     this._statAttempted = new Set()
     /** @type {Record<number, ColumnRule>|null} memoised _effectiveRules() result */
     this._rulesCache = null
+
+    // ── P2-45 / P2-46: difference grading and the thumbnail ───────────────────
+    /** @type {boolean} 依儲存格差異大小深淺分級（仍在「差異＝紅」的語意內） */
+    this._showSeverity = options.showSeverity ?? false
+    /** @type {boolean} 整表差異縮圖 */
+    this._showThumbnail = options.showThumbnail ?? false
+    /** @type {ThumbBucket[]} 目前繪出的縮圖區段，供點擊換算成列號 */
+    this._thumbBuckets = []
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -1288,7 +1451,7 @@ export class TableCompare {
    * @param {'left'|'right'} side
    * @param {number} visibleRowIdx  index into this._visibleRows
    * @param {number} col            display column index
-   * @returns {{ parsedRowIdx: number, sourceCol: number }|null} null 代表不可編輯
+   * @returns {{ parsedRowIdx: number, sourceCol: number, rowRef: string[] }|null} null 代表不可編輯
    */
   _resolveCell(side, visibleRowIdx, col) {
     if (!Number.isInteger(col) || col < 0) return null
@@ -1307,7 +1470,27 @@ export class TableCompare {
     const sourceCol = (side === 'right' && this._rightColMap) ? this._rightColMap[col] : col
     // Under "ignore column order" a left-hand column may have no counterpart.
     if (sourceCol == null || sourceCol < 0) return null
-    return { parsedRowIdx, sourceCol }
+    return { parsedRowIdx, sourceCol, rowRef }
+  }
+
+  /**
+   * 找出某一側在某個可見列的來源列物件；該側在這一列是幻影列時回傳 null。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @returns {{ parsedRowIdx: number, rowRef: string[] }|null}
+   */
+  _resolveRow(side, visibleRowIdx) {
+    const aligned = this._visibleRows?.[visibleRowIdx]
+    if (!aligned) return null
+    const dataIdx = side === 'left' ? aligned.leftIdx : aligned.rightIdx
+    if (dataIdx == null || dataIdx < 0) return null
+    const data = side === 'left' ? this._leftData : this._rightData
+    const rowRef = data?.[dataIdx]
+    if (!rowRef) return null
+    const parsedRowIdx = this._rowIndexMap[side]?.get(rowRef)
+    if (parsedRowIdx == null) return null
+    return { parsedRowIdx, rowRef }
   }
 
   /**
@@ -1370,13 +1553,18 @@ export class TableCompare {
     if (before === after) return true
 
     if (!this._writeParsedCell(side, target.parsedRowIdx, target.sourceCol, after)) return false
-    this._pushHistory({ side, rowIdx: target.parsedRowIdx, col: target.sourceCol, before, after })
+    // rowRef, not just rowIdx: inserting a row shifts every index below it, and
+    // an undo replayed against the shifted index would edit the wrong row.
+    this._pushHistory({
+      kind: 'cell', side, rowIdx: target.parsedRowIdx, col: target.sourceCol,
+      before, after, rowRef: target.rowRef,
+    })
     this._afterEdit(side)
     return true
   }
 
   /**
-   * @param {CellEdit} entry
+   * @param {EditEntry} entry
    */
   _pushHistory(entry) {
     this._undoStack.push(entry)
@@ -1404,12 +1592,18 @@ export class TableCompare {
     this._cancelCellEdit()
     const entry = this._undoStack.pop()
     if (!entry) return false
-    if (!this._writeParsedCell(entry.side, entry.rowIdx, entry.col, entry.before)) return false
+    if (!this._applyHistory(entry, 'undo')) {
+      // Putting it back keeps the stack honest: a failed undo must not silently
+      // consume the entry and leave the user one step further from their data.
+      this._undoStack.push(entry)
+      this._reportError('無法還原這一步：對應的來源資料列已不存在')
+      return false
+    }
     this._redoStack.push(entry)
     if (this._redoStack.length > MAX_EDIT_HISTORY) this._redoStack.shift()
     // The file on disk still differs from what is on screen after an undo, so
     // the modified flag stays set rather than guessing the file is pristine.
-    this._afterEdit(entry.side)
+    this._afterEdit(entry.side, entry.kind === 'row')
     return true
   }
 
@@ -1421,19 +1615,293 @@ export class TableCompare {
     this._cancelCellEdit()
     const entry = this._redoStack.pop()
     if (!entry) return false
-    if (!this._writeParsedCell(entry.side, entry.rowIdx, entry.col, entry.after)) return false
+    if (!this._applyHistory(entry, 'redo')) {
+      this._redoStack.push(entry)
+      this._reportError('無法重做這一步：對應的來源資料列已不存在')
+      return false
+    }
     this._undoStack.push(entry)
     if (this._undoStack.length > MAX_EDIT_HISTORY) this._undoStack.shift()
-    this._afterEdit(entry.side)
+    this._afterEdit(entry.side, entry.kind === 'row')
+    return true
+  }
+
+  /**
+   * 套用一筆歷史紀錄的其中一個方向。
+   *
+   * @param {EditEntry} entry
+   * @param {'undo'|'redo'} direction
+   * @returns {boolean}
+   */
+  _applyHistory(entry, direction) {
+    if (entry.kind === 'row') {
+      if (entry.op === 'insert') {
+        return direction === 'undo'
+          ? this._spliceRow(entry.side, entry.rowIdx, entry.rowRef, 'remove')
+          : this._spliceRow(entry.side, entry.rowIdx, entry.rowRef, 'insert')
+      }
+      return this._writeRowContents(
+        entry.side, entry, direction === 'undo' ? entry.before : entry.after)
+    }
+    const rowIdx = this._historyRowIndex(entry)
+    if (rowIdx == null) return false
+    return this._writeParsedCell(
+      entry.side, rowIdx, entry.col, direction === 'undo' ? entry.before : entry.after)
+  }
+
+  /**
+   * 歷史紀錄指向的列在目前解析結果中的索引。優先用列物件反查，因為插入 /
+   * 刪除會讓當初記下的索引失效。
+   *
+   * @param {{ side: 'left'|'right', rowIdx: number, rowRef?: string[]|null }} entry
+   * @returns {number|null}
+   */
+  _historyRowIndex(entry) {
+    const parsed = entry.side === 'left' ? this._leftParsed : this._rightParsed
+    if (!parsed) return null
+    if (entry.rowRef) {
+      const byRef = this._rowIndexMap[entry.side]?.get(entry.rowRef)
+      if (byRef != null) return byRef
+      // The row object is gone (file reloaded); the index is the only lead left.
+    }
+    return (entry.rowIdx >= 0 && entry.rowIdx < parsed.length) ? entry.rowIdx : null
+  }
+
+  /**
+   * 就地改寫一整列的內容。刻意不換掉陣列物件——列物件的識別是編輯、對齊與
+   * `_rowIndexMap` 三者之間唯一的連結。
+   *
+   * @param {'left'|'right'} side
+   * @param {{ rowIdx: number, rowRef?: string[]|null }} locator
+   * @param {string[]|null} values
+   * @returns {boolean}
+   */
+  _writeRowContents(side, locator, values) {
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    const idx = this._historyRowIndex({ side, rowIdx: locator.rowIdx, rowRef: locator.rowRef })
+    const row = idx == null ? null : parsed?.[idx]
+    if (!row) return false
+    row.length = 0
+    for (const v of values ?? []) row.push(String(v ?? ''))
+    return true
+  }
+
+  /**
+   * 在解析結果中插入或移除一整列。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} rowIdx
+   * @param {string[]} rowRef
+   * @param {'insert'|'remove'} mode
+   * @returns {boolean}
+   */
+  _spliceRow(side, rowIdx, rowRef, mode) {
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    if (!parsed) return false
+    if (mode === 'remove') {
+      const at = this._rowIndexMap[side]?.get(rowRef) ?? rowIdx
+      if (at < 0 || at >= parsed.length || parsed[at] !== rowRef) return false
+      parsed.splice(at, 1)
+      return true
+    }
+    const at = Math.min(Math.max(rowIdx, 0), parsed.length)
+    parsed.splice(at, 0, rowRef)
+    return true
+  }
+
+  // ── P2-44: row-level commands (Copy to Left/Right, Insert Row) ──────────────
+
+  /** @returns {number} 目前顯示的欄數（左右取大） */
+  _displayColCount() {
+    return this._colCount
+      ?? Math.max(this._leftColCount ?? 0, this._rightColCount ?? 0)
+  }
+
+  /**
+   * 顯示欄索引 → 該側檔案中的來源欄索引。忽略欄位排序時右側兩者不同。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} displayCol
+   * @returns {number} -1 代表該側沒有對應欄
+   */
+  _sourceColFor(side, displayCol) {
+    if (side === 'left' || !this._rightColMap) return displayCol
+    return this._rightColMap[displayCol] ?? -1
+  }
+
+  /**
+   * 幻影列（該側沒有資料）要插在解析結果的哪個位置。
+   *
+   * 往上找最近一個在該側真的有資料的可見列，插在它後面；整張表在它之上都沒有
+   * 該側資料時，插在標題列之後。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @returns {number}
+   */
+  _insertionPointFor(side, visibleRowIdx) {
+    for (let i = Math.min(visibleRowIdx, (this._visibleRows?.length ?? 0)) - 1; i >= 0; i--) {
+      const found = this._resolveRow(side, i)
+      if (found) return found.parsedRowIdx + 1
+    }
+    return this._hasHeader ? 1 : 0
+  }
+
+  /**
+   * 目前的作用列：以選取的儲存格為準，沒有選取時退回目前的差異列。
+   * @returns {number|null}
+   */
+  _currentRowIndex() {
+    const sel = this._selectedCell?.visibleRowIdx
+    if (sel != null && this._visibleRows?.[sel]) return sel
+    const fromDiff = this._diffRows?.[this._currentDiffIdx]
+    return fromDiff != null ? fromDiff : null
+  }
+
+  /**
+   * 把一整列複製到對側。目標側已有這一列就整列改寫，是幻影列就插入新的一列。
+   *
+   * 走的是與儲存格編輯同一條路徑（寫回解析後的模型、記入 undo 堆疊、重新比對），
+   * 不直接動 DOM——這個視圖是虛擬捲動的，寫進 DOM 的值捲出畫面就沒了。
+   *
+   * @param {'left'|'right'} fromSide
+   * @param {number} [visibleRowIdx]  預設取目前作用列
+   * @returns {boolean}
+   */
+  copyRowToOtherSide(fromSide, visibleRowIdx) {
+    this._commitCellEdit()
+    const rowIdx = visibleRowIdx ?? this._currentRowIndex()
+    if (rowIdx == null) {
+      this._reportError('請先選取一列，或先跳到一個差異列')
+      return false
+    }
+    const aligned = this._visibleRows?.[rowIdx]
+    if (!aligned) {
+      this._reportError('選取的列已不在目前的篩選結果中')
+      return false
+    }
+
+    const toSide = fromSide === 'left' ? 'right' : 'left'
+    const srcValues = fromSide === 'left' ? aligned.leftRow : aligned.rightRow
+    if (!srcValues) {
+      this._reportError(`${fromSide === 'left' ? '左' : '右'}側這一列沒有資料，無法複製`)
+      return false
+    }
+    const targetParsed = toSide === 'left' ? this._leftParsed : this._rightParsed
+    if (!targetParsed) {
+      this._reportError(`${toSide === 'left' ? '左' : '右'}側尚未載入檔案，無法貼上`)
+      return false
+    }
+
+    /** @type {string[]} */
+    const values = []
+    /** @type {number[]} */
+    const dropped = []
+    const n = Math.max(srcValues.length, this._displayColCount())
+    for (let i = 0; i < n; i++) {
+      const sourceCol = this._sourceColFor(toSide, i)
+      if (sourceCol < 0) {
+        if ((srcValues[i] ?? '') !== '') dropped.push(i)
+        continue
+      }
+      while (values.length <= sourceCol) values.push('')
+      values[sourceCol] = srcValues[i] ?? ''
+    }
+
+    const existing = this._resolveRow(toSide, rowIdx)
+    if (existing) {
+      const before = [...(targetParsed[existing.parsedRowIdx] ?? [])]
+      const locator = { rowIdx: existing.parsedRowIdx, rowRef: existing.rowRef }
+      if (!this._writeRowContents(toSide, locator, values)) {
+        this._reportError('複製失敗：找不到目標側的來源資料列')
+        return false
+      }
+      this._pushHistory({
+        kind: 'row', op: 'replace', side: toSide, rowIdx: existing.parsedRowIdx,
+        before, after: [...values], rowRef: existing.rowRef,
+      })
+      this._afterEdit(toSide)
+    } else {
+      const at = this._insertionPointFor(toSide, rowIdx)
+      const rowRef = [...values]
+      if (!this._spliceRow(toSide, at, rowRef, 'insert')) {
+        this._reportError('複製失敗：目標側無法插入新的列')
+        return false
+      }
+      this._pushHistory({
+        kind: 'row', op: 'insert', side: toSide, rowIdx: at,
+        before: null, after: [...values], rowRef,
+      })
+      this._afterEdit(toSide, true)
+    }
+
+    // Silently dropping data would be the worst outcome of "ignore column
+    // order": the row looks copied and one column's value is simply gone.
+    if (dropped.length) {
+      this._reportError(
+        `第 ${dropped.join('、')} 欄在目標檔案中沒有同名欄位，這些值未被複製`)
+    }
+    return true
+  }
+
+  /** Copy the current row from the left pane to the right. @returns {boolean} */
+  copyRowToRight() { return this.copyRowToOtherSide('left') }
+
+  /** Copy the current row from the right pane to the left. @returns {boolean} */
+  copyRowToLeft() { return this.copyRowToOtherSide('right') }
+
+  /**
+   * 在某一側插入一列空白列，記入 undo 堆疊。
+   *
+   * @param {'left'|'right'} side
+   * @param {number} [visibleRowIdx]  預設取目前作用列
+   * @param {'above'|'below'} [where]
+   * @returns {boolean}
+   */
+  insertRow(side, visibleRowIdx, where = 'below') {
+    this._commitCellEdit()
+    const parsed = side === 'left' ? this._leftParsed : this._rightParsed
+    if (!parsed) {
+      this._reportError(`${side === 'left' ? '左' : '右'}側尚未載入檔案，無法插入列`)
+      return false
+    }
+
+    const rowIdx = visibleRowIdx ?? this._currentRowIndex()
+    let at
+    if (rowIdx == null) {
+      // Nothing selected and nothing to anchor to — append.
+      at = parsed.length
+    } else {
+      const anchor = this._resolveRow(side, rowIdx)
+      at = anchor
+        ? (where === 'above' ? anchor.parsedRowIdx : anchor.parsedRowIdx + 1)
+        : this._insertionPointFor(side, rowIdx)
+    }
+
+    const cols = side === 'left' ? (this._leftColCount ?? 0) : (this._rightColCount ?? 0)
+    const rowRef = new Array(Math.max(1, cols)).fill('')
+    if (!this._spliceRow(side, at, rowRef, 'insert')) {
+      this._reportError('插入列失敗')
+      return false
+    }
+    this._pushHistory({
+      kind: 'row', op: 'insert', side, rowIdx: at,
+      before: null, after: [...rowRef], rowRef,
+    })
+    this._afterEdit(side, true)
     return true
   }
 
   /**
    * 編輯落地後：同步文字內容、標示未儲存、重新比對並重繪（保留捲動位置）。
    * @param {'left'|'right'} side
+   * @param {boolean} [structural]  列數有變動（插入 / 刪除），需重建列索引
    */
-  _afterEdit(side) {
+  _afterEdit(side, structural = false) {
     const parsed = (side === 'left' ? this._leftParsed : this._rightParsed) ?? []
+    // The map is keyed by position, so an insert invalidates every entry below
+    // the insertion point — and with it every pending undo that resolves by index.
+    if (structural) this._rowIndexMap[side] = _buildRowIndexMap(parsed)
     const text = serializeTable(parsed, this._delimiter[side])
     if (side === 'left') this._leftContent = text
     else this._rightContent = text
@@ -1883,6 +2351,52 @@ export class TableCompare {
   /** @returns {boolean} */
   toggleWhitespace() { return this.setWhitespaceVisible(!this._showWhitespace) }
 
+  // ── P2-45: difference magnitude grading ─────────────────────────────────────
+
+  /** @returns {boolean} */
+  isSeverityShaded() { return this._showSeverity }
+
+  /**
+   * 依儲存格差異大小為差異上深淺。色相不變——紅仍然只代表「重要差異」，
+   * 分級只是在這個語意裡再細分，不新增語意。
+   *
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setSeverityShading(on) {
+    this._showSeverity = Boolean(on)
+    this._dom.btnSeverity?.classList.toggle('active', this._showSeverity)
+    // Presentational only: repaint the window, do not re-align.
+    this._windowFirst = null
+    this._windowLast = null
+    this._renderTableWindow()
+    return this._showSeverity
+  }
+
+  /** @returns {boolean} */
+  toggleSeverityShading() { return this.setSeverityShading(!this._showSeverity) }
+
+  // ── P2-46: thumbnail ────────────────────────────────────────────────────────
+
+  /** @returns {boolean} */
+  isThumbnailVisible() { return this._showThumbnail }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setThumbnailVisible(on) {
+    this._showThumbnail = Boolean(on)
+    this._dom.btnThumb?.classList.toggle('active', this._showThumbnail)
+    if (this._dom.thumb) this._dom.thumb.style.display = this._showThumbnail ? '' : 'none'
+    this._dom.body?.classList.toggle('with-thumb', this._showThumbnail)
+    this._renderThumbnail()
+    return this._showThumbnail
+  }
+
+  /** @returns {boolean} */
+  toggleThumbnail() { return this.setThumbnailVisible(!this._showThumbnail) }
+
   /** @returns {boolean} */
   isDetailsVisible() { return this._showDetails }
 
@@ -2151,6 +2665,90 @@ export class TableCompare {
   /** 跳到上一個搜尋命中（環繞） */
   findPrev() { this._stepFind(-1) }
 
+  // ── P2-43: Go To ─────────────────────────────────────────────────────────────
+
+  /** 開啟「跳至」列並聚焦輸入框 */
+  openGoto() {
+    const { gotoBar, gotoInput } = this._dom
+    if (!gotoBar) return
+    gotoBar.style.display = 'flex'
+    if (gotoInput) {
+      gotoInput.focus()
+      gotoInput.select()
+    }
+  }
+
+  /** 關閉「跳至」列 */
+  closeGoto() {
+    const { gotoBar, gotoError } = this._dom
+    if (gotoBar) gotoBar.style.display = 'none'
+    if (gotoError) gotoError.textContent = ''
+  }
+
+  /**
+   * 跳到第 row 列（1-based，以目前篩選後的可見列為準）、第 col 欄（0-based）。
+   *
+   * 列號用可見列而不是檔案列：畫面上的列號欄顯示的就是可見列序號，跳到一個
+   * 使用者在畫面上看不到的號碼只會讓人以為功能壞了。
+   *
+   * @param {number} row  1-based
+   * @param {number|null} [col]  0-based；null 保留目前欄
+   * @returns {boolean}
+   */
+  gotoRowCol(row, col = null) {
+    const rows = this._visibleRows ?? []
+    if (!rows.length) {
+      this._reportError('目前沒有可跳至的列')
+      return false
+    }
+    if (!Number.isInteger(row) || row < 1 || row > rows.length) {
+      this._reportError(`列號必須介於 1 與 ${rows.length} 之間`)
+      return false
+    }
+    const maxCol = Math.max(0, this._displayColCount() - 1)
+    if (col != null && (col < 0 || col > maxCol)) {
+      this._reportError(`欄號必須介於 0 與 ${maxCol} 之間`)
+      return false
+    }
+
+    const side = this._selectedCell?.side ?? 'left'
+    const targetCol = col ?? this._selectedCell?.col ?? 0
+    this._scrollToVisibleRow(row - 1)
+    this.selectCell(side, row - 1, targetCol)
+    this._scrollColumnIntoView(side, row - 1, targetCol)
+    return true
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {number} visibleRowIdx
+   * @param {number} col
+   */
+  _scrollColumnIntoView(side, visibleRowIdx, col) {
+    const first = this._windowFirst
+    if (first == null) return
+    const tbody = this._dom[`${side}Tbody`]
+    const tr = tbody?.children[visibleRowIdx - first]
+    // +1 skips the row-number cell.
+    const td = tr?.children[col + 1]
+    // jsdom has no layout, so scrollIntoView is absent there.
+    if (td && typeof td.scrollIntoView === 'function') {
+      td.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    }
+  }
+
+  /** 讀取輸入框並執行跳轉；格式不合法時把原因寫在列上。 */
+  _submitGoto() {
+    const { gotoInput, gotoError } = this._dom
+    const parsed = parseGotoInput(gotoInput?.value)
+    if (!parsed) {
+      if (gotoError) gotoError.textContent = '格式：列號 或 列號,欄號'
+      return
+    }
+    if (gotoError) gotoError.textContent = ''
+    if (this.gotoRowCol(parsed.row, parsed.col)) this.closeGoto()
+  }
+
   // ── S16-T2: Row-level difference navigation ──────────────────────────────────
 
   /** @returns {number} 目前選取的差異列索引；-1 表示尚未選取 */
@@ -2250,6 +2848,7 @@ export class TableCompare {
     this._windowFirst = null
     this._windowLast = null
     this._renderTableWindow()
+    this._renderThumbnail()
   }
 
   /**
@@ -2464,6 +3063,8 @@ export class TableCompare {
       showWhitespace: this._showWhitespace,
       showDetails: this._showDetails,
       showFileInfo: this._showFileInfo,
+      showSeverity: this._showSeverity,
+      showThumbnail: this._showThumbnail,
     })
   }
 
@@ -2494,6 +3095,8 @@ export class TableCompare {
     if (typeof settings.showWhitespace === 'boolean') this._showWhitespace = settings.showWhitespace
     if (typeof settings.showDetails === 'boolean') this._showDetails = settings.showDetails
     if (typeof settings.showFileInfo === 'boolean') this._showFileInfo = settings.showFileInfo
+    if (typeof settings.showSeverity === 'boolean') this.setSeverityShading(settings.showSeverity)
+    if (typeof settings.showThumbnail === 'boolean') this.setThumbnailVisible(settings.showThumbnail)
     this._applyPanelVisibility()
     this._applyLayout()
     this._syncConfigControls()
@@ -2596,6 +3199,7 @@ export class TableCompare {
     root.appendChild(this._buildPathRow())
     root.appendChild(this._buildToolbar())
     root.appendChild(this._buildFindBar())
+    root.appendChild(this._buildGotoBar())
 
     const body = el('div', { className: 'tc-body' })
     this._dom.body = body
@@ -2618,6 +3222,7 @@ export class TableCompare {
 
     body.appendChild(leftPane)
     body.appendChild(rightPane)
+    body.appendChild(this._buildThumbnail())
     root.appendChild(body)
 
     // P2-41: Text Details / File Info drawer. A sibling of .tc-body, never
@@ -2646,6 +3251,94 @@ export class TableCompare {
     this._applyLayout()
     this._renderEmptyState()
     this._applyPanelVisibility()
+    this.setThumbnailVisible(this._showThumbnail)
+    this._dom.btnSeverity?.classList.toggle('active', this._showSeverity)
+  }
+
+  /**
+   * 整表差異縮圖：一條與窗格等高的色帶，加上目前視窗的位置指示。
+   * @returns {HTMLElement}
+   */
+  _buildThumbnail() {
+    const thumb = el('div', { className: 'tc-thumb', title: '整表差異縮圖（點擊跳至該處）' })
+    const strip = el('div', { className: 'tc-thumb-strip' })
+    const viewport = el('div', { className: 'tc-thumb-viewport' })
+    strip.appendChild(viewport)
+    thumb.appendChild(strip)
+    thumb.style.display = 'none'
+    this._dom.thumb = thumb
+    this._dom.thumbStrip = strip
+    this._dom.thumbViewport = viewport
+    return thumb
+  }
+
+  /**
+   * 重畫縮圖。
+   *
+   * 每列一個節點在十萬列的表上就是十萬個節點——縮圖本身會變成比表格更貴的東西。
+   * 因此先把列壓成至多 THUMB_MAX_MARKS 個區段再畫。
+   */
+  _renderThumbnail() {
+    const strip = this._dom.thumbStrip
+    const viewport = this._dom.thumbViewport
+    if (!strip || !viewport) return
+    if (!this._showThumbnail) {
+      this._thumbBuckets = []
+      return
+    }
+
+    const rows = this._visibleRows ?? []
+    // jsdom reports 0 for every measurement; fall back so the buckets (and the
+    // tests that read them) are still meaningful without layout.
+    const height = strip.clientHeight || THUMB_FALLBACK_HEIGHT
+    const buckets = thumbnailBuckets(rows, Math.min(THUMB_MAX_MARKS, Math.max(1, height)))
+    this._thumbBuckets = buckets
+
+    const frag = document.createDocumentFragment()
+    for (let i = 0; i < buckets.length; i++) {
+      const bucket = buckets[i]
+      // A "same" band is the background; drawing it would double the node count
+      // for no visible difference.
+      if (bucket.status === 'same') continue
+      const mark = el('div', { className: `tc-thumb-mark ${bucket.status}` })
+      mark.style.top = `${(i / buckets.length) * 100}%`
+      mark.style.height = `${Math.max(100 / buckets.length, 0.4)}%`
+      frag.appendChild(mark)
+    }
+    strip.replaceChildren(viewport, frag)
+    this._updateThumbViewport()
+  }
+
+  /** 讓縮圖上的視窗指示對應目前的捲動位置。 */
+  _updateThumbViewport() {
+    const viewport = this._dom.thumbViewport
+    const scroll = this._dom.leftScroll
+    if (!viewport || !scroll || !this._showThumbnail) return
+    const total = (this._visibleRows?.length ?? 0) * TABLE_ROW_HEIGHT
+    if (total <= 0) {
+      viewport.style.top = '0%'
+      viewport.style.height = '100%'
+      return
+    }
+    const top = Math.min(100, Math.max(0, (scroll.scrollTop / total) * 100))
+    const height = Math.min(100 - top, Math.max(2, ((scroll.clientHeight || 0) / total) * 100))
+    viewport.style.top = `${top}%`
+    viewport.style.height = `${height}%`
+  }
+
+  /**
+   * 縮圖上的相對位置 → 捲到對應的列。
+   * @param {number} fraction  0..1
+   * @returns {number} 跳到的可見列索引；沒有列時 -1
+   */
+  scrollToThumbFraction(fraction) {
+    const rows = this._visibleRows ?? []
+    if (!rows.length) return -1
+    const f = Math.min(1, Math.max(0, Number(fraction) || 0))
+    const target = Math.min(rows.length - 1, Math.floor(f * rows.length))
+    this._scrollToVisibleRow(target)
+    this._updateThumbViewport()
+    return target
   }
 
   /** @returns {HTMLElement} */
@@ -2787,6 +3480,38 @@ export class TableCompare {
     toolbar.appendChild(btnUndo)
     toolbar.appendChild(btnRedo)
 
+    // P2-44: row-level edit commands
+    const btnCopyRight = el('button',
+      { id: 'tc-btn-copy-right', className: 'tc-btn', title: '把目前的列複製到右側（Alt+→）' }, '⇥ 複製到右')
+    const btnCopyLeft = el('button',
+      { id: 'tc-btn-copy-left', className: 'tc-btn', title: '把目前的列複製到左側（Alt+←）' }, '⇤ 複製到左')
+    const btnInsertRow = el('button',
+      { id: 'tc-btn-insert-row', className: 'tc-btn', title: '在目前的列下方插入空白列（Ctrl+I）' }, '➕ 插入列')
+    this._dom.btnCopyRight = btnCopyRight
+    this._dom.btnCopyLeft = btnCopyLeft
+    this._dom.btnInsertRow = btnInsertRow
+    toolbar.appendChild(btnCopyRight)
+    toolbar.appendChild(btnCopyLeft)
+    toolbar.appendChild(btnInsertRow)
+
+    // P2-43 / P2-45 / P2-46
+    toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
+
+    const btnGoto = el('button',
+      { id: 'tc-btn-goto', className: 'tc-btn', title: '跳至指定的列 / 欄（Ctrl+G）' }, '⤓ 跳至')
+    const btnSeverity = el('button',
+      { id: 'tc-btn-severity', className: 'tc-btn', title: '依差異大小為儲存格深淺分級' }, '🌡 差異程度')
+    const btnThumb = el('button',
+      { id: 'tc-btn-thumb', className: 'tc-btn', title: '顯示 / 隱藏整表差異縮圖' }, '🗺 縮圖')
+    this._dom.btnGoto = btnGoto
+    this._dom.btnSeverity = btnSeverity
+    this._dom.btnThumb = btnThumb
+    toolbar.appendChild(btnGoto)
+    toolbar.appendChild(btnSeverity)
+    toolbar.appendChild(btnThumb)
+
+    toolbar.appendChild(el('span', { className: 'tc-toolbar-sep' }))
+
     const btnSaveLeft = el('button',
       { id: 'tc-btn-save-left', className: 'tc-btn', title: '儲存左側（Ctrl+S）' }, '💾 左')
     const btnSaveRight = el('button',
@@ -2858,6 +3583,42 @@ export class TableCompare {
     bar.appendChild(btnClose)
 
     this._dom.findBar = bar
+    return bar
+  }
+
+  /**
+   * P2-43: 「跳至」列（預設隱藏，Ctrl+G 開啟）
+   * @returns {HTMLElement}
+   */
+  _buildGotoBar() {
+    const bar = el('div', { className: 'tc-find-bar tc-goto-bar' })
+    bar.style.display = 'none'
+
+    bar.appendChild(el('span', { className: 'tc-goto-label' }, '跳至列 / 欄：'))
+
+    const input = el('input', {
+      type: 'text',
+      id: 'tc-goto-input',
+      className: 'tc-find-input tc-goto-input',
+      placeholder: '例：120 或 120,3',
+    })
+    input.title = '輸入列號，或「列號,欄號」；列號以目前篩選後的顯示列為準'
+    this._dom.gotoInput = input
+    bar.appendChild(input)
+
+    const btnGo = el('button', { id: 'tc-goto-go', className: 'tc-find-btn' }, '前往')
+    this._dom.btnGotoGo = btnGo
+    bar.appendChild(btnGo)
+
+    const err = el('span', { id: 'tc-goto-error', className: 'tc-goto-error' }, '')
+    this._dom.gotoError = err
+    bar.appendChild(err)
+
+    const btnClose = el('button', { id: 'tc-goto-close', className: 'tc-find-btn' }, '✕')
+    this._dom.btnGotoClose = btnClose
+    bar.appendChild(btnClose)
+
+    this._dom.gotoBar = bar
     return bar
   }
 
@@ -3118,7 +3879,10 @@ export class TableCompare {
 
     // Sync scroll between left and right panes, and repaint the virtual window.
     const { leftScroll, rightScroll } = this._dom
-    const repaint = _rafThrottle(() => this._renderTableWindow())
+    const repaint = _rafThrottle(() => {
+      this._renderTableWindow()
+      this._updateThumbViewport()
+    })
     let syncingScroll = false
     leftScroll.addEventListener('scroll', () => {
       if (syncingScroll) return
@@ -3155,6 +3919,29 @@ export class TableCompare {
     this._dom.btnRedo.addEventListener('click', () => this.redo())
     this._dom.btnSaveLeft.addEventListener('click', () => void this.saveLeft())
     this._dom.btnSaveRight.addEventListener('click', () => void this.saveRight())
+
+    // P2-43 / P2-44 / P2-45 / P2-46
+    this._dom.btnCopyRight.addEventListener('click', () => this.copyRowToRight())
+    this._dom.btnCopyLeft.addEventListener('click', () => this.copyRowToLeft())
+    this._dom.btnInsertRow.addEventListener('click', () => {
+      this.insertRow(this._selectedCell?.side ?? 'left')
+    })
+    this._dom.btnGoto.addEventListener('click', () => this.openGoto())
+    this._dom.btnSeverity.addEventListener('click', () => this.toggleSeverityShading())
+    this._dom.btnThumb.addEventListener('click', () => this.toggleThumbnail())
+
+    this._dom.btnGotoGo.addEventListener('click', () => this._submitGoto())
+    this._dom.btnGotoClose.addEventListener('click', () => this.closeGoto())
+    this._dom.gotoInput.addEventListener('keydown', (/** @type {KeyboardEvent} */ e) => {
+      if (e.key === 'Enter') { e.preventDefault(); this._submitGoto() }
+      else if (e.key === 'Escape') { e.preventDefault(); this.closeGoto() }
+    })
+
+    this._dom.thumbStrip.addEventListener('click', (/** @type {MouseEvent} */ e) => {
+      const rect = this._dom.thumbStrip.getBoundingClientRect()
+      if (!rect.height) return
+      this.scrollToThumbFraction((e.clientY - rect.top) / rect.height)
+    })
 
     // P2-33: sheet / table pickers
     this._dom.selLeft.addEventListener('change', () => {
@@ -3353,6 +4140,18 @@ export class TableCompare {
           void (e.shiftKey ? this.saveRight() : this.saveLeft())
           return
         }
+        if (key === 'g') { e.preventDefault(); this.openGoto(); return }
+        if (key === 'i') {
+          e.preventDefault()
+          this.insertRow(this._selectedCell?.side ?? 'left')
+          return
+        }
+      }
+
+      // Alt+←/→ mirrors text compare's Copy Block Left / Right.
+      if (e.altKey && !e.ctrlKey && !e.metaKey && !inInput) {
+        if (e.key === 'ArrowRight') { e.preventDefault(); this.copyRowToRight(); return }
+        if (e.key === 'ArrowLeft')  { e.preventDefault(); this.copyRowToLeft(); return }
       }
 
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
@@ -3416,6 +4215,28 @@ export class TableCompare {
         navigator.clipboard.writeText(csv)
       }
     })
+
+    // P2-43 / P2-44: row-level commands act on the row under the cursor, which
+    // is more precise than the toolbar's "current row".
+    const tbodyForRow = this._dom[`${side}Tbody`]
+    const offset = tbodyForRow ? [...tbodyForRow.children].indexOf(tr) : -1
+    if (offset >= 0) {
+      const visibleRowIdx = (this._windowFirst ?? 0) + offset
+      items.push({ separator: true })
+      items.push({
+        label: side === 'left' ? '複製整列到右側' : '複製整列到左側',
+        action: () => this.copyRowToOtherSide(side, visibleRowIdx),
+      })
+      items.push({
+        label: `在此列上方插入空白列（${side === 'left' ? '左' : '右'}側）`,
+        action: () => this.insertRow(side, visibleRowIdx, 'above'),
+      })
+      items.push({
+        label: `在此列下方插入空白列（${side === 'left' ? '左' : '右'}側）`,
+        action: () => this.insertRow(side, visibleRowIdx, 'below'),
+      })
+      items.push({ label: '跳至列 / 欄…', action: () => this.openGoto() })
+    }
 
     const rowNum = tr.querySelector('.tc-row-num')?.textContent?.trim() ?? ''
     if (rowNum) {
@@ -3738,6 +4559,7 @@ export class TableCompare {
       this._recomputeFind()
       this._updateDetailsPanel()
       this._updateFileInfoPanel()
+      this._renderThumbnail()
       return
     }
 
@@ -3773,6 +4595,7 @@ export class TableCompare {
     this._recomputeFind()
     this._updateDetailsPanel()
     this._updateFileInfoPanel()
+    this._renderThumbnail()
   }
 
   /**
@@ -3810,16 +4633,35 @@ export class TableCompare {
       const cellDiffs = (status === 'different')
         ? this._cellDiffsFor(alignedRow)
         : null
+      const cellLevels = (cellDiffs && this._showSeverity)
+        ? this._cellLevelsFor(alignedRow, cellDiffs)
+        : null
       leftFrag.appendChild(
-        this._buildTableRow(leftRow, status, i + 1, this._leftColCount, cellDiffs, 'left'))
+        this._buildTableRow(leftRow, status, i + 1, this._leftColCount, cellDiffs, 'left', cellLevels))
       rightFrag.appendChild(
-        this._buildTableRow(rightRow, status, i + 1, this._rightColCount, cellDiffs, 'right'))
+        this._buildTableRow(rightRow, status, i + 1, this._rightColCount, cellDiffs, 'right', cellLevels))
     }
 
     leftTbody.replaceChildren(leftFrag)
     rightTbody.replaceChildren(rightFrag)
     this._applyFindHighlights()
     this._applySelectionHighlight()
+  }
+
+  /**
+   * 一列的逐欄差異等級，記在列物件上避免左右兩窗格各算一次。
+   *
+   * 快取隨 `_compare()` 重建對齊列而失效，和 `_cellDiffs` 同一個生命週期。
+   *
+   * @param {object} alignedRow
+   * @param {boolean[]} cellDiffs
+   * @returns {number[]}
+   */
+  _cellLevelsFor(alignedRow, cellDiffs) {
+    if (!alignedRow._cellLevels || alignedRow._cellLevels.length !== cellDiffs.length) {
+      alignedRow._cellLevels = computeCellLevels(alignedRow.leftRow, alignedRow.rightRow, cellDiffs)
+    }
+    return alignedRow._cellLevels
   }
 
   /**
@@ -3919,9 +4761,10 @@ export class TableCompare {
    * @param {number} colCount
    * @param {boolean[]|null} cellDiffs  各欄是否有差異（only used when status=different）
    * @param {'left'|'right'} side
+   * @param {number[]|null} [cellLevels]  各欄差異等級 1–3；null 代表不分級
    * @returns {HTMLTableRowElement}
    */
-  _buildTableRow(rowData, status, rowNum, colCount, cellDiffs, side) {
+  _buildTableRow(rowData, status, rowNum, colCount, cellDiffs, side, cellLevels = null) {
     // Phantom row (孤兒側的填充列)
     if (
       (side === 'left'  && status === 'right-only') ||
@@ -3944,6 +4787,11 @@ export class TableCompare {
 
     const tr = document.createElement('tr')
     tr.className = `tc-row ${status}`
+    if (cellLevels) {
+      let worst = 0
+      for (const lvl of cellLevels) if (lvl > worst) worst = lvl
+      if (worst > 0) tr.classList.add(`tc-row--sev${worst}`)
+    }
 
     // Row number
     const numTd = document.createElement('td')
@@ -3955,8 +4803,10 @@ export class TableCompare {
     for (let i = 0; i < displayCount; i++) {
       const td = document.createElement('td')
       const isDiff = cellDiffs ? (cellDiffs[i] ?? false) : false
+      const level = (isDiff && cellLevels) ? (cellLevels[i] ?? 0) : 0
       td.className = 'tc-cell'
         + (isDiff ? ' cell-diff' : '')
+        + (level > 0 ? ` tc-cell--sev${level}` : '')
         + (this.isColumnHidden(i) ? ' tc-col-hidden' : '')
       const val = rowData?.[i] ?? ''
       // S14-M11: textContent avoids HTML parsing per-cell — ~30% faster on
@@ -4071,4 +4921,5 @@ export {
   normaliseKeyColumns, buildRowKey, measureColumnWidths, DEFAULT_COLUMN_RULE,
   serializeTable, parseHtmlTables, csvPathFor,
   visibleWhitespace, mergeIgnoredColumns, toColumnList, describeDelimiter,
+  cellDiffRatio, severityLevel, computeCellLevels, thumbnailBuckets, parseGotoInput,
 }

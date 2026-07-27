@@ -87,3 +87,95 @@ test('大表格只渲染可視範圍的列（虛擬捲動）', async () => {
   // Two panes, a viewport's worth each plus overscan — nowhere near 20000.
   expect(renderedRows).toBeLessThan(500)
 })
+
+// ── P2-43..46: Go To / Copy row / Insert row / severity shading / thumbnail ──
+//
+// These exist as e2e because this project's recurring failure is a complete
+// implementation with no caller. Driving the real toolbar in the production
+// build is the only check that the entry points are actually connected.
+
+/**
+ * @param {import('@playwright/test').Page} page
+ */
+async function loadSmallTables(page) {
+  await goToTableCompare(page)
+  await page.evaluate(([l, r]) => {
+    window.__testAPI?.tableSetLeft('left.csv', l)
+    window.__testAPI?.tableSetRight('right.csv', r)
+  }, [LEFT_CSV, RIGHT_CSV])
+  await page.waitForFunction(
+    () => (window.__testAPI?.tableGetRowCount() ?? 0) > 0,
+    { timeout: 10000 }
+  )
+}
+
+test('新指令都有工具列入口', async () => {
+  await loadSmallTables(win)
+  for (const id of ['#tc-btn-goto', '#tc-btn-copy-right', '#tc-btn-copy-left',
+                    '#tc-btn-insert-row', '#tc-btn-severity', '#tc-btn-thumb']) {
+    await expect(win.locator(id)).toBeAttached()
+  }
+})
+
+test('Go To 開啟後輸入列,欄會選取該儲存格', async () => {
+  await loadSmallTables(win)
+  await win.locator('#tc-btn-goto').click()
+  await expect(win.locator('.tc-goto-bar')).toBeVisible()
+
+  await win.locator('#tc-goto-input').fill('2,1')
+  await win.locator('#tc-goto-input').press('Enter')
+
+  await expect(win.locator('.tc-goto-bar')).toBeHidden()
+  await expect(win.locator('.tc-cell--selected').first()).toBeAttached({ timeout: 5000 })
+})
+
+test('差異程度色階開關會為差異儲存格加上等級', async () => {
+  await loadSmallTables(win)
+  await expect(win.locator('[class*="tc-cell--sev"]')).toHaveCount(0)
+  await win.locator('#tc-btn-severity').click()
+  await expect(win.locator('[class*="tc-cell--sev"]').first()).toBeAttached({ timeout: 5000 })
+  await win.locator('#tc-btn-severity').click()
+  await expect(win.locator('[class*="tc-cell--sev"]')).toHaveCount(0)
+})
+
+test('縮圖開關會畫出差異色帶', async () => {
+  await loadSmallTables(win)
+  await win.locator('#tc-btn-thumb').click()
+  await expect(win.locator('.tc-thumb')).toBeVisible()
+  await expect(win.locator('.tc-thumb-mark').first()).toBeAttached({ timeout: 5000 })
+  await win.locator('#tc-btn-thumb').click()
+  await expect(win.locator('.tc-thumb')).toBeHidden()
+})
+
+test('複製整列到右側會讓那一列不再是差異', async () => {
+  await loadSmallTables(win)
+  const before = await win.evaluate(() => window.__testAPI?.tableGetDiffCellCount())
+  expect(before).toBeGreaterThan(0)
+
+  // Select a cell on the differing row so the command has a target.
+  await win.locator('.tc-table-scroll').first().locator('tr.tc-row.different td.tc-cell')
+    .first().click()
+  await win.locator('#tc-btn-copy-right').click()
+
+  await expect.poll(
+    () => win.evaluate(() => window.__testAPI?.tableGetDiffCellCount()),
+    { timeout: 5000 }
+  ).toBeLessThan(before)
+
+  // Re-injecting clears the unsaved-changes flag; leaving it set makes the
+  // beforeunload guard block the window close and hang the run's teardown.
+  await loadSmallTables(win)
+})
+
+test('插入列會讓左側多一列', async () => {
+  await loadSmallTables(win)
+  const before = await win.evaluate(() => window.__testAPI?.tableGetRowCount())
+  await win.locator('.tc-table-scroll').first().locator('tr.tc-row td.tc-cell').first().click()
+  await win.locator('#tc-btn-insert-row').click()
+  await expect.poll(
+    () => win.evaluate(() => window.__testAPI?.tableGetRowCount()),
+    { timeout: 5000 }
+  ).toBeGreaterThan(before)
+
+  await loadSmallTables(win)
+})
