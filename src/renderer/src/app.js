@@ -910,10 +910,7 @@ function setupToolbarButtons() {
   })
 
   // T62: Print / PDF export
-  el('btn-print-report')?.addEventListener('click', () => {
-    if (currentView === 'text') textCompare?.exportHtml({ print: true })
-    else if (currentView === 'folder') folderCompare?.exportHtml({ print: true })
-  })
+  el('btn-print-report')?.addEventListener('click', () => void printActiveReport())
 
   // T61: Session Settings Dialog (Named Configs)
   el('btn-config-modal')?.addEventListener('click', openConfigModal)
@@ -1025,6 +1022,23 @@ function _setReportStatus(msg, isError = false) {
  * @param {'save-html'|'save-text'|'copy-html'|'copy-text'} action
  * @returns {Promise<void>}
  */
+/**
+ * Print the active view's report.
+ *
+ * Routed through the same resolver the report dialog uses. The previous
+ * hardcoded text/folder branch meant a view that gained a report still could
+ * not print it, and said nothing when the menu item did nothing.
+ */
+async function printActiveReport() {
+  const src = _activeReportSource()
+  if (!src.htmlFallback) { showStatus('目前視圖不支援列印報告'); return }
+  try {
+    await src.view.exportHtml({ print: true })
+  } catch (err) {
+    showError(`列印報告失敗：${err?.message ?? err}`, err)
+  }
+}
+
 async function runReportAction(action) {
   const src = _activeReportSource()
   if (!_hasAnyReport(src)) { _setReportStatus('目前視圖不支援報告', true); return }
@@ -2305,10 +2319,7 @@ function setupMenuActions() {
       if (currentView === 'text') void textCompare?.exportUnifiedDiff()
       else showStatus('Unified Diff 僅適用於文字比對')
     },
-    'file.print': () => {
-      if (currentView === 'text') void textCompare?.exportHtml({ print: true })
-      else if (currentView === 'folder') void folderCompare?.exportHtml({ print: true })
-    },
+    'file.print': () => void printActiveReport(),
 
     'edit.undo': () => { if (currentView === 'text') textCompare?.undo() },
     'edit.redo': () => { if (currentView === 'text') textCompare?.redo() },
@@ -2383,7 +2394,13 @@ function setupMenuActions() {
     'view.toggleLineNumbers': () => { if (currentView === 'text') textCompare?.toggleLineNumbers() },
     'view.toggleWhitespace':  () => { if (currentView === 'text') textCompare?.toggleWhitespace() },
     'view.toggleWordWrap':    () => { if (currentView === 'text') textCompare?.toggleWordWrap() },
-    'view.toggleLayout':      () => { if (currentView === 'text') textCompare?.toggleLayout() },
+    'view.toggleLayout': () => {
+      // Every view that has the two layouts implements the same method name,
+      // so the menu item works wherever it applies instead of only in text.
+      const view = { text: textCompare, table: tableCompare }[currentView]
+      if (view) view.toggleLayout()
+      else showStatus('目前視圖沒有並排／上下佈局')
+    },
     'view.zoomIn':    () => zoom(1),
     'view.zoomOut':   () => zoom(-1),
     'view.zoomReset': () => {

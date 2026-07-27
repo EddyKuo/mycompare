@@ -1379,7 +1379,7 @@ export class TextCompare {
     ];
     const result = await window.electronAPI.saveFile(
       this._leftPath || 'left.txt', this._leftContent, filters,
-      this._encodingLeft, _settings.getPref('backupOnSave'));
+      this._encodingLeft, _settings.getBackupOptions());
     // Cancelling the save dialog returns falsy. Clearing the flag regardless
     // told the user their edits were saved and let the tab close without a
     // prompt, silently losing them.
@@ -1401,7 +1401,7 @@ export class TextCompare {
     ];
     const result = await window.electronAPI.saveFile(
       this._rightPath || 'right.txt', this._rightContent, filters,
-      this._encodingRight, _settings.getPref('backupOnSave'));
+      this._encodingRight, _settings.getBackupOptions());
     // Cancelling the save dialog returns falsy. Clearing the flag regardless
     // told the user their edits were saved and let the tab close without a
     // prompt, silently losing them.
