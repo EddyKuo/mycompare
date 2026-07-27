@@ -1154,3 +1154,117 @@
 .fc-modal-cancel:hover {
   background: var(--bg-toolbar);
 }
+
+/* ── P2-23: Version column ────────────────────────────────────────────────── */
+
+.fc-version {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  padding-right: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Reads as "being fetched" rather than as an empty value the user can trust. */
+.fc-version--pending {
+  opacity: 0.45;
+  font-style: italic;
+}
+
+/* ── P2-37: settings scope dialog ─────────────────────────────────────────── */
+
+.fc-btn-settings {
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 3px;
+  cursor: pointer;
+  height: 24px;
+  white-space: nowrap;
+}
+
+.fc-btn-settings:hover {
+  background: var(--bg-toolbar);
+  border-color: var(--accent);
+}
+
+.fc-modal-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.fc-modal-field select {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  height: 24px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.fc-settings-scopes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.fc-settings-scopes input[type="radio"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.fc-settings-clear {
+  font-size: 12px;
+  padding: 4px 14px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  border-radius: 3px;
+  cursor: pointer;
+  margin-right: auto;
+}
+
+.fc-settings-clear:hover {
+  background: var(--bg-toolbar);
+}
+
+/* ── P2-26: attributes dialog ─────────────────────────────────────────────── */
+
+.fc-attrs-side {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.fc-attrs-path {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+/* Hidden has no IPC behind it, so it is styled as information, not a control. */
+.fc-attrs-hidden {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.fc-attrs-side input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+}

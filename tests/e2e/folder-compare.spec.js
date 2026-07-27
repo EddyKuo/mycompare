@@ -210,3 +210,51 @@ test('T51: fc-compare-mode 有多個選項（名稱/大小/時間）', async () 
   const count = await options.count()
   expect(count).toBeGreaterThanOrEqual(3)
 })
+
+// ---------------------------------------------------------------------------
+// S21: Move / Exchange, Version column, Compare Attributes, settings scope
+//
+// These check that the new features are *reachable from the UI*. Unit tests
+// verify the modules; only a run through the real app answers whether anything
+// calls them (the Sprint 16 lesson).
+// ---------------------------------------------------------------------------
+
+test('S21: 批次操作選單含「移動」與「互換」', async () => {
+  await goToFolderCompare(win)
+  const menu = win.locator('.fc-batch-menu')
+  await expect(menu.locator('[data-action="move-to-right"]')).toBeAttached()
+  await expect(menu.locator('[data-action="move-to-left"]')).toBeAttached()
+  await expect(menu.locator('[data-action="exchange"]')).toBeAttached()
+})
+
+test('S21: 規則面板有「比對屬性」核取方塊', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-rules').click()
+  const panel = win.locator('.fc-rules-panel')
+  await expect(panel).toBeVisible({ timeout: 2000 })
+  await expect(panel.locator('.fc-compare-attrs')).toBeAttached()
+  await win.locator('.fc-btn-rules').click()
+})
+
+test('S21: ⚙ 設定開啟對話框並提供兩種套用範圍', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-settings').click()
+  const dialog = win.locator('.fc-settings-backdrop')
+  await expect(dialog).toBeVisible({ timeout: 2000 })
+  await expect(dialog.locator('input[value="view"]')).toBeAttached()
+  await expect(dialog.locator('input[value="default"]')).toBeAttached()
+  await dialog.locator('.fc-modal-cancel').click()
+  await expect(dialog).toBeHidden()
+})
+
+test('S21: 欄位選單可切換「版本」欄', async () => {
+  await goToFolderCompare(win)
+  await win.locator('.fc-btn-columns').click()
+  const item = win.locator('.ctx-item', { hasText: '版本' }).first()
+  await expect(item).toBeVisible({ timeout: 2000 })
+  await item.click()
+  await expect(win.locator('.fc-header')).toContainText('版本', { timeout: 2000 })
+  // Restore, so later tests see the default column set.
+  await win.locator('.fc-btn-columns').click()
+  await win.locator('.ctx-item', { hasText: '版本' }).first().click()
+})

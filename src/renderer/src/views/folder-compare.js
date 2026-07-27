@@ -9,7 +9,7 @@ import { isActive } from '../core/active-view.js'
 import { parseMasks, matchesMasks } from '../core/file-mask.js'
 import { diffLines } from '../core/diff-engine.js'
 import { getViewTypeForPath } from '../core/file-type.js'
-import { tagConfig, readConfig } from '../core/named-config-store.js'
+import { tagConfig, readConfig, NamedConfigStore } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import '../styles/folder-compare.css'
 
@@ -528,6 +528,7 @@ export const FOLDER_COLUMN_DEFS = [
   { id: 'ext',     label: '副檔名',   width: '72px' },
   { id: 'relpath', label: '相對路徑', width: '160px' },
   { id: 'attrs',   label: '屬性',     width: '56px' },
+  { id: 'version', label: '版本',     width: '120px' },
 ]
 
 /** @type {string[]} */
@@ -625,6 +626,7 @@ export function extensionOf(name) {
  * @property {string} [ctime]
  * @property {boolean} [readOnly]
  * @property {boolean|null} [hidden]    null ⇒ the platform cannot tell
+ * @property {string} [version]         filled in lazily by the version column
  * @property {number} [depth]           archive entries only
  * @property {string} [parentPath]      archive entries only
  * @property {boolean} [isArchiveEntry]
@@ -661,6 +663,416 @@ export function entryAttrTitle(entry) {
   else if (entry.hidden === false) parts.push('非隱藏')
   else parts.push('?＝隱藏屬性未知（此平台無法判讀）')
   return parts.join('、')
+}
+
+/**
+ * Whether the two sides' attributes disagree, for BC's Compare Attributes.
+ *
+ * `hidden` is only evidence when both sides actually read it: the main process
+ * reports `null` where the platform cannot tell, and treating "unknown" as a
+ * difference would paint every Windows file red.
+ *
+ * @param {FileEntry|null|undefined} left
+ * @param {FileEntry|null|undefined} right
+ * @returns {boolean}
+ */
+export function attributesDiffer(left, right) {
+  if (!left || !right) return false
+  if (!!left.readOnly !== !!right.readOnly) return true
+  if (typeof left.hidden === 'boolean' && typeof right.hidden === 'boolean'
+      && left.hidden !== right.hidden) return true
+  return false
+}
+
+// ── Move / Exchange ─────────────────────────────────────────────────────────
+//
+// Both operations touch two files at once, so a failure has a *middle*: the
+// destination can exist while the source is already gone, or the source can be
+// parked under a temporary name with nothing yet written back. Every function
+// below reports which of those states it ended in, and the view prints that
+// state verbatim. Silence here means the user loses a file without being told.
+
+/**
+ * The subset of `window.electronAPI` these operations need, named so tests can
+ * substitute a stub that fails at a chosen step.
+ *
+ * @typedef {object} FileOpsApi
+ * @property {(src: string, dest: string) => Promise<unknown>} copyFile
+ * @property {(path: string, options?: { permanent?: boolean }) => Promise<unknown>} deleteFile
+ * @property {(oldPath: string, newPath: string) => Promise<unknown>} renameFile
+ */
+
+/**
+ * @typedef {'moved'|'source-remains'|'failed'} MoveState
+ *   moved          — destination written, source gone
+ *   source-remains — destination written, source could NOT be removed
+ *   failed         — source untouched
+ *
+ * @typedef {object} MoveResult
+ * @property {string} src
+ * @property {string} dest
+ * @property {MoveState} state
+ * @property {string} [message]
+ */
+
+/**
+ * Move one file to the other side.
+ *
+ * `rename` is tried first because it is atomic: it either moves the file or
+ * leaves everything alone, with no window in which both copies exist. It fails
+ * across volumes (EXDEV) and, on Windows, when the destination already exists,
+ * which is ordinary rather than exceptional — hence the copy+delete fallback,
+ * whose failure modes are the ones that need reporting.
+ *
+ * @param {{ src: string, dest: string }} job
+ * @param {FileOpsApi} api
+ * @returns {Promise<MoveResult>}
+ */
+export async function runMoveOne(job, api) {
+  const { src, dest } = job
+  try {
+    await api.renameFile(src, dest)
+    return { src, dest, state: 'moved' }
+  } catch (renameErr) {
+    try {
+      await api.copyFile(src, dest)
+    } catch (copyErr) {
+      return {
+        src, dest, state: 'failed',
+        message: `複製到目的地失敗：${errText(copyErr)}（改名先前也失敗：${errText(renameErr)}）。`
+          + `來源仍在原處；目的地可能留下不完整的檔案，請自行確認「${dest}」。`,
+      }
+    }
+    try {
+      await api.deleteFile(src)
+    } catch (delErr) {
+      return {
+        src, dest, state: 'source-remains',
+        message: `已寫入目的地，但刪除來源失敗：${errText(delErr)}。`
+          + `檔案目前兩側都存在，來源「${src}」需要手動處理。`,
+      }
+    }
+    return { src, dest, state: 'moved' }
+  }
+}
+
+/**
+ * @param {Array<{ src: string, dest: string }>} jobs
+ * @param {FileOpsApi} api
+ * @returns {Promise<MoveResult[]>}
+ */
+export async function runMove(jobs, api) {
+  /** @type {MoveResult[]} */
+  const results = []
+  // Sequential rather than concurrent: a half-finished batch is far easier to
+  // explain when the failures are in the order the user listed them.
+  for (const job of jobs ?? []) results.push(await runMoveOne(job, api))
+  return results
+}
+
+/**
+ * @param {MoveResult[]} results
+ * @returns {string}
+ */
+export function formatMoveSummary(results) {
+  const list = results ?? []
+  const moved = list.filter((r) => r.state === 'moved').length
+  const partial = list.filter((r) => r.state === 'source-remains')
+  const failed = list.filter((r) => r.state === 'failed')
+
+  const lines = [`移動完成：${moved} 項成功`]
+  if (partial.length) lines[0] += `，${partial.length} 項只完成一半`
+  if (failed.length) lines[0] += `，${failed.length} 項失敗`
+
+  if (partial.length) {
+    lines.push('', '⚠ 已複製但來源未刪除（檔案兩側都在）：')
+    for (const r of partial) lines.push(`• ${r.src}\n　${r.message}`)
+  }
+  if (failed.length) {
+    lines.push('', '失敗（來源未動）：')
+    for (const r of failed) lines.push(`• ${r.src}\n　${r.message}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Where the left file is parked while the two sides trade places. Same
+ * directory as the original so the parking step is a rename and not a copy.
+ *
+ * @param {string} path
+ * @param {number|string} stamp
+ * @returns {string}
+ */
+export function exchangeTempPath(path, stamp) {
+  return `${path}.mycompare-exchange-${stamp}.tmp`
+}
+
+/**
+ * @typedef {'exchanged'|'exchanged-with-leftover'|'rolled-back'|'unsafe'|'failed'} ExchangeState
+ *   exchanged                — both sides swapped, nothing left behind
+ *   exchanged-with-leftover  — both sides swapped, the temp file could not be removed
+ *   rolled-back              — a step failed and both sides are back as they were
+ *   unsafe                   — a step failed AND the rollback failed; a side is
+ *                              wrong and the original content only exists in `tmp`
+ *   failed                   — nothing was ever changed
+ *
+ * @typedef {object} ExchangeResult
+ * @property {string} left
+ * @property {string} right
+ * @property {string} tmp
+ * @property {ExchangeState} state
+ * @property {string} message
+ * @property {string[]} leftovers paths the user has to deal with by hand
+ */
+
+/**
+ * Swap the contents of a matched pair of files.
+ *
+ * Ordering is chosen so that the original left content is recoverable at every
+ * point: it is renamed aside first (atomic, undoable by name), and only then is
+ * anything overwritten. The two overwrites each have an explicit rollback, and
+ * a rollback that itself fails is reported as `unsafe` with the temp path
+ * named — that file is the only remaining copy and must never be swallowed.
+ *
+ * @param {{ left: string, right: string }} pair
+ * @param {FileOpsApi} api
+ * @param {number|string} [stamp] fixed by tests; defaults to a wall-clock stamp
+ * @returns {Promise<ExchangeResult>}
+ */
+export async function runExchange(pair, api, stamp = Date.now()) {
+  const { left, right } = pair
+  const tmp = exchangeTempPath(left, stamp)
+  /** @type {(state: ExchangeState, message: string, leftovers?: string[]) => ExchangeResult} */
+  const done = (state, message, leftovers = []) => ({ left, right, tmp, state, message, leftovers })
+
+  // 1 — park the left file.
+  try {
+    await api.renameFile(left, tmp)
+  } catch (err) {
+    return done('failed', `無法暫存左側檔案「${left}」：${errText(err)}。兩側都未變更。`)
+  }
+
+  // 2 — right content lands on the left path.
+  try {
+    await api.copyFile(right, left)
+  } catch (copyErr) {
+    try {
+      await api.renameFile(tmp, left)
+      return done('rolled-back',
+        `寫入左側失敗：${errText(copyErr)}。已還原，兩側維持原狀。`)
+    } catch (restoreErr) {
+      return done('unsafe',
+        `寫入左側失敗：${errText(copyErr)}，且還原也失敗：${errText(restoreErr)}。\n`
+        + `左側「${left}」目前不存在，原始內容留在「${tmp}」，請手動改回。`,
+        [tmp])
+    }
+  }
+
+  // 3 — the parked left content lands on the right path.
+  try {
+    await api.copyFile(tmp, right)
+  } catch (copyErr) {
+    try {
+      // `left` exists again by now, so restoring is a copy, not a rename.
+      await api.copyFile(tmp, left)
+      const leftovers = await _removeExchangeTemp(api, tmp)
+      return done(leftovers.length ? 'exchanged-with-leftover' : 'rolled-back',
+        `寫入右側失敗：${errText(copyErr)}。左側已還原，兩側維持原狀。`
+        + (leftovers.length ? `\n暫存檔「${tmp}」未能刪除，請手動移除。` : ''),
+        leftovers)
+    } catch (restoreErr) {
+      return done('unsafe',
+        `寫入右側失敗：${errText(copyErr)}，且還原左側也失敗：${errText(restoreErr)}。\n`
+        + `左側「${left}」現在是右側的內容，左側原始內容只存在於「${tmp}」，請手動改回。`,
+        [tmp])
+    }
+  }
+
+  // 4 — clean up. Both sides are already correct, so a failure here is a
+  // stray file rather than data loss — but it still gets named.
+  const leftovers = await _removeExchangeTemp(api, tmp)
+  return leftovers.length
+    ? done('exchanged-with-leftover',
+      `互換完成，但暫存檔「${tmp}」未能刪除，請手動移除。`, leftovers)
+    : done('exchanged', '互換完成。')
+}
+
+/**
+ * @param {ExchangeResult[]} results
+ * @returns {string}
+ */
+export function formatExchangeSummary(results) {
+  const list = results ?? []
+  const ok = list.filter((r) => r.state === 'exchanged').length
+  const leftover = list.filter((r) => r.state === 'exchanged-with-leftover')
+  const rolledBack = list.filter((r) => r.state === 'rolled-back')
+  const failed = list.filter((r) => r.state === 'failed')
+  const unsafe = list.filter((r) => r.state === 'unsafe')
+
+  const lines = [`互換完成：${ok + leftover.length} 組成功`]
+  if (rolledBack.length) lines[0] += `，${rolledBack.length} 組已還原`
+  if (failed.length) lines[0] += `，${failed.length} 組未執行`
+  if (unsafe.length) lines[0] += `，${unsafe.length} 組需要手動處理`
+
+  // The unsafe group goes first: it is the only one where a file is not where
+  // the user left it, and burying it under the successes would hide it.
+  if (unsafe.length) {
+    lines.push('', '🛑 未完成且無法還原，請立刻處理：')
+    for (const r of unsafe) lines.push(`• ${r.message}`)
+  }
+  if (leftover.length) {
+    lines.push('', '⚠ 已互換，但暫存檔未刪除：')
+    for (const r of leftover) lines.push(`• ${r.tmp}`)
+  }
+  if (rolledBack.length) {
+    lines.push('', '已還原（兩側維持原狀）：')
+    for (const r of rolledBack) lines.push(`• ${r.left}\n　${r.message}`)
+  }
+  if (failed.length) {
+    lines.push('', '未執行：')
+    for (const r of failed) lines.push(`• ${r.left}\n　${r.message}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * @param {FileOpsApi} api
+ * @param {string} tmp
+ * @returns {Promise<string[]>} the temp path when it survived, else empty
+ */
+async function _removeExchangeTemp(api, tmp) {
+  try {
+    // Permanent: this file is ours and was created seconds ago; sending our own
+    // scratch file to the recycle bin would be noise the user has to clean up.
+    await api.deleteFile(tmp, { permanent: true })
+    return []
+  } catch (err) {
+    console.error('FolderCompare exchange: temp cleanup failed:', tmp, err)
+    return [tmp]
+  }
+}
+
+// ── Version column ──────────────────────────────────────────────────────────
+
+/**
+ * Extensions worth a `read-metadata` round trip.
+ *
+ * The main process sniffs the file's magic bytes, so it would answer for any
+ * path — but a version column over a source tree would then fire one IPC per
+ * file to learn "no version" tens of thousands of times. Only these formats
+ * carry a version resource at all.
+ */
+/** Concurrent `read-metadata` calls, matching the hash path's IPC budget. */
+const VERSION_CONCURRENCY = 4
+
+/**
+ * Ceiling on how many files one "sort by version" is allowed to read.
+ *
+ * Sorting is the only operation that legitimately needs versions for rows the
+ * user cannot see, and it is exactly the operation that would otherwise walk a
+ * 50k-file tree one IPC at a time.
+ */
+const MAX_VERSION_PREFETCH = 2000
+
+const VERSION_CANDIDATE_EXTS = new Set([
+  'exe', 'dll', 'sys', 'ocx', 'scr', 'cpl', 'drv', 'efi', 'mun', 'mui', 'mp3',
+])
+
+/**
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function hasVersionCandidateExt(name) {
+  return VERSION_CANDIDATE_EXTS.has(extensionOf(name))
+}
+
+/**
+ * Version text for the column, from a `read-metadata` result.
+ *
+ * PE files get the version resource string, preferring the human-authored
+ * `FileVersion` over the fixed 32-bit pair, which is often coarser. MP3s have
+ * no version resource; their MPEG audio version is the closest true analogue
+ * and is labelled as such rather than dressed up as a file version.
+ *
+ * @param {unknown} meta
+ * @returns {string}
+ */
+export function versionTextFromMetadata(meta) {
+  if (!meta || typeof meta !== 'object') return ''
+  const rec = /** @type {{ kind?: string, fields?: Record<string, string>, audio?: Record<string, unknown> }} */ (meta)
+  const fields = rec.fields ?? {}
+  if (rec.kind === 'pe') {
+    for (const key of ['FileVersion', 'FixedFileVersion', 'ProductVersion', 'FixedProductVersion']) {
+      const value = fields[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+    return ''
+  }
+  if (rec.kind === 'mp3') {
+    const audio = rec.audio ?? {}
+    const ver = audio.mpegVersion
+    const layer = audio.layer
+    if (ver && layer) return `MPEG ${ver} Layer ${layer}`
+    if (ver) return `MPEG ${ver}`
+    return ''
+  }
+  return ''
+}
+
+/**
+ * Tooltip for the version cell: the remaining metadata, which is the reason
+ * the read happened and is otherwise invisible.
+ *
+ * @param {unknown} meta
+ * @returns {string}
+ */
+export function versionTitleFromMetadata(meta) {
+  if (!meta || typeof meta !== 'object') return ''
+  const rec = /** @type {{ kind?: string, fields?: Record<string, string> }} */ (meta)
+  const entries = Object.entries(rec.fields ?? {}).filter(([, v]) => typeof v === 'string' && v.trim())
+  if (!entries.length) return ''
+  return entries.slice(0, 12).map(([k, v]) => `${k}: ${v}`).join('\n')
+}
+
+// ── Folder-view defaults (BC's "update defaults" scope) ─────────────────────
+
+/**
+ * Reserved name under which the folder view's default settings live in the
+ * named-config store. Prefixed so a user-chosen name can never collide.
+ */
+export const FOLDER_DEFAULTS_NAME = '__mycompare:folder-defaults__'
+
+const _folderConfigStore = new NamedConfigStore()
+
+/**
+ * @param {Record<string, unknown>} settings a `getConfig()` snapshot
+ * @returns {boolean} whether it was stored
+ */
+export function saveFolderDefaults(settings) {
+  return !!_folderConfigStore.save(FOLDER_DEFAULTS_NAME, 'folder', settings)
+}
+
+/**
+ * @returns {Record<string, unknown>|null}
+ */
+export function loadFolderDefaults() {
+  const entry = _folderConfigStore.get(FOLDER_DEFAULTS_NAME)
+  if (!entry || entry.viewType !== 'folder') return null
+  return readConfig('folder', entry.settings)
+}
+
+export function clearFolderDefaults() {
+  _folderConfigStore.remove(FOLDER_DEFAULTS_NAME)
+}
+
+/**
+ * Saved folder configs the user can pick from, with the reserved defaults
+ * entry removed — it is reachable through the scope radio, not the list.
+ *
+ * @returns {Array<{ name: string }>}
+ */
+export function listFolderConfigs() {
+  return _folderConfigStore.list('folder').filter((e) => e.name !== FOLDER_DEFAULTS_NAME)
 }
 
 // ── Virtual sources ─────────────────────────────────────────────────────────
@@ -826,6 +1238,9 @@ export function columnSortValue(row, key) {
     case 'ext':     return extensionOf(row?.name)
     case 'relpath': return entry?.path ?? row?.name ?? ''
     case 'attrs':   return entryAttrText(entry)
+    // Rows whose version has not been read yet sort as empty rather than being
+    // guessed at; the view fills the visible set in before sorting on it.
+    case 'version': return String(entry?.version ?? '')
     case 'status':  return String(row?.status ?? '')
     default:        return String(row?.name ?? '')
   }
@@ -938,7 +1353,7 @@ const _caf = globalThis.cancelAnimationFrame ?? clearTimeout
  *   name, status, left: FileEntry|null, right: FileEntry|null
  * }
  */
-function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0) {
+function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0, opts = {}) {
   const leftMap = new Map(leftEntries.map((e) => [e.name, e]))
   const rightMap = new Map(rightEntries.map((e) => [e.name, e]))
   const allNames = new Set([...leftMap.keys(), ...rightMap.keys()])
@@ -957,7 +1372,7 @@ function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0) {
   for (const name of sorted) {
     const left = leftMap.get(name) ?? null
     const right = rightMap.get(name) ?? null
-    const status = computeStatus(left, right, mode, mtimeTolerance)
+    const status = computeStatus(left, right, mode, mtimeTolerance, opts)
     // `children` is null until the directory is expanded or a full scan pulls
     // it in; an empty array means "loaded, and it has no entries".
     rows.push({ name, status, left, right, children: null })
@@ -971,14 +1386,22 @@ function compareEntries(leftEntries, rightEntries, mode, mtimeTolerance = 0) {
  * @param {FileEntry|null} right
  * @param {'name'|'size'|'mtime'|'both'} mode
  * @param {number} [mtimeTolerance] 秒；時間差在容差內視為相同（跨檔案系統複製常見）
+ * @param {{ compareAttributes?: boolean }} [opts]
  * @returns {'same'|'left-only'|'right-only'|'different'|'left-newer'|'right-newer'}
  */
-function computeStatus(left, right, mode, mtimeTolerance = 0) {
+function computeStatus(left, right, mode, mtimeTolerance = 0, opts = {}) {
   if (!right) return 'left-only'
   if (!left) return 'right-only'
 
   // 目錄本身沒有大小/內容可比；狀態改由子項 rollup 決定（見 _rollupStatus）。
+  //
+  // Compare Attributes 因此不套用於目錄：rollupStatus 會在子項載入後覆寫目錄
+  // 狀態，屬性差異在那裡沒有容身之處，標了也會被吃掉。
   if (left.isDirectory && right.isDirectory) return 'same'
+
+  // BC 的 Compare Attributes：屬性不同即為差異，優先於其餘判定，因為大小與
+  // 時間相同的一對檔案正是唯一看得出屬性差異的情況。
+  if (opts.compareAttributes && attributesDiffer(left, right)) return 'different'
 
   if (mode === 'name') return 'same'
 
@@ -1184,6 +1607,35 @@ export class FolderCompare {
     this._findMatches = []   // Array of row elements matching find query
     this._findCursor = 0
     this._findBarVisible = false
+
+    // P2-26: whether read-only/hidden take part in the status decision.
+    this._compareAttributes = !!options.compareAttributes
+
+    // P2-23: version text keyed by absolute path. Survives re-renders and
+    // rescans, so scrolling back over a row never repeats its IPC.
+    /** @type {Map<string, string>} */
+    this._versionCache = new Map()
+    /** @type {Set<string>} paths whose lookup is in flight */
+    this._versionInFlight = new Set()
+    /** @type {Map<string, string>} tooltip text keyed by absolute path */
+    this._versionTitles = new Map()
+    /** @type {Array<{ entry: FileEntry, path: string }>} queued by the renderer */
+    this._versionQueue = []
+    /** Timer coalescing the queue drain into one pass per render. */
+    this._versionTimer = 0
+
+    // P2-37: BC's settings scope. Defaults are stored under a reserved name in
+    // the named-config store and read here, before any DOM exists, so a new
+    // comparison opens with them already in force.
+    if (options.useDefaults !== false) {
+      const defaults = loadFolderDefaults()
+      if (defaults) this._applyConfigSettings(defaults)
+    }
+  }
+
+  /** Comparison options that are not the mode itself. @returns {{ compareAttributes: boolean }} */
+  _compareOpts() {
+    return { compareAttributes: this._compareAttributes }
   }
 
   /**
@@ -1333,6 +1785,11 @@ export class FolderCompare {
     else { this._sortKey = key; this._sortDir = 1 }
     this._rebuildHeader()
     this._applyFilterAndRender()
+    // Versions are read lazily for the visible window only, which is not
+    // enough to order rows the user has not scrolled past yet.
+    if (key === 'version') {
+      void this.prefetchVersionsForSort().then(() => this._applyFilterAndRender())
+    }
   }
 
   /** @returns {{ key: string, dir: number }} */
@@ -1454,6 +1911,7 @@ export class FolderCompare {
       mode: this._mode,
       viewPreset: this._viewPreset,
       mtimeTolerance: this._mtimeTolerance,
+      compareAttributes: this._compareAttributes,
       filterStr: this._filterStr,
       filterFields: { ...this._filterFields },
       columns: [...this._columns],
@@ -1474,27 +1932,33 @@ export class FolderCompare {
   }
 
   /**
-   * @param {unknown} cfg
+   * Write a validated settings bundle into the view's state.
+   *
+   * State only — no DOM and no re-render, because the constructor applies the
+   * stored defaults through here before anything is mounted.
+   *
+   * @param {Record<string, unknown>} settings
    */
-  applyConfig(cfg) {
-    const settings = readConfig('folder', cfg)
-    if (!settings) return
+  _applyConfigSettings(settings) {
     if (['name', 'size', 'mtime', 'both', 'content', 'rules'].includes(settings.mode)) {
       this._mode = settings.mode
     }
     if (settings.rulesOptions) {
       this._rulesOptions = normalizeRulesOptions({ ...this._rulesOptions, ...settings.rulesOptions })
-      this._syncRulesControls()
     }
     if (typeof settings.mtimeTolerance === 'number' && settings.mtimeTolerance >= 0) {
       this._mtimeTolerance = settings.mtimeTolerance
     }
+    if (typeof settings.compareAttributes === 'boolean') {
+      this._compareAttributes = settings.compareAttributes
+    }
     if (typeof settings.filterStr === 'string') this._filterStr = settings.filterStr
     if (settings.filterFields) this._filterFields = normalizeFilterFields(settings.filterFields)
-    this._syncFilterFieldControls()
-    if (Array.isArray(settings.columns)) this.setColumns(settings.columns)
+    if (Array.isArray(settings.columns)) this._columns = saveFolderColumns(settings.columns)
     if (settings.viewPreset && VIEW_PRESETS[settings.viewPreset]) {
-      this.setViewPreset(settings.viewPreset)
+      const preset = VIEW_PRESETS[settings.viewPreset]
+      this._viewPreset = settings.viewPreset
+      for (const key of Object.keys(preset)) this[`_${key}`] = preset[key]
     }
     // After the preset, so an explicit flag set wins over the preset's.
     const filters = settings.filters
@@ -1504,7 +1968,6 @@ export class FolderCompare {
         if (typeof filters[key] === 'boolean') this[`_${key}`] = filters[key]
       }
       this._markPresetCustom()
-      this._syncFilterControls()
     }
     const sort = settings.sort
     if (sort && typeof sort === 'object'
@@ -1512,9 +1975,78 @@ export class FolderCompare {
       this._sortKey = sort.key
       this._sortDir = sort.dir
     }
+  }
+
+  /**
+   * Apply a settings snapshot, optionally promoting it to the default for
+   * every future folder comparison — Beyond Compare's "this view only" versus
+   * "also update defaults" scope.
+   *
+   * @param {unknown} cfg
+   * @param {{ scope?: 'view'|'default' }} [opts]
+   * @returns {boolean} whether the snapshot was accepted
+   */
+  applyConfig(cfg, opts = {}) {
+    const settings = readConfig('folder', cfg)
+    if (!settings) return false
+    this._applyConfigSettings(settings)
+
+    this._syncRulesControls()
+    this._syncFilterFieldControls()
+    this._syncFilterControls()
+    this._syncAttributeControl()
+    this._rebuildHeader()
+
+    if (opts.scope === 'default' && !saveFolderDefaults(this.getConfig())) {
+      alert('無法將設定存為預設值（localStorage 無法寫入）；本次仍已套用至目前檢視。')
+    }
+
     // A mode change alters comparison results, so re-scan rather than just
-    // re-render; without paths there is nothing to do yet.
+    // re-render; without paths there is nothing to compare yet.
     if (this._leftPath || this._rightPath) void this._compareAndRender()
+    else this._applyFilterAndRender()
+    return true
+  }
+
+  /**
+   * Store the view's current settings as the default for new comparisons.
+   * @returns {boolean}
+   */
+  saveAsDefaultConfig() {
+    const ok = saveFolderDefaults(this.getConfig())
+    if (!ok) alert('無法儲存預設值：localStorage 無法寫入。')
+    return ok
+  }
+
+  /** Forget the stored defaults; new comparisons go back to the built-ins. */
+  clearDefaultConfig() {
+    clearFolderDefaults()
+  }
+
+  // ── P2-26: attributes as a comparison criterion ─────────────────────────────
+
+  /** @returns {boolean} */
+  getCompareAttributes() {
+    return this._compareAttributes
+  }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean}
+   */
+  setCompareAttributes(on) {
+    const next = !!on
+    if (next === this._compareAttributes) return next
+    this._compareAttributes = next
+    this._syncAttributeControl()
+    // The criterion feeds computeStatus, so every row has to be graded again.
+    if (this._leftPath || this._rightPath) void this._compareAndRender()
+    return next
+  }
+
+  /** Push the compare-attributes flag back onto its checkbox. */
+  _syncAttributeControl() {
+    if (this._dom.cbCompareAttrs) this._dom.cbCompareAttrs.checked = this._compareAttributes
   }
 
 
@@ -2009,6 +2541,219 @@ export class FolderCompare {
       document.addEventListener('keydown', onKey, true)
       btnOk.focus()
     })
+  }
+
+  // ── P2-37: settings scope ───────────────────────────────────────────────────
+
+  /**
+   * Beyond Compare's session settings dialog, reduced to the part that was
+   * missing: which settings to apply, and how far the choice reaches.
+   *
+   * "此檢視" leaves the stored defaults alone; "更新為預設值" also writes them,
+   * so every comparison opened afterwards starts from the same place.
+   *
+   * @returns {Promise<'view'|'default'|null>} the scope that was applied
+   */
+  openSettingsDialog() {
+    const host = this._dom.root ?? document.body
+    return new Promise((resolve) => {
+      const backdrop = el('div', { className: 'fc-modal-backdrop fc-settings-backdrop' })
+      const modal = el('div', { className: 'fc-modal', role: 'dialog', 'aria-modal': 'true' })
+      modal.appendChild(el('div', { className: 'fc-modal-title' }, '資料夾比對設定'))
+
+      const sourceSelect = el('select', { className: 'fc-settings-source' })
+      sourceSelect.appendChild(el('option', { value: '' }, '（目前檢視的設定）'))
+      for (const cfg of listFolderConfigs()) {
+        sourceSelect.appendChild(el('option', { value: cfg.name }, cfg.name))
+      }
+      const sourceLabel = el('label', { className: 'fc-modal-field' })
+      sourceLabel.appendChild(el('span', {}, '要套用的設定'))
+      sourceLabel.appendChild(sourceSelect)
+      modal.appendChild(sourceLabel)
+
+      const scopes = el('div', { className: 'fc-settings-scopes' })
+      /** @type {HTMLInputElement[]} */
+      const radios = []
+      for (const [value, text] of [
+        ['view', '僅套用至目前這個檢視'],
+        ['default', '同時更新為預設值（之後開啟的比對都採用）'],
+      ]) {
+        const wrap = el('label', { className: 'fc-modal-check' })
+        const radio = el('input', { type: 'radio', name: 'fc-settings-scope', value })
+        if (value === 'view') radio.checked = true
+        radios.push(radio)
+        wrap.appendChild(radio)
+        wrap.appendChild(document.createTextNode(' ' + text))
+        scopes.appendChild(wrap)
+      }
+      modal.appendChild(scopes)
+
+      modal.appendChild(el('div', { className: 'fc-modal-hint' },
+        loadFolderDefaults()
+          ? '目前已有儲存的預設值；「清除預設值」會讓新比對回到內建設定。'
+          : '目前沒有儲存的預設值，新比對使用內建設定。'))
+
+      const actions = el('div', { className: 'fc-modal-actions' })
+      const btnClear = el('button', { className: 'fc-settings-clear' }, '清除預設值')
+      const btnCancel = el('button', { className: 'fc-modal-cancel' }, '取消')
+      const btnOk = el('button', { className: 'fc-modal-ok' }, '套用')
+      actions.append(btnClear, btnCancel, btnOk)
+      modal.appendChild(actions)
+
+      backdrop.appendChild(modal)
+      host.appendChild(backdrop)
+      this._dom.settingsModal = backdrop
+
+      let settled = false
+      /** @param {'view'|'default'|null} scope */
+      const finish = (scope) => {
+        if (settled) return
+        settled = true
+        backdrop.remove()
+        this._dom.settingsModal = null
+        document.removeEventListener('keydown', onKey, true)
+        resolve(scope)
+      }
+      const onKey = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); finish(null) }
+      }
+
+      btnClear.addEventListener('click', () => {
+        this.clearDefaultConfig()
+        finish(null)
+      })
+      btnCancel.addEventListener('click', () => finish(null))
+      btnOk.addEventListener('click', () => {
+        const scope = radios.find((r) => r.checked)?.value === 'default' ? 'default' : 'view'
+        const name = sourceSelect.value
+        const cfg = name
+          ? _folderConfigStore.get(name)?.settings ?? null
+          : this.getConfig()
+        if (name && !cfg) {
+          alert(`找不到名為「${name}」的設定。`)
+          return
+        }
+        if (!this.applyConfig(cfg, { scope })) {
+          alert(`「${name}」不是資料夾比對的設定，未套用。`)
+          return
+        }
+        finish(scope)
+      })
+      backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish(null) })
+      document.addEventListener('keydown', onKey, true)
+      btnOk.focus()
+    })
+  }
+
+  // ── P2-26: attribute editing ────────────────────────────────────────────────
+
+  /**
+   * Show, and where possible edit, one row's attributes on both sides.
+   *
+   * Only `readOnly` has an IPC behind it. `hidden` is shown as read-only text —
+   * including the "unknown" case the main process reports on Windows — rather
+   * than offered as a control that would silently do nothing.
+   *
+   * @param {CompareRow} row
+   * @returns {Promise<void>}
+   */
+  openAttributesDialog(row) {
+    const host = this._dom.root ?? document.body
+    return new Promise((resolve) => {
+      const backdrop = el('div', { className: 'fc-modal-backdrop fc-attrs-backdrop' })
+      const modal = el('div', { className: 'fc-modal', role: 'dialog', 'aria-modal': 'true' })
+      modal.appendChild(el('div', { className: 'fc-modal-title' }, `屬性：${row.name}`))
+
+      /** @type {Array<{ side: 'left'|'right', entry: FileEntry, cb: HTMLInputElement }>} */
+      const editable = []
+      for (const side of ['left', 'right']) {
+        const entry = side === 'left' ? row.left : row.right
+        if (!entry?.path) continue
+        const block = el('div', { className: 'fc-attrs-side' })
+        block.appendChild(el('div', { className: 'fc-attrs-path' },
+          `${side === 'left' ? '左' : '右'}側：${entry.path}`))
+
+        const writable = this._isWritableSide(side)
+        const cb = el('input', { type: 'checkbox', className: `fc-attr-readonly fc-attr-readonly-${side}` })
+        cb.checked = !!entry.readOnly
+        cb.disabled = !writable
+        const cbWrap = el('label', { className: 'fc-modal-check' })
+        cbWrap.appendChild(cb)
+        cbWrap.appendChild(document.createTextNode(
+          writable ? ' 唯讀（R）' : ' 唯讀（R）— 此來源唯讀，無法修改'))
+        block.appendChild(cbWrap)
+        if (writable) editable.push({ side, entry, cb })
+
+        const hiddenText = entry.hidden === true ? '是'
+          : entry.hidden === false ? '否'
+            : '未知（此平台無法判讀）'
+        block.appendChild(el('div', { className: 'fc-attrs-hidden' },
+          `隱藏（H）：${hiddenText} — 不支援修改（沒有對應的 IPC）`))
+        modal.appendChild(block)
+      }
+
+      const actions = el('div', { className: 'fc-modal-actions' })
+      const btnCancel = el('button', { className: 'fc-modal-cancel' }, '取消')
+      const btnOk = el('button', { className: 'fc-modal-ok' }, '套用')
+      actions.append(btnCancel, btnOk)
+      modal.appendChild(actions)
+
+      backdrop.appendChild(modal)
+      host.appendChild(backdrop)
+      this._dom.attrsModal = backdrop
+
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        backdrop.remove()
+        this._dom.attrsModal = null
+        document.removeEventListener('keydown', onKey, true)
+        resolve()
+      }
+      const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); finish() } }
+
+      btnCancel.addEventListener('click', finish)
+      btnOk.addEventListener('click', () => {
+        const changes = editable
+          .filter((f) => f.cb.checked !== !!f.entry.readOnly)
+          .map((f) => ({ side: f.side, entry: f.entry, readOnly: f.cb.checked }))
+        finish()
+        if (changes.length) void this._applyAttributeChanges(changes)
+      })
+      backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish() })
+      document.addEventListener('keydown', onKey, true)
+      btnOk.focus()
+    })
+  }
+
+  /**
+   * @param {Array<{ side: 'left'|'right', entry: FileEntry, readOnly: boolean }>} changes
+   * @returns {Promise<void>}
+   */
+  async _applyAttributeChanges(changes) {
+    /** @type {string[]} */
+    const failures = []
+    for (const change of changes) {
+      try {
+        const res = await window.electronAPI.setReadOnly(change.entry.path, change.readOnly)
+        // Trust what came back rather than what was asked for: the main process
+        // reports the flag it actually observes after the write.
+        change.entry.readOnly = typeof res?.readOnly === 'boolean' ? res.readOnly : change.readOnly
+      } catch (err) {
+        console.error('FolderCompare setReadOnly failed:', change.entry.path, err)
+        failures.push(`• ${change.entry.path}\n　${errText(err)}`)
+      }
+    }
+    if (failures.length) {
+      alert(`${failures.length} 個項目的屬性未能修改：\n\n${failures.join('\n')}`)
+    }
+    // The criterion reads readOnly, so a change can flip a row's status.
+    if (this._compareAttributes && (this._leftPath || this._rightPath)) {
+      await this._compareAndRender()
+    } else {
+      this._applyFilterAndRender()
+    }
   }
 
   /**
@@ -2750,6 +3495,142 @@ ${rows}
     await this.refresh()
   }
 
+  // ── P2-32: Move / Exchange ──────────────────────────────────────────────────
+
+  /**
+   * Rows the checkbox selection — or, with nothing checked, the focused row —
+   * resolves to.
+   *
+   * @returns {CompareRow[]}
+   */
+  _selectedRows() {
+    const keys = this._selectedNames.size
+      ? this._selectedNames
+      : new Set(this._focusedKey ? [this._focusedKey] : [])
+    if (!keys.size) return []
+    return flattenRows(this._rows ?? []).filter((row) => {
+      const key = row.left?.path || row.right?.path
+      return !!key && keys.has(key)
+    })
+  }
+
+  /**
+   * Move the selected files to the other side: BC's Move, as opposed to Copy.
+   *
+   * Every job reports whether the source survived, because a move that copied
+   * but could not delete leaves the file in two places and the user is the
+   * only one who can decide what to do about it.
+   *
+   * @param {'left'|'right'} target
+   * @returns {Promise<void>}
+   */
+  async moveSelectedTo(target) {
+    return this._moveRows(this._selectedRows(), target)
+  }
+
+  /**
+   * @param {CompareRow[]} rows
+   * @param {'left'|'right'} target
+   * @returns {Promise<void>}
+   */
+  async _moveRows(rows, target) {
+    const targetBase = target === 'right' ? this._rightPath : this._leftPath
+    if (!targetBase) {
+      alert(target === 'right' ? '請先選擇右側資料夾' : '請先選擇左側資料夾')
+      return
+    }
+    const source = target === 'right' ? 'left' : 'right'
+    // A move writes to the target *and* deletes from the source, so both ends
+    // have to be a real filesystem.
+    if (!this._requireWritable([target, source])) return
+
+    let jobs = []
+    for (const row of rows ?? []) {
+      const src = target === 'right' ? row.left : row.right
+      if (!src?.path || src.isDirectory) continue
+      const dst = target === 'right' ? row.right : row.left
+      const dest = this._destPathFor(row, target)
+      jobs.push({
+        src: src.path,
+        dest,
+        label: dst?.path ?? dest,
+        targetReadOnly: !!dst?.readOnly,
+        sourceReadOnly: !!src.readOnly,
+      })
+    }
+    if (!jobs.length) { alert('沒有可移動的項目（目錄與孤兒的對側不參與移動）'); return }
+
+    const side = target === 'right' ? '右' : '左'
+    if (!confirm(`確定要將 ${jobs.length} 個檔案移動到${side}側嗎？\n成功後來源檔案會被刪除（送到資源回收桶）。`)) return
+
+    jobs = this._resolveReadOnly(jobs, '覆寫')
+    if (!jobs.length) { alert('目標全部是唯讀檔案，已略過'); return }
+
+    const results = await runMove(
+      jobs.map((j) => ({ src: j.src, dest: j.dest })), window.electronAPI)
+    alert(formatMoveSummary(results))
+    this._selectedNames.clear()
+    await this.refresh()
+  }
+
+  /**
+   * Swap the contents of the selected matched pairs.
+   *
+   * Confirmed twice on purpose: it is the only operation in this view that
+   * overwrites *both* sides, so there is no untouched copy to fall back on if
+   * the user misread the selection.
+   *
+   * @returns {Promise<void>}
+   */
+  async exchangeSelected() {
+    return this._exchangeRows(this._selectedRows())
+  }
+
+  /**
+   * @param {CompareRow[]} rows
+   * @returns {Promise<void>}
+   */
+  async _exchangeRows(rows) {
+    if (!this._requireWritable(['left', 'right'])) return
+
+    let pairs = []
+    for (const row of rows ?? []) {
+      const { left, right } = row
+      if (!left?.path || !right?.path) continue
+      if (left.isDirectory || right.isDirectory) continue
+      pairs.push({
+        left: left.path,
+        right: right.path,
+        label: `${left.path} ⇄ ${right.path}`,
+        targetReadOnly: !!left.readOnly || !!right.readOnly,
+      })
+    }
+    if (!pairs.length) {
+      alert('互換需要兩側都存在的檔案；選取的項目中沒有符合的配對')
+      return
+    }
+
+    const preview = pairs.slice(0, 20).map((p) => `• ${p.left}\n　⇄ ${p.right}`).join('\n')
+    const more = pairs.length > 20 ? `\n…另有 ${pairs.length - 20} 組` : ''
+    if (!confirm(`互換會同時覆寫兩側的檔案，共 ${pairs.length} 組：\n\n${preview}${more}\n\n要繼續嗎？`)) return
+    if (!confirm('再次確認：兩側的內容會互相取代，沒有復原按鈕。確定執行互換？')) return
+
+    pairs = this._resolveReadOnly(pairs, '覆寫')
+    if (!pairs.length) { alert('選取的配對都含唯讀檔案，已全部略過'); return }
+
+    /** @type {ExchangeResult[]} */
+    const results = []
+    // Sequential: each pair leaves a temp file behind while it runs, and a
+    // failure has to be attributable to one pair rather than to a batch.
+    for (const pair of pairs) {
+      results.push(await runExchange(
+        { left: pair.left, right: pair.right }, window.electronAPI))
+    }
+    alert(formatExchangeSummary(results))
+    this._selectedNames.clear()
+    await this.refresh()
+  }
+
   /**
    * @param {CompareRow} row
    * @param {'left'|'right'} target
@@ -3053,6 +3934,11 @@ ${rows}
       _caf(this._scrollFrame)
       this._scrollFrame = 0
     }
+    if (this._versionTimer) {
+      clearTimeout(this._versionTimer)
+      this._versionTimer = 0
+    }
+    this._versionQueue = []
     if (this._container) {
       this._container.innerHTML = ''
       this._container = null
@@ -3257,6 +4143,13 @@ ${rows}
     this._dom.btnRules = btnRules
     toolbar.appendChild(btnRules)
 
+    const btnSettings = el('button', {
+      className: 'fc-btn-settings',
+      title: 'Session 設定：套用範圍（僅此檢視／更新為預設值）',
+    }, '⚙ 設定')
+    this._dom.btnSettings = btnSettings
+    toolbar.appendChild(btnSettings)
+
     // Scan progress + cancel, hidden until a scan is actually running.
     const scanStatus = el('span', { className: 'fc-scan-status' }, '')
     this._dom.scanStatus = scanStatus
@@ -3323,6 +4216,9 @@ ${rows}
       { label: '複製選取到左側（右側孤兒）', action: 'copy-to-left' },
       { label: '刪除選取（左側）',           action: 'delete-left' },
       { label: '刪除選取（右側）',           action: 'delete-right' },
+      { label: '移動選取到右側',             action: 'move-to-right' },
+      { label: '移動選取到左側',             action: 'move-to-left' },
+      { label: '互換選取（左右對調）',       action: 'exchange' },
     ]
     for (const item of batchItems) {
       const btn = el('button', { className: 'fc-batch-item', 'data-action': item.action }, item.label)
@@ -3441,6 +4337,20 @@ ${rows}
     panel.appendChild(el('label', { className: 'fc-rules-size-label' }, '上限 KB'))
     panel.appendChild(sizeInput)
 
+    // P2-26: an independent criterion rather than a text rule — it applies in
+    // every compare mode, not just the content ones, so it is not folded into
+    // _rulesOptions.
+    const cbAttrs = el('input', { type: 'checkbox', className: 'fc-rules-cb fc-compare-attrs' })
+    cbAttrs.checked = this._compareAttributes
+    const attrsWrap = el('label', {
+      className: 'fc-rules-toggle',
+      title: '唯讀/隱藏屬性不同即視為差異；隱藏屬性無法判讀的平台不列入比較',
+    })
+    attrsWrap.appendChild(cbAttrs)
+    attrsWrap.appendChild(document.createTextNode(' 比對屬性'))
+    this._dom.cbCompareAttrs = cbAttrs
+    panel.appendChild(attrsWrap)
+
     const btnApply = el('button', { className: 'fc-rules-apply' }, '套用')
     this._dom.rulesApply = btnApply
     panel.appendChild(btnApply)
@@ -3458,6 +4368,7 @@ ${rows}
     if (rulesIgnore) rulesIgnore.value = this._rulesOptions.ignorePatterns.join(';')
     if (rulesUnimportant) rulesUnimportant.value = this._rulesOptions.unimportantPatterns.join(';')
     if (rulesSize) rulesSize.value = String(Math.floor(this._rulesOptions.maxBytes / 1024))
+    this._syncAttributeControl()
   }
 
   /** Read the panel controls into the rule settings. */
@@ -3472,7 +4383,17 @@ ${rows}
     for (const [key, cb] of Object.entries(rulesToggles ?? {})) next[key] = !!cb.checked
     const kb = Number(rulesSize?.value)
     if (Number.isFinite(kb) && kb > 0) next.maxBytes = Math.round(kb * 1024)
+
+    // One "套用" click has to land both settings, and each of them can trigger
+    // its own rescan — so the flag is written first and the rescan is only
+    // forced when setRulesOptions did not already do it.
+    const attrsBefore = this._compareAttributes
+    this._compareAttributes = !!this._dom.cbCompareAttrs?.checked
     this.setRulesOptions(next)
+    if (attrsBefore !== this._compareAttributes && this._mode !== 'rules'
+        && (this._leftPath || this._rightPath)) {
+      void this._compareAndRender()
+    }
   }
 
   /** 顯示 / 隱藏比對規則面板 */
@@ -3711,6 +4632,10 @@ ${rows}
       this.toggleRulesPanel()
     })
     this._dom.rulesApply?.addEventListener('click', () => this._readRulesPanel())
+    this._dom.btnSettings?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      void this.openSettingsDialog()
+    })
     this._dom.btnCancel?.addEventListener('click', () => this.cancelScan())
 
     // T56: Expand All / Collapse All
@@ -3787,6 +4712,9 @@ ${rows}
       else if (action === 'copy-to-left') await this._batchCopyToLeft()
       else if (action === 'delete-left') await this._batchDelete('left')
       else if (action === 'delete-right') await this._batchDelete('right')
+      else if (action === 'move-to-right') await this.moveSelectedTo('right')
+      else if (action === 'move-to-left') await this.moveSelectedTo('left')
+      else if (action === 'exchange') await this.exchangeSelected()
     })
 
     // S14-M02: store handler refs so destroy() can remove them.
@@ -3944,7 +4872,8 @@ ${rows}
     const sig = signal ?? owned.signal
 
     // 先以 'both'（名稱+大小+時間）做初步比對；content / rules 模式再進一步確認
-    this._rows = compareEntries(this._leftEntries, this._rightEntries, this._baseMode(), this._mtimeTolerance)
+    this._rows = compareEntries(
+      this._leftEntries, this._rightEntries, this._baseMode(), this._mtimeTolerance, this._compareOpts())
 
     try {
       await this._applyDeepCompare(this._rows, sig)
@@ -4240,7 +5169,8 @@ ${rows}
     // Leaving `children` null on cancel keeps the row collapsible and reloadable
     // rather than half-populated.
     if (signal?.aborted) return
-    row.children = compareEntries(leftChildren, rightChildren, this._baseMode(), this._mtimeTolerance)
+    row.children = compareEntries(
+      leftChildren, rightChildren, this._baseMode(), this._mtimeTolerance, this._compareOpts())
     this._tickProgress(row.children.length)
     await this._applyDeepCompare(row.children, signal)
     if (signal?.aborted) { row.children = null; return }
@@ -4392,6 +5322,8 @@ ${rows}
           className: 'fc-attrs',
           title: entryAttrTitle(entry),
         }, entryAttrText(entry))
+      case 'version':
+        return this._buildVersionCell(entry, isDir)
       default: {
         const nameCell = el('div', { className: 'fc-name-cell' })
         if (depth > 0) {
@@ -4405,6 +5337,180 @@ ${rows}
         return nameCell
       }
     }
+  }
+
+  // ── P2-23: version column ───────────────────────────────────────────────────
+
+  /**
+   * A version cell, filled from cache when possible and queued otherwise.
+   *
+   * Nothing here awaits: the row has to be in the DOM before the scroller's
+   * next frame, so the IPC is deferred to {@link _drainVersionQueue} and only
+   * the rows that were actually drawn are ever asked about.
+   *
+   * @param {FileEntry} entry
+   * @param {boolean} isDir
+   * @returns {HTMLElement}
+   */
+  _buildVersionCell(entry, isDir) {
+    const cell = el('span', { className: 'fc-version' })
+    if (isDir || !entry?.path) return cell
+
+    if (entry.version === undefined) {
+      const cached = this._versionCache.get(entry.path)
+      if (cached !== undefined) entry.version = cached
+    }
+    if (entry.version !== undefined) {
+      cell.textContent = entry.version
+      const title = this._versionTitles.get(entry.path)
+      if (title) cell.title = title
+      return cell
+    }
+
+    // Archive, snapshot and remote entries have no path `read-metadata` can
+    // open, and formats without a version resource are not worth an IPC each.
+    if (sourceKindOf(entry.path) !== 'fs' || !hasVersionCandidateExt(entry.name)) {
+      entry.version = ''
+      this._versionCache.set(entry.path, '')
+      return cell
+    }
+
+    cell.classList.add('fc-version--pending')
+    cell.textContent = '…'
+    cell.dataset.versionPath = entry.path
+    this._queueVersion(entry)
+    return cell
+  }
+
+  /**
+   * @param {FileEntry} entry
+   */
+  _queueVersion(entry) {
+    if (this._versionInFlight.has(entry.path)) return
+    if (this._versionQueue.some((job) => job.path === entry.path)) return
+    this._versionQueue.push({ entry, path: entry.path })
+    if (this._versionTimer) return
+    // One drain per render pass; scrolling queues a fresh window each frame and
+    // firing per row would put a burst of IPC behind every wheel tick.
+    this._versionTimer = setTimeout(() => {
+      this._versionTimer = 0
+      void this._drainVersionQueue()
+    }, 0)
+  }
+
+  /**
+   * Read the queued paths' metadata and patch the cells in place.
+   *
+   * Patching rather than re-rendering is deliberate: a re-render during a
+   * scroll would fight the scroller for the same frame, and the only thing
+   * that changed is one span's text.
+   *
+   * @returns {Promise<void>}
+   */
+  async _drainVersionQueue() {
+    const jobs = this._versionQueue
+    this._versionQueue = []
+    if (!jobs.length || !window.electronAPI?.readMetadata) {
+      // Without the IPC there is no version to show; say so once per row
+      // rather than leaving an ellipsis that never resolves.
+      for (const job of jobs) this._resolveVersion(job.entry, '', '')
+      return
+    }
+    for (const job of jobs) this._versionInFlight.add(job.path)
+    await _runWithConcurrency(jobs, VERSION_CONCURRENCY, async (job) => {
+      let text = ''
+      let title = ''
+      try {
+        const meta = await window.electronAPI.readMetadata(job.path)
+        text = versionTextFromMetadata(meta)
+        title = versionTitleFromMetadata(meta)
+      } catch (err) {
+        // An unreadable file is not an error worth a dialog — the column is
+        // informational — but it must not be retried forever either.
+        console.warn('FolderCompare: version lookup failed:', job.path, err)
+        text = '—'
+        title = `無法讀取版本資訊：${errText(err)}`
+      }
+      this._versionInFlight.delete(job.path)
+      this._resolveVersion(job.entry, text, title)
+    })
+  }
+
+  /**
+   * @param {FileEntry} entry
+   * @param {string} text
+   * @param {string} title
+   */
+  _resolveVersion(entry, text, title) {
+    entry.version = text
+    this._versionCache.set(entry.path, text)
+    if (title) this._versionTitles.set(entry.path, title)
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    for (const cell of vlist.querySelectorAll('.fc-version--pending')) {
+      if (cell.dataset.versionPath !== entry.path) continue
+      cell.classList.remove('fc-version--pending')
+      cell.textContent = text
+      if (title) cell.title = title
+    }
+  }
+
+  /**
+   * Read versions for the rows currently in the filtered tree, so sorting on
+   * the column has something to sort.
+   *
+   * Bounded by {@link MAX_VERSION_PREFETCH}: the point of the lazy column is
+   * that a folder of 50k files never gets 50k IPC calls, and a sort must not
+   * be the back door that does it anyway. When the cap bites, the status line
+   * says so instead of quietly sorting on a partial answer.
+   *
+   * @returns {Promise<void>}
+   */
+  async prefetchVersionsForSort() {
+    if (!window.electronAPI?.readMetadata) return
+    /** @type {FileEntry[]} */
+    const pending = []
+    let skipped = 0
+    for (const flat of this._visibleRows ?? []) {
+      for (const entry of [flat.row.left, flat.row.right]) {
+        if (!entry?.path || entry.isDirectory) continue
+        if (entry.version !== undefined) continue
+        const cached = this._versionCache.get(entry.path)
+        if (cached !== undefined) { entry.version = cached; continue }
+        if (sourceKindOf(entry.path) !== 'fs' || !hasVersionCandidateExt(entry.name)) {
+          entry.version = ''
+          this._versionCache.set(entry.path, '')
+          continue
+        }
+        if (pending.length >= MAX_VERSION_PREFETCH) { skipped++; continue }
+        pending.push(entry)
+      }
+    }
+    if (!pending.length) {
+      if (skipped) this._setScanStatus(`版本排序：超過 ${MAX_VERSION_PREFETCH} 個檔案，其餘未讀取`)
+      return
+    }
+
+    this._setScanStatus(`讀取版本資訊… 0/${pending.length}`)
+    let done = 0
+    await _runWithConcurrency(pending, VERSION_CONCURRENCY, async (entry) => {
+      let text = ''
+      let title = ''
+      try {
+        const meta = await window.electronAPI.readMetadata(entry.path)
+        text = versionTextFromMetadata(meta)
+        title = versionTitleFromMetadata(meta)
+      } catch (err) {
+        console.warn('FolderCompare: version lookup failed:', entry.path, err)
+        text = '—'
+      }
+      this._resolveVersion(entry, text, title)
+      done++
+      if (done % 25 === 0) this._setScanStatus(`讀取版本資訊… ${done}/${pending.length}`)
+    })
+    this._setScanStatus(skipped
+      ? `版本排序：僅讀取前 ${pending.length} 個檔案，另有 ${skipped} 個未讀取`
+      : '')
   }
 
   _renderStats(rows) {
@@ -4627,6 +5733,41 @@ ${rows}
           action: () => this._runDelete([{ path: rightPath, readOnly: rightReadOnly }])
         })
       }
+    }
+
+    // ── P2-32: 移動 / 互換（僅檔案）──
+    if (!isDir && modelRow) {
+      const hasLeft = !!modelRow.left?.path && !modelRow.left.isDirectory
+      const hasRight = !!modelRow.right?.path && !modelRow.right.isDirectory
+      if (hasLeft && this._rightPath) {
+        items.push({ separator: true })
+        items.push({
+          label: '移動到右側（來源會被刪除）',
+          action: () => void this._moveRows([modelRow], 'right'),
+        })
+      }
+      if (hasRight && this._leftPath) {
+        if (!hasLeft) items.push({ separator: true })
+        items.push({
+          label: '移動到左側（來源會被刪除）',
+          action: () => void this._moveRows([modelRow], 'left'),
+        })
+      }
+      if (hasLeft && hasRight) {
+        items.push({
+          label: '互換左右（兩側內容對調）',
+          action: () => void this._exchangeRows([modelRow]),
+        })
+      }
+    }
+
+    // ── P2-26: 屬性檢視 / 編輯 ──
+    if (modelRow && (leftPath || rightPath)) {
+      items.push({ separator: true })
+      items.push({
+        label: '屬性…',
+        action: () => void this.openAttributesDialog(modelRow),
+      })
     }
 
     // Algorithm shortcuts for differing files
