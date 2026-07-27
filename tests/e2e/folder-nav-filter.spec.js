@@ -59,6 +59,19 @@ async function captureDialogs(page, { confirmAnswer = true } = {}) {
 
 const alertsOf = (page) => page.evaluate(() => /** @type {any} */ (window).__alerts ?? [])
 
+/**
+ * Wait for a summary message rather than reading the list once.
+ *
+ * The file disappears before the summary alert is raised, so polling on the
+ * file and then reading alerts immediately is a race — which is how this spec
+ * first turned up flaky.
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {RegExp} expected
+ */
+const expectAlert = (page, expected) =>
+  expect.poll(async () => (await alertsOf(page)).join(' | ')).toMatch(expected)
+
 /** The panel is a toggle, so clicking blind closes it half the time. */
 async function openFilterPanel(page) {
   const panel = page.locator('.fc-filter-panel')
@@ -188,8 +201,7 @@ test('deleting from the folder view goes to the recycle bin and says so', async 
   await win.locator('.fc-modal-ok').click()
 
   await expect.poll(() => exists(victim)).toBe(false)
-  const alerts = await alertsOf(win)
-  expect(alerts.join('\n')).toContain('已移至資源回收桶')
+  await expectAlert(win, /已移至資源回收桶/)
 })
 
 test('the permanent checkbox is honoured and reported as permanent', async () => {
@@ -210,8 +222,7 @@ test('the permanent checkbox is honoured and reported as permanent', async () =>
   await win.locator('.fc-modal-ok').click()
 
   await expect.poll(() => exists(victim)).toBe(false)
-  const alerts = await alertsOf(win)
-  expect(alerts.join('\n')).toContain('已永久刪除')
+  await expectAlert(win, /已永久刪除/)
 })
 
 test('cancelling the delete dialog leaves the file alone', async () => {

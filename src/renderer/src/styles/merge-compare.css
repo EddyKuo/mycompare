@@ -27,6 +27,13 @@
 .mw-toolbar-sep { width: 1px; height: 14px; background: #d9d9d9; margin: 0 4px; }
 .mw-conflict-counter { min-width: 96px; }
 
+/* Three input panes means the drop has to say which one it meant, so the pane
+   under the cursor has to be identifiable before the mouse is released. */
+.mw-pane.mw-drop-target {
+  outline: 2px dashed var(--accent, #4a90d9);
+  outline-offset: -2px;
+}
+
 .mw-conflict-card {
   border: 1px solid #e0a000;
   border-radius: 4px;

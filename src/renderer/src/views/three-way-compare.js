@@ -6,6 +6,8 @@
 import { diffLines } from '../core/diff-engine.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, getNavOptions } from '../core/diff-nav.js'
+import { renderTextTable, reportHeader } from '../core/report.js'
+import { toast } from '../core/toast.js'
 // Imported here rather than from the renderer entry so the view stays
 // self-contained; the bundler emits it once no matter how many tabs mount.
 import '../styles/merge-compare.css'
@@ -319,6 +321,35 @@ export function buildPaneRows(side, opts = {}) {
   return diffToPaneRows(diff)
 }
 
+/**
+ * Ceiling for a dropped text file, in characters. Beyond this the merge would
+ * hold three copies plus every diff structure derived from them.
+ */
+export const MAX_MERGE_CHARS = 20_000_000
+
+/** Report labels for a conflict's resolution state. */
+const CHOICE_LABELS = {
+  left: '採用左側',
+  right: '採用右側',
+  base: '採用基準',
+  both: '採用兩者',
+  none: '未解決',
+}
+
+/** How much of a conflict's first line a report shows. */
+const PREVIEW_CHARS = 60
+
+/**
+ * One line, trimmed and clipped, safe to place in a table cell.
+ * @param {string} text
+ * @returns {string}
+ */
+function _previewLine(text) {
+  const one = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (!one) return '（空行）'
+  return one.length > PREVIEW_CHARS ? `${one.slice(0, PREVIEW_CHARS)}…` : one
+}
+
 // ---------------------------------------------------------------------------
 // ThreeWayCompare
 // ---------------------------------------------------------------------------
@@ -348,6 +379,9 @@ export class ThreeWayCompare {
 
     /** @type {Array<{ pane: HTMLElement, handler: Function }>|null} */
     this._syncScrollHandlers = null
+
+    /** @type {(() => void)|null} Removes the drag & drop listeners on destroy */
+    this._dropCleanup = null
 
     /**
      * Parsed segments from the last _threeWayMerge call.
@@ -501,6 +535,210 @@ export class ThreeWayCompare {
     return n
   }
 
+  // ---------------------------------------------------------------------------
+  // Reports
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Conflict-by-conflict view of the merge, shared by both report formats and
+   * usable on its own by a caller that wants the numbers without the layout.
+   *
+   * @returns {{
+   *   total: number, resolved: number, unresolved: number,
+   *   items: Array<{
+   *     index: number, id: number, baseLine: number|null,
+   *     leftLines: number, baseLines: number, rightLines: number,
+   *     choice: ConflictChoice|null, preview: string
+   *   }>
+   * }}
+   */
+  getConflictSummary() {
+    const items = []
+    let index = 0
+    for (const seg of this._segments) {
+      if (seg.type !== 'conflict') continue
+      const choice = this._conflictChoices.get(seg.id) ?? null
+      items.push({
+        index,
+        id: seg.id,
+        // baseStart counts lines from zero; a report is read against an editor.
+        baseLine: typeof seg.baseStart === 'number' ? seg.baseStart + 1 : null,
+        leftLines: seg.leftLines.length,
+        baseLines: seg.baseLines.length,
+        rightLines: seg.rightLines.length,
+        choice,
+        preview: _previewLine(seg.leftLines[0] ?? seg.rightLines[0] ?? seg.baseLines[0] ?? ''),
+      })
+      index++
+    }
+    const resolved = items.filter((it) => it.choice != null).length
+    return { total: items.length, resolved, unresolved: items.length - resolved, items }
+  }
+
+  /**
+   * Plain-text report of the merge.
+   *
+   * Capped like the hex and text reports: a merge of two heavily diverged
+   * branches can hold thousands of conflicts, and a report nobody can read is
+   * no more useful than no report.
+   *
+   * @param {{ generatedAt?: Date, maxConflicts?: number }} [opts]
+   * @returns {string}
+   */
+  buildTextReport(opts = {}) {
+    const maxConflicts = opts.maxConflicts ?? 500
+    const summary = this.getConflictSummary()
+    const header = reportHeader({
+      title: '三向合併報告',
+      leftPath: this._leftPath,
+      rightPath: this._rightPath,
+      generatedAt: opts.generatedAt,
+    })
+    const basePath = `基準：${this._basePath || '（未知）'}\n`
+
+    const counts = summary.total === 0
+      ? '無衝突'
+      : `衝突 ${summary.total}，已解決 ${summary.resolved}，未解決 ${summary.unresolved}`
+
+    const shown = summary.items.slice(0, maxConflicts)
+    const rows = shown.map((it) => [
+      String(it.index + 1),
+      it.baseLine == null ? '-' : String(it.baseLine),
+      String(it.leftLines),
+      String(it.baseLines),
+      String(it.rightLines),
+      CHOICE_LABELS[it.choice ?? 'none'],
+      it.preview,
+    ])
+
+    const table = rows.length
+      ? renderTextTable(
+          [{ title: '#', align: 'right' }, { title: '基準行', align: 'right' },
+           { title: '左行數', align: 'right' }, { title: '基準行數', align: 'right' },
+           { title: '右行數', align: 'right' }, { title: '狀態' }, { title: '內容' }],
+          rows)
+      : '（三個來源可自動合併，沒有衝突）'
+
+    const omitted = summary.total - shown.length
+    const note = omitted > 0 ? `\n\n（另有 ${omitted} 個衝突未列出）` : ''
+    return `${header}${basePath}\n${counts}\n\n${table}${note}\n`
+  }
+
+  /**
+   * Self-contained HTML report of the merge. Capped for the same reason as the
+   * plain-text one.
+   *
+   * @param {{ generatedAt?: Date, maxConflicts?: number }} [opts]
+   * @returns {string}
+   */
+  buildHtmlReport(opts = {}) {
+    const maxConflicts = opts.maxConflicts ?? 500
+    const summary = this.getConflictSummary()
+    const esc = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    const timestamp = (opts.generatedAt ?? new Date()).toLocaleString('zh-TW')
+
+    const shown = summary.items.slice(0, maxConflicts)
+    const rows = shown.map((it) => `<tr>
+  <td class="num">${it.index + 1}</td>
+  <td class="num">${it.baseLine == null ? '-' : it.baseLine}</td>
+  <td class="num">${it.leftLines}</td>
+  <td class="num">${it.baseLines}</td>
+  <td class="num">${it.rightLines}</td>
+  <td class="${it.choice == null ? 'unresolved' : 'resolved'}">${esc(CHOICE_LABELS[it.choice ?? 'none'])}</td>
+  <td class="preview">${esc(it.preview)}</td>
+</tr>`).join('\n')
+
+    const omitted = summary.total - shown.length
+    const note = omitted > 0 ? `<p class="note">另有 ${omitted} 個衝突未列出。</p>` : ''
+    const body = rows
+      ? `<table>
+<thead><tr><th>#</th><th>基準行</th><th>左行數</th><th>基準行數</th><th>右行數</th><th>狀態</th><th>內容</th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>${note}`
+      : '<p class="note">三個來源可自動合併，沒有衝突。</p>'
+
+    return `<!DOCTYPE html>
+<html lang="zh-TW"><head><meta charset="UTF-8">
+<title>MyCompare — 三向合併報告</title>
+<style>
+body{font-family:sans-serif;font-size:13px;background:#fff;color:#222;margin:16px}
+h2{margin-bottom:4px}
+.paths{font-size:12px;color:#666;margin-bottom:12px;line-height:1.6}
+.report-stats{font-size:12px;display:flex;flex-wrap:wrap;gap:10px;padding:8px 12px;
+  background:#f5f5f5;border:1px solid #ddd;border-radius:4px;margin-bottom:12px}
+.report-stats .stat-mod{color:#996c00;font-weight:600}
+.report-stats .stat-eq{color:#666;font-weight:600}
+.report-stats .ts{margin-left:auto;color:#888}
+.note{font-size:12px;color:#666}
+table{border-collapse:collapse;width:100%}
+th{background:#f0f0f0;border-bottom:2px solid #aaa;padding:2px 6px;text-align:left}
+td{padding:1px 6px;border-bottom:1px solid #eee;word-break:break-all}
+.num{text-align:right}
+.preview{font-family:monospace;white-space:pre-wrap}
+.unresolved{background:#ffd7d7;font-weight:600}
+.resolved{background:#d7ffd7}
+@media print{
+  body{margin:8mm;font-size:11px}
+  .no-print{display:none !important}
+  h2{font-size:14px}
+  .paths,.report-stats{font-size:10px}
+  table{page-break-inside:auto}
+  tr{page-break-inside:avoid;page-break-after:auto}
+}
+</style>
+</head><body>
+<h2>三向合併報告</h2>
+<div class="paths">
+左：${esc(this._leftPath || '（未知）')}<br>
+基準：${esc(this._basePath || '（未知）')}<br>
+右：${esc(this._rightPath || '（未知）')}
+</div>
+<div class="report-stats">
+  <div>衝突: <span class="stat-mod">${summary.total}</span></div>
+  <div>已解決: <span class="stat-eq">${summary.resolved}</span></div>
+  <div>未解決: <span class="stat-mod">${summary.unresolved}</span></div>
+  <div class="ts">生成時間: ${esc(timestamp)}</div>
+</div>
+${body}
+</body></html>`
+  }
+
+  /**
+   * @param {{ print?: boolean }} [opts] print=true opens the report in a blob
+   *   window and calls print() instead of writing it to disk.
+   * @returns {Promise<void>}
+   */
+  async exportHtml(opts = {}) {
+    const html = this.buildHtmlReport()
+    if (opts.print) {
+      const blob = new Blob([html], { type: 'text/html' })
+      const url = URL.createObjectURL(blob)
+      const win = window.open(url, '_blank')
+      if (win) {
+        win.addEventListener('load', () => {
+          try { win.print() } catch { /* 使用者取消列印 */ }
+        })
+        return
+      }
+      // Pop-up blocked — fall back to saving rather than doing nothing.
+      this._reportError('無法開啟列印視窗，改為另存報告')
+    }
+    await window.electronAPI.saveFile(
+      'merge-report.html', html,
+      [{ name: 'HTML', extensions: ['html'] }, { name: '所有檔案', extensions: ['*'] }])
+  }
+
+  /** Save the plain-text report. */
+  async exportTextReport() {
+    await window.electronAPI.saveFile(
+      'merge-report.txt',
+      this.buildTextReport(),
+      [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }])
+  }
+
   /**
    * Comparison settings only — never paths or file contents, because a named
    * config is meant to be reusable across sessions.
@@ -565,6 +803,10 @@ export class ThreeWayCompare {
         pane.removeEventListener('scroll', handler)
       }
       this._syncScrollHandlers = null
+    }
+    if (this._dropCleanup) {
+      this._dropCleanup()
+      this._dropCleanup = null
     }
     if (this._container) this._container.innerHTML = ''
     this._listeners.clear()
@@ -735,7 +977,7 @@ export class ThreeWayCompare {
             right: this._rightPath,
           })
         } catch (err) {
-          console.error('[ThreeWayCompare] openFile error:', err)
+          this._reportError(`開啟檔案失敗：${err instanceof Error ? err.message : String(err)}`)
         }
       })
     })
@@ -746,7 +988,7 @@ export class ThreeWayCompare {
       try {
         await window.electronAPI.saveFile('merged-output.txt', content)
       } catch (err) {
-        console.error('[ThreeWayCompare] saveFile error:', err)
+        this._reportError(`儲存輸出失敗：${err instanceof Error ? err.message : String(err)}`)
       }
     })
 
@@ -761,6 +1003,132 @@ export class ThreeWayCompare {
 
     // T26: Sync scroll across all three content panes
     this._setupSyncScroll()
+    this._setupDropTargets()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal – drag & drop
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Accept files dropped onto any of the three input panes.
+   *
+   * Three inputs means the drop has to say which one it meant, and the only
+   * thing that can say it is the pane the file was released over.
+   */
+  _setupDropTargets() {
+    /** @type {Array<[HTMLElement, 'left'|'base'|'right']>} */
+    const targets = /** @type {Array<'left'|'base'|'right'>} */ (['left', 'base', 'right'])
+      .map((side) => [this._q(`.mw-pane--${side}`), side])
+      .filter(([node]) => Boolean(node))
+
+    /** @type {Array<() => void>} */
+    const cleanups = []
+
+    for (const [node, side] of targets) {
+      const onOver = (/** @type {DragEvent} */ e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+        node.classList.add('mw-drop-target')
+      }
+      const onLeave = () => node.classList.remove('mw-drop-target')
+      const onDrop = (/** @type {DragEvent} */ e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        node.classList.remove('mw-drop-target')
+        void this._acceptDrop(e, side)
+      }
+      node.addEventListener('dragenter', onOver)
+      node.addEventListener('dragover', onOver)
+      node.addEventListener('dragleave', onLeave)
+      node.addEventListener('drop', onDrop)
+      cleanups.push(() => {
+        node.removeEventListener('dragenter', onOver)
+        node.removeEventListener('dragover', onOver)
+        node.removeEventListener('dragleave', onLeave)
+        node.removeEventListener('drop', onDrop)
+      })
+    }
+
+    this._dropCleanup = () => { for (const fn of cleanups) fn() }
+  }
+
+  /**
+   * Report a failure where the user will actually see it.
+   *
+   * The host wires a 'status' listener; without one the message would vanish,
+   * so a toast is the fallback rather than a console line. Not an alert: a
+   * modal dialog raised from a drop handler blocks the renderer.
+   *
+   * @param {string} message
+   */
+  _reportError(message) {
+    this._emit('status', { message, level: 'error' })
+    if (!this._listeners.get('status')?.size) toast(message, { type: 'error' })
+  }
+
+  /**
+   * @param {DragEvent} e
+   * @param {'left'|'base'|'right'} side  the pane the drop landed on
+   * @returns {Promise<void>}
+   */
+  async _acceptDrop(e, side) {
+    const files = [...(e.dataTransfer?.files ?? [])]
+    if (!files.length) return
+
+    let entries
+    try {
+      // The File objects go across as they are: Electron 32 removed File.path,
+      // and letting the renderer name a path would be self-authorisation.
+      entries = await window.electronAPI?.acceptDroppedFiles?.(files)
+    } catch (err) {
+      this._reportError(`無法接受拖放的檔案：${err instanceof Error ? err.message : String(err)}`)
+      return
+    }
+
+    if (!entries?.length) {
+      // preload resolves a path only for a File the OS really handed over.
+      this._reportError('無法取得拖放檔案的路徑')
+      return
+    }
+
+    const usable = entries.filter((entry) => entry && !entry.isDirectory)
+    if (!usable.length) {
+      this._reportError('請拖放檔案，而非資料夾')
+      return
+    }
+
+    // Three files at once fill all three inputs in pane order; anything else
+    // only touches the pane that took the drop, because guessing which of the
+    // three a second file belongs to would be a coin flip.
+    const plan = usable.length >= 3
+      ? /** @type {Array<['left'|'base'|'right', { path: string }]>} */ (
+          [['left', usable[0]], ['base', usable[1]], ['right', usable[2]]])
+      : /** @type {Array<['left'|'base'|'right', { path: string }]>} */ ([[side, usable[0]]])
+
+    for (const [target, entry] of plan) {
+      await this._loadDroppedFile(target, entry.path)
+    }
+  }
+
+  /**
+   * @param {'left'|'base'|'right'} side
+   * @param {string} path
+   * @returns {Promise<void>}
+   */
+  async _loadDroppedFile(side, path) {
+    try {
+      const result = await window.electronAPI.readFile(path)
+      if (!result) return
+      if ((result.content?.length ?? 0) > MAX_MERGE_CHARS) {
+        this._reportError(`${path} 超過大小上限（${MAX_MERGE_CHARS} 字元），未載入`)
+        return
+      }
+      this.setSide(side, result.content, result.path)
+    } catch (err) {
+      this._reportError(`載入 ${path} 失敗：${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   /**

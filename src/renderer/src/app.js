@@ -496,6 +496,9 @@ function showTableCompare() {
   if (!tableCompare) {
     tableCompare = new TableCompare({})
     tableCompare.mount(el('view-table'))
+    // A failed drop or read has no other way to reach the user; without this
+    // the view falls back to a toast, which is easy to miss.
+    tableCompare.on('status', _viewStatus)
     tableCompare.on('paths-changed', ({ left, right }) => {
       recordSession('table', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
@@ -528,10 +531,7 @@ function showImageCompare() {
       updateToolbar()
     })
     // A drop that fails has no other way to reach the user.
-    imageCompare.on('status', ({ message, level }) => {
-      if (level === 'error') showError(message)
-      else showStatus(message)
-    })
+    imageCompare.on('status', _viewStatus)
   }
   updateToolbar()
 }
@@ -551,6 +551,9 @@ function showHexCompare() {
   if (!hexCompare) {
     hexCompare = new HexCompare({})
     hexCompare.mount(el('view-hex'))
+    // A failed drop or read has no other way to reach the user; without this
+    // the view falls back to a toast, which is easy to miss.
+    hexCompare.on('status', _viewStatus)
     hexCompare.on('paths-changed', ({ left, right }) => {
       recordSession('hex', { leftPath: left ?? '', rightPath: right ?? '' })
       el('path-left').textContent = left || '（未選擇）'
@@ -576,6 +579,10 @@ function showMerge3() {
   if (!mergeCompare) {
     mergeCompare = new ThreeWayCompare()
     mergeCompare.mount(el('view-merge3'))
+
+    // A failed drop or read has no other way to reach the user; without this
+    // the view falls back to a toast, which is easy to miss.
+    mergeCompare.on('status', _viewStatus)
 
     mergeCompare.on('paths-changed', ({ left, base, right }) => {
       recordSession('merge3', { leftPath: left ?? '', rightPath: right ?? '', basePath: base ?? '' })
@@ -1029,6 +1036,16 @@ function _setReportStatus(msg, isError = false) {
  * hardcoded text/folder branch meant a view that gained a report still could
  * not print it, and said nothing when the menu item did nothing.
  */
+/**
+ * Route a view's status event to the status bar.
+ *
+ * @param {{message: string, level?: string}} evt
+ */
+function _viewStatus({ message, level }) {
+  if (level === 'error') showError(message)
+  else showStatus(message)
+}
+
 /**
  * Run a folder-view command from the menu.
  *

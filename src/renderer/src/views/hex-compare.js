@@ -20,6 +20,7 @@ import { renderTextTable, reportHeader } from '../core/report.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import { SettingsStore } from '../core/settings-store.js'
+import { toast } from '../core/toast.js'
 import '../styles/hex-compare.css'
 
 const _settings = new SettingsStore()
@@ -408,6 +409,9 @@ export class HexCompare {
     /** @type {Function|null} Ctrl+F keydown handler reference (for removeEventListener) */
     this._ctrlFHandler = null
 
+    /** @type {(() => void)|null} Removes the drag & drop listeners on destroy */
+    this._dropCleanup = null
+
     // S16: byte-level difference navigation
     /** @type {Array<{ start: number, end: number, length: number }>} */
     this._diffRegions = []
@@ -456,6 +460,10 @@ export class HexCompare {
     if (this._ctrlFHandler) {
       document.removeEventListener('keydown', this._ctrlFHandler)
       this._ctrlFHandler = null
+    }
+    if (this._dropCleanup) {
+      this._dropCleanup()
+      this._dropCleanup = null
     }
     // T27: 清除所有 hx-selected 高亮
     // S14-M04: scope to this container so we don't wipe highlights on other hex tabs.
@@ -1411,6 +1419,130 @@ ${body}
     // Diff-navigation keys are owned solely by app.js's SettingsStore binding,
     // which routes to whichever view is active. Binding them here as well made
     // every F8 press advance two differences.
+
+    this._setupDropTargets()
+  }
+
+  // ── Private: Drag & drop ─────────────────────────────────────────────────────
+
+  /**
+   * Accept binaries dropped onto either pane.
+   *
+   * The pane that took the drop chooses the side, so one file can be replaced
+   * without disturbing the other; dropping two at once fills both.
+   */
+  _setupDropTargets() {
+    /** @type {Array<[HTMLElement, 'left'|'right']>} */
+    const targets = [
+      [this._dom.pane_left, 'left'],
+      [this._dom.pane_right, 'right'],
+    ].filter(([node]) => Boolean(node))
+
+    /** @type {Array<() => void>} */
+    const cleanups = []
+
+    for (const [node, side] of targets) {
+      const onOver = (/** @type {DragEvent} */ e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+        node.classList.add('hx-drop-target')
+      }
+      const onLeave = () => node.classList.remove('hx-drop-target')
+      const onDrop = (/** @type {DragEvent} */ e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        node.classList.remove('hx-drop-target')
+        void this._acceptDrop(e, side)
+      }
+      node.addEventListener('dragenter', onOver)
+      node.addEventListener('dragover', onOver)
+      node.addEventListener('dragleave', onLeave)
+      node.addEventListener('drop', onDrop)
+      cleanups.push(() => {
+        node.removeEventListener('dragenter', onOver)
+        node.removeEventListener('dragover', onOver)
+        node.removeEventListener('dragleave', onLeave)
+        node.removeEventListener('drop', onDrop)
+      })
+    }
+
+    this._dropCleanup = () => { for (const fn of cleanups) fn() }
+  }
+
+  /**
+   * Report a drop failure where the user will actually see it.
+   *
+   * The host wires a 'status' listener; without one the message would vanish,
+   * so a toast is the fallback rather than a console line. Not an alert: a
+   * modal dialog raised from a drop handler blocks the renderer.
+   *
+   * @param {string} message
+   */
+  _dropError(message) {
+    this._emit('status', { message, level: 'error' })
+    if (!this._handlers.status?.length) toast(message, { type: 'error' })
+  }
+
+  /**
+   * @param {DragEvent} e
+   * @param {'left'|'right'} side  the pane the drop landed on
+   * @returns {Promise<void>}
+   */
+  async _acceptDrop(e, side) {
+    const files = [...(e.dataTransfer?.files ?? [])]
+    if (!files.length) return
+
+    let entries
+    try {
+      // The File objects go across as they are: Electron 32 removed File.path,
+      // and letting the renderer name a path would be self-authorisation.
+      entries = await window.electronAPI?.acceptDroppedFiles?.(files)
+    } catch (err) {
+      this._dropError(`無法接受拖放的檔案：${err instanceof Error ? err.message : String(err)}`)
+      return
+    }
+
+    if (!entries?.length) {
+      // preload resolves a path only for a File the OS really handed over.
+      this._dropError('無法取得拖放檔案的路徑')
+      return
+    }
+
+    const usable = entries.filter((entry) => entry && !entry.isDirectory)
+    if (!usable.length) {
+      this._dropError('請拖放檔案，而非資料夾')
+      return
+    }
+
+    const plan = usable.length > 1
+      ? /** @type {Array<['left'|'right', { path: string }]>} */ ([['left', usable[0]], ['right', usable[1]]])
+      : /** @type {Array<['left'|'right', { path: string }]>} */ ([[side, usable[0]]])
+
+    for (const [target, entry] of plan) {
+      await this._loadDroppedFile(target, entry.path)
+    }
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @returns {Promise<void>}
+   */
+  async _loadDroppedFile(side, path) {
+    let result
+    try {
+      result = await window.electronAPI.readFileBinary(path, MAX_BYTES)
+    } catch (err) {
+      this._dropError(`載入 ${path} 失敗：${err instanceof Error ? err.message : String(err)}`)
+      return
+    }
+    if (!result) return
+    if (side === 'left') this.setLeft(result.path, result.base64)
+    else this.setRight(result.path, result.base64)
+    if (result.truncated) {
+      this._dropError(`${path} 超過大小上限 ${formatSize(MAX_BYTES)}，僅載入前段內容`)
+    }
   }
 
   // ── Private: Find (T10) ──────────────────────────────────────────────────────

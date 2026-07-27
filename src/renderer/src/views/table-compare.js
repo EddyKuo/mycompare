@@ -23,6 +23,7 @@ import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el } from '../core/utils.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
+import { toast } from '../core/toast.js'
 import '../styles/table-compare.css'
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
@@ -606,6 +607,14 @@ function stepIndexWrapped(current, total, delta) {
   return ((current + delta) % total + total) % total
 }
 
+/**
+ * Ceiling for a dropped delimited-text file, in characters.
+ *
+ * Parsing allocates several arrays per row, so a file large enough to be worth
+ * refusing has to be refused before it is parsed rather than after.
+ */
+export const MAX_TABLE_CHARS = 20_000_000
+
 // ── TableCompare Class ────────────────────────────────────────────────────────
 
 export class TableCompare {
@@ -661,6 +670,9 @@ export class TableCompare {
     /** @type {((e: KeyboardEvent) => void)|null} */
     this._keyHandler = null
 
+    /** @type {(() => void)|null} Removes the drag & drop listeners on destroy */
+    this._dropCleanup = null
+
     // S16-T2: row-level difference navigation
     /** @type {number[]} */
     this._diffRows = []
@@ -714,6 +726,10 @@ export class TableCompare {
     if (this._keyHandler) {
       document.removeEventListener('keydown', this._keyHandler)
       this._keyHandler = null
+    }
+    if (this._dropCleanup) {
+      this._dropCleanup()
+      this._dropCleanup = null
     }
     if (this._container) {
       this._container.innerHTML = ''
@@ -772,7 +788,7 @@ export class TableCompare {
   async _openExcel(side, path) {
     const result = await window.electronAPI.readExcel(path)
     if (result?.error) {
-      console.error('Excel read error:', result.error)
+      this._reportError(`讀取 Excel 失敗：${result.error}`)
       return
     }
     const sheetName = result.sheetNames[0]
@@ -1862,7 +1878,134 @@ export class TableCompare {
     leftScroll.addEventListener('contextmenu',  (e) => this._onTableContextMenu(e, 'left'))
     rightScroll.addEventListener('contextmenu', (e) => this._onTableContextMenu(e, 'right'))
 
+    this._setupDropTargets()
     this._bindNavEvents()
+  }
+
+  // ── Private: Drag & drop ─────────────────────────────────────────────────────
+
+  /**
+   * Accept table files dropped onto either pane.
+   *
+   * The pane that took the drop chooses the side, so one file can be replaced
+   * without disturbing the other; dropping two at once fills both.
+   */
+  _setupDropTargets() {
+    /** @type {Array<[HTMLElement, 'left'|'right']>} */
+    const targets = [
+      [this._dom.leftPane, 'left'],
+      [this._dom.rightPane, 'right'],
+    ].filter(([node]) => Boolean(node))
+
+    /** @type {Array<() => void>} */
+    const cleanups = []
+
+    for (const [node, side] of targets) {
+      const onOver = (/** @type {DragEvent} */ e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+        node.classList.add('tc-drop-target')
+      }
+      const onLeave = () => node.classList.remove('tc-drop-target')
+      const onDrop = (/** @type {DragEvent} */ e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        node.classList.remove('tc-drop-target')
+        void this._acceptDrop(e, side)
+      }
+      node.addEventListener('dragenter', onOver)
+      node.addEventListener('dragover', onOver)
+      node.addEventListener('dragleave', onLeave)
+      node.addEventListener('drop', onDrop)
+      cleanups.push(() => {
+        node.removeEventListener('dragenter', onOver)
+        node.removeEventListener('dragover', onOver)
+        node.removeEventListener('dragleave', onLeave)
+        node.removeEventListener('drop', onDrop)
+      })
+    }
+
+    this._dropCleanup = () => { for (const fn of cleanups) fn() }
+  }
+
+  /**
+   * Report a failure where the user will actually see it.
+   *
+   * The host wires a 'status' listener; without one the message would vanish,
+   * so a toast is the fallback rather than a console line. Not an alert: a
+   * modal dialog raised from a drop handler blocks the renderer.
+   *
+   * @param {string} message
+   */
+  _reportError(message) {
+    this._emit('status', { message, level: 'error' })
+    if (!this._handlers.status?.length) toast(message, { type: 'error' })
+  }
+
+  /**
+   * @param {DragEvent} e
+   * @param {'left'|'right'} side  the pane the drop landed on
+   * @returns {Promise<void>}
+   */
+  async _acceptDrop(e, side) {
+    const files = [...(e.dataTransfer?.files ?? [])]
+    if (!files.length) return
+
+    let entries
+    try {
+      // The File objects go across as they are: Electron 32 removed File.path,
+      // and letting the renderer name a path would be self-authorisation.
+      entries = await window.electronAPI?.acceptDroppedFiles?.(files)
+    } catch (err) {
+      this._reportError(`無法接受拖放的檔案：${err instanceof Error ? err.message : String(err)}`)
+      return
+    }
+
+    if (!entries?.length) {
+      // preload resolves a path only for a File the OS really handed over.
+      this._reportError('無法取得拖放檔案的路徑')
+      return
+    }
+
+    const usable = entries.filter((entry) => entry && !entry.isDirectory)
+    if (!usable.length) {
+      this._reportError('請拖放檔案，而非資料夾')
+      return
+    }
+
+    const plan = usable.length > 1
+      ? /** @type {Array<['left'|'right', { path: string }]>} */ ([['left', usable[0]], ['right', usable[1]]])
+      : /** @type {Array<['left'|'right', { path: string }]>} */ ([[side, usable[0]]])
+
+    for (const [target, entry] of plan) {
+      await this._loadDroppedFile(target, entry.path)
+    }
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @returns {Promise<void>}
+   */
+  async _loadDroppedFile(side, path) {
+    const lower = path.toLowerCase()
+    try {
+      if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
+        await this._openExcel(side, path)
+        return
+      }
+      const result = await window.electronAPI.readFile(path)
+      if (!result) return
+      if ((result.content?.length ?? 0) > MAX_TABLE_CHARS) {
+        this._reportError(`${path} 超過大小上限（${MAX_TABLE_CHARS} 字元），未載入`)
+        return
+      }
+      if (side === 'left') this.setLeft(result.path, result.content)
+      else this.setRight(result.path, result.content)
+    } catch (err) {
+      this._reportError(`載入 ${path} 失敗：${err instanceof Error ? err.message : String(err)}`)
+    }
   }
 
   /** S16: find bar, difference navigation and swap wiring */

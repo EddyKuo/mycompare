@@ -253,6 +253,14 @@
   border-right: none;
 }
 
+/* Which pane the drop lands in decides which side is replaced, so the pane
+   under the cursor has to be identifiable before the mouse is released.
+   Scoped to .table-compare because the text view owns `.tc-pane` too. */
+.table-compare .tc-pane.tc-drop-target {
+  outline: 2px dashed var(--accent-color, #4a90d9);
+  outline-offset: -2px;
+}
+
 .tc-body.over-under > .tc-pane {
   border-right: none;
   border-bottom: 1px solid var(--border-color);

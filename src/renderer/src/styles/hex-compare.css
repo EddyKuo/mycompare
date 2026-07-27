@@ -186,6 +186,13 @@
   border-right: none;
 }
 
+/* Which pane the drop lands in decides which side is replaced, so the pane
+   under the cursor has to be identifiable before the mouse is released. */
+.hx-pane.hx-drop-target {
+  outline: 2px dashed var(--accent-color, #4a90d9);
+  outline-offset: -2px;
+}
+
 /* ── Pane Header ─────────────────────────────────────────────────────────────── */
 
 .hx-header {
