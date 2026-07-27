@@ -30,10 +30,11 @@ const SAMPLE = [
 ].join('\r\n')
 
 test.beforeAll(async () => {
-  ;({ app, win } = await launchApp())
   dir = await mkdtemp(join(tmpdir(), 'mycompare-reg-'))
   regPath = join(dir, 'sample.reg')
   await writeFile(regPath, `\uFEFF${SAMPLE}`, 'utf16le')
+  // Authorised on the command line: the renderer has no way to add a root.
+  ;({ app, win } = await launchApp([regPath]))
 })
 
 test.afterAll(async () => {
@@ -50,10 +51,8 @@ test('the registry IPC surface is exposed', async () => {
 })
 
 test('a UTF-16 .reg file parses through the real handler', async () => {
-  const result = await win.evaluate(async (p) => {
-    await window.electronAPI.acceptDroppedPaths([p])
-    return window.electronAPI.readRegFile(p)
-  }, regPath)
+  const result = await win.evaluate(
+    (p) => window.electronAPI.readRegFile(p), regPath)
 
   expect(result.format).toBe('reg5')
   const byName = Object.fromEntries(result.rows.map((r) => [r.name, r]))

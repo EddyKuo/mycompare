@@ -13,13 +13,16 @@ const ROOT = join(__dirname, '../../..')
  * Launch the Electron app from the built output.
  * Prerequisites: `npm run build` must have been executed beforehand.
  *
+ * @param {string[]} [extraArgs] positional paths passed on the command line.
+ *   The main process registers CLI arguments as allowed roots, which is how a
+ *   test authorises a fixture directory without a file dialog.
  * @returns {Promise<{ app: import('@playwright/test').ElectronApplication, win: import('@playwright/test').Page }>}
  */
-export async function launchApp() {
+export async function launchApp(extraArgs = []) {
   const mainEntry = join(ROOT, 'out/main/index.js')
 
   const app = await electron.launch({
-    args: [mainEntry],
+    args: [mainEntry, ...extraArgs],
     env: {
       ...process.env,
       NODE_ENV: 'production',

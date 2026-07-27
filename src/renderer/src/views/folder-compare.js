@@ -342,10 +342,9 @@ export function rollupUnimportant(row) {
 /**
  * Columns the folder view is able to show, in canonical display order.
  *
- * Beyond Compare also offers read-only / hidden / archive attribute columns.
- * The `read-dir` IPC reports only name / path / size / mtime / isDirectory /
- * isSymbolicLink, so `attrs` is limited to the flags the main process actually
- * returns rather than inventing values the renderer cannot know.
+ * `attrs` shows D/L/R/H plus `?` when the hidden flag is unreadable; see
+ * {@link entryAttrText}. Virtual sources (archives, snapshots, remote hosts)
+ * carry no attribute bits at all, so their rows show only what they do know.
  *
  * @type {FolderColumnDef[]}
  */
@@ -440,13 +439,164 @@ export function extensionOf(name) {
 }
 
 /**
+ * One directory entry, as produced by `read-dir`, `read-archive`,
+ * `read-snapshot-dir` or `remote-list-dir`.
+ *
+ * @typedef {object} FileEntry
+ * @property {string} name
+ * @property {string} path              absolute fs path, or a virtual path
+ * @property {boolean} isDirectory
+ * @property {boolean} [isSymbolicLink]
+ * @property {number} [size]
+ * @property {string} [mtime]
+ * @property {string} [ctime]
+ * @property {boolean} [readOnly]
+ * @property {boolean|null} [hidden]    null ⇒ the platform cannot tell
+ * @property {number} [depth]           archive entries only
+ * @property {string} [parentPath]      archive entries only
+ * @property {boolean} [isArchiveEntry]
+ */
+
+/**
  * Attribute flags for one side, from what `read-dir` reports.
+ *
+ * `hidden` is tri-state: the main process reports `null` where the platform
+ * gives it no way to tell (Windows keeps the flag in an attribute word Node's
+ * `Stats` does not carry). A trailing `?` marks that case, because rendering
+ * "not hidden" for something we simply cannot read would be a lie.
+ *
  * @param {FileEntry|null|undefined} entry
  * @returns {string}
  */
 export function entryAttrText(entry) {
   if (!entry) return ''
-  return (entry.isDirectory ? 'D' : '') + (entry.isSymbolicLink ? 'L' : '')
+  return (entry.isDirectory ? 'D' : '') +
+    (entry.isSymbolicLink ? 'L' : '') +
+    (entry.readOnly ? 'R' : '') +
+    (entry.hidden === true ? 'H' : '') +
+    (entry.hidden === null || entry.hidden === undefined ? '?' : '')
+}
+
+/** Human-readable expansion of {@link entryAttrText}, used as the cell tooltip. */
+export function entryAttrTitle(entry) {
+  if (!entry) return ''
+  const parts = []
+  if (entry.isDirectory) parts.push('D＝目錄')
+  if (entry.isSymbolicLink) parts.push('L＝符號連結')
+  parts.push(entry.readOnly ? 'R＝唯讀' : '可寫入')
+  if (entry.hidden === true) parts.push('H＝隱藏')
+  else if (entry.hidden === false) parts.push('非隱藏')
+  else parts.push('?＝隱藏屬性未知（此平台無法判讀）')
+  return parts.join('、')
+}
+
+// ── Virtual sources ─────────────────────────────────────────────────────────
+//
+// A folder side is not always a directory on disk: it can be an archive, a
+// saved snapshot, or a remote host. Each names its entries with a path only
+// its own reader understands, so every listing and every content read has to
+// be routed by that path's scheme rather than assumed to be a filesystem path.
+// Handing an archive's `zip::entry` to `readFile()` is exactly the bug this
+// abstraction exists to prevent — the path validator rejects it and the
+// comparison silently came up empty.
+
+/**
+ * @typedef {'fs'|'archive'|'snapshot'|'remote'} SourceKind
+ *
+ * @typedef {object} FolderSource
+ * @property {SourceKind} kind
+ * @property {string} root      fs directory, archive file, or snapshot file
+ * @property {string} [profileId] remote only
+ * @property {string} [secret]    remote only; never persisted
+ * @property {string} [startDir]  remote only; directory the root row lists
+ * @property {string} [label]     what to show in the path bar
+ */
+
+/**
+ * Classify a path by the store that can actually read it.
+ * @param {string|null|undefined} path
+ * @returns {SourceKind}
+ */
+export function sourceKindOf(path) {
+  const p = String(path ?? '')
+  if (p.startsWith('snapshot://')) return 'snapshot'
+  if (p.startsWith('remote://')) return 'remote'
+  if (p.includes('::')) return 'archive'
+  return 'fs'
+}
+
+/**
+ * Split a path into the container that can read it and the path within.
+ * @param {string|null|undefined} path
+ * @returns {{ kind: SourceKind, container: string, entry: string }}
+ */
+export function parseVirtualPath(path) {
+  const p = String(path ?? '')
+  const kind = sourceKindOf(p)
+  if (kind === 'archive') {
+    const i = p.indexOf('::')
+    return { kind, container: p.slice(0, i), entry: p.slice(i + 2) }
+  }
+  if (kind === 'snapshot') {
+    return { kind, container: '', entry: p.slice('snapshot://'.length) }
+  }
+  if (kind === 'remote') {
+    const rest = p.slice('remote://'.length)
+    const i = rest.indexOf('/')
+    return i < 0
+      ? { kind, container: rest, entry: '' }
+      : { kind, container: rest.slice(0, i), entry: rest.slice(i + 1) }
+  }
+  return { kind, container: p, entry: '' }
+}
+
+/**
+ * Convert `read-archive`'s flat entry list into the FileEntry shape the tree
+ * works with, synthesising the parent directories that tar and 7z omit —
+ * without them a nested entry would have no row to hang under.
+ *
+ * @param {string} archivePath
+ * @param {Array<{ path: string, size?: number, mtime?: string, isDirectory?: boolean }>} entries
+ * @returns {FileEntry[]}
+ */
+export function archiveEntriesToFileEntries(archivePath, entries) {
+  /** @type {Map<string, FileEntry>} */
+  const out = new Map()
+
+  /** @param {string} rel @param {boolean} isDir @param {object} extra */
+  const put = (rel, isDir, extra) => {
+    const parts = rel.split('/').filter(Boolean)
+    if (!parts.length) return
+    const key = parts.join('/')
+    if (out.has(key) && !extra) return
+    out.set(key, {
+      name: parts[parts.length - 1],
+      // Directories keep the trailing slash the zip reader already used, so a
+      // parent path computed here matches one computed there.
+      path: `${archivePath}::${key}${isDir ? '/' : ''}`,
+      isDirectory: isDir,
+      size: extra?.size ?? 0,
+      mtime: extra?.mtime ?? new Date(0).toISOString(),
+      depth: parts.length - 1,
+      parentPath: parts.length > 1
+        ? `${archivePath}::${parts.slice(0, -1).join('/')}/`
+        : archivePath,
+      isArchiveEntry: true,
+    })
+  }
+
+  const prefix = `${archivePath}::`
+  for (const e of entries ?? []) {
+    // `read-archive` already returns fully-qualified `archive::entry` paths
+    // while the raw parsers return bare relative ones; accept either.
+    const raw = String(e.path ?? '')
+    const rel = (raw.startsWith(prefix) ? raw.slice(prefix.length) : raw).replace(/\/+$/, '')
+    if (!rel) continue
+    const parts = rel.split('/').filter(Boolean)
+    for (let i = 1; i < parts.length; i++) put(parts.slice(0, i).join('/'), true, null)
+    put(rel, !!e.isDirectory, { size: e.size ?? 0, mtime: e.mtime })
+  }
+  return [...out.values()]
 }
 
 /**
@@ -790,9 +940,18 @@ export class FolderCompare {
     this._syncDirection = 'left-to-right' // 'left-to-right' | 'right-to-left' | 'bidirectional'
     this._syncOps = []
 
-    // Zip virtual entries (null if not a zip)
+    // Flattened archive entries, kept per side because an archive is listed
+    // once and then sliced by parent path rather than re-read per level.
+    /** @type {FileEntry[]|null} */
     this._leftZipEntries = null
+    /** @type {FileEntry[]|null} */
     this._rightZipEntries = null
+
+    // What backs each side. Absent ⇒ an ordinary filesystem directory.
+    /** @type {FolderSource|null} */
+    this._leftSource = null
+    /** @type {FolderSource|null} */
+    this._rightSource = null
 
     // Batch selection: Set of path keys (leftPath || rightPath)
     this._selectedNames = new Set()
@@ -1052,66 +1211,156 @@ export class FolderCompare {
   async swap() {
     ;[this._leftPath, this._rightPath] = [this._rightPath, this._leftPath]
     ;[this._leftZipEntries, this._rightZipEntries] = [this._rightZipEntries, this._leftZipEntries]
-    this._updatePathDisplay('left', this._leftPath ?? '')
-    this._updatePathDisplay('right', this._rightPath ?? '')
+    ;[this._leftSource, this._rightSource] = [this._rightSource, this._leftSource]
+    this._updatePathDisplay('left', this._sourceLabel('left'))
+    this._updatePathDisplay('right', this._sourceLabel('right'))
     this._expanded.clear()
     await this._scan()
   }
 
-  /** 開啟左側 Zip 檔案 */
+  /** 開啟左側壓縮檔 */
   async openZipLeft() {
     const result = await window.electronAPI.openZip()
     if (!result) return
-    this._leftPath = result.zipPath
-    this._leftZipEntries = this._flattenZipEntries(result.entries)
-    this._updatePathDisplay('left', `${result.zipPath} [ZIP]`)
-    this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
-    this._leftEntries = this._leftZipEntries.filter(e => e.depth === 0)
-    this._rightEntries = this._rightZipEntries ?? this._rightEntries
-    this._expanded.clear()
-    this._compareAndRender()
+    await this.openArchiveSide('left', result.zipPath, result.entries)
   }
 
-  /** 開啟右側 Zip 檔案 */
+  /** 開啟右側壓縮檔 */
   async openZipRight() {
     const result = await window.electronAPI.openZip()
     if (!result) return
-    this._rightPath = result.zipPath
-    this._rightZipEntries = this._flattenZipEntries(result.entries)
-    this._updatePathDisplay('right', `${result.zipPath} [ZIP]`)
-    this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
-    this._rightEntries = this._rightZipEntries.filter(e => e.depth === 0)
-    this._leftEntries = this._leftZipEntries ?? this._leftEntries
-    this._expanded.clear()
-    this._compareAndRender()
+    await this.openArchiveSide('right', result.zipPath, result.entries)
   }
 
-  /** 將 zip 扁平清單轉換為 FileEntry[] */
-  _flattenZipEntries(entries) {
-    return entries.map(e => ({
-      name: e.name,
-      path: e.path,
-      isDirectory: e.isDirectory,
-      size: e.size,
-      mtime: e.mtime,
-      depth: e.depth ?? 0,
-      parentPath: e.parentPath,
-      isZipEntry: true,
-    }))
+  /**
+   * Put an archive on one side of the comparison.
+   *
+   * Separate from the dialog so a session restore, a drop, or a test can
+   * supply the path directly; when no listing is handed in it is fetched
+   * through `read-archive`, which also covers tar/7z rather than zip alone.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} archivePath
+   * @param {Array<object>} [entries] pre-listed entries from `open-zip`
+   */
+  async openArchiveSide(side, archivePath, entries) {
+    const listing = entries ?? await window.electronAPI.readArchive(archivePath)
+    const rows = Array.isArray(listing) ? listing : (listing?.entries ?? [])
+    // `open-zip` already returns tree-shaped entries; `read-archive` returns a
+    // flat list that still needs its parent directories synthesised.
+    const flat = rows.length && rows[0]?.parentPath !== undefined
+      ? rows.map((e) => ({ ...e, isArchiveEntry: true }))
+      : archiveEntriesToFileEntries(archivePath, rows)
+
+    if (side === 'left') this._leftZipEntries = flat
+    else this._rightZipEntries = flat
+    await this.setSource(side, { kind: 'archive', root: archivePath, label: `${archivePath} [壓縮檔]` })
+  }
+
+  /**
+   * Point one side at any backing store and re-scan.
+   *
+   * @param {'left'|'right'} side
+   * @param {FolderSource} source
+   */
+  async setSource(side, source) {
+    // A remote side being replaced owns a live connection; dropping the
+    // reference without closing it leaks the session until the idle timer.
+    await this._disconnectRemote(side)
+
+    if (side === 'left') {
+      this._leftSource = source
+      this._leftPath = source.root
+      if (source.kind !== 'archive') this._leftZipEntries = null
+    } else {
+      this._rightSource = source
+      this._rightPath = source.root
+      if (source.kind !== 'archive') this._rightZipEntries = null
+    }
+    this._updatePathDisplay(side, this._sourceLabel(side))
+    this._expanded.clear()
+    await this._scan()
+  }
+
+  /** @param {'left'|'right'} side */
+  _sourceOf(side) {
+    return side === 'left' ? this._leftSource : this._rightSource
+  }
+
+  /** @param {'left'|'right'} side */
+  _sourceLabel(side) {
+    const src = this._sourceOf(side)
+    return src?.label ?? (side === 'left' ? this._leftPath : this._rightPath) ?? ''
+  }
+
+  /**
+   * Whether a side can be written to. Archives, snapshots and remote hosts are
+   * browse-only here, so copy/delete/rename must not be offered for them.
+   * @param {'left'|'right'} side
+   */
+  _isWritableSide(side) {
+    return (this._sourceOf(side)?.kind ?? 'fs') === 'fs'
+  }
+
+  /**
+   * List one directory level from whichever store backs the side.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @returns {Promise<FileEntry[]>}
+   */
+  async _listDir(side, path) {
+    const src = this._sourceOf(side)
+    switch (src?.kind) {
+      case 'archive': {
+        const all = side === 'left' ? this._leftZipEntries : this._rightZipEntries
+        return (all ?? []).filter((e) => e.parentPath === path)
+      }
+      case 'snapshot': {
+        const rel = path === src.root ? '' : parseVirtualPath(path).entry
+        return window.electronAPI.readSnapshotDir(src.root, rel)
+      }
+      case 'remote': {
+        const dir = path === src.root ? (src.startDir ?? '') : parseVirtualPath(path).entry
+        return window.electronAPI.remoteListDir(src.profileId, dir, src.secret)
+      }
+      default:
+        return window.electronAPI.readDir(path)
+    }
+  }
+
+  /**
+   * Close a side's remote session if it holds one.
+   * @param {'left'|'right'} side
+   */
+  async _disconnectRemote(side) {
+    const src = this._sourceOf(side)
+    if (src?.kind !== 'remote' || !src.profileId) return
+    const other = this._sourceOf(side === 'left' ? 'right' : 'left')
+    if (other?.kind === 'remote' && other.profileId === src.profileId) return
+    try {
+      await window.electronAPI?.remoteDisconnect?.(src.profileId)
+    } catch (err) {
+      console.error('FolderCompare: remote disconnect failed:', err)
+    }
+  }
+
+  /** Close every remote session this view opened. */
+  async disconnectAll() {
+    await this._disconnectRemote('left')
+    await this._disconnectRemote('right')
+    this._leftSource = this._leftSource?.kind === 'remote' ? null : this._leftSource
+    this._rightSource = this._rightSource?.kind === 'remote' ? null : this._rightSource
   }
 
   /** 直接設定左側路徑後自動掃描 */
   async setLeft(path) {
-    this._leftPath = path
-    this._updatePathDisplay('left', path)
-    await this._scan()
+    await this.setSource('left', { kind: 'fs', root: path })
   }
 
   /** 直接設定右側路徑後自動掃描 */
   async setRight(path) {
-    this._rightPath = path
-    this._updatePathDisplay('right', path)
-    await this._scan()
+    await this.setSource('right', { kind: 'fs', root: path })
   }
 
   /** 重新掃描兩側目錄 */
@@ -1564,6 +1813,12 @@ ${rows}
       alert(target === 'right' ? '請先選擇右側資料夾' : '請先選擇左側資料夾')
       return
     }
+    // copy-file only understands filesystem paths; failing here is clearer
+    // than letting every job fail one by one in the path validator.
+    if (!this._isWritableSide(target)) {
+      alert(`${target === 'right' ? '右' : '左'}側為唯讀來源（壓縮檔／快照／遠端），無法寫入`)
+      return
+    }
 
     const keys = this._selectedNames.size
       ? this._selectedNames
@@ -1883,6 +2138,9 @@ ${rows}
     // Late IPC results must not land on a torn-down view.
     this._scanController?.abort()
     this._scanController = null
+    // Closing the tab must close the connection too — otherwise the session
+    // survives every comparison the user opens and closes.
+    void this.disconnectAll()
     if (this._onDocumentClick) {
       document.removeEventListener('click', this._onDocumentClick)
       this._onDocumentClick = null
@@ -2639,8 +2897,8 @@ ${rows}
 
     try {
       const [leftEntries, rightEntries] = await Promise.all([
-        this._leftPath  ? window.electronAPI.readDir(this._leftPath)  : Promise.resolve([]),
-        this._rightPath ? window.electronAPI.readDir(this._rightPath) : Promise.resolve([]),
+        this._leftPath  ? this._listDir('left', this._leftPath)   : Promise.resolve([]),
+        this._rightPath ? this._listDir('right', this._rightPath) : Promise.resolve([]),
       ])
       // Entries that arrive after a cancel belong to a comparison the user no
       // longer wants; keeping the previous tree is the consistent outcome.
@@ -2956,8 +3214,8 @@ ${rows}
       return
     }
     const [leftChildren, rightChildren] = await Promise.all([
-      leftPath  ? window.electronAPI.readDir(leftPath)  : Promise.resolve([]),
-      rightPath ? window.electronAPI.readDir(rightPath) : Promise.resolve([]),
+      leftPath  ? this._listDir('left', leftPath)   : Promise.resolve([]),
+      rightPath ? this._listDir('right', rightPath) : Promise.resolve([]),
     ])
     // Leaving `children` null on cancel keeps the row collapsible and reloadable
     // rather than half-populated.
@@ -3110,7 +3368,10 @@ ${rows}
         return el('span', { className: 'fc-relpath', title: entry.path ?? rel }, rel)
       }
       case 'attrs':
-        return el('span', { className: 'fc-attrs' }, entryAttrText(entry))
+        return el('span', {
+          className: 'fc-attrs',
+          title: entryAttrTitle(entry),
+        }, entryAttrText(entry))
       default: {
         const nameCell = el('div', { className: 'fc-name-cell' })
         if (depth > 0) {
@@ -3225,6 +3486,10 @@ ${rows}
     const name     = rowEl.dataset.name      || ''
 
     const items = []
+    // Only filesystem paths can be handed to Explorer or to the write
+    // handlers; a virtual side offers browsing and comparison only.
+    const leftIsFs = this._isWritableSide('left')
+    const rightIsFs = this._isWritableSide('right')
 
     // ── 開啟比對（檔案）──
     if (!isDir && leftPath && rightPath &&
@@ -3237,17 +3502,23 @@ ${rows}
     }
 
     // ── 在檔案總管中顯示 ──
-    if (leftPath) {
+    if (leftPath && leftIsFs) {
       items.push({
         label: isDir ? '在檔案總管中顯示（左側資料夾）' : '在檔案總管中顯示（左側）',
         action: () => window.electronAPI.showInExplorer(leftPath)
       })
     }
-    if (rightPath) {
+    if (rightPath && rightIsFs) {
       items.push({
         label: isDir ? '在檔案總管中顯示（右側資料夾）' : '在檔案總管中顯示（右側）',
         action: () => window.electronAPI.showInExplorer(rightPath)
       })
+    }
+
+    // Everything past this point mutates the filesystem.
+    if (!leftIsFs || !rightIsFs) {
+      if (items.length) showContextMenu(e, items)
+      return
     }
 
     // ── 複製 / 刪除（僅檔案）──

@@ -20,6 +20,7 @@ import {
   saveFolderColumns,
   extensionOf,
   entryAttrText,
+  entryAttrTitle,
   columnSortValue,
   compareRowsBy,
   sortRows,
@@ -218,11 +219,29 @@ describe('extensionOf / entryAttrText', () => {
     expect(extensionOf(undefined)).toBe('')
   })
 
-  it('reports only the flags read-dir actually returns', () => {
-    expect(entryAttrText({ isDirectory: true })).toBe('D')
-    expect(entryAttrText({ isSymbolicLink: true })).toBe('L')
-    expect(entryAttrText({ isDirectory: true, isSymbolicLink: true })).toBe('DL')
+  it('reports the flags read-dir returns, marking an unknown hidden bit', () => {
+    // `hidden` absent or null means "the platform cannot tell", which must not
+    // render the same as a known-false.
+    expect(entryAttrText({ isDirectory: true })).toBe('D?')
+    expect(entryAttrText({ isSymbolicLink: true })).toBe('L?')
+    expect(entryAttrText({ isDirectory: true, isSymbolicLink: true })).toBe('DL?')
     expect(entryAttrText(null)).toBe('')
+  })
+
+  it('renders read-only and hidden once read-dir supplies them', () => {
+    expect(entryAttrText({ readOnly: true, hidden: false })).toBe('R')
+    expect(entryAttrText({ readOnly: false, hidden: true })).toBe('H')
+    expect(entryAttrText({ isDirectory: true, readOnly: true, hidden: true })).toBe('DRH')
+    expect(entryAttrText({ readOnly: false, hidden: false })).toBe('')
+    // Windows reports null: unknown, not "no".
+    expect(entryAttrText({ readOnly: false, hidden: null })).toBe('?')
+  })
+
+  it('explains every flag in the tooltip, including the unknown case', () => {
+    expect(entryAttrTitle({ readOnly: true, hidden: true })).toContain('唯讀')
+    expect(entryAttrTitle({ readOnly: true, hidden: true })).toContain('隱藏')
+    expect(entryAttrTitle({ readOnly: false, hidden: null })).toContain('未知')
+    expect(entryAttrTitle(null)).toBe('')
   })
 })
 

@@ -21,12 +21,16 @@ let dir
 let snapPath
 
 test.beforeAll(async () => {
-  ;({ app, win } = await launchApp())
   dir = await mkdtemp(join(tmpdir(), 'mycompare-snap-e2e-'))
   await mkdir(join(dir, 'src'), { recursive: true })
   await writeFile(join(dir, 'a.txt'), 'hello', 'utf-8')
   await writeFile(join(dir, 'src', 'b.js'), 'console.log(1)', 'utf-8')
   snapPath = join(dir, 'tree.mcss')
+
+  // The fixture directory is authorised on the command line, the way the app
+  // authorises a path outside a dialog. Nothing the renderer says can widen
+  // the allow-list, so a test cannot take that shortcut either.
+  ;({ app, win } = await launchApp([dir]))
 })
 
 /** Build the snapshot fixture once, on demand. */
@@ -46,10 +50,6 @@ test('a snapshot round-trips and projects one level at a time', async () => {
   // Written from the test process rather than through the IPC, because the
   // create-snapshot handler opens a save dialog that cannot be driven headlessly.
   await writeSnapshotFixture()
-
-  const authorised = await win.evaluate(
-    (p) => window.electronAPI.acceptDroppedPaths([p]), snapPath)
-  expect(authorised).toHaveLength(1)
 
   const root = await win.evaluate(
     (p) => window.electronAPI.readSnapshotDir(p, ''), snapPath)

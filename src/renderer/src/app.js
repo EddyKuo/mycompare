@@ -1,5 +1,5 @@
 import { TextCompare } from './views/text-compare.js'
-import { FolderCompare } from './views/folder-compare.js'
+import { FolderCompare, parseVirtualPath, sourceKindOf } from './views/folder-compare.js'
 import { TableCompare } from './views/table-compare.js'
 import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
 import { HexCompare } from './views/hex-compare.js'
@@ -192,6 +192,22 @@ let hexCompare = null
 /** @type {ThreeWayCompare | null} */
 let mergeCompare = null
 
+/**
+ * Passwords for remote profiles the user chose not to save, keyed by profile
+ * id. In memory only, for the lifetime of the window: every remote IPC call
+ * needs the secret again, and asking once per file would be unusable.
+ * @type {Map<string, string|undefined>}
+ */
+const _remoteSecrets = new Map()
+
+/** How to name a path's backing store in a message. */
+const SOURCE_LABELS = Object.freeze({
+  fs: '檔案',
+  archive: '壓縮檔內的檔案',
+  snapshot: '快照項目',
+  remote: '遠端檔案',
+})
+
 // ---------------------------------------------------------------------------
 // 公開入口
 // ---------------------------------------------------------------------------
@@ -265,7 +281,56 @@ export function initApp() {
       mergeCompare?.setSide('right', right)
     },
     mergeGetConflictCount: () => document.querySelectorAll('.mw-conflict-card').length,
+
+    // S17: the wiring these specs exercise all sits behind a native dialog,
+    // which cannot be driven headlessly; these are the same entry points the
+    // menu items reach once the dialog has returned.
+    openComparison: (opts) => openComparison(opts),
+    openArchiveSide: async (side, archivePath) => {
+      showFolderCompare()
+      await folderCompare?.openArchiveSide(side, archivePath)
+    },
+    folderSetLeft: async (path) => { showFolderCompare(); await folderCompare?.setLeft(path) },
+    folderSetRight: async (path) => { showFolderCompare(); await folderCompare?.setRight(path) },
+    folderSetColumns: (columns) => folderCompare?.setColumns(columns),
+    folderRows: () => [...document.querySelectorAll('.fc-row')].map((r) => ({
+      name: r.dataset.name ?? '',
+      status: r.dataset.status ?? '',
+      isDir: r.dataset.isDir === 'true',
+      leftPath: r.dataset.leftPath ?? '',
+      rightPath: r.dataset.rightPath ?? '',
+      attrs: r.querySelector('.fc-attrs')?.textContent ?? '',
+      attrsTitle: r.querySelector('.fc-attrs')?.getAttribute('title') ?? '',
+    })),
+    folderDblClick: (name) => {
+      const row = [...document.querySelectorAll('.fc-row')]
+        .find((r) => r.dataset.name === name)
+      row?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    },
+    folderClick: (name) => {
+      const row = [...document.querySelectorAll('.fc-row')]
+        .find((r) => r.dataset.name === name)
+      row?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    },
+    openSnapshotCompare: (info) => openSnapshotCompare(info),
+    openRegCompare: (left, right) => openRegCompare(left, right),
+    openRemoteCompare: (profile, secret, startDir, side) =>
+      openRemoteCompare(profile, secret, startDir, side),
+    textGetContents: () => ({
+      left: textCompare?.getContent('left') ?? '',
+      right: textCompare?.getContent('right') ?? '',
+    }),
+    textGetStats: () => textCompare?.getDiffStats?.() ?? null,
+    currentView: () => currentView,
+    statusText: () => el('status-message')?.textContent ?? '',
+    statusLevel: () => el('status-message')?.dataset.level ?? '',
   }
+
+  // Remote sessions outlive the view unless something closes them; a window
+  // going away is the last chance to do it.
+  window.addEventListener('beforeunload', () => {
+    void folderCompare?.disconnectAll()
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,6 +1419,22 @@ function setupKeyboardShortcuts() {
 }
 
 /**
+ * Tell the user a side could not be read, naming the side and the store.
+ *
+ * Every caller used to swallow this, which is how comparing two files inside
+ * an archive could show two empty panes and announce that they matched.
+ *
+ * @param {string} side
+ * @param {string} path
+ * @param {unknown} err
+ */
+function reportReadFailure(side, path, err) {
+  const what = SOURCE_LABELS[sourceKindOf(path)] ?? '檔案'
+  const message = err instanceof Error ? err.message : String(err)
+  showError(`無法讀取${side === 'right' ? '右' : side === 'base' ? '中' : '左'}側${what}「${path}」：${message}`, err)
+}
+
+/**
  * Open a comparison of the given paths in a new tab.
  *
  * Shared by folder-compare double-click and by opening a stored session, so
@@ -1381,9 +1462,11 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
     for (const [side, path] of [['left', leftPath], ['base', basePath], ['right', rightPath]]) {
       if (!path) continue
       try {
-        const r = await window.electronAPI.readFile(path)
-        if (r) mergeCompare?.setSide(side, r.content, r.path)
-      } catch { /* leave the pane empty for manual selection */ }
+        const r = await readPathText(path)
+        mergeCompare?.setSide(side, r.content, path)
+      } catch (err) {
+        reportReadFailure(side, path, err)
+      }
     }
     return
   }
@@ -1391,18 +1474,18 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
   if (viewType === 'image') {
     tabMgr.addTab('image', '圖片比對')
     showImageCompare()
-    // image 需要 base64；透過 readFileBinary IPC 讀取
+    // image 需要 base64
     if (leftPath) {
       try {
-        const r = await window.electronAPI.readFileBinary(leftPath, MAX_IMAGE_BYTES)
+        const r = await readPathBinary(leftPath, MAX_IMAGE_BYTES)
         if (r) await imageCompare?.setLeft(r.path, r.base64, r.ext)
-      } catch { /* 讓使用者手動開啟 */ }
+      } catch (err) { reportReadFailure('left', leftPath, err) }
     }
     if (rightPath) {
       try {
-        const r = await window.electronAPI.readFileBinary(rightPath, MAX_IMAGE_BYTES)
+        const r = await readPathBinary(rightPath, MAX_IMAGE_BYTES)
         if (r) await imageCompare?.setRight(r.path, r.base64, r.ext)
-      } catch { /* 讓使用者手動開啟 */ }
+      } catch (err) { reportReadFailure('right', rightPath, err) }
     }
     return
   }
@@ -1414,10 +1497,12 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
     let lContent = leftContent
     let rContent = rightContent
     if (lContent === undefined && leftPath) {
-      try { lContent = (await window.electronAPI.readFile(leftPath))?.content ?? '' } catch { lContent = '' }
+      try { lContent = (await readPathText(leftPath)).content }
+      catch (err) { reportReadFailure('left', leftPath, err) }
     }
     if (rContent === undefined && rightPath) {
-      try { rContent = (await window.electronAPI.readFile(rightPath))?.content ?? '' } catch { rContent = '' }
+      try { rContent = (await readPathText(rightPath)).content }
+      catch (err) { reportReadFailure('right', rightPath, err) }
     }
     if (leftPath)  tableCompare?.setLeft(leftPath, lContent ?? '')
     if (rightPath) tableCompare?.setRight(rightPath, rContent ?? '')
@@ -1427,18 +1512,18 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
   if (viewType === 'hex') {
     tabMgr.addTab('hex', 'Hex 比對')
     showHexCompare()
-    // hex 需要 base64；透過 readFileBinary IPC 讀取
+    // hex 需要 base64
     if (leftPath) {
       try {
-        const r = await window.electronAPI.readFileBinary(leftPath)
+        const r = await readPathBinary(leftPath)
         if (r) hexCompare?.setLeft(r.path, r.base64)
-      } catch { /* 讓使用者手動開啟 */ }
+      } catch (err) { reportReadFailure('left', leftPath, err) }
     }
     if (rightPath) {
       try {
-        const r = await window.electronAPI.readFileBinary(rightPath)
+        const r = await readPathBinary(rightPath)
         if (r) hexCompare?.setRight(r.path, r.base64)
-      } catch { /* 讓使用者手動開啟 */ }
+      } catch (err) { reportReadFailure('right', rightPath, err) }
     }
     return
   }
@@ -1450,20 +1535,20 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
   let rEncoding
   if (lContent === undefined && leftPath) {
     try {
-      const result = await window.electronAPI.readFile(leftPath)
-      lContent = result?.content ?? ''
-      lEncoding = result?.encoding
-    } catch {
-      lContent = ''
+      const result = await readPathText(leftPath)
+      lContent = result.content
+      lEncoding = result.encoding
+    } catch (err) {
+      reportReadFailure('left', leftPath, err)
     }
   }
   if (rContent === undefined && rightPath) {
     try {
-      const result = await window.electronAPI.readFile(rightPath)
-      rContent = result?.content ?? ''
-      rEncoding = result?.encoding
-    } catch {
-      rContent = ''
+      const result = await readPathText(rightPath)
+      rContent = result.content
+      rEncoding = result.encoding
+    } catch (err) {
+      reportReadFailure('right', rightPath, err)
     }
   }
   tabMgr.addTab('text', '文字比對')
@@ -1502,14 +1587,16 @@ function setupDragAndDrop() {
     stop(e)
     home.classList.remove('session-home--drag-over')
 
+    // The File objects go across as they are. Electron 32 removed `File.path`,
+    // and resolving it in preload is also what keeps this honest: a path can
+    // only come from a File the user really dropped, and the renderer cannot
+    // manufacture one for a file it was never given.
     const dropped = [...(e.dataTransfer?.files ?? [])]
-      .map((f) => f.path)
-      .filter(Boolean)
     if (!dropped.length) return
 
     let entries
     try {
-      entries = await window.electronAPI?.acceptDroppedPaths?.(dropped)
+      entries = await window.electronAPI?.acceptDroppedFiles?.(dropped)
     } catch (err) {
       console.error('[drop] could not accept paths:', err)
       return
@@ -1699,40 +1786,143 @@ ${profiles.map((p, i) => `${i + 1}. ${p.name}`).join('\n')}`, '1')
     ? undefined
     : (prompt(`「${profile.name}」的密碼：`) ?? undefined)
 
+  const startDir = prompt(`「${profile.name}」的起始路徑（可留空）：`, profile.path ?? '') ?? ''
+  const side = (prompt('放在哪一側？（left / right）：', 'left') ?? 'left').trim().toLowerCase() === 'right'
+    ? 'right' : 'left'
+
+  await openRemoteCompare(profile, secret, startDir, side)
+}
+
+/**
+ * Browse a remote profile as one side of a folder comparison.
+ *
+ * Separated from the profile picker so the dialogs are not in the way of a
+ * restored session or a test.
+ *
+ * @param {{ id: string, name: string }} profile
+ * @param {string|undefined} secret
+ * @param {string} [startDir]
+ * @param {'left'|'right'} [side]
+ */
+async function openRemoteCompare(profile, secret, startDir = '', side = 'left') {
   showStatus(`連線至 ${profile.name}…`)
   try {
-    const rows = await api.remoteListDir(profile.id, '', secret)
-    showStatus(`${profile.name}：${rows.length} 個項目（遠端瀏覽為唯讀）`)
+    // The secret is needed again by every later call (listing a subdirectory,
+    // reading a file), so it is kept for this window rather than re-prompted.
+    _remoteSecrets.set(profile.id, secret)
+
+    tabMgr.addTab('folder', `遠端：${profile.name}`)
+    showFolderCompare()
+    await folderCompare?.setSource(side, {
+      kind: 'remote',
+      root: `remote://${profile.id}/${startDir}`.replace(/\/+$/, '/'),
+      profileId: profile.id,
+      secret,
+      startDir,
+      label: `${profile.name} [遠端]`,
+    })
+    showStatus(`${profile.name}：已連線。選擇另一側資料夾即可比對（遠端側為唯讀）`)
   } catch (err) {
-    showStatus(`連線失敗：${err.message}`)
+    _remoteSecrets.delete(profile.id)
+    showError(`連線 ${profile.name} 失敗：${err.message}`, err)
   }
 }
 
-/** Open a .reg file and report what it contains. */
+/** Open one or two .reg files and compare them as normalised text. */
 async function openRegFile() {
   try {
-    const picked = await window.electronAPI?.openFile?.({
+    const left = await window.electronAPI?.openFile?.({
       filters: [{ name: '登錄檔', extensions: ['reg'] }],
     })
-    if (!picked) return
-    const parsed = await window.electronAPI?.readRegFile?.(picked.path)
-    showStatus(`已載入 ${parsed.rows.length} 個登錄項目（${parsed.format}）`)
+    if (!left) return
+    const right = await window.electronAPI?.openFile?.({
+      filters: [{ name: '登錄檔', extensions: ['reg'] }],
+    })
+    await openRegCompare(left.path, right?.path)
   } catch (err) {
-    showStatus(`讀取登錄檔失敗：${err.message}`)
+    showError(`讀取登錄檔失敗：${err.message}`, err)
   }
 }
 
-/** Load a snapshot file and report what it contains. */
+/**
+ * Compare two .reg exports as text.
+ *
+ * The text view is the right carrier: a registry export is a sorted list of
+ * `key\name = value` triples, and once both sides are rendered in that canonical
+ * form the existing line diff answers the question the user actually has.
+ *
+ * @param {string} leftPath
+ * @param {string} [rightPath]
+ */
+async function openRegCompare(leftPath, rightPath) {
+  const api = window.electronAPI
+  const [left, right] = await Promise.all([
+    leftPath ? api.readRegFile(leftPath) : Promise.resolve(null),
+    rightPath ? api.readRegFile(rightPath) : Promise.resolve(null),
+  ])
+
+  tabMgr.addTab('text', '登錄檔比對')
+  showTextCompare()
+  textCompare?.setLeft(leftPath ?? '', formatRegRows(left?.rows))
+  textCompare?.setRight(rightPath ?? '', formatRegRows(right?.rows))
+  showStatus(
+    `登錄檔比對：左 ${left?.rows?.length ?? 0} 項` +
+    (right ? `，右 ${right.rows.length} 項` : '（未選擇右側）'))
+}
+
+/**
+ * Render flattened registry rows as one comparable line per value.
+ *
+ * @param {Array<{ path: string, name: string, type: string, value: string }>|null|undefined} rows
+ * @returns {string}
+ */
+function formatRegRows(rows) {
+  if (!rows?.length) return ''
+  const out = []
+  let currentKey = null
+  for (const row of rows) {
+    if (row.path !== currentKey) {
+      if (currentKey !== null) out.push('')
+      out.push(`[${row.path}]`)
+      currentKey = row.path
+    }
+    if (row.type === 'KEY') continue
+    out.push(`${row.name === '' ? '@' : `"${row.name}"`} = ${row.type}: ${row.value}`)
+  }
+  return `${out.join('\n')}\n`
+}
+
+/** Load a snapshot file and compare it against a folder. */
 async function openSnapshot() {
   try {
     const info = await window.electronAPI?.loadSnapshot?.()
     if (!info) return
-    const when = new Date(info.createdAt).toLocaleString('zh-TW')
-    showStatus(`已載入快照「${info.name}」：${info.count} 項，建立於 ${when}` +
-      (info.hasCrc ? '（含內容雜湊）' : '（僅結構與時間戳）'))
+    await openSnapshotCompare(info)
+    // Compared against what? A snapshot on its own says nothing, so the folder
+    // picker follows immediately instead of leaving a half-set-up view.
+    const folder = await window.electronAPI?.openFolder?.()
+    if (folder?.path) await folderCompare?.setRight(folder.path)
   } catch (err) {
-    showStatus(`開啟快照失敗：${err.message}`)
+    showError(`開啟快照失敗：${err.message}`, err)
   }
+}
+
+/**
+ * Show a loaded snapshot as the left side of a folder comparison.
+ *
+ * @param {{ path: string, name: string, count: number, createdAt: string, hasCrc: boolean }} info
+ */
+async function openSnapshotCompare(info) {
+  tabMgr.addTab('folder', `快照：${info.name}`)
+  showFolderCompare()
+  await folderCompare?.setSource('left', {
+    kind: 'snapshot',
+    root: info.path,
+    label: `${info.name} [快照]`,
+  })
+  const when = new Date(info.createdAt).toLocaleString('zh-TW')
+  showStatus(`快照「${info.name}」：${info.count} 項，建立於 ${when}` +
+    (info.hasCrc ? '（含內容雜湊）' : '（僅結構與時間戳）') + '，請選擇要比對的資料夾')
 }
 
 /**
@@ -1776,6 +1966,10 @@ function recordSession(type, paths) {
   const { leftPath = '', rightPath = '', basePath = '' } = paths
   // Nothing worth remembering until at least one side points somewhere.
   if (!leftPath && !rightPath) return
+  // A virtual path cannot be reopened later: the archive listing, the loaded
+  // snapshot and the remote session all live only in this window. Recording
+  // one would put an entry in "最近的 Session" that fails when clicked.
+  if ([leftPath, rightPath, basePath].some((p) => p && sourceKindOf(p) !== 'fs')) return
 
   const name = (p) => (p ? p.replace(/\\/g, '/').split('/').pop() : '')
   const label = [name(leftPath), name(rightPath)].filter(Boolean).join(' ↔ ') || type
@@ -2243,9 +2437,96 @@ function showStatus(message) {
   const statusEl = el('status-message')
   if (statusEl) {
     statusEl.textContent = message
+    statusEl.removeAttribute('data-level')
+    statusEl.style.fontWeight = ''
+    statusEl.style.color = ''
     // 3 秒後恢復
     setTimeout(() => {
+      // An error raised in the meantime must not be wiped by this timer.
+      if (statusEl.dataset.level === 'error') return
       statusEl.textContent = '就緒'
     }, 3000)
   }
+}
+
+/**
+ * Report a failure the user can see and act on.
+ *
+ * Deliberately sticky: the reason a file opened blank on both sides went
+ * unnoticed for so long is that the failure was swallowed, and a message that
+ * clears itself after three seconds is barely better than none.
+ *
+ * @param {string} message
+ * @param {unknown} [cause]
+ */
+function showError(message, cause) {
+  if (cause) console.error(message, cause)
+  else console.error(message)
+  const statusEl = el('status-message')
+  if (!statusEl) return
+  statusEl.textContent = `⚠ ${message}`
+  statusEl.dataset.level = 'error'
+  // The status bar has no error styling of its own and its stylesheet is not
+  // this module's to extend, so the emphasis is applied directly.
+  statusEl.style.color = '#ffd7d5'
+  statusEl.style.fontWeight = '600'
+}
+
+/**
+ * Read a path as text, whichever store it lives in.
+ *
+ * `readFile` only accepts filesystem paths — the path validator rejects the
+ * `::`, `snapshot://` and `remote://` forms outright — so routing by scheme is
+ * what makes a file inside an archive or on a remote host openable at all.
+ *
+ * @param {string} path
+ * @returns {Promise<{ content: string, encoding?: string }>}
+ */
+async function readPathText(path) {
+  const bin = await readPathBinaryOrNull(path)
+  if (bin) {
+    const bytes = Uint8Array.from(atob(bin.base64), (c) => c.charCodeAt(0))
+    return { content: new TextDecoder('utf-8').decode(bytes), encoding: 'UTF-8' }
+  }
+  const r = await window.electronAPI.readFile(path)
+  return { content: r?.content ?? '', encoding: r?.encoding }
+}
+
+/**
+ * Read a path as base64 bytes, whichever store it lives in.
+ *
+ * @param {string} path
+ * @param {number} [maxBytes]
+ * @returns {Promise<{ path: string, base64: string, ext?: string }>}
+ */
+async function readPathBinary(path, maxBytes) {
+  const virtual = await readPathBinaryOrNull(path, maxBytes)
+  if (virtual) return virtual
+  return window.electronAPI.readFileBinary(path, maxBytes)
+}
+
+/**
+ * Bytes for a virtual path, or null when the path is an ordinary file.
+ * @param {string} path
+ * @param {number} [maxBytes]
+ * @returns {Promise<{ path: string, base64: string, ext?: string }|null>}
+ */
+async function readPathBinaryOrNull(path, maxBytes) {
+  const { kind, container, entry } = parseVirtualPath(path)
+  const ext = (path.split('.').pop() ?? '').toLowerCase()
+
+  if (kind === 'archive') {
+    const base64 = await window.electronAPI.readArchiveEntry(container, entry)
+    return { path, base64, ext }
+  }
+  if (kind === 'remote') {
+    const r = await window.electronAPI.remoteReadFile(container, entry, maxBytes, _remoteSecrets.get(container))
+    return { path, base64: r?.base64 ?? '', ext }
+  }
+  if (kind === 'snapshot') {
+    // A snapshot records structure and timestamps only; there is nothing to
+    // read back, and pretending otherwise would show an empty file as "same".
+    throw new Error('快照未儲存檔案內容，只能比對結構與時間戳')
+  }
+  return null
 }

@@ -33,6 +33,38 @@ const VS_ROW_HEIGHT = 20;
 const VS_OVERSCAN = 5;
 
 // ---------------------------------------------------------------------------
+// File watching
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a path names something `fs.watch` could actually open.
+ *
+ * A pane can now hold an archive entry, a snapshot entry or a remote file.
+ * Those paths are rejected by the main process's path validator, so watching
+ * them would raise an unhandled rejection on every open for no benefit —
+ * there is no local file whose changes could be observed.
+ *
+ * @param {string|null|undefined} path
+ * @returns {boolean}
+ */
+function _isWatchablePath(path) {
+  if (!path) return false;
+  return !path.startsWith('snapshot://') &&
+    !path.startsWith('remote://') &&
+    !path.includes('::');
+}
+
+/** @param {string|null|undefined} path */
+function _watch(path) {
+  if (_isWatchablePath(path)) window.electronAPI?.watchFile(path);
+}
+
+/** @param {string|null|undefined} path */
+function _unwatch(path) {
+  if (_isWatchablePath(path)) window.electronAPI?.unwatchFile(path);
+}
+
+// ---------------------------------------------------------------------------
 // highlight.js language registry (lazy, keyed by extension)
 // ---------------------------------------------------------------------------
 
@@ -776,13 +808,13 @@ export class TextCompare {
         paneLeft.classList.remove('tc-pane--drag-over');
         const file = e.dataTransfer.files[0];
         if (!file) return;
-        const filePath = file.path; // Electron provides .path
-        if (!filePath) return;
         try {
-          // A dropped path is not an allowed root yet, so reading it straight
-          // away failed validation in the main process — which is why this
-          // never actually worked.
-          await window.electronAPI.acceptDroppedPaths?.([filePath]);
+          // The path is resolved in preload from the dropped File itself, and
+          // the drop is what authorises reading it — a dropped path is not an
+          // allowed root until the main process is told about it.
+          const [entry] = await window.electronAPI.acceptDroppedFiles?.([file]) ?? [];
+          if (!entry) return;
+          const filePath = entry.path;
           const result = await window.electronAPI.readFile(filePath);
           if (result) {
             this._hlLeft = await loadHighlighter(this._extFrom(result.path));
@@ -804,10 +836,10 @@ export class TextCompare {
         paneRight.classList.remove('tc-pane--drag-over');
         const file = e.dataTransfer.files[0];
         if (!file) return;
-        const filePath = file.path;
-        if (!filePath) return;
         try {
-          await window.electronAPI.acceptDroppedPaths?.([filePath]);
+          const [entry] = await window.electronAPI.acceptDroppedFiles?.([file]) ?? [];
+          if (!entry) return;
+          const filePath = entry.path;
           const result = await window.electronAPI.readFile(filePath);
           if (result) {
             this._hlRight = await loadHighlighter(this._extFrom(result.path));
@@ -1014,8 +1046,8 @@ export class TextCompare {
     }
 
     // T33: unwatch both files on destroy
-    if (this._leftPath) window.electronAPI?.unwatchFile(this._leftPath);
-    if (this._rightPath) window.electronAPI?.unwatchFile(this._rightPath);
+    _unwatch(this._leftPath);
+    _unwatch(this._rightPath);
 
     // S13-C08: remove the file-changed listener registered in mount().
     if (this._unsubFileChanged) {
@@ -1387,7 +1419,7 @@ export class TextCompare {
   setLeft(path, content, encoding) {
     // T33: unwatch old path before switching
     if (this._leftPath && this._leftPath !== path) {
-      window.electronAPI?.unwatchFile(this._leftPath);
+      _unwatch(this._leftPath);
     }
     this._leftPath = path;
     this._leftContent = content;
@@ -1396,8 +1428,17 @@ export class TextCompare {
     if (this._pathLeft) this._pathLeft.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
     // T33: start watching the new file path (if it's a real file path)
-    if (path) window.electronAPI?.watchFile(path);
+    _watch(path);
     this._runDiff({ resetScroll: true });
+  }
+
+  /**
+   * Current text of one pane.
+   * @param {'left'|'right'} side
+   * @returns {string}
+   */
+  getContent(side) {
+    return (side === 'right' ? this._rightContent : this._leftContent) ?? '';
   }
 
   /**
@@ -1407,7 +1448,7 @@ export class TextCompare {
   setRight(path, content, encoding) {
     // T33: unwatch old path before switching
     if (this._rightPath && this._rightPath !== path) {
-      window.electronAPI?.unwatchFile(this._rightPath);
+      _unwatch(this._rightPath);
     }
     this._rightPath = path;
     this._rightContent = content;
@@ -1416,7 +1457,7 @@ export class TextCompare {
     if (this._pathRight) this._pathRight.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
     // T33: start watching the new file path (if it's a real file path)
-    if (path) window.electronAPI?.watchFile(path);
+    _watch(path);
     this._runDiff({ resetScroll: true });
   }
 
