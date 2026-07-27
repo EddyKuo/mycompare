@@ -18,14 +18,23 @@
  *   is one bitstream and one sliding window, so a folder's blocks are even
  *   less separable than MSZIP's.
  *
- *   Quantum is recognised and refused by name rather than mis-decoded, and
- *   the reason has been checked rather than inherited: `makecab` rejects
- *   `CompressionType=QUANTUM`, and a sweep of every cabinet on both drives —
- *   686 of them that parse as MSCF — found 404 LZX, 277 MSZIP, 5 uncompressed
- *   and not one Quantum. With no Quantum cabinet obtainable and no generator
- *   that will emit one, a decoder here could only ever be checked against
- *   itself, and one that agrees only with itself is worse than an honest
- *   refusal.
+ *   Quantum is recognised and refused by name rather than mis-decoded. Every
+ *   part of that reason has been run, not inherited:
+ *
+ *     - Windows' `makecab` rejects `CompressionType=QUANTUM`.
+ *     - Microsoft's own Cabinet SDK (1997), fetched and unpacked to check,
+ *       rejects it too: its `MAKECAB.EXE` answers "Invalid Compression Type:
+ *       QUANTUM" and its `CABARC.EXE` answers "-m option supports
+ *       LZX:<15..21>, MSZIP or NONE". Quantum was licensed from David
+ *       Stafford and its compressor never shipped in the public SDK.
+ *     - A sweep of every cabinet on both drives — 686 that parse as MSCF —
+ *       found 404 LZX, 277 MSZIP, 5 uncompressed, and not one Quantum.
+ *
+ *   So no Quantum cabinet can be produced or found here, and a decoder could
+ *   only ever be checked against itself. One that agrees only with itself is
+ *   worse than an honest refusal. If a genuine Quantum cabinet ever turns up,
+ *   7-Zip reads the format and would serve as the reference, and libmspack's
+ *   qtmd.c is the same kind of guide lzxd.c was for LZX above.
  *
  *   Say that carefully, because LZX carried the identical stated reason and
  *   it was simply false — `makecab /D CompressionType=LZX` works. Two more
