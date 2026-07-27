@@ -307,7 +307,7 @@ async function openMerge3WithPaths(page) {
   })
 }
 
-test('Merge Parent Folders：接上後按鈕啟用，並以左右兩側的上層資料夾開比對', async () => {
+test('Merge Parent Folders：接上後按鈕啟用，三個來源都在時開三向資料夾比對', async () => {
   await openMerge3WithPaths(win)
 
   // The view keeps this disabled until app.js subscribes, so an enabled button
@@ -317,10 +317,20 @@ test('Merge Parent Folders：接上後按鈕啟用，並以左右兩側的上層
 
   await btn.click()
   await expect(win.locator('#view-folder')).toBeVisible({ timeout: 5000 })
-  await expect(win.locator('#status-message')).toContainText('左側與右側')
+
+  // This used to assert 「左側與右側」, i.e. that the base was thrown away. That
+  // encoded a limitation rather than a requirement: the ancestor is the whole
+  // basis for deciding who changed what, so a merge's parent folders opened
+  // without it show every difference as a conflict.
+  await expect(win.locator('#status-message')).toContainText('三向')
 
   const last = await win.evaluate(() => window.__testAPI.tabs().at(-1))
   expect(last.type).toBe('folder')
+
+  // The base really arrived, rather than the status line merely saying so.
+  const threeSided = await win.evaluate(() =>
+    document.querySelectorAll('#view-folder .fc-header-side').length)
+  expect(threeSided).toBe(3)
 })
 
 test('Compare to Output：在真正的文字比對分頁開啟，而不是唯讀對話框', async () => {

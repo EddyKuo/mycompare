@@ -694,10 +694,10 @@ function showMerge3() {
       updateToolbar()
     })
 
-    // BC's Merge Parent Folders. The view deliberately does not choose which
-    // pair to open — this app has no three-way folder compare, so the choice
-    // only exists at this level. Subscribing is also what enables the view's
-    // button, which stays disabled while nobody can service it.
+    // BC's Merge Parent Folders. The view deliberately does not decide what to
+    // open; that choice only exists at this level, which is also where the
+    // folder view's merge mode can be turned on. Subscribing is what enables
+    // the view's button, which stays disabled while nobody can service it.
     mergeCompare.on('open-parent-folders', ({ left, base, right }) => {
       void openMergeParentFolders({ left, base, right })
     })
@@ -2348,6 +2348,18 @@ async function compareParentFolders() {
  * @param {{ left: string, base: string, right: string }} parents
  */
 async function openMergeParentFolders({ left, base, right }) {
+  // All three parents means a three-way folder comparison, which is what BC
+  // opens here. This used to always collapse to a pair, on the grounds that
+  // the app had no three-way folder compare — true when it was written, and
+  // false since the folder view gained merge mode. Dropping the base is not a
+  // cosmetic loss: the ancestor is the whole basis for deciding who changed
+  // what, so without it every differing file reads as a conflict.
+  if (left && base && right) {
+    await openComparison({ type: 'folder', leftPath: left, basePath: base, rightPath: right })
+    showStatus('已開啟上層資料夾的三向比對（左／基準／右）')
+    return
+  }
+
   /** @type {[string, string, string]|null} */
   let pair = null
   if (left && right) pair = [left, right, '左側與右側']
@@ -2652,9 +2664,15 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
   }
 
   if (viewType === 'folder') {
-    tabMgr.addTab('folder', '資料夾比對')
+    tabMgr.addTab('folder', basePath ? '三向資料夾合併' : '資料夾比對')
     showFolderCompare()
+    // Merge mode first: it decides how many sides exist, and setting a base
+    // path on a two-sided view would be stored and never shown.
+    if (basePath && typeof folderCompare?.setMergeMode === 'function') {
+      await folderCompare.setMergeMode(true)
+    }
     if (leftPath) await folderCompare?.setLeft(leftPath)
+    if (basePath) await folderCompare?.setBase(basePath)
     if (rightPath) await folderCompare?.setRight(rightPath)
     return
   }
