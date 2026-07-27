@@ -9,6 +9,13 @@
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
   min-width: 170px;
   padding: 3px 0;
+  /* A menu taller than the window cannot be shifted into view — the JS clamps
+     the offset at 0 and the tail stays unreachable. The text pane's menu grew
+     past that point once grammar elements, three detail modes, the ruler, the
+     side locks, six fonts and six conversions were all on it. */
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   opacity: 0;
   transform: scale(0.96);
   transform-origin: top left;

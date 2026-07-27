@@ -264,6 +264,28 @@ body {
 .char-insert { background: var(--diff-char-insert); border-radius: 2px; }
 .char-delete { background: var(--diff-char-delete); border-radius: 2px; }
 
+/* 1.5 — the in-line difference the Ctrl+F7 / Ctrl+F8 cursor is sitting on.
+   Outlined rather than recoloured, so the red/blue diff semantics survive. */
+.char-diff--current {
+  outline: 2px solid var(--accent, #0a84ff);
+  outline-offset: -1px;
+  border-radius: 2px;
+}
+
+/* 1.4 Align With — a row the user pinned by hand. The marker is on the line
+   number and the gutter so it cannot be mistaken for a difference colour. */
+.diff-line.align-anchor .line-num {
+  border-left: 3px solid var(--accent, #0a84ff);
+  font-weight: 600;
+}
+.diff-line.align-anchor .line-gutter::before {
+  content: '⇄';
+  position: absolute;
+  left: 0;
+  color: var(--accent, #0a84ff);
+  font-size: 10px;
+}
+
 /* Collapsed section */
 .diff-line.collapsed {
   background: var(--bg-secondary);
@@ -1090,6 +1112,125 @@ body {
   min-width: 68px;
   text-align: right;
 }
+
+/* ── Grammar (File Format) editor ── */
+.modal-box--grammar {
+  width: 900px;
+  max-width: 96vw;
+  height: 640px;
+  max-height: 92vh;
+}
+.grammar-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.grammar-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+}
+.grammar-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  overflow: auto;
+}
+.grammar-col--wide { padding-right: 4px; }
+.grammar-def-list { max-height: 260px; }
+.grammar-def-item--active { background: var(--accent-strong); }
+.grammar-def-item--active .name,
+.grammar-def-item--active .meta { color: var(--accent-fg); }
+
+.grammar-item-list {
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-secondary);
+  min-height: 96px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.grammar-item-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: grab;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-primary);
+}
+.grammar-item-row:last-child { border-bottom: none; }
+.grammar-item-row--active { background: var(--accent-strong); color: var(--accent-fg); }
+.grammar-item-row--active .grammar-item-row__meta { color: var(--accent-fg); }
+/* The drop target needs to be visible during the drag, when the pointer is the
+   only thing telling the user where the item will land. */
+.grammar-item-row--dropping { border-top: 2px solid var(--accent-active); }
+.grammar-item-row__ord {
+  min-width: 20px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.grammar-item-row__meta { color: var(--text-secondary); font-size: 11px; }
+.grammar-item-empty {
+  padding: 10px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.grammar-item-editor {
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.grammar-item-editor legend { font-size: 12px; color: var(--text-secondary); padding: 0 4px; }
+.grammar-item-editor[disabled] { opacity: 0.55; }
+.grammar-field { display: flex; flex-direction: column; gap: 6px; }
+.grammar-field[hidden] { display: none; }
+.grammar-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: center;
+  border-top: 1px solid var(--border-color);
+  padding-top: 6px;
+}
+
+.grammar-ignore-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-secondary);
+  padding: 6px 8px;
+  min-height: 28px;
+}
+.grammar-ignore-empty { font-size: 12px; font-style: italic; color: var(--text-secondary); }
+
+.grammar-errors { display: none; }
+.grammar-errors:not(:empty) {
+  display: block;
+  border: 1px solid #c33;
+  border-radius: 3px;
+  background: rgba(204, 51, 51, 0.08);
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-primary);
+  max-height: 120px;
+  overflow-y: auto;
+}
+.grammar-errors ul { margin: 0; padding-left: 18px; }
+.grammar-errors .grammar-errors__title { font-weight: 600; color: #c33; }
 
 /* ── P2-28: print preview ── */
 .modal-box--preview {

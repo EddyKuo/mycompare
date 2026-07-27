@@ -74,8 +74,20 @@ export function showContextMenu(e, items) {
   // After paint: adjust if the menu overflows the viewport
   requestAnimationFrame(() => {
     const rect = menu.getBoundingClientRect()
-    if (rect.right  > window.innerWidth)  { x = Math.max(0, window.innerWidth  - rect.width  - 4); menu.style.left = `${x}px` }
-    if (rect.bottom > window.innerHeight) { y = Math.max(0, window.innerHeight - rect.height - 4); menu.style.top  = `${y}px` }
+    if (rect.right > window.innerWidth) {
+      x = Math.max(0, window.innerWidth - rect.width - 4)
+      menu.style.left = `${x}px`
+    }
+    if (rect.bottom > window.innerHeight) {
+      y = Math.max(0, window.innerHeight - rect.height - 4)
+      menu.style.top = `${y}px`
+      // Shifting up only works while the menu is shorter than the window.
+      // Past that the clamp above pins it to 0 and the tail is unreachable,
+      // so the menu has to give up height and scroll instead.
+      if (rect.height > window.innerHeight - 8) {
+        menu.style.maxHeight = `${Math.max(120, window.innerHeight - 8)}px`
+      }
+    }
     menu.classList.add('ctx-menu--visible')
   })
 

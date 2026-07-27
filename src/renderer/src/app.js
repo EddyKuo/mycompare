@@ -1,4 +1,4 @@
-import { TextCompare } from './views/text-compare.js'
+import { TextCompare, FONT_CHOICES } from './views/text-compare.js'
 import { FolderCompare, parseVirtualPath, sourceKindOf } from './views/folder-compare.js'
 import { TableCompare } from './views/table-compare.js'
 import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
@@ -11,6 +11,12 @@ import { NamedConfigStore } from './core/named-config-store.js'
 import { describeNavResult } from './core/diff-nav.js'
 import { WorkspaceStore } from './core/workspace-store.js'
 import { setActiveView } from './core/active-view.js'
+import {
+  BUILTIN_GRAMMARS,
+  compileGrammar,
+  getUserGrammars,
+  setUserGrammars,
+} from './core/grammar.js'
 import {
   SettingsStore,
   DEFAULT_SHORTCUTS,
@@ -254,6 +260,7 @@ export function initApp() {
   setupPathBarButtons()
   setupMenuActions()
   setupSettingsModal()
+  setupGrammarModal()
   setupPrintPreview()
   setupViewPrintInterception()
   setupViewPicker()
@@ -294,6 +301,23 @@ export function initApp() {
     hexGetInnerHeight: () => {
       const inner = document.querySelector('.hx-pane .hx-inner')
       return inner ? inner.style.height : ''
+    },
+
+    // Text injection. Without it a spec could only assert that an entry point
+    // exists, never that the comparison it opens does the right thing.
+    // These throw rather than no-op: a silently skipped injection would leave
+    // the assertions passing against an empty view.
+    textSetLeft: (path, content, encoding) => {
+      if (!textCompare) throw new Error('文字比對尚未建立，請先切換到文字比對視圖')
+      textCompare.setLeft(path, content, encoding)
+    },
+    textSetRight: (path, content, encoding) => {
+      if (!textCompare) throw new Error('文字比對尚未建立，請先切換到文字比對視圖')
+      textCompare.setRight(path, content, encoding)
+    },
+    textOpenPatch: (patchText, label) => {
+      if (!textCompare) throw new Error('文字比對尚未建立，請先切換到文字比對視圖')
+      return textCompare.openPatch(patchText, label).length
     },
 
     // S15-U01 image
@@ -2899,6 +2923,36 @@ function setupMenuActions() {
     }
   }
 
+  /**
+   * Run `fn` against the text view, or say why nothing happened.
+   * @param {(view: TextCompare) => void} fn
+   * @param {string} [okMessage] status to show when the action itself says nothing
+   */
+  const _textPanel = (fn, okMessage) => {
+    if (currentView !== 'text' || !textCompare) { showStatus('此項目僅適用於文字比對'); return }
+    fn(textCompare)
+    if (okMessage) showStatus(okMessage)
+  }
+
+  /** @param {number} index into FONT_CHOICES */
+  const _textFont = (index) => {
+    const choice = FONT_CHOICES[index]
+    if (!choice) return
+    _textPanel((v) => v.setFontFamily(choice.value), `字型：${choice.label}`)
+  }
+
+  /** @param {(view: HexCompare) => void} fn */
+  const _hexPanel = (fn) => {
+    if (currentView !== 'hex' || !hexCompare) { showStatus('此項目僅適用於 Hex 比對'); return }
+    fn(hexCompare)
+  }
+
+  /** @param {(view: TableCompare) => void} fn */
+  const _tablePanel = (fn) => {
+    if (currentView !== 'table' || !tableCompare) { showStatus('此項目僅適用於表格比對'); return }
+    fn(tableCompare)
+  }
+
   /** @type {Record<string, () => void>} */
   const commands = {
     'session.new.text':   () => newSession('text'),
@@ -3116,6 +3170,34 @@ function setupMenuActions() {
     'view.toggleTheme': () => el('btn-theme').click(),
     'view.fullScreen':  () => { void window.electronAPI?.toggleFullScreen?.() },
 
+    // View ▸ panels. These all existed as view methods reachable only from a
+    // pane context menu; BC puts them on the View menu, which is also the only
+    // way to reach them without a mouse.
+    'view.text.details.text':      () => _textPanel((v) => v.setDetailsMode('text'), '詳細資料：文字'),
+    'view.text.details.hex':       () => _textPanel((v) => v.setDetailsMode('hex'), '詳細資料：Hex'),
+    'view.text.details.alignment': () => _textPanel((v) => v.setDetailsMode('alignment'), '詳細資料：對齊決策'),
+    'view.text.details.off':       () => _textPanel((v) => v.setDetailsMode(null), '關閉詳細資料'),
+    'view.text.ruler':       () => _textPanel((v) => showStatus(v.toggleRuler() ? '已顯示欄位標尺' : '已隱藏欄位標尺')),
+    'view.text.fileInfo':    () => _textPanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
+    'view.text.description': () => _textPanel((v) => showStatus(v.toggleDescription() ? '已顯示說明欄' : '已隱藏說明欄')),
+    'view.text.readOnly.left':  () => _textPanel((v) => showStatus(v.setSideReadOnly('left') ? '左側已鎖定' : '左側已解鎖')),
+    'view.text.readOnly.right': () => _textPanel((v) => showStatus(v.setSideReadOnly('right') ? '右側已鎖定' : '右側已解鎖')),
+    'view.text.font.default':   () => _textFont(0),
+    'view.text.font.consolas':  () => _textFont(1),
+    'view.text.font.cascadia':  () => _textFont(2),
+    'view.text.font.fira':      () => _textFont(3),
+    'view.text.font.courier':   () => _textFont(4),
+    'view.text.font.jetbrains': () => _textFont(5),
+
+    'view.hex.details':  () => _hexPanel((v) => showStatus(v.toggleDetails() ? '已顯示詳細資料' : '已隱藏詳細資料')),
+    'view.hex.fileInfo': () => _hexPanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
+    'view.hex.ruler':    () => _hexPanel((v) => showStatus(v.toggleRuler() ? '已顯示位移標尺' : '已隱藏位移標尺')),
+
+    'view.table.details':    () => _tablePanel((v) => showStatus(v.toggleDetails() ? '已顯示詳細資料' : '已隱藏詳細資料')),
+    'view.table.fileInfo':   () => _tablePanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
+    'view.table.whitespace': () => _tablePanel((v) => showStatus(v.toggleWhitespace() ? '已顯示空白字元' : '已隱藏空白字元')),
+
+    'tools.grammar':      () => openGrammarModal(),
     'tools.ignoreRules':  () => openIgnoreRulesModal(),
     'tools.namedConfigs': () => openConfigModal(),
     'tools.shortcuts':    () => el('btn-settings-modal')?.click(),
@@ -3631,6 +3713,622 @@ function openIgnoreRulesModal() {
 
 function closeIgnoreRulesModal() {
   el('ignore-rules-modal').style.display = 'none'
+}
+
+// ---------------------------------------------------------------------------
+// 文法（File Format）Modal
+// ---------------------------------------------------------------------------
+
+/** @typedef {import('./core/grammar.js').GrammarDef} GrammarDef */
+/** @typedef {import('./core/grammar.js').GrammarItem} GrammarItem */
+/** @typedef {import('./core/grammar.js').GrammarItemType} GrammarItemType */
+
+/** Which editor fields and per-item options each item type actually uses. */
+const GRAMMAR_TYPE_FIELDS = Object.freeze({
+  basic:     { opts: ['matchCase', 'regex', 'wholeWord'] },
+  delimited: { opts: ['matchCase'] },
+  list:      { opts: ['matchCase', 'wholeWord'] },
+  columns:   { opts: [] },
+  lines:     { opts: ['matchCase', 'regex'] },
+})
+
+/**
+ * The dialog edits a detached copy and only writes it back on 套用, so cancelling
+ * leaves the registry — and therefore every open comparison — untouched.
+ *
+ * @type {{ defs: Array<GrammarDef & { builtin?: boolean }>, defIndex: number,
+ *          itemIndex: number, ignored: Set<string>, dragFrom: number }}
+ */
+const _grammarEdit = {
+  defs: [],
+  defIndex: -1,
+  itemIndex: -1,
+  ignored: new Set(),
+  dragFrom: -1,
+}
+
+/** @returns {(GrammarDef & { builtin?: boolean }) | null} */
+function _grammarDef() {
+  return _grammarEdit.defs[_grammarEdit.defIndex] ?? null
+}
+
+/** @returns {boolean} whether the selected definition may be edited */
+function _grammarEditable() {
+  const def = _grammarDef()
+  return !!def && !def.builtin
+}
+
+/**
+ * @param {GrammarDef & { builtin?: boolean }} def
+ * @returns {GrammarDef & { builtin?: boolean }}
+ */
+function _cloneGrammarDef(def) {
+  return {
+    name: def.name,
+    masks: [...(def.masks ?? [])],
+    caseSensitive: def.caseSensitive !== false,
+    builtin: !!def.builtin,
+    items: (def.items ?? []).map((i) => ({ ...i })),
+  }
+}
+
+function openGrammarModal() {
+  const overlay = el('grammar-modal')
+  if (!overlay) return
+
+  const user = getUserGrammars().map((d) => _cloneGrammarDef({ ...d, builtin: false }))
+  const builtin = BUILTIN_GRAMMARS.map((d) => _cloneGrammarDef(d))
+  _grammarEdit.defs = [...user, ...builtin]
+  _grammarEdit.defIndex = _grammarEdit.defs.length > 0 ? 0 : -1
+  _grammarEdit.itemIndex = -1
+  _grammarEdit.dragFrom = -1
+  _grammarEdit.ignored = new Set(textCompare?.getGrammarInfo?.().ignored ?? [])
+
+  overlay.style.display = 'flex'
+  _setGrammarStatus('')
+  renderGrammarModal()
+}
+
+function closeGrammarModal() {
+  const overlay = el('grammar-modal')
+  if (overlay) overlay.style.display = 'none'
+}
+
+/** @param {string} msg */
+function _setGrammarStatus(msg) {
+  const status = el('grammar-modal-status')
+  if (status) status.textContent = msg
+}
+
+function renderGrammarModal() {
+  renderGrammarDefList()
+  renderGrammarDefFields()
+  renderGrammarItemList()
+  renderGrammarItemEditor()
+  renderGrammarIgnoreList()
+  renderGrammarErrors()
+}
+
+function renderGrammarDefList() {
+  const list = el('grammar-def-list')
+  if (!list) return
+  list.replaceChildren()
+
+  if (_grammarEdit.defs.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'config-list-empty'
+    empty.textContent = '（沒有任何文法定義）'
+    list.appendChild(empty)
+    return
+  }
+
+  _grammarEdit.defs.forEach((def, index) => {
+    const row = document.createElement('div')
+    row.className = 'config-list-item'
+    if (index === _grammarEdit.defIndex) row.classList.add('grammar-def-item--active')
+    row.dataset.index = String(index)
+
+    const name = document.createElement('span')
+    name.className = 'name'
+    name.textContent = def.name || '（未命名）'
+
+    const meta = document.createElement('span')
+    meta.className = 'meta'
+    meta.textContent = def.builtin ? '內建' : '自訂'
+
+    row.append(name, meta)
+    row.addEventListener('click', () => {
+      _grammarEdit.defIndex = index
+      _grammarEdit.itemIndex = -1
+      renderGrammarModal()
+    })
+    list.appendChild(row)
+  })
+}
+
+function renderGrammarDefFields() {
+  const def = _grammarDef()
+  const editable = _grammarEditable()
+
+  const name = el('input-grammar-name')
+  const masks = el('input-grammar-masks')
+  const caseChk = el('chk-grammar-case')
+  if (name) { name.value = def?.name ?? ''; name.disabled = !editable }
+  if (masks) { masks.value = (def?.masks ?? []).join(', '); masks.disabled = !editable }
+  if (caseChk) { caseChk.checked = def?.caseSensitive !== false; caseChk.disabled = !editable }
+
+  setDisabled('btn-grammar-def-copy', !def)
+  setDisabled('btn-grammar-def-remove', !editable)
+  for (const id of ['btn-grammar-item-add', 'btn-grammar-item-up',
+    'btn-grammar-item-down', 'btn-grammar-item-remove']) {
+    setDisabled(id, !editable)
+  }
+}
+
+/**
+ * One-line description of an item, so the ordering list is readable without
+ * selecting every row in turn.
+ * @param {GrammarItem} item
+ * @returns {string}
+ */
+function _grammarItemSummary(item) {
+  switch (item.type) {
+    case 'basic':     return item.regex ? `/${item.text ?? ''}/` : `"${item.text ?? ''}"`
+    case 'delimited': return `${item.start ?? ''} … ${item.end ?? (item.stopAtEol ? '行尾' : '')}`
+    case 'list':      return `${(item.items ?? []).length} 個關鍵字`
+    case 'columns':   return `第 ${item.startColumn ?? 1} – ${item.toEol ? '行尾' : (item.endColumn ?? '?')} 欄`
+    case 'lines':     return item.regex ? `/${item.match ?? ''}/` : `"${item.match ?? ''}"`
+    default:          return String(item.type ?? '')
+  }
+}
+
+function renderGrammarItemList() {
+  const list = el('grammar-item-list')
+  if (!list) return
+  list.replaceChildren()
+
+  const def = _grammarDef()
+  const items = def?.items ?? []
+  if (items.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'grammar-item-empty'
+    empty.textContent = def ? '（這個文法沒有任何項目）' : '（尚未選擇文法）'
+    list.appendChild(empty)
+    return
+  }
+
+  const editable = _grammarEditable()
+  items.forEach((item, index) => {
+    const row = document.createElement('div')
+    row.className = 'grammar-item-row'
+    if (index === _grammarEdit.itemIndex) row.classList.add('grammar-item-row--active')
+    row.dataset.index = String(index)
+    row.draggable = editable
+
+    const ord = document.createElement('span')
+    ord.className = 'grammar-item-row__ord'
+    ord.textContent = `${index + 1}.`
+
+    const label = document.createElement('span')
+    label.textContent = `${item.element ?? '(無名稱)'} — ${item.type ?? '?'}`
+
+    const meta = document.createElement('span')
+    meta.className = 'grammar-item-row__meta'
+    meta.textContent = _grammarItemSummary(item)
+
+    row.append(ord, label, meta)
+    row.addEventListener('click', () => {
+      _grammarEdit.itemIndex = index
+      renderGrammarItemList()
+      renderGrammarItemEditor()
+    })
+
+    if (editable) _wireGrammarItemDrag(row, index)
+    list.appendChild(row)
+  })
+}
+
+/**
+ * Drag-to-reorder. Priority *is* array order in this engine, so reordering is
+ * the only way to say "match /* before //".
+ *
+ * @param {HTMLElement} row
+ * @param {number} index
+ */
+function _wireGrammarItemDrag(row, index) {
+  row.addEventListener('dragstart', (e) => {
+    _grammarEdit.dragFrom = index
+    e.dataTransfer?.setData('text/plain', String(index))
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+  })
+  row.addEventListener('dragover', (e) => {
+    if (_grammarEdit.dragFrom < 0) return
+    e.preventDefault()
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+    row.classList.add('grammar-item-row--dropping')
+  })
+  row.addEventListener('dragleave', () => row.classList.remove('grammar-item-row--dropping'))
+  row.addEventListener('drop', (e) => {
+    e.preventDefault()
+    row.classList.remove('grammar-item-row--dropping')
+    const from = _grammarEdit.dragFrom
+    _grammarEdit.dragFrom = -1
+    if (from < 0 || from === index) return
+    _reorderGrammarItem(from, index)
+  })
+  row.addEventListener('dragend', () => {
+    _grammarEdit.dragFrom = -1
+    row.classList.remove('grammar-item-row--dropping')
+  })
+}
+
+/**
+ * @param {number} from
+ * @param {number} to
+ */
+function _reorderGrammarItem(from, to) {
+  const def = _grammarDef()
+  if (!def || !_grammarEditable()) return
+  const items = def.items
+  if (from < 0 || from >= items.length || to < 0 || to >= items.length) return
+  const [moved] = items.splice(from, 1)
+  items.splice(to, 0, moved)
+  _grammarEdit.itemIndex = to
+  renderGrammarItemList()
+  renderGrammarErrors()
+  _setGrammarStatus(`已將「${moved.element ?? ''}」移到第 ${to + 1} 順位`)
+}
+
+/** @param {number} delta -1 to move up, +1 to move down */
+function moveGrammarItem(delta) {
+  const def = _grammarDef()
+  if (!def || !_grammarEditable()) return
+  const from = _grammarEdit.itemIndex
+  if (from < 0) { _setGrammarStatus('請先選擇一個項目'); return }
+  const to = from + delta
+  if (to < 0 || to >= def.items.length) { _setGrammarStatus('已經在邊界了'); return }
+  _reorderGrammarItem(from, to)
+}
+
+function renderGrammarItemEditor() {
+  const editor = el('grammar-item-editor')
+  if (!editor) return
+  const def = _grammarDef()
+  const item = def?.items?.[_grammarEdit.itemIndex] ?? null
+  const editable = _grammarEditable() && !!item
+
+  editor.disabled = !editable
+  editor.toggleAttribute('disabled', !editable)
+
+  const type = /** @type {GrammarItemType} */ (item?.type ?? 'basic')
+
+  for (const field of editor.querySelectorAll('.grammar-field')) {
+    field.toggleAttribute('hidden', field.getAttribute('data-for') !== type)
+  }
+  const shown = GRAMMAR_TYPE_FIELDS[type]?.opts ?? []
+  for (const opt of editor.querySelectorAll('[data-opt]')) {
+    opt.toggleAttribute('hidden', !shown.includes(opt.getAttribute('data-opt') ?? ''))
+  }
+
+  /** @param {string} id @param {string} value */
+  const setText = (id, value) => { const node = el(id); if (node) node.value = value }
+  /** @param {string} id @param {boolean} value */
+  const setChk = (id, value) => { const node = el(id); if (node) node.checked = value }
+
+  setText('sel-grammar-item-type', type)
+  setText('input-grammar-item-element', item?.element ?? '')
+  setText('input-grammar-item-text', item?.text ?? '')
+  setText('input-grammar-item-start', item?.start ?? '')
+  setText('input-grammar-item-end', item?.end ?? '')
+  setText('input-grammar-item-escape', item?.escape ?? '')
+  setText('input-grammar-item-items', (item?.items ?? []).join('\n'))
+  setText('input-grammar-item-startcol', item?.startColumn == null ? '' : String(item.startColumn))
+  setText('input-grammar-item-endcol', item?.endColumn == null ? '' : String(item.endColumn))
+  setText('input-grammar-item-match', item?.match ?? '')
+  setText('input-grammar-item-heading', item?.headingLines == null ? '' : String(item.headingLines))
+  setText('input-grammar-item-weight', item?.lineWeight == null ? '' : String(item.lineWeight))
+  setChk('chk-grammar-item-stopateol', !!item?.stopAtEol)
+  setChk('chk-grammar-item-multiline', !!item?.multiline)
+  setChk('chk-grammar-item-toeol', !!item?.toEol)
+  setChk('chk-grammar-item-orline1', !!item?.orLine1)
+  setChk('chk-grammar-item-matchcase', item?.matchCase ?? (def?.caseSensitive !== false))
+  setChk('chk-grammar-item-regex', !!item?.regex)
+  setChk('chk-grammar-item-wholeword', !!item?.wholeWord)
+}
+
+/**
+ * Read the editor back into the selected item.
+ *
+ * Fields belonging to other types are dropped rather than kept, so switching a
+ * Basic item to Delimited cannot leave a stale `text` behind that compileGrammar
+ * would then complain about.
+ */
+function commitGrammarItemEditor() {
+  const def = _grammarDef()
+  if (!def || !_grammarEditable()) return
+  const index = _grammarEdit.itemIndex
+  const current = def.items[index]
+  if (!current) return
+
+  /** @param {string} id @returns {string} */
+  const text = (id) => String(el(id)?.value ?? '')
+  /** @param {string} id @returns {boolean} */
+  const chk = (id) => !!el(id)?.checked
+  /** @param {string} id @returns {number|undefined} */
+  const num = (id) => {
+    const raw = text(id).trim()
+    if (raw === '') return undefined
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : undefined
+  }
+
+  const type = /** @type {GrammarItemType} */ (text('sel-grammar-item-type') || 'basic')
+  /** @type {GrammarItem} */
+  const next = { type, element: text('input-grammar-item-element').trim() }
+
+  const weight = num('input-grammar-item-weight')
+  if (weight !== undefined) next.lineWeight = weight
+
+  const opts = GRAMMAR_TYPE_FIELDS[type]?.opts ?? []
+  if (opts.includes('matchCase')) next.matchCase = chk('chk-grammar-item-matchcase')
+  if (opts.includes('regex')) next.regex = chk('chk-grammar-item-regex')
+  if (opts.includes('wholeWord')) next.wholeWord = chk('chk-grammar-item-wholeword')
+
+  switch (type) {
+    case 'basic':
+      next.text = text('input-grammar-item-text')
+      break
+    case 'delimited':
+      next.start = text('input-grammar-item-start')
+      next.end = text('input-grammar-item-end')
+      next.escape = text('input-grammar-item-escape')
+      next.stopAtEol = chk('chk-grammar-item-stopateol')
+      next.multiline = chk('chk-grammar-item-multiline')
+      break
+    case 'list':
+      next.items = text('input-grammar-item-items')
+        .split('\n').map((s) => s.trim()).filter(Boolean)
+      break
+    case 'columns': {
+      next.startColumn = num('input-grammar-item-startcol') ?? 1
+      const end = num('input-grammar-item-endcol')
+      if (end !== undefined) next.endColumn = end
+      next.toEol = chk('chk-grammar-item-toeol')
+      break
+    }
+    case 'lines': {
+      next.match = text('input-grammar-item-match')
+      const heading = num('input-grammar-item-heading')
+      if (heading !== undefined) next.headingLines = heading
+      next.orLine1 = chk('chk-grammar-item-orline1')
+      break
+    }
+    default:
+      break
+  }
+
+  def.items[index] = next
+  renderGrammarItemList()
+  renderGrammarIgnoreList()
+  renderGrammarErrors()
+}
+
+function renderGrammarIgnoreList() {
+  const list = el('grammar-ignore-list')
+  if (!list) return
+  list.replaceChildren()
+
+  // The elements the user can currently act on: whatever the selected grammar
+  // defines, whatever the loaded files' grammars define, plus anything already
+  // ignored — otherwise an ignore set restored from a session would silently
+  // become unreachable.
+  /** @type {string[]} */
+  const names = []
+  const add = (name) => { if (name && !names.includes(name)) names.push(name) }
+  for (const item of _grammarDef()?.items ?? []) add(item.element)
+  for (const name of textCompare?.getGrammarElements?.() ?? []) add(name)
+  for (const name of _grammarEdit.ignored) add(name)
+
+  if (names.length === 0) {
+    const empty = document.createElement('span')
+    empty.className = 'grammar-ignore-empty'
+    empty.textContent = '（目前的文法沒有定義任何元素）'
+    list.appendChild(empty)
+    return
+  }
+
+  for (const name of names) {
+    const label = document.createElement('label')
+    label.className = 'settings-check'
+    label.dataset.element = name
+
+    const input = document.createElement('input')
+    input.type = 'checkbox'
+    input.checked = _grammarEdit.ignored.has(name)
+    input.addEventListener('change', () => {
+      if (input.checked) _grammarEdit.ignored.add(name)
+      else _grammarEdit.ignored.delete(name)
+      _setGrammarStatus(input.checked ? `比對時將忽略「${name}」` : `不再忽略「${name}」`)
+    })
+
+    const span = document.createElement('span')
+    span.textContent = name
+
+    label.append(input, span)
+    list.appendChild(label)
+  }
+}
+
+/**
+ * Show why a rule is not running.
+ *
+ * compileGrammar drops invalid items and reports the reason; discarding that
+ * would leave a rule visible in the list that silently does nothing.
+ *
+ * @param {string[]} [extra] messages from a write-back attempt
+ */
+function renderGrammarErrors(extra) {
+  const box = el('grammar-errors')
+  if (!box) return
+  box.replaceChildren()
+
+  /** @type {string[]} */
+  const messages = [...(extra ?? [])]
+  const def = _grammarDef()
+  if (def) {
+    for (const err of compileGrammar(def).errors) messages.push(`${def.name || '（未命名）'}：${err}`)
+  }
+  if (messages.length === 0) return
+
+  const title = document.createElement('div')
+  title.className = 'grammar-errors__title'
+  title.textContent = `${messages.length} 個問題，對應的規則不會生效：`
+
+  const ul = document.createElement('ul')
+  for (const msg of messages) {
+    const li = document.createElement('li')
+    li.textContent = msg
+    ul.appendChild(li)
+  }
+  box.append(title, ul)
+}
+
+function applyGrammarChanges() {
+  const userDefs = _grammarEdit.defs
+    .filter((d) => !d.builtin)
+    .map((d) => ({
+      name: d.name,
+      masks: [...(d.masks ?? [])],
+      caseSensitive: d.caseSensitive !== false,
+      items: (d.items ?? []).map((i) => ({ ...i })),
+    }))
+
+  // Grammars with no usable item at all are refused outright by the registry;
+  // those that merely lost an item still register, and compileGrammar reports
+  // the loss below.
+  const rejected = setUserGrammars(userDefs)
+
+  if (textCompare) {
+    textCompare.applyConfig({ ...textCompare.getConfig(), grammarIgnore: [..._grammarEdit.ignored] })
+  }
+
+  renderGrammarErrors(rejected)
+  const kept = getUserGrammars().length
+  if (rejected.length > 0) {
+    _setGrammarStatus(`${rejected.length} 個文法無法套用，其餘 ${kept} 個已生效`)
+    return
+  }
+  _setGrammarStatus(textCompare
+    ? `已套用 ${kept} 個自訂文法`
+    : `已套用 ${kept} 個自訂文法（目前沒有開啟文字比對）`)
+}
+
+function setupGrammarModal() {
+  const overlay = el('grammar-modal')
+  if (!overlay) return
+
+  el('btn-grammar-modal-close')?.addEventListener('click', closeGrammarModal)
+  el('btn-grammar-modal-cancel')?.addEventListener('click', closeGrammarModal)
+  el('btn-grammar-apply')?.addEventListener('click', applyGrammarChanges)
+
+  el('btn-grammar-def-add')?.addEventListener('click', () => {
+    const base = _grammarEdit.defs.filter((d) => !d.builtin).length + 1
+    _grammarEdit.defs.unshift({
+      name: `自訂文法 ${base}`,
+      masks: [],
+      caseSensitive: true,
+      builtin: false,
+      items: [],
+    })
+    _grammarEdit.defIndex = 0
+    _grammarEdit.itemIndex = -1
+    renderGrammarModal()
+    _setGrammarStatus('已新增文法，請填入名稱與檔案遮罩')
+  })
+
+  el('btn-grammar-def-copy')?.addEventListener('click', () => {
+    const def = _grammarDef()
+    if (!def) { _setGrammarStatus('請先選擇一個文法'); return }
+    const copy = _cloneGrammarDef(def)
+    copy.builtin = false
+    copy.name = `${def.name} (複本)`
+    _grammarEdit.defs.unshift(copy)
+    _grammarEdit.defIndex = 0
+    _grammarEdit.itemIndex = -1
+    renderGrammarModal()
+    _setGrammarStatus(`已複製為「${copy.name}」`)
+  })
+
+  el('btn-grammar-def-remove')?.addEventListener('click', () => {
+    if (!_grammarEditable()) { _setGrammarStatus('內建文法無法刪除，請先複製為自訂'); return }
+    const [removed] = _grammarEdit.defs.splice(_grammarEdit.defIndex, 1)
+    _grammarEdit.defIndex = Math.min(_grammarEdit.defIndex, _grammarEdit.defs.length - 1)
+    _grammarEdit.itemIndex = -1
+    renderGrammarModal()
+    _setGrammarStatus(`已刪除「${removed?.name ?? ''}」（按「套用」後才會寫回）`)
+  })
+
+  /** @param {string} id @param {(def: GrammarDef & { builtin?: boolean }) => void} apply */
+  const onDefField = (id, apply) => {
+    el(id)?.addEventListener('input', () => {
+      const def = _grammarDef()
+      if (!def || !_grammarEditable()) return
+      apply(def)
+      renderGrammarDefList()
+      renderGrammarErrors()
+    })
+  }
+  onDefField('input-grammar-name', (def) => { def.name = String(el('input-grammar-name')?.value ?? '') })
+  onDefField('input-grammar-masks', (def) => {
+    def.masks = String(el('input-grammar-masks')?.value ?? '')
+      .split(/[,\s]+/).map((s) => s.trim()).filter(Boolean)
+  })
+  el('chk-grammar-case')?.addEventListener('change', () => {
+    const def = _grammarDef()
+    if (!def || !_grammarEditable()) return
+    def.caseSensitive = !!el('chk-grammar-case')?.checked
+    renderGrammarErrors()
+  })
+
+  el('btn-grammar-item-add')?.addEventListener('click', () => {
+    const def = _grammarDef()
+    if (!def || !_grammarEditable()) { _setGrammarStatus('內建文法無法編輯，請先複製為自訂'); return }
+    def.items.push({ type: 'basic', element: 'Element', text: '', lineWeight: 1 })
+    _grammarEdit.itemIndex = def.items.length - 1
+    renderGrammarItemList()
+    renderGrammarItemEditor()
+    renderGrammarIgnoreList()
+    renderGrammarErrors()
+    _setGrammarStatus('已新增項目，請填入元素名稱與內容')
+  })
+
+  el('btn-grammar-item-remove')?.addEventListener('click', () => {
+    const def = _grammarDef()
+    if (!def || !_grammarEditable()) return
+    if (_grammarEdit.itemIndex < 0) { _setGrammarStatus('請先選擇一個項目'); return }
+    def.items.splice(_grammarEdit.itemIndex, 1)
+    _grammarEdit.itemIndex = Math.min(_grammarEdit.itemIndex, def.items.length - 1)
+    renderGrammarItemList()
+    renderGrammarItemEditor()
+    renderGrammarIgnoreList()
+    renderGrammarErrors()
+  })
+
+  el('btn-grammar-item-up')?.addEventListener('click', () => moveGrammarItem(-1))
+  el('btn-grammar-item-down')?.addEventListener('click', () => moveGrammarItem(1))
+
+  // The type select rebuilds which fields are visible, so it commits and then
+  // re-renders rather than only committing.
+  el('sel-grammar-item-type')?.addEventListener('change', () => {
+    commitGrammarItemEditor()
+    renderGrammarItemEditor()
+  })
+
+  const editor = el('grammar-item-editor')
+  for (const input of editor?.querySelectorAll('input, textarea') ?? []) {
+    const event = input.type === 'checkbox' ? 'change' : 'input'
+    input.addEventListener(event, commitGrammarItemEditor)
+  }
 }
 
 // ---------------------------------------------------------------------------

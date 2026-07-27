@@ -241,6 +241,45 @@ export function buildAppMenu(win) {
     {
       label: '檢視(&V)',
       submenu: [
+        {
+          label: '文字比對面板',
+          submenu: [
+            item('詳細資料：文字', 'view.text.details.text'),
+            item('詳細資料：十六進位', 'view.text.details.hex'),
+            item('詳細資料：對齊', 'view.text.details.alignment'),
+            item('關閉詳細資料', 'view.text.details.off'),
+            { type: 'separator' },
+            item('標尺', 'view.text.ruler'),
+            item('檔案資訊', 'view.text.fileInfo'),
+            item('說明欄', 'view.text.description'),
+            { type: 'separator' },
+            item('鎖定左側（唯讀）', 'view.text.readOnly.left'),
+            item('鎖定右側（唯讀）', 'view.text.readOnly.right'),
+            { type: 'separator' },
+            item('字型：預設', 'view.text.font.default'),
+            item('字型：Consolas', 'view.text.font.consolas'),
+            item('字型：Cascadia Code', 'view.text.font.cascadia'),
+            item('字型：Fira Code', 'view.text.font.fira'),
+            item('字型：Courier New', 'view.text.font.courier'),
+            item('字型：JetBrains Mono', 'view.text.font.jetbrains')
+          ]
+        },
+        {
+          label: '十六進位比對面板',
+          submenu: [
+            item('詳細資料', 'view.hex.details'),
+            item('檔案資訊', 'view.hex.fileInfo'),
+            item('標尺', 'view.hex.ruler')
+          ]
+        },
+        {
+          label: '表格比對面板',
+          submenu: [
+            item('詳細資料', 'view.table.details'),
+            item('檔案資訊', 'view.table.fileInfo'),
+            item('顯示空白字元', 'view.table.whitespace')
+          ]
+        },
         item('圖片資訊', 'view.image.info'),
         { type: 'separator' },
         item('顯示工具列', 'view.toggleToolbar'),
@@ -288,6 +327,7 @@ export function buildAppMenu(win) {
         item('選項…', 'tools.options'),
         { type: 'separator' },
         item('比對規則（忽略設定）…', 'tools.ignoreRules'),
+        item('文法定義…', 'tools.grammar'),
         item('已命名設定…', 'tools.namedConfigs'),
         item('自訂快捷鍵…', 'tools.shortcuts'),
         { type: 'separator' },

@@ -316,6 +316,173 @@
     </div>
   </div>
 
+  <!-- Grammar (File Format) editor. The engine in core/grammar.js shipped with
+       no way to author a definition, so the only reachable part of it was the
+       built-in set. -->
+  <div id="grammar-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="grammar-modal-title" style="display:none">
+    <div class="modal-box modal-box--grammar">
+      <div class="modal-header">
+        <h3 id="grammar-modal-title">檔案格式與文法</h3>
+        <button id="btn-grammar-modal-close" class="modal-close">✕</button>
+      </div>
+
+      <div class="modal-body grammar-body">
+        <div class="grammar-layout">
+          <section class="grammar-col">
+            <label>文法定義：</label>
+            <div id="grammar-def-list" class="config-list grammar-def-list"></div>
+            <div class="u-row-gap-6">
+              <button id="btn-grammar-def-add">新增</button>
+              <button id="btn-grammar-def-copy">複製為自訂</button>
+              <button id="btn-grammar-def-remove" class="danger">刪除</button>
+            </div>
+            <p class="settings-hint">
+              自訂文法排在內建文法之前，因此同一個檔案遮罩可以覆寫內建定義。
+            </p>
+          </section>
+
+          <section class="grammar-col grammar-col--wide">
+            <label class="settings-field">
+              <span>名稱：</span>
+              <input id="input-grammar-name" type="text" placeholder="例：我的 SQL" />
+            </label>
+            <label class="settings-field">
+              <span>檔案遮罩：</span>
+              <input id="input-grammar-masks" type="text" placeholder="*.sql, *.ddl" />
+            </label>
+            <label class="settings-check">
+              <input type="checkbox" id="chk-grammar-case" />
+              <span>預設區分大小寫</span>
+            </label>
+
+            <label class="u-mt-8">Grammar Item（由上而下比對，先匹配者勝；可拖曳排序）：</label>
+            <div id="grammar-item-list" class="grammar-item-list"></div>
+            <div class="u-row-gap-6">
+              <button id="btn-grammar-item-add">新增項目</button>
+              <button id="btn-grammar-item-up">▲ 上移</button>
+              <button id="btn-grammar-item-down">▼ 下移</button>
+              <button id="btn-grammar-item-remove" class="danger">刪除項目</button>
+            </div>
+
+            <fieldset id="grammar-item-editor" class="grammar-item-editor">
+              <legend>項目設定</legend>
+
+              <label class="settings-field">
+                <span>類型：</span>
+                <select id="sel-grammar-item-type">
+                  <option value="basic">Basic — 文字或 Regex</option>
+                  <option value="delimited">Delimited — 成對分隔符</option>
+                  <option value="list">List — 關鍵字清單</option>
+                  <option value="columns">Columns — 固定欄位範圍</option>
+                  <option value="lines">Lines — 整行</option>
+                </select>
+              </label>
+              <label class="settings-field">
+                <span>元素名稱：</span>
+                <input id="input-grammar-item-element" type="text" placeholder="Comment" />
+              </label>
+
+              <div class="grammar-field" data-for="basic" hidden>
+                <label class="settings-field">
+                  <span>文字 / 樣式：</span>
+                  <input id="input-grammar-item-text" type="text" />
+                </label>
+              </div>
+
+              <div class="grammar-field" data-for="delimited" hidden>
+                <label class="settings-field">
+                  <span>起始分隔符：</span>
+                  <input id="input-grammar-item-start" type="text" />
+                </label>
+                <label class="settings-field">
+                  <span>結束分隔符：</span>
+                  <input id="input-grammar-item-end" type="text" />
+                </label>
+                <label class="settings-field">
+                  <span>跳脫字元：</span>
+                  <input id="input-grammar-item-escape" type="text" maxlength="1" class="u-size-input" />
+                </label>
+                <label class="settings-check">
+                  <input type="checkbox" id="chk-grammar-item-stopateol" />
+                  <span>未結束時於行尾結束</span>
+                </label>
+                <label class="settings-check">
+                  <input type="checkbox" id="chk-grammar-item-multiline" />
+                  <span>可跨行延續</span>
+                </label>
+              </div>
+
+              <div class="grammar-field" data-for="list" hidden>
+                <label>清單項目（每行一個）：</label>
+                <textarea id="input-grammar-item-items" rows="4" placeholder="if&#10;else&#10;while"></textarea>
+              </div>
+
+              <div class="grammar-field" data-for="columns" hidden>
+                <label class="settings-field">
+                  <span>起始欄（1 起算）：</span>
+                  <input id="input-grammar-item-startcol" type="number" min="1" class="u-size-input" />
+                </label>
+                <label class="settings-field">
+                  <span>結束欄（含）：</span>
+                  <input id="input-grammar-item-endcol" type="number" min="1" class="u-size-input" />
+                </label>
+                <label class="settings-check">
+                  <input type="checkbox" id="chk-grammar-item-toeol" />
+                  <span>延伸至行尾</span>
+                </label>
+              </div>
+
+              <div class="grammar-field" data-for="lines" hidden>
+                <label class="settings-field">
+                  <span>整行比對：</span>
+                  <input id="input-grammar-item-match" type="text" />
+                </label>
+                <label class="settings-field">
+                  <span>僅前 N 行（留空為不限）：</span>
+                  <input id="input-grammar-item-heading" type="number" min="0" class="u-size-input" />
+                </label>
+                <label class="settings-check">
+                  <input type="checkbox" id="chk-grammar-item-orline1" />
+                  <span>第 1 行亦適用</span>
+                </label>
+              </div>
+
+              <div class="grammar-opts">
+                <label class="settings-check" data-opt="matchCase">
+                  <input type="checkbox" id="chk-grammar-item-matchcase" />
+                  <span>區分大小寫</span>
+                </label>
+                <label class="settings-check" data-opt="regex">
+                  <input type="checkbox" id="chk-grammar-item-regex" />
+                  <span>使用 Regex</span>
+                </label>
+                <label class="settings-check" data-opt="wholeWord">
+                  <input type="checkbox" id="chk-grammar-item-wholeword" />
+                  <span>全字比對</span>
+                </label>
+                <label class="settings-field">
+                  <span>行權重：</span>
+                  <input id="input-grammar-item-weight" type="number" min="0" max="100" step="0.5" class="u-size-input" />
+                </label>
+              </div>
+            </fieldset>
+
+            <label class="u-mt-8">比對時忽略下列元素的差異：</label>
+            <div id="grammar-ignore-list" class="grammar-ignore-list"></div>
+
+            <div id="grammar-errors" class="grammar-errors" role="alert"></div>
+          </section>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <span id="grammar-modal-status" class="u-modal-status u-push-right-status"></span>
+        <button id="btn-grammar-modal-cancel">取消</button>
+        <button id="btn-grammar-apply">套用</button>
+      </div>
+    </div>
+  </div>
+
   <!-- View picker: used both by Smart Routing when an extension has more than
        one sensible reading (.html → text or table) and by Session ▸ 以其他方式
        比對，so the user is asked rather than guessed at. -->
