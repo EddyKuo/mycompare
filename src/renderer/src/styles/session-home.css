@@ -89,3 +89,22 @@
   font-size: 11px;
   max-width: 140px;
 }
+
+/* Search box over the saved sessions. Sits between the action bar and the
+   list because it filters the list, not the buttons. */
+.session-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+  padding: 6px 10px;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+}
+
+.session-search:focus {
+  outline: none;
+  border-color: var(--accent-color, #4a90d9);
+}

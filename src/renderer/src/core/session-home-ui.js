@@ -180,6 +180,37 @@ function escapeHtml(str) {
  *   The list is automatically re-rendered before this callback fires.
  * @returns {void}
  */
+/**
+ * Filter sessions by a free-text query.
+ *
+ * Matches the name and both paths, because people look for a comparison by
+ * whichever of the three they remember — usually a folder name buried in the
+ * middle of a path, which is why this is a substring match and not a prefix.
+ *
+ * @param {object[]} sessions
+ * @param {string} query
+ * @returns {object[]}
+ */
+export function filterSessions(sessions, query) {
+  const q = String(query ?? '').trim().toLowerCase()
+  if (!q) return sessions
+  return sessions.filter((s) => {
+    const o = s?.options ?? {}
+    const haystack = [
+      s?.name, s?.type,
+      o.leftPath, o.rightPath, o.basePath, o.outputPath,
+      s?.leftPath, s?.rightPath,
+    ].filter(Boolean).join(' ').toLowerCase()
+    return haystack.includes(q)
+  })
+}
+
+/** Survives a re-render so typing does not reset the box. */
+let _searchQuery = ''
+
+/** Test seam: reset the search box between cases. */
+export function _resetSessionSearch() { _searchQuery = '' }
+
 export function renderRecentSessions(onOpen, onRemove) {
   // Locate or create the container
   let container = document.querySelector('.recent-sessions')
@@ -197,8 +228,10 @@ export function renderRecentSessions(onOpen, onRemove) {
     }
   }
 
-  // Fetch sessions
-  const sessions = store.getRecent(10)
+  // Searching has to look past the ten most recent, or the box can only find
+  // what is already on screen.
+  const all = store.getRecent(_searchQuery ? 500 : 10)
+  const sessions = filterSessions(all, _searchQuery)
 
   // Build header
   container.innerHTML = '<h2>最近的 Session</h2>'
@@ -243,10 +276,28 @@ export function renderRecentSessions(onOpen, onRemove) {
   actionBar.appendChild(btnImport)
   container.appendChild(actionBar)
 
+  const search = document.createElement('input')
+  search.type = 'search'
+  search.className = 'session-search'
+  search.placeholder = '搜尋 Session（名稱或路徑）'
+  search.value = _searchQuery
+  search.addEventListener('input', () => {
+    _searchQuery = search.value
+    renderRecentSessions(onOpen, onRemove)
+    // Re-rendering replaces the input, so focus and caret have to be restored
+    // or every keystroke after the first lands nowhere.
+    const next = container.querySelector('.session-search')
+    if (next instanceof HTMLInputElement) {
+      next.focus()
+      next.setSelectionRange(next.value.length, next.value.length)
+    }
+  })
+  container.appendChild(search)
+
   if (sessions.length === 0) {
     const empty = document.createElement('p')
     empty.className = 'recent-empty'
-    empty.textContent = '尚無最近記錄'
+    empty.textContent = _searchQuery ? `找不到符合「${_searchQuery}」的 Session` : '尚無最近記錄'
     container.appendChild(empty)
     return
   }
