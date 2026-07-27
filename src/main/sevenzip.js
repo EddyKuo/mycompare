@@ -239,7 +239,13 @@ class Reader {
    * @returns {boolean[]}
    */
   boolsWithAllDefined(count) {
-    return this.byte() !== 0 ? new Array(count).fill(true) : this.bits(count)
+    const allDefined = this.byte() !== 0
+    // The shortcut byte says "all of them" without spending a byte per eight
+    // entries, so a header of a few dozen bytes can name a count of any size.
+    // The bit-vector form is self-limiting; this one has to be bounded against
+    // what is left to read, or a tiny file allocates an array of any length.
+    if (count > this.remaining * 8) throw new SevenZipError('7z 標頭的項目數超出檔案內容')
+    return allDefined ? new Array(count).fill(true) : this.bits(count)
   }
 
   /** Skip a property whose contents this reader does not need. */
@@ -593,6 +599,12 @@ function readNames(r, size) {
  */
 function readFilesInfo(r) {
   const numFiles = r.number()
+  // Every entry costs at least a two-byte UTF-16 name terminator, so a count
+  // larger than the header can describe is a lie — and acting on it allocates
+  // several arrays of that size before any entry limit is consulted.
+  if (numFiles > r.remaining / 2) {
+    throw new SevenZipError('7z 標頭宣告的檔案數超出檔案內容')
+  }
   /** @type {string[]} */
   let names = []
   /** @type {boolean[]|null} */

@@ -174,6 +174,22 @@ app.whenReady().then(async () => {
     userDataPath: () => app.getPath('userData'),
     fs: { readFile, writeFile, mkdir },
     crypto: safeStorage,
+    // An unrecognised SSH host key is a decision only the user can make, and
+    // it has to be made before the password is sent. Defaulting to "cancel"
+    // means a mis-click refuses rather than trusts.
+    onUnknownHostKey: async ({ fingerprint, keyType }) => {
+      const { response } = await dialog.showMessageBox(win, {
+        type: 'warning',
+        buttons: ['取消', '信任並繼續'],
+        defaultId: 0,
+        cancelId: 0,
+        title: '無法辨識的主機金鑰',
+        message: '這台伺服器的金鑰過去沒有見過。',
+        detail: `金鑰類型：${keyType}\n指紋：${fingerprint}\n\n`
+          + '請先用其他管道核對這串指紋。若不核對就繼續，無法分辨對方是伺服器本人還是中間人。',
+      })
+      return response === 1
+    },
   })
 
   const cliFiles = cli.paths
@@ -282,7 +298,14 @@ const MAX_BINARY_BYTES = 10_485_760 // 10 MB
  * @param {number} maxBytes
  * @returns {Promise<{ base64: string, size: number, truncated: boolean }>}
  */
-async function readBinaryBounded(safePath, maxBytes = MAX_BINARY_BYTES) {
+async function readBinaryBounded(safePath, requested = MAX_BINARY_BYTES) {
+  // The caller asks for a ceiling; it does not get to raise the one set here.
+  // Taking the requested value at face value lets a renderer pass a huge
+  // number and have the main process read and base64-encode an arbitrarily
+  // large file — the limit exists to bound memory, so it cannot be an opt-in.
+  const maxBytes = Math.min(
+    typeof requested === 'number' && requested > 0 ? requested : MAX_BINARY_BYTES,
+    MAX_BINARY_BYTES)
   const info = await stat(safePath)
   if (info.size <= maxBytes) {
     const buffer = await readFile(safePath)

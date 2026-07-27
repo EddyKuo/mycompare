@@ -29,6 +29,9 @@ const MAX_SESSIONS = 8
  * @property {object} [crypto]           Electron safeStorage, or a stand-in
  * @property {Function} [FtpClientCtor]
  * @property {Function} [S3ClientCtor]
+ * @property {Function} [connectSftp]
+ * @property {Function} [onUnknownHostKey] decides whether to trust a host key
+ *           the app has not seen before; without one, SFTP fails closed
  */
 
 /**
@@ -76,6 +79,9 @@ export function registerRemoteIpc(deps) {
     clearTimeout(s.timer)
     try {
       await s.client.close?.()
+      // SFTP runs over a channel inside an SSH connection; closing the channel
+      // leaves the socket and its session keys alive.
+      await s.client._transport?.close?.()
     } catch {
       // A server that has already gone away is not an error worth surfacing.
     }
@@ -114,6 +120,26 @@ export function registerRemoteIpc(deps) {
         secretAccessKey: password,
         pathStyle: profile.pathStyle,
       })
+    } else if (profile.kind === 'sftp') {
+      const { connectSftp } = deps.connectSftp
+        ? { connectSftp: deps.connectSftp }
+        : await import('./remote-sftp.js')
+      // A host key that has never been seen needs a human decision, so the
+      // answer comes from the caller. With no responder the connection fails
+      // closed rather than trusting whatever answered on the port.
+      const session = await connectSftp({
+        host: profile.host,
+        port: profile.port,
+        user: profile.user,
+        password,
+        knownHosts: profile.knownHosts,
+        onUnknownHostKey: deps.onUnknownHostKey,
+        onHostKeyAccepted: async (line) => {
+          await s.update(profileId, { knownHosts: line })
+        },
+      })
+      client = session.client
+      client._transport = session.transport
     } else {
       const { FtpClient } = deps.FtpClientCtor
         ? { FtpClient: deps.FtpClientCtor }
@@ -207,7 +233,10 @@ export function registerRemoteIpc(deps) {
         return rows.filter((r) => r.name && !r.name.includes('/'))
       }
 
-      const entries = await client.list(dir || '.')
+      // FTP hands back a bare array; SFTP wraps it alongside the resolved path
+      // and the names it dropped as unsafe.
+      const listed = await client.list(dir || '.')
+      const entries = Array.isArray(listed) ? listed : listed.entries
       return entries.map((e) => toRow(profileId, e, dir))
     },
 

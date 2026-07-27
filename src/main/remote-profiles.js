@@ -60,13 +60,10 @@ import { join } from 'path'
 import { randomUUID } from 'crypto'
 
 /** Kinds this application can actually talk to. */
-export const PROFILE_KINDS = Object.freeze(['ftp', 'ftps', 's3'])
+export const PROFILE_KINDS = Object.freeze(['ftp', 'ftps', 'sftp', 's3'])
 
 /** Kinds Beyond Compare has that we deliberately do not, with the reason. */
 export const UNSUPPORTED_KINDS = Object.freeze({
-  sftp: 'SFTP requires a full SSH transport layer (key exchange, host-key ' +
-    'verification, ciphers, MACs). Node ships no SSH primitives and the project ' +
-    'forbids new dependencies, so it cannot be implemented safely.',
   dropbox: 'Dropbox requires an interactive OAuth 2.0 flow and a registered ' +
     'application client ID, which this application does not have.',
   onedrive: 'OneDrive requires an interactive OAuth 2.0 flow and a registered ' +
@@ -128,7 +125,9 @@ export const NULL_CRYPTO = Object.freeze({
  * @returns {number}
  */
 export function defaultPort(kind) {
-  return kind === 's3' ? 443 : 21
+  if (kind === 's3') return 443
+  if (kind === 'sftp') return 22
+  return 21
 }
 
 /**
@@ -241,7 +240,7 @@ export function normaliseProfile(input, opts = {}) {
   const { ok, errors } = validateProfile(input)
   if (!ok) throw new Error(`Invalid remote profile: ${errors.join('; ')}`)
 
-  const kind = /** @type {'ftp'|'ftps'|'s3'} */ (input.kind)
+  const kind = /** @type {'ftp'|'ftps'|'sftp'|'s3'} */ (input.kind)
   const idFactory = opts.idFactory ?? randomUUID
   const id = typeof input.id === 'string' && input.id.trim() !== '' ? input.id.trim() : idFactory()
   const saveSecret = input.saveSecret !== false
@@ -261,6 +260,11 @@ export function normaliseProfile(input, opts = {}) {
     pathStyle: kind === 's3' ? Boolean(input.pathStyle) : false,
     saveSecret,
     needsSecret: false,
+    // The host key the user has already accepted, in known_hosts line form. A
+    // public key, so it is not a secret — but losing it means being asked to
+    // approve the same server on every connection, which trains people to
+    // click through the one prompt that is supposed to stop an interception.
+    knownHosts: kind === 'sftp' ? String(input.knownHosts ?? '').trim() : '',
   }
   if (typeof input.secret === 'string' && input.secret !== '') {
     profile.secret = input.secret
@@ -497,6 +501,25 @@ export function createProfileStore(opts) {
      */
     get(id) {
       return profiles.find((p) => p.id === id)
+    },
+
+    /**
+     * Merge a patch into one profile.
+     *
+     * Separate from `upsert` because the caller here is the app itself
+     * recording something it learned during a connection, not the user editing
+     * a form: it must not have to resupply fields it never saw.
+     *
+     * @param {string} id
+     * @param {Partial<RemoteProfile>} patch
+     * @returns {Promise<RemoteProfile|undefined>}
+     */
+    async update(id, patch) {
+      const i = profiles.findIndex((p) => p.id === id)
+      if (i === -1) return undefined
+      profiles[i] = normaliseProfile({ ...profiles[i], ...patch, id })
+      await this.save()
+      return profiles[i]
     },
 
     /**

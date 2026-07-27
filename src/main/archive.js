@@ -617,6 +617,58 @@ function stripOffset({ path, size, mtime, isDirectory }) {
 }
 
 /**
+ * Inflate one zip entry with a ceiling on what actually comes out.
+ *
+ * The size in a zip's directory is a claim, not a measurement: nothing forces
+ * it to match what the deflate stream really produces. Checking it and then
+ * calling `async('nodebuffer')` bounds the honest case and does nothing about
+ * the hostile one — a small declared size over a high-ratio stream inflates
+ * unbounded. Streaming stops at the limit instead of after it.
+ *
+ * @param {object} file JSZip entry
+ * @param {string} name for the error message
+ * @param {number} maxBytes
+ * @returns {Promise<Buffer>}
+ */
+function readZipEntryBounded(file, name, maxBytes) {
+  return new Promise((resolve, reject) => {
+    /** @type {Buffer[]} */
+    const chunks = []
+    let total = 0
+    let settled = false
+    const stream = file.internalStream('nodebuffer')
+
+    stream
+      .on('data', (chunk) => {
+        if (settled) return
+        total += chunk.length
+        if (total > maxBytes) {
+          settled = true
+          stream.pause()
+          reject(new ArchiveError(
+            `Entry "${name}" expands past the ${maxBytes} byte limit`, 'limit'))
+          return
+        }
+        chunks.push(Buffer.from(chunk))
+      })
+      .on('error', (err) => {
+        if (settled) return
+        settled = true
+        reject(new ArchiveError(
+          `Corrupt zip entry "${name}": ${err instanceof Error ? err.message : err}`,
+          'corrupt'))
+      })
+      .on('end', () => {
+        if (settled) return
+        settled = true
+        resolve(Buffer.concat(chunks))
+      })
+
+    stream.resume()
+  })
+}
+
+/**
  * Read one entry's bytes.
  *
  * @param {string} archivePath absolute, already validated by the caller
@@ -650,7 +702,7 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
     if ((file._data?.uncompressedSize ?? 0) > lim.maxEntryBytes) {
       throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
     }
-    return Buffer.from(await file.async('nodebuffer'))
+    return readZipEntryBounded(file, wanted, lim.maxEntryBytes)
   }
 
   if (format === '7z') {

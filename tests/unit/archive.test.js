@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { gzipSync, deflateSync } from 'zlib'
+import { gzipSync, deflateSync, deflateRawSync, crc32 } from 'zlib'
 import { mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -21,6 +21,55 @@ import {
 // tar builders — the tests construct real tar bytes so the parser is exercised
 // against the on-disk format, not a mock.
 // ---------------------------------------------------------------------------
+
+/**
+ * Build a one-entry zip whose declared uncompressed size is a lie.
+ *
+ * A writer cannot be asked to produce this, and it is the shape that matters:
+ * the size in the directory is what a reader checks limits against, while the
+ * deflate stream decides what actually comes out.
+ *
+ * @param {string} name
+ * @param {Buffer} content  what really inflates
+ * @param {number} declaredSize  what the headers claim
+ * @returns {Buffer}
+ */
+function lyingZip(name, content, declaredSize) {
+  const data = deflateRawSync(content, { level: 9 })
+  const nameBuf = Buffer.from(name, 'utf8')
+  const sum = crc32(content) >>> 0
+
+  const local = Buffer.alloc(30)
+  local.write('PK\x03\x04', 0, 'binary')
+  local.writeUInt16LE(20, 4)
+  local.writeUInt16LE(8, 8) // deflate
+  local.writeUInt32LE(sum, 14)
+  local.writeUInt32LE(data.length, 18)
+  local.writeUInt32LE(declaredSize, 22)
+  local.writeUInt16LE(nameBuf.length, 26)
+
+  const central = Buffer.alloc(46)
+  central.write('PK\x01\x02', 0, 'binary')
+  central.writeUInt16LE(20, 4)
+  central.writeUInt16LE(20, 6)
+  central.writeUInt16LE(8, 10)
+  central.writeUInt32LE(sum, 16)
+  central.writeUInt32LE(data.length, 20)
+  central.writeUInt32LE(declaredSize, 24)
+  central.writeUInt16LE(nameBuf.length, 28)
+
+  const cdOffset = local.length + nameBuf.length + data.length
+  const cdSize = central.length + nameBuf.length
+
+  const eocd = Buffer.alloc(22)
+  eocd.write('PK\x05\x06', 0, 'binary')
+  eocd.writeUInt16LE(1, 8)
+  eocd.writeUInt16LE(1, 10)
+  eocd.writeUInt32LE(cdSize, 12)
+  eocd.writeUInt32LE(cdOffset, 16)
+
+  return Buffer.concat([local, nameBuf, data, central, nameBuf, eocd])
+}
 
 const BLOCK = 512
 
@@ -359,6 +408,29 @@ describe('readArchive / readArchiveEntry', () => {
     writeFileSync(p, buf)
     return p
   }
+
+  describe('zip entries that lie about their size', () => {
+    // 1 MB of one byte deflates to a couple of KB, which is all a ratio attack
+    // needs: the declared size passes the limit check and the stream does not.
+    const payload = Buffer.alloc(1024 * 1024, 0x41)
+
+    it('stops inflating at the limit instead of after it', async () => {
+      const p = put('bomb.zip', lyingZip('bomb.txt', payload, 1000))
+      await expect(readArchiveEntry(p, 'bomb.txt', { maxEntryBytes: 4096 }))
+        .rejects.toMatchObject({ code: 'limit' })
+    })
+
+    it('reports a size mismatch as corruption rather than returning the bytes', async () => {
+      const p = put('bomb2.zip', lyingZip('bomb.txt', payload, 1000))
+      await expect(readArchiveEntry(p, 'bomb.txt')).rejects.toMatchObject({ code: 'corrupt' })
+    })
+
+    it('still reads an entry whose declared size is honest', async () => {
+      const honest = Buffer.from('the truth')
+      const p = put('honest.zip', lyingZip('ok.txt', honest, honest.length))
+      expect((await readArchiveEntry(p, 'ok.txt')).toString()).toBe('the truth')
+    })
+  })
 
   const sample = () =>
     buildTar([

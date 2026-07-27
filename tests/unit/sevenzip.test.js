@@ -21,6 +21,9 @@ import {
 /** @param {string} b64 */
 const bytes = (b64) => new Uint8Array(Buffer.from(b64, 'base64'))
 
+/** Signature header length, fixed by the format. */
+const SIG_HEADER_SIZE = 32
+
 // py7zr defaults: BCJ (x86) chained into LZMA2.
 // { 'a.txt': b'alpha', 'dir/b.txt': b'beta'*10 }
 const DEFAULT_7Z = bytes('N3q8ryccAASTGdj5hQAAAAAAAAAUAAAAAAAAAOLkB/PgACwADl0AMJsKZySQyTQ/qfeDeAAA4AB4AGddAACBMweuD89dLwwHsMPaKtdYZKyzeM5U3dvYYcn8sT+oiYa8+2ZJHY8wMx5YUZ1l9ifkTB/N+KP5iXjXIVeR5iEVGehm3ss/DFKfyxCUq8S8j4kJ3kp4Ncw2bvJoS1HKfRRGT60AAAAAFwYWAQlvAAcLAQABISEBGAx5AAA=')
@@ -67,6 +70,21 @@ describe('parse7z', () => {
     for (const e of parse7z(DEFAULT_7Z).entries) {
       expect(Number.isNaN(Date.parse(e.mtime))).toBe(false)
     }
+  })
+
+  it('refuses a header that claims more files than it could describe', () => {
+    // Header: kHeader, kFilesInfo, numFiles = 0x0FFFFFFF. Acting on that count
+    // allocates several arrays of half a billion entries from a 40-byte file,
+    // long before any archive-level entry limit is consulted.
+    const header = Uint8Array.from([0x01, 0x05, 0xf0, 0xff, 0xff, 0xff, 0x0f, 0x00])
+    const buf = new Uint8Array(SIG_HEADER_SIZE + header.length)
+    buf.set(DEFAULT_7Z.subarray(0, 12))
+    const dv = new DataView(buf.buffer)
+    dv.setUint32(12, 0, true) // nextHeaderOffset
+    dv.setUint32(20, header.length, true) // nextHeaderSize
+    buf.set(header, SIG_HEADER_SIZE)
+
+    expect(() => parse7z(buf)).toThrow(/超出檔案內容/)
   })
 
   it('rejects data that is not 7z', () => {

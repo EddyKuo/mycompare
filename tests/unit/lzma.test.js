@@ -22,6 +22,8 @@ const buf = (u8) => Buffer.from(u8)
 const HELLO_XZ = bytes('/Td6WFoAAATm1rRGAgAhARYAAAB0L+WjAQAKaGVsbG8gd29ybGQAANpSI+/NfgNTAAEjC8Ib/QkftvN9AQAAAAAEWVo=')
 // b''
 const EMPTY_XZ = bytes('/Td6WFoAAATm1rRGAAAAABzfRCEftvN9AQAAAAAEWVo=')
+// Two independent streams written back to back, as `cat a.xz b.xz` produces.
+const CONCAT_XZ = bytes('/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4AGjAB1dADMaSqwMcsHOMXdQWZpa7Dj9Jw/819EHIRW+bAAAAAAAAP9X2yF94K1tAAE5pAMAAAAAFDJ3scRn+wIAAAAABFla/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4AG3AB5dACmRRHBUKfzX6Al2W5zOMN6tWTVX/gW3J+bTEOMgAAAAAFLYAsBfVH9aAAE6uAMAAAAtHLZUscRn+wIAAAAABFla')
 // b'a'*10 + b'b' + b'c'*300
 const RLE_XZ = bytes('/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4AE2AAtdADDrlIx8H+8bBAAAAAAg8BK+r9b4SAABJ7cCAAAA3P0S0bHEZ/sCAAAAAARZWg==')
 // b'hello world', LZMA_ALONE container
@@ -48,6 +50,17 @@ describe('decodeXz', () => {
 
   it('decodes an empty stream', () => {
     expect(decodeXz(EMPTY_XZ)).toHaveLength(0)
+  })
+
+  it('decodes every stream in a concatenated file', () => {
+    // `cat a.xz b.xz` is a valid .xz and every real tool reads it whole.
+    // Stopping at the first index returns a prefix and reports success — the
+    // integrity checks all pass, because they only cover what was decoded.
+    const expected = Buffer.concat([
+      Buffer.from('first stream payload '.repeat(20)),
+      Buffer.from('SECOND STREAM PAYLOAD '.repeat(20)),
+    ])
+    expect(buf(decodeXz(CONCAT_XZ)).equals(expected)).toBe(true)
   })
 
   it('decodes runs, which exercise overlapping matches', () => {

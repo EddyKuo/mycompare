@@ -35,23 +35,24 @@ const ftpProfile = (over = {}) => ({
 })
 
 describe('kinds', () => {
-  it('supports ftp, ftps and s3', () => {
-    expect([...PROFILE_KINDS].sort()).toEqual(['ftp', 'ftps', 's3'])
+  it('supports ftp, ftps, sftp and s3', () => {
+    expect([...PROFILE_KINDS].sort()).toEqual(['ftp', 'ftps', 's3', 'sftp'])
   })
 
   it('names the kinds it cannot do, with a reason', () => {
-    // SFTP needs an SSH transport; the cloud drives need OAuth. Saying so
+    // The cloud drives need an OAuth flow and a registered client ID. Saying so
     // beats letting a user create a profile that can never connect.
     for (const [kind, reason] of Object.entries(UNSUPPORTED_KINDS)) {
       expect(PROFILE_KINDS).not.toContain(kind)
       expect(String(reason).length).toBeGreaterThan(0)
     }
-    expect(Object.keys(UNSUPPORTED_KINDS)).toContain('sftp')
+    expect(Object.keys(UNSUPPORTED_KINDS)).toContain('dropbox')
   })
 
   it('defaults the port by kind', () => {
     expect(defaultPort('ftp')).toBe(21)
     expect(defaultPort('ftps')).toBe(21)
+    expect(defaultPort('sftp')).toBe(22)
     expect(defaultPort('s3')).toBe(443)
   })
 })
@@ -93,8 +94,12 @@ describe('validateProfile', () => {
   })
 
   it('rejects a kind that is known but unsupported, by name', () => {
-    const { errors } = validateProfile(ftpProfile({ kind: 'sftp' }))
-    expect(errors.join(' ')).toMatch(/sftp/i)
+    const { errors } = validateProfile(ftpProfile({ kind: 'dropbox' }))
+    expect(errors.join(' ')).toMatch(/dropbox/i)
+  })
+
+  it('accepts an sftp profile', () => {
+    expect(validateProfile(ftpProfile({ kind: 'sftp', port: 22 })).errors).toEqual([])
   })
 
   it('requires bucket and region for s3', () => {

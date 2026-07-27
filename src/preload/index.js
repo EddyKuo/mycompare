@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 // S13-C08: keep handler references so callers can unsubscribe.
 /** @type {Map<string, Set<(data: any) => void>>} */
@@ -30,7 +30,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readSnapshotDir: (snapshotPath, relDir) =>
     ipcRenderer.invoke('read-snapshot-dir', { snapshotPath, relDir }),
   readFile: (path, encoding) => ipcRenderer.invoke('read-file', path, encoding),
-  acceptDroppedPaths: (paths) => ipcRenderer.invoke('accept-dropped-paths', paths),
+  acceptDroppedFiles: (files) => ipcRenderer.invoke(
+    'accept-dropped-paths',
+    Array.from(files ?? [], (f) => {
+      try { return webUtils.getPathForFile(f) } catch { return '' }
+    }).filter(Boolean)),
   openFileBinary: (options) => ipcRenderer.invoke('open-file-binary', options),
   readFileBinary: (path, maxBytes) => ipcRenderer.invoke('read-file-binary', path, maxBytes),
   showInExplorer: (path) => ipcRenderer.invoke('show-in-explorer', path),

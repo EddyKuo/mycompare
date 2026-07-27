@@ -639,6 +639,7 @@ function decodeLzma2(buf, dictProps, maxBytes) {
     if (control < 0x80) {
       if (control > 0x02) throw new LzmaError('LZMA2 控制位元組不合法')
       // Stored chunk: length is a 16-bit big-endian count minus one.
+      if (pos + 2 > buf.length) throw new LzmaError('LZMA2 區塊標頭被截斷')
       const size = ((buf[pos] << 8) | buf[pos + 1]) + 1
       pos += 2
       if (pos + size > buf.length) throw new LzmaError('LZMA2 未壓縮區塊超出範圍')
@@ -648,13 +649,21 @@ function decodeLzma2(buf, dictProps, maxBytes) {
       continue
     }
 
+    // Every field below is read positionally, and a missing byte reads as
+    // undefined rather than failing: the properties check in particular
+    // compares undefined against a bound, quietly passes, and leaves the
+    // decoder running with lc=lp=pb=0 on truncated input.
+    const resetMode = (control >> 5) & 0x03
+    if (pos + 4 + (resetMode >= 2 ? 1 : 0) > buf.length) {
+      throw new LzmaError('LZMA2 區塊標頭被截斷')
+    }
+
     const unpackSize = (((control & 0x1f) << 16) |
       (buf[pos] << 8) | buf[pos + 1]) + 1
     pos += 2
     const packSize = ((buf[pos] << 8) | buf[pos + 1]) + 1
     pos += 2
 
-    const resetMode = (control >> 5) & 0x03
     if (resetMode >= 2) {
       const p = buf[pos++]
       if (p >= 9 * 5 * 5) throw new LzmaError('LZMA2 屬性位元組不合法')
@@ -679,7 +688,45 @@ function decodeLzma2(buf, dictProps, maxBytes) {
 }
 
 /**
- * Decompress an `.xz` stream.
+ * Step over a stream's index and footer, returning where the next stream
+ * starts, or null when this was the last one.
+ *
+ * The index is walked rather than skipped by length because its size is only
+ * recoverable by parsing it: record count, then two lengths per record, padded
+ * to a 4-byte boundary, then a CRC32. The 12-byte footer follows.
+ *
+ * @param {Uint8Array} buf
+ * @param {number} start  offset of the index indicator byte
+ * @returns {number|null}
+ */
+function skipIndexAndFooter(buf, start) {
+  let count
+  let p
+  try {
+    count = readVli(buf, start + 1)
+    p = count.next
+    for (let i = 0; i < count.value; i++) {
+      if (p >= buf.length) return null
+      p = readVli(buf, readVli(buf, p).next).next
+    }
+  } catch {
+    // A clipped index is not a reason to discard blocks that already decoded
+    // and passed their own integrity checks; it only means nothing follows.
+    return null
+  }
+  p += (4 - ((p - start) % 4)) % 4
+  p += 4 // index CRC32
+  p += 12 // stream footer
+
+  // Stream padding is zero bytes in multiples of four, present only when
+  // another stream follows.
+  while (p < buf.length && buf[p] === 0) p++
+  if (p + 6 > buf.length) return null
+  return XZ_MAGIC.every((b, i) => buf[p + i] === b) ? p + 12 : null
+}
+
+/**
+ * Decompress an `.xz` file.
  *
  * Only the LZMA2 filter is handled — it is what every xz encoder emits by
  * default. A BCJ or delta filter would need its own pass, and is reported
@@ -695,15 +742,31 @@ export function decodeXz(buf, opts = {}) {
   if (buf.length < 24) throw new LzmaError('xz 檔太短')
 
   // Stream header is 12 bytes: magic(6) + flags(2) + CRC32(4).
-  const pos = 12
+  let pos = 12
   /** @type {Uint8Array[]} */
   const parts = []
   let total = 0
 
+  // Stream flags are the two bytes after the magic: the first is reserved and
+  // always zero, the check type lives in the second. It is a property of the
+  // stream, not of a block, so every block uses the same one.
+  const checkType = buf[7] & 0x0f
+  const checkSize = CHECK_SIZES[checkType]
+  if (checkSize === undefined) {
+    throw new LzmaError(`xz 使用了未知的完整性檢查型別 0x${checkType.toString(16)}`)
+  }
+
   while (pos < buf.length) {
     const headerSizeByte = buf[pos]
-    // 0 marks the index, which follows the last block.
-    if (headerSizeByte === 0) break
+    // 0 marks the index, which ends the stream. A file may hold several
+    // streams back to back — `cat a.xz b.xz` produces a valid .xz — so the
+    // index has to be stepped over rather than treated as end-of-file.
+    if (headerSizeByte === 0) {
+      const nextStream = skipIndexAndFooter(buf, pos)
+      if (nextStream === null) break
+      pos = nextStream
+      continue
+    }
 
     const headerSize = (headerSizeByte + 1) * 4
     if (pos + headerSize > buf.length) throw new LzmaError('xz 區塊標頭超出範圍')
@@ -735,15 +798,8 @@ export function decodeXz(buf, opts = {}) {
     // The check value sits after the compressed data, padded to a 4-byte
     // boundary. Skipping verification would let corrupt input decode to
     // plausible garbage and be returned as correct.
-    // Stream flags are the two bytes after the magic: the first is reserved
-    // and always zero, the check type lives in the second.
-    const checkType = buf[7] & 0x0f
-    const checkSize = CHECK_SIZES[checkType]
-    if (checkSize === undefined) {
-      throw new LzmaError(`xz 使用了未知的完整性檢查型別 0x${checkType.toString(16)}`)
-    }
+    const padded = dataStart + consumed + ((4 - (consumed % 4)) % 4)
     if (checkSize > 0) {
-      const padded = dataStart + consumed + ((4 - (consumed % 4)) % 4)
       if (padded + checkSize > buf.length) {
         throw new LzmaError('xz 區塊的完整性檢查值超出範圍')
       }
@@ -756,9 +812,15 @@ export function decodeXz(buf, opts = {}) {
     parts.push(chunk)
     total += chunk.length
 
-    // Only single-block streams are produced by default encoders, and the
-    // block payload length is not recoverable here without parsing the index.
-    break
+    // Block padding plus the check value put the next block header on the
+    // following 4-byte boundary. Stopping after the first block instead would
+    // return a prefix of a multi-block file and report success — every
+    // integrity check would still pass, because they only cover what was
+    // decoded. Multi-block streams come out of any threaded encoder (xz -T,
+    // pixz), so that is not a rare shape.
+    const next = padded + checkSize
+    if (next <= pos) throw new LzmaError('xz 區塊長度為零，檔案已毀損')
+    pos = next
   }
 
   if (parts.length === 1) return parts[0]
