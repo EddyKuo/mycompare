@@ -18,11 +18,9 @@
  *   PutObject/DeleteObject are not implemented, so no bug in this file can
  *   destroy a user's bucket.
  *
- * Not possible with built-ins (see also remote-ftp.js):
- *   - **SFTP** requires a full SSH transport layer (key exchange, host-key
- *     verification, per-direction ciphers and MACs). Node exposes no SSH
- *     primitives; implementing it would mean hand-rolling a cryptographic
- *     transport. Unsupported.
+ * Other remote kinds:
+ *   - **SFTP** is implemented in `ssh-transport.js` / `remote-sftp.js`. A note
+ *     here used to say Node had no SSH primitives; it does.
  *   - **Dropbox / OneDrive** require OAuth 2.0 interactive authorization plus
  *     each vendor's REST API and a registered application client ID. That is an
  *     integration project with a per-vendor registration prerequisite, not

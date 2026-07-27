@@ -30,15 +30,9 @@
  *
  * ## Unsupported kinds
  *
- * Beyond Compare also offers SFTP, Dropbox and OneDrive. Those are rejected
- * here rather than half-implemented:
+ * Beyond Compare also offers Dropbox and OneDrive. Those are rejected here
+ * rather than half-implemented:
  *
- *   - **SFTP** runs over SSH and would need a full SSH transport layer (key
- *     exchange, host-key verification, per-direction ciphers and MACs, rekeying)
- *     before the SFTP packet layer even starts. Node exposes no SSH primitives,
- *     and the project forbids new npm dependencies, so the only route would be
- *     hand-written cryptographic transport code — which would be less secure
- *     than no feature at all.
  *   - **Dropbox / OneDrive** need an interactive OAuth 2.0 authorization-code +
  *     PKCE flow, a registered per-vendor application client ID, a redirect
  *     listener, refresh-token rotation, and each vendor's own REST API. There is

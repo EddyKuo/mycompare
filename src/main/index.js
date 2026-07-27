@@ -371,10 +371,15 @@ ipcMain.handle('show-in-explorer', (_event, filePath) => {
 })
 
 // IPC: 複製檔案（自動建立目的資料夾）
-ipcMain.handle('copy-file', async (_event, { src, dest }) => {
+ipcMain.handle('copy-file', async (_event, { src, dest, backup }) => {
   const { src: safeSrc, dest: safeDest } = validatePathPair(src, dest)
+  // Copying over an existing file destroys it just as surely as saving over
+  // it does, and a folder sync does it in bulk without the user looking at
+  // each one — so the backup applies here at least as much as on save.
+  const backupResult = await backupExisting(safeDest, backup)
   await mkdir(dirname(safeDest), { recursive: true })
   await copyFile(safeSrc, safeDest)
+  return { copied: true, path: safeDest, backup: backupResult }
 })
 
 // IPC: 刪除檔案

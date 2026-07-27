@@ -26,18 +26,16 @@
  *   Comparison only needs reads, and a read-only client cannot destroy a remote
  *   tree through a bug.
  *
- * Not possible with built-ins (see also remote-s3.js):
- *   - **SFTP** is *not* FTP-over-TLS. It is a subsystem of SSH and requires a
- *     complete SSH transport layer: algorithm negotiation, Diffie-Hellman /
- *     ECDH key exchange, host-key verification, per-direction cipher and MAC
- *     state, key re-exchange, then the SSH connection protocol and finally the
- *     SFTP packet layer. Node ships no SSH primitives, so this would mean
- *     hand-rolling cryptographic transport code — exactly the kind of thing
- *     that must not be hand-rolled. Unsupported; the profile layer rejects it.
+ * Other remote kinds:
+ *   - **SFTP** is *not* FTP-over-TLS — it is a subsystem of SSH, and lives in
+ *     `ssh-transport.js` and `remote-sftp.js`. An earlier note here claimed it
+ *     could not be built on Node's built-ins. That was wrong: `crypto` has
+ *     x25519 key agreement, aes-256-ctr/gcm, hmac-sha2-256 and ed25519
+ *     verification, which is the whole set SSH-2 needs.
  *   - **Dropbox / OneDrive** need an OAuth 2.0 authorization-code + PKCE flow
  *     (browser window, redirect listener, registered client ID, refresh-token
- *     storage) plus each vendor's own REST API. That is an integration project,
- *     not a protocol module. Unsupported.
+ *     storage) plus each vendor's own REST API. That is an integration project
+ *     with an external registration prerequisite, not a protocol module.
  *
  * Everything above `FtpClient` is a pure string -> object function so the
  * protocol parsing — where the real bugs live — is testable without a network.

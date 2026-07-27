@@ -38,7 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openFileBinary: (options) => ipcRenderer.invoke('open-file-binary', options),
   readFileBinary: (path, maxBytes) => ipcRenderer.invoke('read-file-binary', path, maxBytes),
   showInExplorer: (path) => ipcRenderer.invoke('show-in-explorer', path),
-  copyFile: (src, dest) => ipcRenderer.invoke('copy-file', { src, dest }),
+  copyFile: (src, dest, backup) => ipcRenderer.invoke('copy-file', { src, dest, backup }),
   deleteFile: (path) => ipcRenderer.invoke('delete-file', path),
   saveFile: (defaultPath, content, filters, encoding, backup) =>
     ipcRenderer.invoke('save-file', { defaultPath, content, filters, encoding, backup }),
