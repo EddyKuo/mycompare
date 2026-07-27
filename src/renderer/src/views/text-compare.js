@@ -21,6 +21,10 @@ import { SettingsStore } from '../core/settings-store.js';
 import { renderTextTable, reportHeader, reportSummary } from '../core/report.js';
 import { detectEol } from '../core/eol-detect.js';
 import { isActive } from '../core/active-view.js';
+import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js';
+import { tagConfig, readConfig } from '../core/named-config-store.js';
+
+/** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
 // ---------------------------------------------------------------------------
 // Virtual scroll constants
@@ -781,15 +785,9 @@ export class TextCompare {
       if (text != null) this.setRight('（貼上）', text);
     });
 
-    // ── T36: F5/F7/F8 navigation shortcuts ──
-    this._onKeyDownNav = (e) => {
-      // S14-M07: don't fire when another view is active.
-      if (!isActive('text')) return;
-      if (e.key === 'F5') { e.preventDefault(); this.refresh(); }
-      if (e.key === 'F7') { e.preventDefault(); this.navigatePrev(); }
-      if (e.key === 'F8') { e.preventDefault(); this.navigateNext(); }
-    };
-    document.addEventListener('keydown', this._onKeyDownNav);
+    // F5/F7/F8 are owned solely by app.js's SettingsStore binding, which routes
+    // to whichever view is active. Binding them here as well made every F8
+    // press advance two differences and every F5 re-diff twice.
 
     // ── T04: Drag-and-drop for text panes ──
     const paneLeft  = document.getElementById('pane-left');
@@ -1017,11 +1015,6 @@ export class TextCompare {
     this._closeGoto();
     if (this._onKeyDownGoto) {
       document.removeEventListener('keydown', this._onKeyDownGoto);
-    }
-
-    // T36: cleanup nav shortcuts
-    if (this._onKeyDownNav) {
-      document.removeEventListener('keydown', this._onKeyDownNav);
     }
 
     // T42: cleanup replace shortcuts
@@ -1384,11 +1377,16 @@ export class TextCompare {
       { name: '文字檔', extensions: ['txt','js','ts','py','java','c','cpp','cs','go','rs','html','css','json','yaml','yml','xml','sql','md','sh'] },
       { name: '所有檔案', extensions: ['*'] }
     ];
-    await window.electronAPI.saveFile(
+    const result = await window.electronAPI.saveFile(
       this._leftPath || 'left.txt', this._leftContent, filters,
       this._encodingLeft, _settings.getPref('backupOnSave'));
+    // Cancelling the save dialog returns falsy. Clearing the flag regardless
+    // told the user their edits were saved and let the tab close without a
+    // prompt, silently losing them.
+    if (!result) return;
     this._modified.left = false;
     this._updateModifiedIndicator();
+    this._reportBackup(result);
   }
 
   /**
@@ -1401,11 +1399,36 @@ export class TextCompare {
       { name: '文字檔', extensions: ['txt','js','ts','py','java','c','cpp','cs','go','rs','html','css','json','yaml','yml','xml','sql','md','sh'] },
       { name: '所有檔案', extensions: ['*'] }
     ];
-    await window.electronAPI.saveFile(
+    const result = await window.electronAPI.saveFile(
       this._rightPath || 'right.txt', this._rightContent, filters,
       this._encodingRight, _settings.getPref('backupOnSave'));
+    // Cancelling the save dialog returns falsy. Clearing the flag regardless
+    // told the user their edits were saved and let the tab close without a
+    // prompt, silently losing them.
+    if (!result) return;
     this._modified.right = false;
     this._updateModifiedIndicator();
+    this._reportBackup(result);
+  }
+
+  /**
+   * Surface the backup outcome the main process now reports alongside a save.
+   *
+   * A failed backup still leaves the file saved, so this is a status line
+   * rather than an error: the user needs to know the safety net was missing,
+   * not that their save failed.
+   *
+   * @param {unknown} result value returned by the `save-file` IPC
+   */
+  _reportBackup(result) {
+    if (!result || typeof result !== 'object') return;
+    const backup = result.backup;
+    if (!backup || typeof backup !== 'object') return;
+    if (backup.backedUp && backup.path) {
+      this._emit('status', { message: `已備份至 ${backup.path}` });
+    } else if (backup.reason) {
+      this._emit('status', { message: `備份失敗：${backup.reason}`, level: 'warn' });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1465,32 +1488,41 @@ export class TextCompare {
   // Public: navigation
   // -------------------------------------------------------------------------
 
-  navigateNext() {
-    if (this._diffBlocks.length === 0) return;
-    this._currentDiff = Math.min(this._currentDiff + 1, this._diffBlocks.length - 1);
-    this._scrollToDiff(this._currentDiff);
-    this._updateStatusBar();
+  /** 下一個差異（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  navigateNext() { return this._navStep(1); }
+
+  /** 上一個差異（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  navigatePrev() { return this._navStep(-1); }
+
+  /** @returns {NavResult} */
+  navigateFirst() { return this._navJump(0); }
+
+  /** @returns {NavResult} */
+  navigateLast() { return this._navJump(this._diffBlocks.length - 1); }
+
+  /**
+   * @param {number} delta
+   * @returns {NavResult}
+   */
+  _navStep(delta) {
+    const total = this._diffBlocks.length;
+    const from = this._currentDiff;
+    const to = stepDiffIndex(from, total, delta);
+    return this._navJump(to);
   }
 
-  navigatePrev() {
-    if (this._diffBlocks.length === 0) return;
-    this._currentDiff = Math.max(this._currentDiff - 1, 0);
-    this._scrollToDiff(this._currentDiff);
+  /**
+   * @param {number} target
+   * @returns {NavResult}
+   */
+  _navJump(target) {
+    const total = this._diffBlocks.length;
+    const from = this._currentDiff;
+    if (total === 0 || target < 0) return navResult(from, -1, total);
+    this._currentDiff = target;
+    this._scrollToDiff(target);
     this._updateStatusBar();
-  }
-
-  navigateFirst() {
-    if (this._diffBlocks.length === 0) return;
-    this._currentDiff = 0;
-    this._scrollToDiff(0);
-    this._updateStatusBar();
-  }
-
-  navigateLast() {
-    if (this._diffBlocks.length === 0) return;
-    this._currentDiff = this._diffBlocks.length - 1;
-    this._scrollToDiff(this._currentDiff);
-    this._updateStatusBar();
+    return navResult(from, target, total);
   }
 
   // -------------------------------------------------------------------------
@@ -1979,6 +2011,11 @@ ${rows}
 
     // Reset navigation
     this._currentDiff = this._diffBlocks.length > 0 ? 0 : -1;
+    // resetScroll marks the "new files were loaded" path, which is exactly
+    // when BC's "go to first difference" option applies.
+    if (resetScroll && this._currentDiff >= 0 && getNavOptions().firstDiffOnLoad) {
+      this._scrollToDiff(0);
+    }
     this._emit('diff-count', { total: this._diffBlocks.length, currentIndex: this._currentDiff });
     this._emit('ready');
   }
@@ -2083,7 +2120,7 @@ ${rows}
    * @returns {Record<string, unknown>}
    */
   getConfig() {
-    return {
+    return tagConfig('text', {
       algorithm:          this._opts.algorithm,
       ignoreWhitespace:   this._opts.ignoreWhitespace,
       ignoreCase:         this._opts.ignoreCase,
@@ -2092,16 +2129,17 @@ ${rows}
       ignoreUnimportant:  this._opts.ignoreUnimportant,
       ignorePatterns:     Array.isArray(this._opts.ignorePatterns) ? [...this._opts.ignorePatterns] : [],
       unimportantPatterns:Array.isArray(this._opts.unimportantPatterns) ? [...this._opts.unimportantPatterns] : [],
-    }
+    })
   }
 
   /**
    * Apply a previously captured settings snapshot.
    * Unknown keys are ignored. Triggers a diff re-run if content is loaded.
-   * @param {Record<string, unknown>} settings
+   * @param {unknown} cfg
    */
-  applyConfig(settings) {
-    if (!settings || typeof settings !== 'object') return
+  applyConfig(cfg) {
+    const settings = readConfig('text', cfg)
+    if (!settings) return
     const known = ['algorithm','ignoreWhitespace','ignoreCase','ignoreLineEndings','contextLines','ignorePatterns','unimportantPatterns','ignoreUnimportant']
     for (const key of known) {
       if (Object.prototype.hasOwnProperty.call(settings, key)) {
@@ -2779,6 +2817,11 @@ ${rows}
    */
   _scrollToDiff(idx) {
     if (idx < 0 || idx >= this._diffBlocks.length) return;
+    // Navigation is now also driven automatically (go-to-first-difference on
+    // load), so it can run before the panes exist or in a DOM that has no
+    // scrollTo. Scrolling is a convenience; never let it break the diff.
+    if (typeof this._contentLeft?.scrollTo !== 'function') return;
+    if (typeof this._contentRight?.scrollTo !== 'function') return;
 
     const block = this._diffBlocks[idx];
     const targetRow = block.startRow;
@@ -2832,7 +2875,14 @@ ${rows}
       this._leftContent = newContent;
     }
 
+    // The copied block is gone from the new diff, so the index that was
+    // current now points at what used to be the following difference; BC's
+    // "go to next difference after copying" is off by one from that.
+    const wasAt = this._currentDiff;
     this._runDiff();
+    if (!getNavOptions().nextAfterCopy) return;
+    if (!this._diffBlocks.length) return;
+    this._navJump(Math.min(Math.max(wasAt, 0), this._diffBlocks.length - 1));
   }
 
   // -------------------------------------------------------------------------

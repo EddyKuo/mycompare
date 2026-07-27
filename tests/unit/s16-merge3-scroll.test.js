@@ -12,6 +12,7 @@ import {
   diffToPaneRows,
   buildPaneRows,
 } from '../../src/renderer/src/views/three-way-compare.js'
+import { SettingsStore } from '../../src/renderer/src/core/settings-store.js'
 
 const ROW_HEIGHT = 18
 
@@ -52,6 +53,11 @@ const renderedTexts = (host) =>
 
 beforeEach(() => {
   window.electronAPI = { openFile: vi.fn(), saveFile: vi.fn() }
+  const settings = new SettingsStore()
+  // These cover virtualisation, so the cursor must stay put until they move it.
+  settings.setPref('navFirstDiffOnLoad', false)
+  settings.setPref('navWrapAround', true)
+  settings.setPref('navNextAfterCopy', false)
 })
 
 afterEach(() => {
@@ -518,6 +524,7 @@ describe('S16 merge3 — getConfig / applyConfig', () => {
     const b = new ThreeWayCompare()
     b.applyConfig(a.getConfig())
     expect(b.getConfig()).toEqual({
+      __v: 1, __view: 'merge3',
       showFilter: 'conflicts', algorithm: 'patience',
       ignoreWhitespace: true, ignoreCase: true,
     })

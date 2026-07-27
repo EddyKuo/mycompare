@@ -123,6 +123,8 @@ describe('T61 TextCompare config snapshot', () => {
     })
     const cfg = tc.getConfig()
     expect(cfg).toEqual({
+      __v: 1,
+      __view: 'text',
       algorithm: 'patience',
       ignoreWhitespace: true,
       ignoreCase: true,
@@ -147,7 +149,8 @@ describe('T61 TextCompare config snapshot', () => {
       ignoreUnimportant: true,
     }
     tc.applyConfig(snapshot)
-    expect(tc.getConfig()).toEqual(snapshot)
+    // The envelope is added by getConfig, so compare against the tagged shape.
+    expect(tc.getConfig()).toEqual({ __v: 1, __view: 'text', ...snapshot })
   })
 
   it('applyConfig triggers _runDiff when content is loaded', () => {

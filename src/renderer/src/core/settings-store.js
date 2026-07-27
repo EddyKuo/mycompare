@@ -27,6 +27,10 @@ const KEY_SETTINGS = 'mycompare:settings'
 /**
  * @typedef {object} AppPreferences
  * @property {boolean} backupOnSave  keep a .bak copy before overwriting a file
+ * @property {boolean} navWrapAround  next/prev wraps past the last difference
+ * @property {boolean} navFirstDiffOnLoad  jump to the first difference on load
+ * @property {boolean} navNextAfterCopy  advance after copying to the other side
+ * @property {boolean} navShowNoDiffMessage  report "no more differences"
  */
 
 /**
@@ -35,10 +39,17 @@ const KEY_SETTINGS = 'mycompare:settings'
  * backupOnSave defaults on, as it does in Beyond Compare: saving overwrites
  * the user's file in place and there is otherwise no way back.
  *
+ * The nav* defaults mirror BC's Options ▸ Next Difference page: wrap-around
+ * off, go-to-first-difference-on-load on, advance-after-copy on.
+ *
  * @type {AppPreferences}
  */
 export const DEFAULT_PREFS = {
   backupOnSave: true,
+  navWrapAround: false,
+  navFirstDiffOnLoad: true,
+  navNextAfterCopy: true,
+  navShowNoDiffMessage: true,
 }
 
 /**

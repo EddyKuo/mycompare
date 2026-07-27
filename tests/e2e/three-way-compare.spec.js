@@ -132,7 +132,20 @@ test('衝突導航把遠處的衝突捲進可見範圍', async () => {
     [...document.querySelectorAll('#view-merge3 .mw-content-left .mw-linetext')]
       .some((el) => el.textContent === 'L5000'))
 
+  // "When loading new files, go to first difference" is on by default (as in
+  // Beyond Compare), so the only conflict is already scrolled into the window.
+  expect(await visible()).toBe(true)
+
+  // Scroll it back out, then prove navigation brings it back.
+  await win.evaluate(() => {
+    for (const side of ['left', 'base', 'right']) {
+      document.querySelector(`#view-merge3 .mw-content-${side}`).scrollTop = 0
+      document.querySelector(`#view-merge3 .mw-content-${side}`)
+        .dispatchEvent(new Event('scroll'))
+    }
+  })
   expect(await visible()).toBe(false)
+
   await win.locator('#view-merge3 .mw-btn-next').click()
   expect(await visible()).toBe(true)
 })

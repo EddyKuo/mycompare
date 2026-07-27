@@ -11,6 +11,14 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { HexCompare, computeHexDiffRegions } from '../../src/renderer/src/views/hex-compare.js'
+import { SettingsStore } from '../../src/renderer/src/core/settings-store.js'
+
+// Beyond Compare's "go to first difference on load" default would move the
+// cursor before these tests navigate; they are about the stepping rules, so
+// the option is turned off and exercised separately.
+beforeEach(() => {
+  new SettingsStore().setPref('navFirstDiffOnLoad', false)
+})
 
 /** @param {number[]} arr */
 const bytes = (arr) => new Uint8Array(arr)

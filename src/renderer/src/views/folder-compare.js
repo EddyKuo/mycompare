@@ -9,7 +9,11 @@ import { isActive } from '../core/active-view.js'
 import { parseMasks, matchesMasks } from '../core/file-mask.js'
 import { diffLines } from '../core/diff-engine.js'
 import { getViewTypeForPath } from '../core/file-type.js'
+import { tagConfig, readConfig } from '../core/named-config-store.js'
+import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import '../styles/folder-compare.css'
+
+/** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -897,6 +901,10 @@ export class FolderCompare {
     this._columns = loadFolderColumns()
     this._sortKey = 'name'
     this._sortDir = 1
+    /** @type {number} index into _visibleRows of the current difference, -1 = none */
+    this._currentDiffIdx = -1
+    /** @type {boolean} set when new folders are scanned, consumed after render */
+    this._pendingFirstDiff = false
 
     // Expanded directories: Set of "side:path"
     this._expanded = new Set()
@@ -1186,35 +1194,163 @@ export class FolderCompare {
    * @returns {object}
    */
   getConfig() {
-    return {
+    return tagConfig('folder', {
       mode: this._mode,
       viewPreset: this._viewPreset,
       mtimeTolerance: this._mtimeTolerance,
       filterStr: this._filterStr,
       columns: [...this._columns],
       rulesOptions: this.getRulesOptions(),
+      // The six flags are stored alongside the preset because a hand-tuned
+      // combination that matches no preset is reported as 'all', which on its
+      // own would restore the wrong set of rows.
+      filters: {
+        showSame: this._showSame,
+        showDiff: this._showDiff,
+        showLeftOnly: this._showLeftOnly,
+        showRightOnly: this._showRightOnly,
+        showLeftNewer: this._showLeftNewer,
+        showRightNewer: this._showRightNewer,
+      },
+      sort: { key: this._sortKey, dir: this._sortDir },
+    })
+  }
+
+  /**
+   * @param {unknown} cfg
+   */
+  applyConfig(cfg) {
+    const settings = readConfig('folder', cfg)
+    if (!settings) return
+    if (['name', 'size', 'mtime', 'both', 'content', 'rules'].includes(settings.mode)) {
+      this._mode = settings.mode
+    }
+    if (settings.rulesOptions) {
+      this._rulesOptions = normalizeRulesOptions({ ...this._rulesOptions, ...settings.rulesOptions })
+      this._syncRulesControls()
+    }
+    if (typeof settings.mtimeTolerance === 'number' && settings.mtimeTolerance >= 0) {
+      this._mtimeTolerance = settings.mtimeTolerance
+    }
+    if (typeof settings.filterStr === 'string') this._filterStr = settings.filterStr
+    if (Array.isArray(settings.columns)) this.setColumns(settings.columns)
+    if (settings.viewPreset && VIEW_PRESETS[settings.viewPreset]) {
+      this.setViewPreset(settings.viewPreset)
+    }
+    // After the preset, so an explicit flag set wins over the preset's.
+    const filters = settings.filters
+    if (filters && typeof filters === 'object') {
+      for (const key of ['showSame', 'showDiff', 'showLeftOnly',
+        'showRightOnly', 'showLeftNewer', 'showRightNewer']) {
+        if (typeof filters[key] === 'boolean') this[`_${key}`] = filters[key]
+      }
+      this._markPresetCustom()
+      this._syncFilterControls()
+    }
+    const sort = settings.sort
+    if (sort && typeof sort === 'object'
+        && typeof sort.key === 'string' && (sort.dir === 1 || sort.dir === -1)) {
+      this._sortKey = sort.key
+      this._sortDir = sort.dir
+    }
+    // A mode change alters comparison results, so re-scan rather than just
+    // re-render; without paths there is nothing to do yet.
+    if (this._leftPath || this._rightPath) void this._compareAndRender()
+  }
+
+
+  // ── Public: difference navigation ───────────────────────────────────────────
+
+  /**
+   * Flattened-row indices whose entry is not identical on both sides.
+   *
+   * Derived from _visibleRows rather than the tree so navigation shares the
+   * virtual scroller's coordinate system; anything else lands on the wrong
+   * scrollTop.
+   *
+   * @returns {number[]}
+   */
+  getDiffIndices() {
+    const out = []
+    const flat = this._visibleRows ?? []
+    for (let i = 0; i < flat.length; i++) {
+      const status = flat[i]?.row?.status
+      if (status && status !== 'same') out.push(i)
+    }
+    return out
+  }
+
+  /** @returns {number} 目前選取的差異索引；-1 表示尚未選取 */
+  getCurrentDiffIndex() {
+    return this._currentDiffIdx
+  }
+
+  /** 下一個差異項目（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  nextDifference() { return this._stepDiff(1) }
+
+  /** 上一個差異項目（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  prevDifference() { return this._stepDiff(-1) }
+
+  /** @returns {NavResult} */
+  firstDifference() { return this._jumpDiff(0) }
+
+  /** @returns {NavResult} */
+  lastDifference() { return this._jumpDiff(this.getDiffIndices().length - 1) }
+
+  /**
+   * @param {number} delta
+   * @returns {NavResult}
+   */
+  _stepDiff(delta) {
+    const total = this.getDiffIndices().length
+    const to = stepDiffIndex(this._currentDiffIdx, total, delta)
+    return this._jumpDiff(to)
+  }
+
+  /**
+   * @param {number} target index into getDiffIndices()
+   * @returns {NavResult}
+   */
+  _jumpDiff(target) {
+    const indices = this.getDiffIndices()
+    const total = indices.length
+    const from = this._currentDiffIdx
+    if (total === 0 || target < 0 || target >= total) return navResult(from, -1, total)
+    this._currentDiffIdx = target
+    this._scrollFlatIndexIntoView(indices[target])
+    this._applyCurrentDiffMark(indices[target])
+    return navResult(from, target, total)
+  }
+
+  /**
+   * Mark the current difference row.
+   *
+   * Styled inline rather than through a class because the row cursor has no
+   * entry in folder-compare.css, and an outline cannot shift the virtualised
+   * row geometry the way a border would.
+   *
+   * @param {number} flatIndex
+   */
+  _applyCurrentDiffMark(flatIndex) {
+    const vlist = this._dom.vlist
+    if (!vlist) return
+    for (const rowEl of vlist.querySelectorAll('.fc-row')) {
+      const isCurrent = Number(rowEl.dataset.flatIndex) === flatIndex
+      rowEl.dataset.currentDiff = isCurrent ? 'true' : 'false'
+      rowEl.style.outline = isCurrent ? '2px solid var(--accent-color, #4a90d9)' : ''
+      rowEl.style.outlineOffset = isCurrent ? '-2px' : ''
     }
   }
 
   /**
-   * @param {object} cfg
+   * BC's "when loading new files, go to first difference". Flag-gated so that
+   * a filter change, which also re-renders, leaves the user where they were.
    */
-  applyConfig(cfg) {
-    if (!cfg || typeof cfg !== 'object') return
-    if (['name', 'size', 'mtime', 'both', 'content', 'rules'].includes(cfg.mode)) this._mode = cfg.mode
-    if (cfg.rulesOptions) {
-      this._rulesOptions = normalizeRulesOptions({ ...this._rulesOptions, ...cfg.rulesOptions })
-      this._syncRulesControls()
-    }
-    if (typeof cfg.mtimeTolerance === 'number' && cfg.mtimeTolerance >= 0) {
-      this._mtimeTolerance = cfg.mtimeTolerance
-    }
-    if (typeof cfg.filterStr === 'string') this._filterStr = cfg.filterStr
-    if (Array.isArray(cfg.columns)) this.setColumns(cfg.columns)
-    if (cfg.viewPreset && VIEW_PRESETS[cfg.viewPreset]) this.setViewPreset(cfg.viewPreset)
-    // A mode change alters comparison results, so re-scan rather than just
-    // re-render; without paths there is nothing to do yet.
-    if (this._leftPath || this._rightPath) void this._compareAndRender()
+  _consumePendingFirstDiff() {
+    if (!this._pendingFirstDiff) return
+    this._pendingFirstDiff = false
+    if (!getNavOptions().firstDiffOnLoad) return
+    this.firstDifference()
   }
 
   /** 開啟檔名搜尋列（Search ▸ Find Filename）。 */
@@ -1295,6 +1431,7 @@ export class FolderCompare {
     this._updatePathDisplay(side, this._sourceLabel(side))
     this._syncModeAvailability()
     this._expanded.clear()
+    this._pendingFirstDiff = true
     await this._scan()
   }
 
@@ -3147,6 +3284,9 @@ ${rows}
     }
     this._renderVirtualList()
     this._renderStats(this._rows)
+    // The flattened row set just changed, so any stored index is stale.
+    if (this._currentDiffIdx >= this.getDiffIndices().length) this._currentDiffIdx = -1
+    this._consumePendingFirstDiff()
   }
 
   _isRowVisible(row) {
@@ -3286,6 +3426,10 @@ ${rows}
     }
     vlist.appendChild(fragment)
     this._applyFindClasses()
+    const indices = this.getDiffIndices()
+    if (this._currentDiffIdx >= 0 && this._currentDiffIdx < indices.length) {
+      this._applyCurrentDiffMark(indices[this._currentDiffIdx])
+    }
   }
 
   /**

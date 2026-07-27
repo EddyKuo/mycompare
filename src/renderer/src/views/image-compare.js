@@ -23,7 +23,11 @@
 
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { isActive } from '../core/active-view.js'
+import { tagConfig, readConfig } from '../core/named-config-store.js'
+import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import '../styles/image-compare.css'
+
+/** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
 // ── DOM helper ────────────────────────────────────────────────────────────────
 
@@ -209,6 +213,9 @@ export function highlightRGBA(colorKey, level = MISMATCH_LEVELS) {
  * @property {'exact'|'tolerance'|'grayscale'} [algorithm]
  * @property {boolean} [mismatchRange] - true 時依差異強度分級上色
  * @property {string} [highlightColor]
+ * @property {Uint32Array} [tileCounts] - 選用；每個 tile 累計的差異像素數
+ * @property {number} [tileSize] - tile 邊長（px），搭配 tileCounts 使用
+ * @property {number} [tileCols] - tileCounts 的每列 tile 數
  */
 
 /**
@@ -223,7 +230,12 @@ export function computeDiffBuffer(opts) {
     algorithm = 'exact',
     mismatchRange = false,
     highlightColor = DEFAULT_HIGHLIGHT_COLOR,
+    tileCounts = null,
+    tileSize = 0,
+    tileCols = 0,
   } = opts
+
+  const tally = tileCounts && tileSize > 0 && tileCols > 0 ? tileCounts : null
 
   // The inner loop runs once per pixel, so the per-level colours are resolved
   // up-front rather than recomputed millions of times.
@@ -235,6 +247,8 @@ export function computeDiffBuffer(opts) {
   let diffCount = 0
 
   for (let y = 0; y < height; y++) {
+    // Hoisted: the row's tile band is constant across the inner loop.
+    const tileRowBase = tally ? Math.floor(y / tileSize) * tileCols : 0
     for (let x = 0; x < width; x++) {
       const outIdx = (y * width + x) * 4
 
@@ -248,6 +262,7 @@ export function computeDiffBuffer(opts) {
         out[outIdx + 2] = flat[2]
         out[outIdx + 3] = flat[3]
         diffCount++
+        if (tally) tally[tileRowBase + Math.floor(x / tileSize)]++
         continue
       }
 
@@ -273,6 +288,7 @@ export function computeDiffBuffer(opts) {
         out[outIdx + 2] = rgba[2]
         out[outIdx + 3] = rgba[3]
         diffCount++
+        if (tally) tally[tileRowBase + Math.floor(x / tileSize)]++
       } else {
         out[outIdx]     = lR
         out[outIdx + 1] = lG
@@ -283,6 +299,67 @@ export function computeDiffBuffer(opts) {
   }
 
   return diffCount
+}
+
+// ── Diff regions (difference navigation) ──────────────────────────────────────
+
+/**
+ * Upper bound on the tile grid per axis.
+ *
+ * Regions exist so F7/F8 can walk a picture's differing areas. A per-pixel or
+ * connected-component decomposition would produce thousands of stops on a
+ * photo, so the image is bucketed into a coarse grid instead — capped here so
+ * the region count stays navigable regardless of resolution.
+ */
+export const DIFF_TILE_GRID = 32
+
+/**
+ * @param {number} width
+ * @param {number} height
+ * @returns {number} tile edge length in px (>= 1)
+ */
+export function diffTileSize(width, height) {
+  const longest = Math.max(width, height, 1)
+  return Math.max(1, Math.ceil(longest / DIFF_TILE_GRID))
+}
+
+/**
+ * @typedef {object} ImageDiffRegion
+ * @property {number} x
+ * @property {number} y
+ * @property {number} w
+ * @property {number} h
+ * @property {number} count differing pixels inside the tile
+ */
+
+/**
+ * Turn a per-tile diff tally into navigable regions, in reading order.
+ *
+ * @param {Uint32Array} tileCounts
+ * @param {number} tileCols
+ * @param {number} tileSize
+ * @param {number} width
+ * @param {number} height
+ * @returns {ImageDiffRegion[]}
+ */
+export function tilesToRegions(tileCounts, tileCols, tileSize, width, height) {
+  /** @type {ImageDiffRegion[]} */
+  const regions = []
+  if (!tileCounts || tileCols <= 0 || tileSize <= 0) return regions
+  for (let i = 0; i < tileCounts.length; i++) {
+    const count = tileCounts[i]
+    if (!count) continue
+    const x = (i % tileCols) * tileSize
+    const y = Math.floor(i / tileCols) * tileSize
+    regions.push({
+      x,
+      y,
+      w: Math.min(tileSize, width - x),
+      h: Math.min(tileSize, height - y),
+      count,
+    })
+  }
+  return regions
 }
 
 // ── Diff geometry (auto scale) ────────────────────────────────────────────────
@@ -395,6 +472,8 @@ export const MAX_IMAGE_BYTES = 134_217_728 // 128 MB
  * @property {(z: number) => void} setZoom
  * @property {(deg: number) => void} setRotation
  * @property {(h: boolean, v: boolean) => void} setFlip
+ * @property {() => { x: number, y: number }} getPan
+ * @property {(x: number, y: number) => void} setPan
  * @property {() => void} reset
  */
 
@@ -502,6 +581,13 @@ function createSyncTransform(wraps) {
       document.removeEventListener('mouseup', onMouseUp)
     },
     getZoom() { return zoom },
+    getPan() { return { x: panX, y: panY } },
+    setPan(x, y) {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return
+      panX = x
+      panY = y
+      applyTransform()
+    },
     getRotation() { return rotation },
     getFlip() { return { h: flipH, v: flipV } },
     setZoom(z) {
@@ -571,6 +657,12 @@ export class ImageCompare {
      * @type {boolean}
      */
     this._mismatchRange = false
+    /** @type {ImageDiffRegion[]} tile-grid regions used by F7/F8 navigation */
+    this._diffRegions = []
+    /** @type {number} -1 = no region selected yet */
+    this._currentDiffIdx = -1
+    /** @type {boolean} set by setLeft/setRight, consumed after the next diff */
+    this._pendingFirstDiff = false
 
     /**
      * S16: user-selectable highlight colour key (see HIGHLIGHT_COLORS).
@@ -643,33 +735,117 @@ export class ImageCompare {
    * @returns {object}
    */
   getConfig() {
-    return {
+    return tagConfig('image', {
       threshold: this._threshold,
       algorithm: this._algorithm,
       blendMode: this._blendMode,
       autoScale: this._autoScale,
       mismatchRange: this._mismatchRange,
       highlightColor: this._highlightColor,
-    }
+    })
   }
 
   /**
-   * @param {object} cfg
+   * @param {unknown} cfg
    */
   applyConfig(cfg) {
-    if (!cfg || typeof cfg !== 'object') return
-    if (typeof cfg.threshold === 'number' && cfg.threshold >= 0 && cfg.threshold <= 1) {
-      this._threshold = cfg.threshold
+    const s = readConfig('image', cfg)
+    if (!s) return
+    if (typeof s.threshold === 'number' && s.threshold >= 0 && s.threshold <= 1) {
+      this._threshold = s.threshold
     }
-    if (['exact', 'tolerance', 'grayscale'].includes(cfg.algorithm)) this._algorithm = cfg.algorithm
-    if (['normal', 'difference', 'blend'].includes(cfg.blendMode)) this._blendMode = cfg.blendMode
-    if (typeof cfg.autoScale === 'boolean') this._autoScale = cfg.autoScale
-    if (typeof cfg.mismatchRange === 'boolean') this._mismatchRange = cfg.mismatchRange
-    if (typeof cfg.highlightColor === 'string'
-        && Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, cfg.highlightColor)) {
-      this._highlightColor = cfg.highlightColor
+    if (['exact', 'tolerance', 'grayscale'].includes(s.algorithm)) this._algorithm = s.algorithm
+    if (['normal', 'difference', 'blend'].includes(s.blendMode)) this._blendMode = s.blendMode
+    if (typeof s.autoScale === 'boolean') this._autoScale = s.autoScale
+    if (typeof s.mismatchRange === 'boolean') this._mismatchRange = s.mismatchRange
+    if (typeof s.highlightColor === 'string'
+        && Object.prototype.hasOwnProperty.call(HIGHLIGHT_COLORS, s.highlightColor)) {
+      this._highlightColor = s.highlightColor
     }
+    this._syncConfigControls()
     this.refresh()
+  }
+
+  /** Reflect the applied settings back onto the toolbar controls. */
+  _syncConfigControls() {
+    const dom = this._dom
+    if (dom.autoScaleCheck) dom.autoScaleCheck.checked = this._autoScale
+    if (dom.mismatchRangeCheck) dom.mismatchRangeCheck.checked = this._mismatchRange
+    if (dom.overlaySelect) dom.overlaySelect.value = this._blendMode
+    if (dom.highlightSelect) dom.highlightSelect.value = this._highlightColor
+    if (dom.thresholdSlider) dom.thresholdSlider.value = String(this._threshold)
+    if (dom.thresholdVal) dom.thresholdVal.textContent = this._threshold.toFixed(2)
+  }
+
+  // ── Public: difference navigation ───────────────────────────────────────────
+
+  /** @returns {ImageDiffRegion[]} 目前的差異區塊（tile 網格） */
+  getDiffRegions() {
+    return this._diffRegions
+  }
+
+  /** @returns {number} 目前選取的差異索引；-1 表示尚未選取 */
+  getCurrentDiffIndex() {
+    return this._currentDiffIdx
+  }
+
+  /** 下一個差異區塊（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  nextDifference() { return this._stepDiff(1) }
+
+  /** 上一個差異區塊（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  prevDifference() { return this._stepDiff(-1) }
+
+  /** @returns {NavResult} */
+  firstDifference() { return this._jumpDiff(0) }
+
+  /** @returns {NavResult} */
+  lastDifference() { return this._jumpDiff(this._diffRegions.length - 1) }
+
+  /**
+   * @param {number} delta
+   * @returns {NavResult}
+   */
+  _stepDiff(delta) {
+    const from = this._currentDiffIdx
+    const to = stepDiffIndex(from, this._diffRegions.length, delta)
+    return this._jumpDiff(to)
+  }
+
+  /**
+   * @param {number} target
+   * @returns {NavResult}
+   */
+  _jumpDiff(target) {
+    const total = this._diffRegions.length
+    const from = this._currentDiffIdx
+    if (total === 0 || target < 0) return navResult(from, -1, total)
+    this._currentDiffIdx = target
+    this._centreOnRegion(this._diffRegions[target])
+    return navResult(from, target, total)
+  }
+
+  /**
+   * Pan so a diff region sits in the middle of the viewport.
+   *
+   * Rotation and flip are deliberately ignored: honouring them would need the
+   * full inverse transform for a convenience scroll, and the region stays on
+   * screen either way at the zoom levels this is used at.
+   *
+   * @param {ImageDiffRegion | undefined} region
+   */
+  _centreOnRegion(region) {
+    const st = this._syncTransform
+    if (!st || !region || typeof st.setPan !== 'function') return
+    const canvas = this._dom.canvasDiff
+    const host = canvas?.parentElement?.parentElement
+    // Natural pixels → CSS pixels; jsdom reports 0, in which case 1:1 is right.
+    const displayScale = canvas?.width ? (canvas.clientWidth || canvas.width) / canvas.width : 1
+    const zoom = st.getZoom() || 1
+    const viewW = host?.clientWidth ?? 0
+    const viewH = host?.clientHeight ?? 0
+    const cx = (region.x + region.w / 2) * displayScale
+    const cy = (region.y + region.h / 2) * displayScale
+    st.setPan(viewW / (2 * zoom) - cx, viewH / (2 * zoom) - cy)
   }
 
   /** 銷毀元件，清除 DOM 與事件 */
@@ -904,6 +1080,7 @@ export class ImageCompare {
     // S14-M06: drop the base64 string after decode — nothing reads it later
     // and it can double image memory for large files.
     this._left = { path, ext, img }
+    this._pendingFirstDiff = true
     this._drawImage('left', img)
     this._updatePathDisplay('left', path, img.naturalWidth, img.naturalHeight)
     this._emit('paths-changed', {
@@ -923,6 +1100,7 @@ export class ImageCompare {
     const img = await this._loadImage(base64, ext)
     // S14-M06: drop base64 after decode.
     this._right = { path, ext, img }
+    this._pendingFirstDiff = true
     this._drawImage('right', img)
     this._updatePathDisplay('right', path, img.naturalWidth, img.naturalHeight)
     this._emit('paths-changed', {
@@ -1527,6 +1705,8 @@ export class ImageCompare {
   async _runDiff() {
     if (!this._left || !this._right) {
       this._updateStats(null, null)
+      this._diffRegions = []
+      this._currentDiffIdx = -1
       return
     }
     const diffCanvas = /** @type {HTMLCanvasElement | undefined} */ (this._dom.canvasDiff)
@@ -1563,6 +1743,10 @@ export class ImageCompare {
     if (!leftCtx || !rightCtx) return
 
     const diffImgData = this._diffCtx.createImageData(geo.width, geo.height)
+    const tileSize = diffTileSize(geo.width, geo.height)
+    const tileCols = Math.max(1, Math.ceil(geo.width / tileSize))
+    const tileRows = Math.max(1, Math.ceil(geo.height / tileSize))
+    const tileCounts = new Uint32Array(tileCols * tileRows)
     const diffCount = computeDiffBuffer({
       leftData: leftCtx.getImageData(0, 0, geo.leftW, geo.leftH).data,
       rightData: rightCtx.getImageData(0, 0, geo.rightW, geo.rightH).data,
@@ -1575,8 +1759,15 @@ export class ImageCompare {
       algorithm: this._algorithm,
       mismatchRange: this._mismatchRange,
       highlightColor: this._highlightColor,
+      tileCounts, tileSize, tileCols,
     })
     this._diffCtx.putImageData(diffImgData, 0, 0)
+
+    // Recomputing the diff invalidates the old regions, so the cursor resets
+    // rather than pointing at an area that may no longer differ.
+    this._diffRegions = tilesToRegions(tileCounts, tileCols, tileSize, geo.width, geo.height)
+    this._currentDiffIdx = -1
+    this._consumePendingFirstDiff()
 
     // Report stats at the FULL resolution so user-facing numbers match the
     // image dimensions the user sees. Extrapolating diffCount by 1/scale² is an
@@ -1590,6 +1781,19 @@ export class ImageCompare {
 
     // 若 overlay 已關閉，隱藏 diff canvas
     this._toggleDiffOverlay()
+  }
+
+  /**
+   * BC's "when loading new files, go to first difference". Flag-gated so a
+   * threshold or blend-mode change, which also re-runs the diff, leaves the
+   * user's pan alone.
+   */
+  _consumePendingFirstDiff() {
+    if (!this._pendingFirstDiff) return
+    this._pendingFirstDiff = false
+    if (!this._diffRegions.length) return
+    if (!getNavOptions().firstDiffOnLoad) return
+    this._jumpDiff(0)
   }
 
   // ── Private: Stats ──────────────────────────────────────────────────────────

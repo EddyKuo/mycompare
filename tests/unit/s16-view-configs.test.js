@@ -28,7 +28,9 @@ describe('HexCompare config', () => {
     a.applyConfig({ bytesPerRow: 32, diffAlgorithm: 'complete' })
     const b = new HexCompare()
     b.applyConfig(a.getConfig())
-    expect(b.getConfig()).toEqual({ bytesPerRow: 32, diffAlgorithm: 'complete' })
+    expect(b.getConfig()).toEqual({
+      __v: 1, __view: 'hex', bytesPerRow: 32, diffAlgorithm: 'complete',
+    })
   })
 
   it('rejects values outside the supported set', () => {

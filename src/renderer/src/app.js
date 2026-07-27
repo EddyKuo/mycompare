@@ -8,6 +8,7 @@ import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { createSession, updateSession } from './core/session.js'
 import { getViewTypeForPath } from './core/file-type.js'
 import { NamedConfigStore } from './core/named-config-store.js'
+import { describeNavResult } from './core/diff-nav.js'
 import { WorkspaceStore } from './core/workspace-store.js'
 import { setActiveView } from './core/active-view.js'
 import {
@@ -292,6 +293,20 @@ export function initApp() {
     },
     mergeGetConflictCount: () => document.querySelectorAll('.mw-conflict-card').length,
 
+    // S17: difference navigation is routed centrally, so the e2e check is
+    // "does the key reach the active view", not per-view internals.
+    navDiffIndex: () => {
+      const view = {
+        text: textCompare, hex: hexCompare, table: tableCompare,
+        image: imageCompare, folder: folderCompare,
+      }[currentView]
+      if (currentView === 'merge3') return mergeCompare?.getCurrentConflictIndex?.() ?? -1
+      if (currentView === 'text') return textCompare?._currentDiff ?? -1
+      return view?.getCurrentDiffIndex?.() ?? -1
+    },
+    navStatusText: () => el('status-message')?.textContent ?? '',
+    navSetPref: (name, value) => settings.setPref(name, value),
+
     // S17: the wiring these specs exercise all sits behind a native dialog,
     // which cannot be driven headlessly; these are the same entry points the
     // menu items reach once the dialog has returned.
@@ -409,6 +424,12 @@ function showTextCompare() {
 
     textCompare.on('ready', () => {
       updateToolbar()
+    })
+
+    // Backup outcome of a save — the file is written either way, so this is
+    // information rather than a failure.
+    textCompare.on('status', ({ message }) => {
+      if (message) showStatus(message)
     })
 
     textCompare.on('edit-mode-changed', ({ editMode }) => {
@@ -1946,14 +1967,32 @@ async function openSnapshotCompare(info) {
  */
 function navigateDiff(where) {
   const cap = where[0].toUpperCase() + where.slice(1)
+  /** @type {import('./core/diff-nav.js').NavResult | null} */
+  let result = null
+
   if (currentView === 'text') {
-    textCompare?.[`navigate${cap}`]?.()
+    result = textCompare?.[`navigate${cap}`]?.() ?? null
   } else if (currentView === 'merge3') {
-    mergeCompare?.[`${where}Conflict`]?.()
+    // merge3 reports the landed index rather than a NavResult, so the before /
+    // after pair is what tells "stepped" from "stopped at the end".
+    const before = mergeCompare?.getCurrentConflictIndex?.() ?? -1
+    const landed = mergeCompare?.[`${where}Conflict`]?.() ?? -1
+    const total = mergeCompare?.getConflictCount?.() ?? 0
+    result = landed < 0
+      ? { index: -1, total, moved: false }
+      : { index: landed, total, moved: landed !== before }
   } else {
-    const view = { hex: hexCompare, table: tableCompare }[currentView]
-    view?.[`${where}Difference`]?.()
+    const view = {
+      hex: hexCompare,
+      table: tableCompare,
+      image: imageCompare,
+      folder: folderCompare,
+    }[currentView]
+    result = view?.[`${where}Difference`]?.() ?? null
   }
+
+  const message = describeNavResult(where, result)
+  if (message) showStatus(message)
 }
 
 // ---------------------------------------------------------------------------

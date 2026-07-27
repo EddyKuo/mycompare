@@ -4,6 +4,8 @@
  */
 
 import { diffLines } from '../core/diff-engine.js'
+import { tagConfig, readConfig } from '../core/named-config-store.js'
+import { stepDiffIndex, getNavOptions } from '../core/diff-nav.js'
 // Imported here rather than from the renderer entry so the view stays
 // self-contained; the bundler emits it once no matter how many tabs mount.
 import '../styles/merge-compare.css'
@@ -367,6 +369,8 @@ export class ThreeWayCompare {
 
     /** Index (not id) of the conflict the navigation cursor is on; -1 = none. */
     this._currentConflict = -1
+    /** @type {boolean} set by setSide, consumed after the next merge */
+    this._pendingFirstDiff = false
 
     /** @type {'all'|'conflicts'} */
     this._showFilter = 'all'
@@ -405,6 +409,7 @@ export class ThreeWayCompare {
     if (path != null) this[`_${side}Path`] = path
     const pathEl = this._pathEl(side)
     if (pathEl && path != null) pathEl.textContent = path
+    this._pendingFirstDiff = true
     this._runMerge()
     this._emit('paths-changed', {
       left: this._leftPath,
@@ -423,14 +428,19 @@ export class ThreeWayCompare {
     return this._currentConflict
   }
 
-  /** @returns {number} the index landed on, -1 when there are no conflicts */
+  /**
+   * Whether navigation wraps is the shared Next Difference option, not a
+   * merge-specific rule; this view used to wrap unconditionally.
+   *
+   * @returns {number} the index landed on, -1 when there are no conflicts
+   */
   nextConflict() {
-    return this._gotoConflict(wrapConflictIndex(this._currentConflict, 1, this.getConflictCount()))
+    return this._gotoConflict(stepDiffIndex(this._currentConflict, this.getConflictCount(), 1))
   }
 
   /** @returns {number} */
   prevConflict() {
-    return this._gotoConflict(wrapConflictIndex(this._currentConflict, -1, this.getConflictCount()))
+    return this._gotoConflict(stepDiffIndex(this._currentConflict, this.getConflictCount(), -1))
   }
 
   /** @returns {number} */
@@ -469,6 +479,9 @@ export class ThreeWayCompare {
     if (!this._conflictChoices.has(id)) return
     this._conflictChoices.set(id, choice)
     this._renderOutputPane()
+    // BC's "go to next difference after copying to other side": resolving a
+    // conflict is this view's equivalent of a copy.
+    if (getNavOptions().nextAfterCopy) this.nextConflict()
   }
 
   /**
@@ -492,23 +505,23 @@ export class ThreeWayCompare {
    * Comparison settings only — never paths or file contents, because a named
    * config is meant to be reusable across sessions.
    *
-   * @returns {{ showFilter: 'all'|'conflicts', algorithm: 'myers'|'patience'|'histogram', ignoreWhitespace: boolean, ignoreCase: boolean }}
+   * @returns {Record<string, unknown>}
    */
   getConfig() {
-    return {
+    return tagConfig('merge3', {
       showFilter: this._showFilter,
       algorithm: this._algorithm,
       ignoreWhitespace: this._ignoreWhitespace,
       ignoreCase: this._ignoreCase,
-    }
+    })
   }
 
   /**
-   * @param {object} cfg  untrusted: comes from localStorage / an imported file
+   * @param {unknown} cfg  untrusted: comes from localStorage / an imported file
    */
   applyConfig(cfg) {
-    if (!cfg || typeof cfg !== 'object') return
-    const c = /** @type {Record<string, unknown>} */ (cfg)
+    const c = readConfig('merge3', cfg)
+    if (!c) return
 
     if (c.showFilter === 'all' || c.showFilter === 'conflicts') this._showFilter = c.showFilter
     if (c.algorithm === 'myers' || c.algorithm === 'patience' || c.algorithm === 'histogram') {
@@ -851,8 +864,21 @@ export class ThreeWayCompare {
     this._renderOutputPane()
     this._updateConflictCounter()
     this._updateFilterButton()
+    this._consumePendingFirstDiff()
 
     this._emit('ready', { hasConflicts })
+  }
+
+  /**
+   * BC's "when loading new files, go to first difference". Flag-gated so an
+   * option change, which also re-merges, leaves the user where they were.
+   */
+  _consumePendingFirstDiff() {
+    if (!this._pendingFirstDiff) return
+    this._pendingFirstDiff = false
+    if (!this.getConflictCount()) return
+    if (!getNavOptions().firstDiffOnLoad) return
+    this.firstConflict()
   }
 
   /** Recompute the row lists for all three panes and repaint the window. */

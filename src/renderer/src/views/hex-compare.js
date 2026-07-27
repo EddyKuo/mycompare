@@ -17,7 +17,11 @@ import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el, formatSize } from '../core/utils.js'
 import { isActive } from '../core/active-view.js'
 import { renderTextTable, reportHeader } from '../core/report.js'
+import { tagConfig, readConfig } from '../core/named-config-store.js'
+import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import '../styles/hex-compare.css'
+
+/** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -388,8 +392,8 @@ export class HexCompare {
     this._diffRegions = []
     /** @type {number} -1 = no region selected yet */
     this._currentDiffIdx = -1
-    /** @type {Function|null} F7/F8/Alt+Home/Alt+End handler (for removeEventListener) */
-    this._navKeyHandler = null
+    /** @type {boolean} set by setLeft/setRight, consumed after the next diff */
+    this._pendingFirstDiff = false
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -410,10 +414,6 @@ export class HexCompare {
     if (this._ctrlFHandler) {
       document.removeEventListener('keydown', this._ctrlFHandler)
       this._ctrlFHandler = null
-    }
-    if (this._navKeyHandler) {
-      document.removeEventListener('keydown', this._navKeyHandler)
-      this._navKeyHandler = null
     }
     // T27: 清除所有 hx-selected 高亮
     // S14-M04: scope to this container so we don't wipe highlights on other hex tabs.
@@ -476,6 +476,7 @@ export class HexCompare {
     this._leftOriginalSize = raw.byteLength
     this._leftTruncated = raw.byteLength > MAX_BYTES
     this._leftBytes = this._leftTruncated ? raw.slice(0, MAX_BYTES) : raw
+    this._pendingFirstDiff = true
     this._updatePathDisplay('left', path)
     this._updateSizeInfo()
     this.refresh()
@@ -493,6 +494,7 @@ export class HexCompare {
     this._rightOriginalSize = raw.byteLength
     this._rightTruncated = raw.byteLength > MAX_BYTES
     this._rightBytes = this._rightTruncated ? raw.slice(0, MAX_BYTES) : raw
+    this._pendingFirstDiff = true
     this._updatePathDisplay('right', path)
     this._updateSizeInfo()
     this.refresh()
@@ -525,25 +527,35 @@ export class HexCompare {
    * Paths and file contents are deliberately excluded — a saved config is
    * meant to be applied to any pair of files.
    *
-   * @returns {{ bytesPerRow: number, diffAlgorithm: string }}
+   * @returns {Record<string, unknown>}
    */
   getConfig() {
-    return {
+    return tagConfig('hex', {
       bytesPerRow: this._bytesPerRow,
       diffAlgorithm: this._diffAlgorithm,
-    }
+    })
   }
 
   /**
-   * @param {{ bytesPerRow?: number, diffAlgorithm?: string }} cfg
+   * @param {unknown} cfg
    */
   applyConfig(cfg) {
-    if (!cfg || typeof cfg !== 'object') return
-    if ([8, 16, 32].includes(cfg.bytesPerRow)) this._bytesPerRow = cfg.bytesPerRow
-    if (cfg.diffAlgorithm === 'fast' || cfg.diffAlgorithm === 'complete') {
-      this._diffAlgorithm = cfg.diffAlgorithm
+    const settings = readConfig('hex', cfg)
+    if (!settings) return
+    if ([8, 16, 32].includes(settings.bytesPerRow)) this._bytesPerRow = settings.bytesPerRow
+    if (settings.diffAlgorithm === 'fast' || settings.diffAlgorithm === 'complete') {
+      this._diffAlgorithm = settings.diffAlgorithm
     }
+    this._syncConfigControls()
     this.refresh()
+  }
+
+  /** Reflect the applied settings back onto the toolbar controls. */
+  _syncConfigControls() {
+    const bpr = this._dom.bprSelect
+    if (bpr) bpr.value = String(this._bytesPerRow)
+    const algo = this._dom.algoSelect
+    if (algo) algo.value = this._diffAlgorithm
   }
 
   // ── Public: reports ─────────────────────────────────────────────────────────
@@ -646,28 +658,40 @@ export class HexCompare {
     return this._currentDiffIdx
   }
 
-  /** 跳至下一個差異區塊（到尾端維持在最後一個，與 TextCompare.navigateNext 一致） */
-  nextDifference() {
-    if (this._diffRegions.length === 0) return
-    this._gotoDiff(Math.min(this._currentDiffIdx + 1, this._diffRegions.length - 1))
+  /** 跳至下一個差異區塊（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  nextDifference() { return this._stepDiff(1) }
+
+  /** 跳至上一個差異區塊（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  prevDifference() { return this._stepDiff(-1) }
+
+  /** 跳至第一個差異區塊 @returns {NavResult} */
+  firstDifference() { return this._jumpDiff(0) }
+
+  /** 跳至最後一個差異區塊 @returns {NavResult} */
+  lastDifference() { return this._jumpDiff(this._diffRegions.length - 1) }
+
+  /**
+   * @param {number} delta
+   * @returns {NavResult}
+   */
+  _stepDiff(delta) {
+    const total = this._diffRegions.length
+    const from = this._currentDiffIdx
+    const to = stepDiffIndex(from, total, delta)
+    if (to >= 0) this._gotoDiff(to)
+    return navResult(from, to, total)
   }
 
-  /** 跳至上一個差異區塊（到頭端維持在第一個） */
-  prevDifference() {
-    if (this._diffRegions.length === 0) return
-    this._gotoDiff(Math.max(this._currentDiffIdx - 1, 0))
-  }
-
-  /** 跳至第一個差異區塊 */
-  firstDifference() {
-    if (this._diffRegions.length === 0) return
-    this._gotoDiff(0)
-  }
-
-  /** 跳至最後一個差異區塊 */
-  lastDifference() {
-    if (this._diffRegions.length === 0) return
-    this._gotoDiff(this._diffRegions.length - 1)
+  /**
+   * @param {number} target
+   * @returns {NavResult}
+   */
+  _jumpDiff(target) {
+    const total = this._diffRegions.length
+    const from = this._currentDiffIdx
+    if (total === 0 || target < 0) return navResult(from, -1, total)
+    this._gotoDiff(target)
+    return navResult(from, target, total)
   }
 
   /**
@@ -1059,19 +1083,9 @@ export class HexCompare {
     btnDiffLast.addEventListener('click',  () => this.lastDifference())
     btnSwap.addEventListener('click',      () => this.swap())
 
-    // app.js only routes F7/F8/Alt+Home/Alt+End to the text view, so hex binds
-    // its own listener; isActive() keeps other tabs from reacting.
-    this._navKeyHandler = (/** @type {KeyboardEvent} */ e) => {
-      if (!isActive('hex')) return
-      const target = e.target
-      if (target instanceof Element && target.matches('input, textarea, select')) return
-      if (e.ctrlKey || e.metaKey) return
-      if (e.key === 'F7' && !e.altKey) { e.preventDefault(); this.prevDifference() }
-      else if (e.key === 'F8' && !e.altKey) { e.preventDefault(); this.nextDifference() }
-      else if (e.key === 'Home' && e.altKey) { e.preventDefault(); this.firstDifference() }
-      else if (e.key === 'End' && e.altKey) { e.preventDefault(); this.lastDifference() }
-    }
-    document.addEventListener('keydown', this._navKeyHandler)
+    // Diff-navigation keys are owned solely by app.js's SettingsStore binding,
+    // which routes to whichever view is active. Binding them here as well made
+    // every F8 press advance two differences.
   }
 
   // ── Private: Find (T10) ──────────────────────────────────────────────────────
@@ -1291,6 +1305,20 @@ export class HexCompare {
       this._currentDiffIdx = this._diffRegions.length - 1
     }
     this._updateDiffCounter()
+    this._consumePendingFirstDiff()
+  }
+
+  /**
+   * BC's "when loading new files, go to first difference". Gated on a flag set
+   * by setLeft/setRight so that a mere option or algorithm change — which also
+   * recomputes regions — does not yank the user's scroll position.
+   */
+  _consumePendingFirstDiff() {
+    if (!this._pendingFirstDiff) return
+    this._pendingFirstDiff = false
+    if (!this._diffRegions.length) return
+    if (!getNavOptions().firstDiffOnLoad) return
+    this._gotoDiff(0)
   }
 
   /**

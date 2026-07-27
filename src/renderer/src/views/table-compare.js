@@ -21,7 +21,11 @@ import { isActive } from '../core/active-view.js'
 import { renderTextTable, reportHeader, reportSummary } from '../core/report.js'
 import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { el } from '../core/utils.js'
+import { tagConfig, readConfig } from '../core/named-config-store.js'
+import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
 import '../styles/table-compare.css'
+
+/** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
 /** Fixed row height, mirroring `.tc-row { height: 24px }` in the stylesheet. */
 const TABLE_ROW_HEIGHT = 24
@@ -661,6 +665,8 @@ export class TableCompare {
     /** @type {number[]} */
     this._diffRows = []
     this._currentDiffIdx = 0
+    /** @type {boolean} set by setLeft/setRight, consumed after the next render */
+    this._pendingFirstDiff = false
 
     // Visibility filters
     this._showSame = true
@@ -782,6 +788,7 @@ export class TableCompare {
   setLeft(path, content) {
     this._leftPath = path
     this._leftContent = content
+    this._pendingFirstDiff = true
     this._updatePathDisplay('left', path)
     this._parseAndRefresh()
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
@@ -795,6 +802,7 @@ export class TableCompare {
   setRight(path, content) {
     this._rightPath = path
     this._rightContent = content
+    this._pendingFirstDiff = true
     this._updatePathDisplay('right', path)
     this._parseAndRefresh()
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath })
@@ -981,17 +989,33 @@ export class TableCompare {
 
   // ── S16-T2: Row-level difference navigation ──────────────────────────────────
 
-  /** 跳到下一個差異列 */
-  nextDifference() { this._gotoDiff(stepIndexClamped(this._currentDiffIdx, this._diffRows.length, 1)) }
+  /** @returns {number} 目前選取的差異列索引；-1 表示尚未選取 */
+  getCurrentDiffIndex() {
+    return this._currentDiffIdx
+  }
 
-  /** 跳到上一個差異列 */
-  prevDifference() { this._gotoDiff(stepIndexClamped(this._currentDiffIdx, this._diffRows.length, -1)) }
+  /** 跳到下一個差異列（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  nextDifference() { return this._navTo(stepDiffIndex(this._currentDiffIdx, this._diffRows.length, 1)) }
 
-  /** 跳到第一個差異列 */
-  firstDifference() { this._gotoDiff(this._diffRows.length ? 0 : -1) }
+  /** 跳到上一個差異列（是否環繞依 Next Difference 設定）。 @returns {NavResult} */
+  prevDifference() { return this._navTo(stepDiffIndex(this._currentDiffIdx, this._diffRows.length, -1)) }
 
-  /** 跳到最後一個差異列 */
-  lastDifference() { this._gotoDiff(this._diffRows.length - 1) }
+  /** 跳到第一個差異列 @returns {NavResult} */
+  firstDifference() { return this._navTo(this._diffRows.length ? 0 : -1) }
+
+  /** 跳到最後一個差異列 @returns {NavResult} */
+  lastDifference() { return this._navTo(this._diffRows.length - 1) }
+
+  /**
+   * @param {number} target index into _diffRows, -1 when there is none
+   * @returns {NavResult}
+   */
+  _navTo(target) {
+    const total = this._diffRows.length
+    const from = this._currentDiffIdx
+    this._gotoDiff(target)
+    return navResult(from, target, total)
+  }
 
   /**
    * 訂閱事件
@@ -1186,24 +1210,46 @@ export class TableCompare {
    * @returns {object}
    */
   getConfig() {
-    return {
+    return tagConfig('table', {
       hasHeader: this._hasHeader,
       keyColumns: this.getKeyColumns(),
       ignoreColumnOrder: this._ignoreColumnOrder,
       columnRules: JSON.parse(JSON.stringify(this.getColumnRules() ?? {})),
-    }
+      // Measured widths are data-dependent, so only the on/off state travels;
+      // applyConfig re-measures against whatever table is loaded.
+      fitColumns: Boolean(this._colWidths.left || this._colWidths.right),
+    })
   }
 
   /**
-   * @param {object} cfg
+   * @param {unknown} cfg
    */
   applyConfig(cfg) {
-    if (!cfg || typeof cfg !== 'object') return
-    if (typeof cfg.hasHeader === 'boolean') this._hasHeader = cfg.hasHeader
-    if (typeof cfg.ignoreColumnOrder === 'boolean') this._ignoreColumnOrder = cfg.ignoreColumnOrder
-    if (cfg.keyColumns !== undefined) this.setKeyColumns(cfg.keyColumns)
-    if (cfg.columnRules && typeof cfg.columnRules === 'object') this.setColumnRules(cfg.columnRules)
+    const settings = readConfig('table', cfg)
+    if (!settings) return
+    if (typeof settings.hasHeader === 'boolean') this._hasHeader = settings.hasHeader
+    if (typeof settings.ignoreColumnOrder === 'boolean') {
+      this._ignoreColumnOrder = settings.ignoreColumnOrder
+    }
+    if (settings.keyColumns !== undefined) this.setKeyColumns(settings.keyColumns)
+    if (settings.columnRules && typeof settings.columnRules === 'object') {
+      this.setColumnRules(settings.columnRules)
+    }
+    this._syncConfigControls()
     this.refresh()
+    if (typeof settings.fitColumns === 'boolean') {
+      const fitted = Boolean(this._colWidths.left || this._colWidths.right)
+      // resizeColumnsToFit() toggles, so only call it when the states disagree.
+      if (fitted !== settings.fitColumns) this.resizeColumnsToFit()
+    }
+  }
+
+  /** Reflect the applied settings back onto the toolbar controls. */
+  _syncConfigControls() {
+    const cbHeader = this._dom.cbHeader
+    if (cbHeader) cbHeader.checked = this._hasHeader
+    const cbColOrder = this._dom.cbColOrder
+    if (cbColOrder) cbColOrder.checked = this._ignoreColumnOrder
   }
 
   /**
@@ -1946,6 +1992,20 @@ export class TableCompare {
     }
     this._compare()
     this._renderTable()
+    this._consumePendingFirstDiff()
+  }
+
+  /**
+   * BC's "when loading new files, go to first difference". Flag-gated so that
+   * a filter or option change — which also re-renders — leaves the user where
+   * they were.
+   */
+  _consumePendingFirstDiff() {
+    if (!this._pendingFirstDiff) return
+    this._pendingFirstDiff = false
+    if (!this._diffRows.length) return
+    if (!getNavOptions().firstDiffOnLoad) return
+    this._gotoDiff(0)
   }
 
   _compare() {

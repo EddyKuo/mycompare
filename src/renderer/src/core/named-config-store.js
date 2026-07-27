@@ -13,8 +13,60 @@ const KEY_NAMED_CONFIGS = 'mycompare:namedConfigs'
 const SCHEMA_VERSION = 1   // S15-U10
 
 /**
- * @typedef {'text' | 'folder' | 'table' | 'image' | 'hex'} NamedConfigViewType
+ * @typedef {'text' | 'folder' | 'table' | 'image' | 'hex' | 'merge3'} NamedConfigViewType
  */
+
+/**
+ * Version of the *payload* a view writes through `getConfig()`.
+ *
+ * Distinct from SCHEMA_VERSION above, which versions the storage envelope:
+ * the envelope can change without any view changing its settings shape, and
+ * vice versa.
+ */
+export const CONFIG_SCHEMA_VERSION = 1
+
+/**
+ * Stamp a view's settings snapshot with its version and owning view type.
+ *
+ * The view tag is what lets `readConfig` refuse a foreign snapshot outright.
+ * Without it a folder config applied to the table view would set whichever
+ * keys happened to collide and silently leave the rest — a half-applied
+ * state that is worse than doing nothing.
+ *
+ * @param {NamedConfigViewType} viewType
+ * @param {Record<string, unknown>} settings
+ * @returns {Record<string, unknown>}
+ */
+export function tagConfig(viewType, settings) {
+  return { __v: CONFIG_SCHEMA_VERSION, __view: viewType, ...settings }
+}
+
+/**
+ * Validate an incoming snapshot for `viewType` and hand back its settings.
+ *
+ * @param {NamedConfigViewType} viewType the view asking to apply the snapshot
+ * @param {unknown} cfg
+ * @returns {Record<string, unknown> | null} null when the caller must not apply it
+ */
+export function readConfig(viewType, cfg) {
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return null
+  /** @type {Record<string, unknown>} */ const rec = cfg
+
+  // Absent version = a snapshot written before versioning existed. Those only
+  // ever held the writing view's own keys, so they stay loadable.
+  const version = rec.__v
+  if (version !== undefined) {
+    if (typeof version !== 'number' || !Number.isFinite(version)) return null
+    // A newer format may have changed the meaning of a key we still recognise,
+    // so guessing is unsafe — refuse rather than apply a subset.
+    if (version > CONFIG_SCHEMA_VERSION) return null
+  }
+
+  const view = rec.__view
+  if (view !== undefined && view !== viewType) return null
+
+  return rec
+}
 
 /**
  * @typedef {object} NamedConfigEntry

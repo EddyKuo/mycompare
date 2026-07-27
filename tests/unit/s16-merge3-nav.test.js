@@ -13,6 +13,18 @@ import {
   buildMergedText,
   segmentsToPaneLines,
 } from '../../src/renderer/src/views/three-way-compare.js'
+import { SettingsStore } from '../../src/renderer/src/core/settings-store.js'
+
+// Beyond Compare's "go to first difference on load" default would move the
+// cursor before these tests navigate; they are about the stepping rules, so
+// the option is turned off and exercised separately.
+beforeEach(() => {
+  const settings = new SettingsStore()
+  settings.setPref('navFirstDiffOnLoad', false)
+  // These predate the option and were written against unconditional wrapping.
+  settings.setPref('navWrapAround', true)
+  settings.setPref('navNextAfterCopy', false)
+})
 
 /** Base / left / right that produce exactly two conflicting hunks. */
 const BASE  = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].join('\n')
