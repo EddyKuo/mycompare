@@ -18,13 +18,17 @@
  *   is one bitstream and one sliding window, so a folder's blocks are even
  *   less separable than MSZIP's.
  *
- *   Quantum is recognised and refused by name rather than mis-decoded. No tool
- *   on this machine will produce a Quantum cabinet — `makecab` rejects
- *   `CompressionType=QUANTUM` — so a Quantum decoder here could only ever be
- *   checked against itself, and a decoder that agrees only with itself is
- *   worse than an honest refusal. LZX used to be refused for the same stated
- *   reason and that reason was simply wrong: `makecab /D CompressionType=LZX`
- *   works, and `expand.exe` reads back what it wrote.
+ *   Quantum is recognised and refused by name rather than mis-decoded, and
+ *   the reason has been checked rather than inherited: `makecab` rejects
+ *   `CompressionType=QUANTUM`, and a scan of all 42 cabinets under
+ *   C:\Windows found only MSZIP and LZX. With no Quantum cabinet obtainable,
+ *   a decoder here could only ever be checked against itself, and one that
+ *   agrees only with itself is worse than an honest refusal.
+ *
+ *   Say that carefully, because LZX carried the identical stated reason and
+ *   it was simply false — `makecab /D CompressionType=LZX` works. Two more
+ *   refusals in this file's history turned out the same way. Before writing
+ *   "no tool here can produce one", run the tool.
  */
 import { inflateRawSync } from 'zlib'
 
