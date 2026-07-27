@@ -11,9 +11,29 @@ import { diffLines } from '../core/diff-engine.js'
 import { getViewTypeForPath } from '../core/file-type.js'
 import { tagConfig, readConfig, NamedConfigStore } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
+import { SettingsStore } from '../core/settings-store.js'
 import '../styles/folder-compare.css'
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
+
+/**
+ * The Options dialog writes straight to localStorage, so the store is read at
+ * every point of use rather than snapshotted into the view: a snapshot would
+ * leave an already-open comparison obeying the rules the user just changed.
+ *
+ * app.js's `applyBcDefaults` only pushes settings that have a real setter on
+ * the view; none of the four folder preferences below is view state the user
+ * can also change from the toolbar, so there is nothing to push and nothing
+ * that could go stale. Reading the store here matches hex-compare.js and
+ * core/diff-nav.js.
+ *
+ * Each preference is read through a literal `getPref('name')` rather than a
+ * `folderPref(name)` wrapper: the wrapper reads better but hides the name from
+ * a plain text search, and options-bc-pages.test.js searches the sources for
+ * exactly that literal to prove no preference is write-only. Indirection here
+ * would defeat the check that this whole change exists to satisfy.
+ */
+const _settings = new SettingsStore()
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -2039,13 +2059,20 @@ export function columnSortValue(row, key) {
  * @param {CompareRow} b
  * @param {string} key
  * @param {number} [dir] 1 ascending, -1 descending
+ * @param {boolean} [foldersFirst] group directories above files (BC's
+ *   "Show folders first"); when false a directory sorts by the column value
+ *   like any other row. Defaults to on, which is the stored default.
  * @returns {number}
  */
-export function compareRowsBy(a, b, key, dir = 1) {
+export function compareRowsBy(a, b, key, dir = 1, foldersFirst = true) {
   // Directories stay above files whichever way the column sorts, as in BC.
-  const aDir = isDirRow(a)
-  const bDir = isDirRow(b)
-  if (aDir !== bDir) return aDir ? -1 : 1
+  // The grouping is applied before `dir` is, so descending reverses the order
+  // *within* each group rather than putting files above folders.
+  if (foldersFirst) {
+    const aDir = isDirRow(a)
+    const bDir = isDirRow(b)
+    if (aDir !== bDir) return aDir ? -1 : 1
+  }
 
   const av = columnSortValue(a, key)
   const bv = columnSortValue(b, key)
@@ -2066,10 +2093,11 @@ export function compareRowsBy(a, b, key, dir = 1) {
  * @param {CompareRow[]} rows
  * @param {string} [key]
  * @param {number} [dir]
+ * @param {boolean} [foldersFirst] see {@link compareRowsBy}
  * @returns {CompareRow[]}
  */
-export function sortRows(rows, key = 'name', dir = 1) {
-  return [...(rows ?? [])].sort((a, b) => compareRowsBy(a, b, key, dir))
+export function sortRows(rows, key = 'name', dir = 1, foldersFirst = true) {
+  return [...(rows ?? [])].sort((a, b) => compareRowsBy(a, b, key, dir, foldersFirst))
 }
 
 // ── Visible-tree flattening ─────────────────────────────────────────────────
@@ -2123,6 +2151,52 @@ export function flattenVisibleRows(rows, opts = {}, depth = 0) {
 const ROW_HEIGHT = 22
 /** Rows rendered beyond each edge of the viewport, to hide scroll latency. */
 const OVERSCAN = 4
+
+/**
+ * Rows drawn beyond the viewport, honouring the Options override.
+ *
+ * Read at each render rather than captured once, so changing it in the dialog
+ * shows up on the next scroll instead of at the next launch. The default
+ * equals {@link OVERSCAN}, so an untouched dialog draws exactly what it did
+ * before this became configurable.
+ *
+ * @returns {number}
+ */
+function overscanRows() {
+  const n = Number(_settings.getPref('tweakVirtualOverscan'))
+  // `Number('')` is 0 and 0 is a legitimate overscan, so a cleared value
+  // cannot be told apart from a deliberate zero by its value alone — the
+  // control refuses empty input, and anything non-numeric falls back here.
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : OVERSCAN
+}
+
+/**
+ * The prefetch ceiling for one column, given that column's own budget.
+ *
+ * A ceiling, not a replacement: the checksum column deliberately stops lower
+ * than the version column because each of its reads hashes an entire file, and
+ * a single preference raising every column to the same number would undo that
+ * on the most expensive one. So lowering this tightens every column and
+ * raising it never pushes a column past what it can afford.
+ *
+ * @param {number} columnBudget
+ * @returns {number}
+ */
+function prefetchCap(columnBudget) {
+  const n = Number(_settings.getPref('tweakPrefetchLimit'))
+  return Number.isFinite(n) && n > 0 ? Math.min(columnBudget, Math.floor(n)) : columnBudget
+}
+
+/**
+ * Concurrent file-pair reads for the content-comparison pass.
+ *
+ * @returns {number}
+ */
+function rulesConcurrency() {
+  const n = Number(_settings.getPref('tweakConcurrency'))
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : RULES_CONCURRENCY
+}
+
 /** Used when clientHeight is 0 (detached container / jsdom). */
 const FALLBACK_VIEWPORT_HEIGHT = 600
 
@@ -3565,7 +3639,7 @@ export class FolderCompare {
 
     let graded = 0
     let failed = 0
-    await _runWithConcurrency(targets, RULES_CONCURRENCY, async (row) => {
+    await _runWithConcurrency(targets, rulesConcurrency(), async (row) => {
       if (signal?.aborted) return
       try {
         const [lHash, rHash] = await Promise.all([
@@ -4285,17 +4359,20 @@ export class FolderCompare {
     /** @type {CompareRow[]} */
     const candidates = []
     let skipped = 0
+    // Hoisted: reading the preference inside the loop would hit storage once
+    // per row, which is the cost this cap exists to avoid.
+    const cap = prefetchCap(MAX_VERSION_PREFETCH)
     for (const row of eachRow(rows ?? [])) {
       const { left, right } = row
       if (!left?.path || !right?.path) continue
       if (left.isDirectory || right.isDirectory) continue
       if (sourceKindOf(left.path) !== 'fs' || sourceKindOf(right.path) !== 'fs') continue
       if (!hasVersionCandidateExt(left.name) && !hasVersionCandidateExt(right.name)) continue
-      if (candidates.length >= MAX_VERSION_PREFETCH) { skipped++; continue }
+      if (candidates.length >= cap) { skipped++; continue }
       candidates.push(row)
     }
     if (skipped) {
-      this._setScanStatus(`版本比對：超過 ${MAX_VERSION_PREFETCH} 對檔案，其餘 ${skipped} 對未比對`)
+      this._setScanStatus(`版本比對：超過 ${cap} 對檔案，其餘 ${skipped} 對未比對`)
     }
     if (!candidates.length) return
 
@@ -5447,7 +5524,13 @@ ${errText(err)}`)
   async _runDelete(targets, opts = {}) {
     if (!targets.length) { alert('沒有可刪除的項目'); return false }
 
-    const choice = await this._confirmDelete(targets.map((t) => t.path), opts)
+    const defaults = this._deleteDefaults(opts)
+    const choice = defaults.confirm
+      ? await this._confirmDelete(targets.map((t) => t.path),
+        { ...opts, permanent: defaults.permanent })
+      // Confirmations off: the preference already answered both questions the
+      // dialog would have asked, so it is not shown at all.
+      : { ok: true, permanent: defaults.permanent }
     if (!choice.ok) return false
 
     // Read-only only blocks the permanent route: trashItem moves the file
@@ -5465,7 +5548,11 @@ ${errText(err)}`)
     // The main process refuses to fall back on its own. Offering the fallback
     // here — named, counted, and only after the user says so — is the whole
     // point of that refusal.
-    if (!choice.permanent && isRecycleBinUnavailable(outcome.failures)) {
+    // Escalating to an unrecoverable delete is never done on the strength of
+    // "do not ask before deleting" — that preference turns off the routine
+    // confirmation, not the one guarding permanent loss. With it off the
+    // failures are simply reported and the files are left alone.
+    if (defaults.confirm && !choice.permanent && isRecycleBinUnavailable(outcome.failures)) {
       const retry = confirm(
         `${outcome.failures.length} 個項目無法移至資源回收桶：\n` +
         `${outcome.failures[0].message}\n\n改為「永久刪除」這些項目嗎？此操作無法復原。`)
@@ -5480,10 +5567,38 @@ ${errText(err)}`)
       }
     }
 
-    alert(formatDeleteSummary(outcome))
+    // A silent delete still has to leave a trace. The status line (and with it
+    // the log panel) is written either way; only the modal summary is tied to
+    // the confirmation preference, since the point of turning it off is to
+    // stop being interrupted.
+    const summary = formatDeleteSummary(outcome)
+    this._setScanStatus(summary)
+    if (defaults.confirm) alert(summary)
     this._selectedNames.clear()
     await this.refresh()
     return outcome.trashed + outcome.permanent > 0
+  }
+
+  /**
+   * The delete choice the preferences imply, before any dialog is shown.
+   *
+   * `folderUseRecycleBin` is the *recoverable* option, so it maps to
+   * `permanent: false`; getting this backwards would destroy files the user
+   * asked to keep recoverable, which is why the polarity is stated once here
+   * instead of at each call site.
+   *
+   * `opts.permanent` is only honoured when it is explicitly `true`
+   * (Shift+Delete). The keyboard path always passes a boolean, so `??` would
+   * let a plain Delete override a stored "never use the recycle bin".
+   *
+   * @param {{ permanent?: boolean }} [opts]
+   * @returns {{ confirm: boolean, permanent: boolean }}
+   */
+  _deleteDefaults(opts = {}) {
+    return {
+      confirm: _settings.getPref('folderConfirmDelete') !== false,
+      permanent: opts.permanent === true || _settings.getPref('folderUseRecycleBin') === false,
+    }
   }
 
   /**
@@ -6540,7 +6655,14 @@ ${rows}
         if (execBtn) execBtn.disabled = false
         return
       }
-      deleteChoice = await this._confirmDelete(deletes.map((op) => op.path))
+      // Same preferences as every other delete in this view: the recycle-bin
+      // setting supplies the default, and with confirmations off the mirror
+      // warning above is the only prompt.
+      const defaults = this._deleteDefaults()
+      deleteChoice = defaults.confirm
+        ? await this._confirmDelete(deletes.map((op) => op.path),
+          { permanent: defaults.permanent })
+        : { ok: true, permanent: defaults.permanent }
     }
 
     const copies = this._resolveReadOnly(
@@ -8953,6 +9075,17 @@ ${rows}
     } finally {
       this._endScan(ctrl)
     }
+
+    // BC's "Expand all folders when opening a session". Reuses expandAll, so
+    // the children are really loaded into the model and `_expanded` is filled
+    // in — a flag set on the DOM would be discarded by the next virtual-list
+    // repaint, and the rows are virtualised.
+    //
+    // Deliberately after `_endScan`: expandAll opens its own scan generation,
+    // which would abort the one that just produced these rows.
+    if (!ctrl.signal.aborted && _settings.getPref('folderExpandOnOpen') === true) {
+      await this.expandAll()
+    }
   }
 
   /**
@@ -9300,7 +9433,7 @@ ${rows}
     if (plan.hash.length) await this._applyContentHash(plan.hash, signal)
     if (!plan.text.length || !window.electronAPI?.readFile) return
 
-    await _runWithConcurrency(plan.text, RULES_CONCURRENCY, async (row) => {
+    await _runWithConcurrency(plan.text, rulesConcurrency(), async (row) => {
       if (signal?.aborted) return
       const [left, right] = await Promise.all([
         window.electronAPI.readFile(row.left.path),
@@ -9336,7 +9469,7 @@ ${rows}
     // S14-M05: cap concurrent IPC to avoid flooding main when thousands of
     // candidates exist (10k files × 2 hashFile calls = 20k parallel IPCs).
     if (!window.electronAPI?.hashFile) return
-    await _runWithConcurrency(candidates, RULES_CONCURRENCY, async (row) => {
+    await _runWithConcurrency(candidates, rulesConcurrency(), async (row) => {
       if (signal?.aborted) return
       try {
         const [lHash, rHash] = await Promise.all([
@@ -9362,11 +9495,22 @@ ${rows}
 
   // ── Private: Filter ─────────────────────────────────────────────────────────
 
+  /**
+   * Whether directories group above files, from the stored preference.
+   * Unset reads as on, matching DEFAULT_PREFS.
+   * @returns {boolean}
+   */
+  _foldersFirst() {
+    return _settings.getPref('folderShowFoldersFirst') !== false
+  }
+
   _applyFilterAndRender() {
     this._visibleRows = flattenVisibleRows(this._rows, {
       isExpanded: (row, depth) => this._expanded.has(this._expandKey(depth, row)),
       isVisible: (row) => this._isRowVisible(row),
-      sort: (rows) => sortRows(rows, this._sortKey, this._sortDir),
+      // BC's "Show folders first" applies to every column and both
+      // directions, so it is read here rather than baked into the comparator.
+      sort: (rows) => sortRows(rows, this._sortKey, this._sortDir, this._foldersFirst()),
     })
     // Click handlers reach the real model object through this index rather than
     // rebuilding a stub from dataset attributes.
@@ -9559,8 +9703,9 @@ ${rows}
 
     const flat = this._visibleRows
     const viewHeight = list.clientHeight || FALLBACK_VIEWPORT_HEIGHT
-    const start = Math.max(0, Math.floor((list.scrollTop || 0) / ROW_HEIGHT) - OVERSCAN)
-    const end = Math.min(flat.length - 1, start + Math.ceil(viewHeight / ROW_HEIGHT) + OVERSCAN * 2)
+    const over = overscanRows()
+    const start = Math.max(0, Math.floor((list.scrollTop || 0) / ROW_HEIGHT) - over)
+    const end = Math.min(flat.length - 1, start + Math.ceil(viewHeight / ROW_HEIGHT) + over * 2)
 
     vlist.innerHTML = ''
     const fragment = document.createDocumentFragment()
@@ -9990,6 +10135,8 @@ ${rows}
     /** @type {FileEntry[]} */
     const pending = []
     let skipped = 0
+    // Hoisted out of the loop: one storage read, not one per row.
+    const cap = prefetchCap(MAX_VERSION_PREFETCH)
     for (const flat of this._visibleRows ?? []) {
       for (const entry of [flat.row.left, flat.row.right]) {
         if (!entry?.path || entry.isDirectory) continue
@@ -10001,12 +10148,12 @@ ${rows}
           this._versionCache.set(entry.path, '')
           continue
         }
-        if (pending.length >= MAX_VERSION_PREFETCH) { skipped++; continue }
+        if (pending.length >= cap) { skipped++; continue }
         pending.push(entry)
       }
     }
     if (!pending.length) {
-      if (skipped) this._setScanStatus(`版本排序：超過 ${MAX_VERSION_PREFETCH} 個檔案，其餘未讀取`)
+      if (skipped) this._setScanStatus(`版本排序：超過 ${cap} 個檔案，其餘未讀取`)
       return
     }
 
@@ -10219,6 +10366,8 @@ ${rows}
     /** @type {FileEntry[]} */
     const pending = []
     let skipped = 0
+    // Hoisted out of the loop: one storage read, not one per row.
+    const cap = prefetchCap(MAX_CRC_PREFETCH)
     for (const flat of this._visibleRows ?? []) {
       for (const entry of [flat.row.left, flat.row.right]) {
         if (!entry?.path || entry.isDirectory) continue
@@ -10227,12 +10376,12 @@ ${rows}
         if (cached !== undefined) { entry.crc = cached; continue }
         if (sourceKindOf(entry.path) !== 'fs') { this._resolveCrc(entry, '', ''); continue }
         if ((entry.size ?? 0) > MAX_CRC_FILE_BYTES) { this._resolveCrc(entry, '—', ''); continue }
-        if (pending.length >= MAX_CRC_PREFETCH) { skipped++; continue }
+        if (pending.length >= cap) { skipped++; continue }
         pending.push(entry)
       }
     }
     if (!pending.length) {
-      if (skipped) this._setScanStatus(`檢查碼排序：超過 ${MAX_CRC_PREFETCH} 個檔案，其餘未計算`)
+      if (skipped) this._setScanStatus(`檢查碼排序：超過 ${cap} 個檔案，其餘未計算`)
       return
     }
 
@@ -10722,18 +10871,20 @@ ${rows}
     /** @type {FileEntry[]} */
     const pending = []
     let skipped = 0
+    // Hoisted out of the loop: one storage read, not one per row.
+    const cap = prefetchCap(MAX_OWNER_PREFETCH)
     for (const flat of this._visibleRows ?? []) {
       for (const entry of [flat.row.left, flat.row.right]) {
         if (!entry?.path) continue
         const cached = this._ownerCache.get(entry.path)
         if (cached) { entry.owner = cached.owner; entry.group = cached.group; continue }
         if (sourceKindOf(entry.path) !== 'fs') continue
-        if (pending.length >= MAX_OWNER_PREFETCH) { skipped++; continue }
+        if (pending.length >= cap) { skipped++; continue }
         pending.push(entry)
       }
     }
     if (!pending.length) {
-      if (skipped) this._setScanStatus(`擁有者排序：超過 ${MAX_OWNER_PREFETCH} 個檔案，其餘未查詢`)
+      if (skipped) this._setScanStatus(`擁有者排序：超過 ${cap} 個檔案，其餘未查詢`)
       return
     }
 

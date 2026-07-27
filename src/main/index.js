@@ -6,6 +6,7 @@ import { tmpdir } from 'os'
 import { execFile } from 'child_process'
 import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
+import { buildOpenWithArgs } from './open-with.js'
 import { buildAppMenu } from './menu.js'
 import { parseCli, usageText } from './cli.js'
 import { parseScript, describeScript, isMutating } from './script.js'
@@ -531,9 +532,93 @@ async function backupExisting(filePath, backup) {
 }
 
 // IPC: 讀取壓縮檔目錄（tar / gzip / tar.gz / zip 家族），回傳統一形狀
+/**
+ * Archive preferences pushed from the renderer.
+ *
+ * `enabled` is the set of formats the user wants treated as archives; a format
+ * left out is refused by name rather than opened, so turning one off is
+ * visible instead of looking like an empty folder. `maxEntryMB` is 0 when the
+ * user has not set it, in which case the decoder's own default stands.
+ *
+ * @type {{ enabled: Set<string>, maxEntryMB: number }}
+ */
+let archivePrefs = { enabled: new Set(), maxEntryMB: 0 }
+
+ipcMain.handle('set-archive-limits', (_event, enabled, maxEntryMB) => {
+  archivePrefs = {
+    enabled: new Set(String(enabled ?? '')
+      .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)),
+    maxEntryMB: Number.isFinite(maxEntryMB) && maxEntryMB > 0 ? Number(maxEntryMB) : 0,
+  }
+  return { enabled: [...archivePrefs.enabled], maxEntryMB: archivePrefs.maxEntryMB }
+})
+
+/**
+ * The limits override for one archive call, or `{}` to keep the defaults.
+ * @returns {{ maxEntryBytes?: number }}
+ */
+function archiveLimitOverride() {
+  return archivePrefs.maxEntryMB > 0
+    ? { maxEntryBytes: archivePrefs.maxEntryMB * 1024 * 1024 }
+    : {}
+}
+
+/**
+ * The preference tokens that enable a detected format.
+ *
+ * `detectFormat` answers with decoder names (`gzip`, `bzip2`), while the
+ * preference is spelled with the extensions a user recognises (`gz`, `bz2`).
+ * Matching the two by string equality, or by taking the part after the last
+ * dot, silently refused every plain `.gz` and `.bz2` archive while the list
+ * appeared to allow them.
+ *
+ * A compound format is enabled by either half, so `tar.gz` opens for someone
+ * who listed `tar` or `gz`.
+ *
+ * @param {string} format
+ * @returns {string[]}
+ */
+function ARCHIVE_PREF_TOKENS(format) {
+  /** @type {Record<string, string[]>} */
+  const alias = {
+    gzip: ['gz', 'gzip'],
+    bzip2: ['bz2', 'bzip2'],
+    'tar.gz': ['tar', 'gz', 'gzip'],
+    'tar.bz2': ['tar', 'bz2', 'bzip2'],
+    'tar.xz': ['tar', 'xz'],
+  }
+  return alias[format] ?? [format]
+}
+
+/**
+ * Refuse a format the user has switched off, before anything is decoded.
+ *
+ * An empty set means the preference has not been pushed yet (the very first
+ * open can race the renderer's startup), and refusing everything in that case
+ * would break archive support outright.
+ *
+ * @param {string} filePath
+ */
+async function assertArchiveFormatEnabled(filePath) {
+  if (archivePrefs.enabled.size === 0) return
+  const { detectFormat } = await import('./archive.js')
+  const handle = await open(filePath, 'r')
+  try {
+    const head = Buffer.alloc(64)
+    const { bytesRead } = await handle.read(head, 0, 64, 0)
+    const format = String(detectFormat(filePath, head.subarray(0, bytesRead)))
+    if (!ARCHIVE_PREF_TOKENS(format).some((t) => archivePrefs.enabled.has(t))) {
+      throw new Error(`「${format}」已在選項中停用，因此不以壓縮檔開啟。`)
+    }
+  } finally {
+    await handle.close()
+  }
+}
+
 ipcMain.handle('read-archive', async (_event, archivePath) => {
   const safe = validatePath(archivePath)
-  return readArchive(safe)
+  await assertArchiveFormatEnabled(safe)
+  return readArchive(safe, archiveLimitOverride())
 })
 
 // IPC: 讀取壓縮檔內單一 entry 的內容
@@ -543,7 +628,8 @@ ipcMain.handle('read-archive', async (_event, archivePath) => {
 // sanitizeEntryPath() 負責。
 ipcMain.handle('read-archive-entry', async (_event, { archivePath, entryPath }) => {
   const safe = validatePath(archivePath)
-  const buffer = await readArchiveEntry(safe, entryPath)
+  await assertArchiveFormatEnabled(safe)
+  const buffer = await readArchiveEntry(safe, entryPath, archiveLimitOverride())
   return buffer.toString('base64')
 })
 
@@ -673,9 +759,40 @@ ipcMain.handle('set-mtime', async (_event, filePath, mtime) => {
  * never a shell string — so a filename containing quotes or `&` is an argument
  * and not a command.
  */
+/**
+ * The user's chosen external program for "Open With", pushed from the renderer
+ * whenever the preference changes.
+ *
+ * It lives here rather than being passed per call because every call site is
+ * in a view, and the preference would otherwise have to be threaded through
+ * each of them. Launching a program is a main-process concern anyway.
+ *
+ * @type {{ command: string, args: string }}
+ */
+let openWithDefaults = { command: '', args: '"%1"' }
+
+ipcMain.handle('set-open-with-defaults', (_event, command, args) => {
+  openWithDefaults = {
+    command: typeof command === 'string' ? command.trim() : '',
+    args: typeof args === 'string' ? args : '"%1"',
+  }
+  return { command: openWithDefaults.command, args: openWithDefaults.args }
+})
+
 ipcMain.handle('open-with', async (_event, filePath, options) => {
   const safe = validatePath(filePath)
   await stat(safe) // fail here rather than in a dialog that shrugs
+
+  // An explicit picker request outranks the configured program: the user asked
+  // to choose this time.
+  if (options?.withPicker !== true && openWithDefaults.command) {
+    const args = buildOpenWithArgs(openWithDefaults.args, safe)
+    await new Promise((resolve, reject) => {
+      execFile(openWithDefaults.command, args, { windowsHide: true },
+        (err) => (err ? reject(err) : resolve(undefined)))
+    })
+    return { opened: true, path: safe, picker: false, command: openWithDefaults.command }
+  }
 
   if (options?.withPicker === true && process.platform === 'win32') {
     await new Promise((resolve, reject) => {

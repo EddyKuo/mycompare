@@ -2153,6 +2153,51 @@ export class ImageCompare {
   }
 
   /**
+   * 1.9 Options ▸ Picture：新的圖片比對啟始的容差值。
+   *
+   * The dialog states tolerance as a per-channel difference in 0–255 ("容差是
+   * 每個色板允許的差距；0 代表完全相同才算相同"), while the view carries it as
+   * `_threshold` in 0–1. `diffCutoff` multiplies the threshold back up by 255,
+   * so tol/255 reproduces the stated cutoff exactly.
+   *
+   * A tolerance of 0 *is* the exact algorithm, so 0 is a no-op: it leaves the
+   * view on the defaults it has always had, which is what a user who never
+   * opened the dialog must keep getting. Any positive tolerance has to leave
+   * 'exact', because that algorithm pins its cutoff at 0 and would silently
+   * ignore the number the user just typed.
+   *
+   * This only supplies the starting value — the toolbar slider still owns
+   * `_threshold` from the first time it is dragged.
+   *
+   * @param {number|string} tolerance 0–255; anything outside is ignored
+   */
+  setTolerance(tolerance) {
+    // Number('') is 0 and 0 is finite, so emptiness has to be rejected before
+    // the finiteness check or a cleared field would read as a deliberate zero.
+    if (tolerance == null || tolerance === '') return
+    const n = Number(tolerance)
+    if (!Number.isFinite(n) || n < 0 || n > 255) return
+    if (n === 0) return
+    const next = n / 255
+    if (next === this._threshold && this._algorithm === 'tolerance') return
+    this._threshold = next
+    this._algorithm = 'tolerance'
+    const slider = /** @type {HTMLInputElement | undefined} */ (this._dom.thresholdSlider)
+    if (slider) slider.value = String(next)
+    const label = /** @type {HTMLElement | undefined} */ (this._dom.thresholdVal)
+    if (label) label.textContent = next.toFixed(2)
+    void this._runDiff()
+  }
+
+  /**
+   * The starting tolerance expressed the way the Options dialog states it.
+   * @returns {number} 0–255
+   */
+  getTolerance() {
+    return this._algorithm === 'exact' ? 0 : this._threshold * 255
+  }
+
+  /**
    * 開啟後，差異像素依強度分成 MISMATCH_LEVELS 級顯示深淺。
    * @param {boolean} on
    */

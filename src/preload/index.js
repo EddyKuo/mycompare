@@ -74,6 +74,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   vcsRun: (req) => ipcRenderer.invoke('vcs-run', req),
   vcsText: (req) => ipcRenderer.invoke('vcs-text', req),
   fileOwners: (paths) => ipcRenderer.invoke('file-owners', paths),
+  setOpenWithDefaults: (command, args) =>
+    ipcRenderer.invoke('set-open-with-defaults', command, args),
+  setArchiveLimits: (enabled, maxEntryMB) =>
+    ipcRenderer.invoke('set-archive-limits', enabled, maxEntryMB),
   setMenuVisibility: (hidden) => ipcRenderer.invoke('set-menu-visibility', hidden),
   printToPdf: (html, suggestedName) => ipcRenderer.invoke('print-to-pdf', html, suggestedName),
   toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),

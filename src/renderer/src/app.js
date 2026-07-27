@@ -2550,8 +2550,11 @@ function setupKeyboardShortcuts() {
  * render so a value the user changes inside a session is not overwritten by
  * the default on the next repaint.
  *
- * Only settings with a real setter on the view are pushed; the rest are read
- * at their point of use.
+ * Only settings with a real setter on the view are pushed. "The rest are read
+ * at their point of use" is what this comment used to claim, and for fourteen
+ * of the eighteen preferences it was simply untrue — nothing read them
+ * anywhere. Anything added here needs a reader, and
+ * options-bc-pages.test.js now fails if it does not have one.
  *
  * @param {'text'|'image'} kind
  * @param {object|null} view
@@ -2570,6 +2573,9 @@ function applyBcDefaults(kind, view) {
       }
       if (typeof view.setAutoScale === 'function') {
         view.setAutoScale(Boolean(settings.getPref('pictureAutoScale')))
+      }
+      if (typeof view.setTolerance === 'function') {
+        view.setTolerance(settings.getPref('pictureTolerance'))
       }
     }
   } catch (err) {
@@ -5226,6 +5232,27 @@ function applyDisplayPrefs() {
   if (toolbar) toolbar.style.display = settings.getPref('showToolbar') === false ? 'none' : ''
   const statusbar = el('statusbar')
   if (statusbar) statusbar.style.display = settings.getPref('showStatusBar') === false ? 'none' : ''
+  applyMainProcessPrefs()
+}
+
+/**
+ * Hand the main process the preferences it is the one to act on.
+ *
+ * "Open With" launches a program and archive limits guard a decoder, both of
+ * which live in main. Every call site for them is inside a view, so pushing
+ * the values once — here, on load and on every change — is what keeps the
+ * preference from having to be threaded through each of those call sites.
+ */
+function applyMainProcessPrefs() {
+  const api = window.electronAPI
+  void api?.setOpenWithDefaults?.(
+    String(settings.getPref('openWithCommand') ?? ''),
+    String(settings.getPref('openWithArgs') ?? '"%1"'),
+  )
+  void api?.setArchiveLimits?.(
+    String(settings.getPref('archiveEnabled') ?? ''),
+    Number(settings.getPref('archiveMaxEntryMB')),
+  )
 }
 
 // ---------------------------------------------------------------------------

@@ -392,12 +392,13 @@ const WRITE_ARGS = Object.freeze({
 })
 
 /**
- * Run a write operation, one path at a time.
+ * Run a write operation over a set of paths.
  *
- * Sequential and per-path for the same reason `runMove` in the folder view is:
- * a batch that stops halfway has to be reportable as "these succeeded,
- * these did not", and a single git invocation over N paths gives one exit code
- * for the whole set.
+ * Batched, then per-path only where a batch failed. A single invocation over N
+ * paths gives one exit code for the whole set, and this operation owes the
+ * user "these succeeded, these did not" — the same reason `runMove` in the
+ * folder view reports per path. Retrying just the failing batch buys that
+ * report back without making the common case spawn one process per file.
  *
  * @param {{ action: VcsWriteAction, root: string, paths: string[] }} req
  *   `root` and every entry of `paths` are already-validated absolute paths
@@ -415,6 +416,8 @@ export async function runVcsCommand(req) {
   /** @type {VcsOpResult[]} */
   const results = []
 
+  /** @type {Array<{ abs: string, rel: string }>} */
+  const targets = []
   for (const abs of req?.paths ?? []) {
     const rel = toRepoRelative(root, abs)
     if (!rel) {
@@ -424,15 +427,43 @@ export async function runVcsCommand(req) {
       })
       continue
     }
+    targets.push({ abs, rel })
+  }
+
+  for (let i = 0; i < targets.length; i += WRITE_BATCH_SIZE) {
+    const chunk = targets.slice(i, i + WRITE_BATCH_SIZE)
     try {
-      await git([...base, rel], { cwd: root, maxBuffer: MAX_TEXT_BYTES })
-      results.push({ path: abs, state: 'done', message: '' })
-    } catch (err) {
-      results.push({ path: abs, state: 'failed', message: errText(err) })
+      // One call for the batch. "Select all modified" then 加入索引 is an
+      // ordinary thing to do, and a process per file turns it into a minute of
+      // frozen window on a large repository — the very pattern this module's
+      // header calls out for the read path.
+      await git([...base, ...chunk.map((t) => t.rel)], { cwd: root, maxBuffer: MAX_TEXT_BYTES })
+      for (const t of chunk) results.push({ path: t.abs, state: 'done', message: '' })
+    } catch {
+      // One exit code for the whole set says nothing about which path caused
+      // it, and "these succeeded, these did not" is the report this operation
+      // owes the user. Only the failing batch pays for that.
+      for (const t of chunk) {
+        try {
+          await git([...base, t.rel], { cwd: root, maxBuffer: MAX_TEXT_BYTES })
+          results.push({ path: t.abs, state: 'done', message: '' })
+        } catch (err) {
+          results.push({ path: t.abs, state: 'failed', message: errText(err) })
+        }
+      }
     }
   }
   return { results }
 }
+
+/**
+ * Paths per git invocation on the write path.
+ *
+ * Bounded so the argument list stays well inside the Windows command-line
+ * limit (~32k characters) even for long paths, and so a failing batch falls
+ * back to a bounded number of individual retries.
+ */
+const WRITE_BATCH_SIZE = 100
 
 /** Commits shown by the log command; a full history is not a dialog's job. */
 const LOG_LIMIT = 50

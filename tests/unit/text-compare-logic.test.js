@@ -1077,6 +1077,24 @@ describe('TextCompare._convertFile (T45)', () => {
     expect(tc._runDiff).toHaveBeenCalledOnce()
   })
 
+  it('trim: also works on a CRLF file', async () => {
+    // The reason this went unnoticed: every test above uses LF. The old
+    // implementation split on '\n', which leaves the '\r' as each line's last
+    // character, so /[ \t]+$/ matched nothing and Trim Trailing Whitespace
+    // silently did nothing on Windows line endings.
+    const tc = await makeConvertTC('hello   \r\nworld  \r\n', 'right')
+    tc._eolLeft = 'CRLF'
+    tc._convertFile('left', 'trim')
+    expect(tc._leftContent).toBe('hello\r\nworld\r\n')
+  })
+
+  it('trim: leaves a lone CR file alone but still trims it', async () => {
+    const tc = await makeConvertTC('hello  \rworld  \r', 'right')
+    tc._eolLeft = 'CR'
+    tc._convertFile('left', 'trim')
+    expect(tc._leftContent).toBe('hello\rworld\r')
+  })
+
   it('tabs-to-spaces: converts tab to 4 spaces', async () => {
     const tc = await makeConvertTC('\thello\n\t\tworld\n', 'right')
     tc._convertFile('left', 'tabs-to-spaces')

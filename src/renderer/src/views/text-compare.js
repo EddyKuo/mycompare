@@ -1026,6 +1026,48 @@ function createCollapsedEl(start, end, count, expanded = false) {
 const _settings = new SettingsStore();
 
 // ---------------------------------------------------------------------------
+// 1.9 Options ▸ Editor — save-time text clean-ups
+//
+// Both rewrite the user's file, so both default to false: someone who never
+// opens the Options dialog must get byte-identical saves.
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip trailing spaces and tabs from every line, leaving the line
+ * terminators untouched.
+ *
+ * Matching before the terminator rather than splitting on '\n' is what keeps
+ * CRLF files correct: after a split on '\n' every line still ends with '\r',
+ * so a `/[ \t]+$/` anchor never fires and a CRLF file comes back untrimmed.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function trimTrailingWhitespace(text) {
+  if (!text) return text;
+  return text.replace(/[ \t]+(?=\r\n|\r|\n|$)/g, '');
+}
+
+/**
+ * Guarantee the text ends with a line terminator, in the file's own style.
+ *
+ * Appends only when one is missing. Trailing blank lines are content the user
+ * typed, not formatting — collapsing "a\n\n\n" down to "a\n" would delete
+ * lines on save, which is not what "ensure a final newline" asks for. An
+ * empty file stays empty: a zero-byte file has no last line to terminate,
+ * and writing one byte into it would be a change the user never made.
+ *
+ * @param {string} text
+ * @param {'CRLF'|'LF'|'CR'} [eol] detected line ending of the file
+ * @returns {string}
+ */
+export function ensureFinalNewline(text, eol = 'LF') {
+  if (!text) return text;
+  if (/(?:\r\n|\r|\n)$/.test(text)) return text;
+  return text + (eol === 'CRLF' ? '\r\n' : eol === 'CR' ? '\r' : '\n');
+}
+
+// ---------------------------------------------------------------------------
 // 1.4 / 1.7 — Text Replacements
 //
 // BC's match→replacement pairs: both sides are rewritten before they are
@@ -3072,8 +3114,9 @@ export class TextCompare {
       { name: '文字檔', extensions: ['txt','js','ts','py','java','c','cpp','cs','go','rs','html','css','json','yaml','yml','xml','sql','md','sh'] },
       { name: '所有檔案', extensions: ['*'] }
     ];
+    const content = this._applySavePrefs('left');
     const result = await window.electronAPI.saveFile(
-      this._leftPath || 'left.txt', this._leftContent, filters,
+      this._leftPath || 'left.txt', content, filters,
       this._encodingLeft, _settings.getBackupOptions());
     // Cancelling the save dialog returns falsy. Clearing the flag regardless
     // told the user their edits were saved and let the tab close without a
@@ -3094,8 +3137,9 @@ export class TextCompare {
       { name: '文字檔', extensions: ['txt','js','ts','py','java','c','cpp','cs','go','rs','html','css','json','yaml','yml','xml','sql','md','sh'] },
       { name: '所有檔案', extensions: ['*'] }
     ];
+    const content = this._applySavePrefs('right');
     const result = await window.electronAPI.saveFile(
-      this._rightPath || 'right.txt', this._rightContent, filters,
+      this._rightPath || 'right.txt', content, filters,
       this._encodingRight, _settings.getBackupOptions());
     // Cancelling the save dialog returns falsy. Clearing the flag regardless
     // told the user their edits were saved and let the tab close without a
@@ -3104,6 +3148,65 @@ export class TextCompare {
     this._modified.right = false;
     this._updateModifiedIndicator();
     this._reportBackup(result);
+  }
+
+  /**
+   * 1.9 Options ▸ Editor: apply the save-time clean-ups to one pane and
+   * return the text that should actually be written.
+   *
+   * The transformed text is written back into the model and re-rendered, not
+   * just handed to the writer. Writing trimmed text while the pane still
+   * shows the untrimmed original would leave the view describing a file that
+   * no longer exists on disk, and the next diff would be computed against it.
+   *
+   * Both preferences default to false, so with an untouched Options dialog
+   * this returns the current content unchanged and nothing re-renders.
+   *
+   * @param {'left'|'right'} side
+   * @returns {string} the text to write
+   */
+  _applySavePrefs(side) {
+    const trim = Boolean(_settings.getPref('editTrimOnSave'));
+    const finalNl = Boolean(_settings.getPref('editEnsureFinalNewline'));
+    if (!trim && !finalNl) {
+      return (side === 'left' ? this._leftContent : this._rightContent) ?? '';
+    }
+
+    // A keystroke within the last 300ms is still sitting in the textarea and
+    // has not reached the model yet. Committing it here stops the pending
+    // timer from firing after the save and putting the untransformed text
+    // back, which would silently un-do the clean-up the user asked for.
+    this._commitPendingEdit(side);
+
+    const original = (side === 'left' ? this._leftContent : this._rightContent) ?? '';
+    let next = original;
+    if (trim) next = trimTrailingWhitespace(next);
+    if (finalNl) {
+      next = ensureFinalNewline(next, side === 'left' ? this._eolLeft : this._eolRight);
+    }
+    if (next === original) return original;
+
+    if (side === 'left') this._leftContent = next;
+    else this._rightContent = next;
+    this._syncEditTextareas();
+    this._runDiff();
+    this._updateStatusBar();
+    return next;
+  }
+
+  /**
+   * Flush a debounced edit-mode keystroke into the model immediately.
+   * @param {'left'|'right'} side
+   */
+  _commitPendingEdit(side) {
+    const timerKey = side === 'left' ? '_editTimerLeft' : '_editTimerRight';
+    if (this[timerKey] == null) return;
+    clearTimeout(this[timerKey]);
+    this[timerKey] = null;
+    const ta = side === 'left' ? this._textareaLeft : this._textareaRight;
+    if (!ta) return;
+    if (side === 'left') this._leftContent = ta.value;
+    else this._rightContent = ta.value;
   }
 
   /**
@@ -6820,7 +6923,10 @@ ${rows}
     const transform = (text) => {
       switch (op) {
         case 'trim':
-          return text.split('\n').map(l => l.replace(/[ \t]+$/, '')).join('\n');
+          // Not split('\n') + /[ \t]+$/: on a CRLF file every line still ends
+          // with the \r, so the anchor sits after it and the trim silently did
+          // nothing — on the platform this app mostly runs on.
+          return trimTrailingWhitespace(text);
         case 'tabs-to-spaces':
           return text.split('\n').map(l => l.replaceAll('\t', ' '.repeat(TAB_WIDTH))).join('\n');
         case 'spaces-to-tabs':

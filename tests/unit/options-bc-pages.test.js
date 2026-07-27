@@ -9,11 +9,30 @@
  * Difference and backup preferences had readers and no controls.
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'fs'
+import { readFileSync, readdirSync, statSync } from 'fs'
+import { join } from 'path'
+import { fileURLToPath } from 'url'
 import { DEFAULT_PREFS, PREF_PAGES } from '../../src/renderer/src/core/settings-store.js'
 
 const HTML = readFileSync(new URL('../../src/renderer/index.html', import.meta.url), 'utf-8')
 const APP = readFileSync(new URL('../../src/renderer/src/app.js', import.meta.url), 'utf-8')
+
+/** @param {string} dir @returns {string[]} every .js beneath it */
+function jsFiles(dir) {
+  const out = []
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name)
+    if (statSync(full).isDirectory()) out.push(...jsFiles(full))
+    else if (name.endsWith('.js')) out.push(full)
+  }
+  return out
+}
+
+/** Every renderer and main source, for finding who consumes a preference. */
+const SRC = [
+  ...jsFiles(fileURLToPath(new URL('../../src/renderer/src', import.meta.url))),
+  ...jsFiles(fileURLToPath(new URL('../../src/main', import.meta.url))),
+].map((f) => readFileSync(f, 'utf-8'))
 
 /** The six pages this change added, on top of the seven already there. */
 const NEW_PAGES = ['folderViews', 'picture', 'textEditing', 'archives', 'openWith', 'tweaks']
@@ -79,6 +98,27 @@ describe('every preference is reachable and every control is bound', () => {
     expect(unbound).toEqual([])
   })
 
+  it('every preference is read by something, not only written', () => {
+    // The half this file originally missed. Proving a control writes the
+    // preference says nothing about whether anything consumes it, and a
+    // dialog whose settings are all write-only looks complete while changing
+    // nothing at all. Fourteen of these eighteen were in exactly that state.
+    //
+    // The binding table itself is not a reader: it names every preference by
+    // construction, so counting it would make this check vacuous again.
+    const bindings = APP.slice(APP.indexOf('function setupPreferenceControls'))
+    const bindingBody = bindings.slice(0, bindings.indexOf('\n}\n'))
+    const consumers = SRC.map((s) => (s === APP ? s.replace(bindingBody, '') : s)).join('\n')
+
+    const writeOnly = []
+    for (const page of NEW_PAGES) {
+      for (const pref of PREF_PAGES[page]) {
+        if (!consumers.includes(`getPref('${pref}')`)) writeOnly.push(`${page}.${pref}`)
+      }
+    }
+    expect(writeOnly, 'stored by a control and consumed by nothing').toEqual([])
+  })
+
   it('no preference is claimed by two pages', () => {
     // Two pages resetting the same preference makes "restore this page" mean
     // different things depending on where you clicked.
@@ -107,6 +147,22 @@ describe('the defaults are the safe answer', () => {
 
   it('starts image comparison at exact match', () => {
     expect(DEFAULT_PREFS.pictureTolerance).toBe(0)
+  })
+
+  it('every tuning default matches the constant it overrides', () => {
+    // A default that disagrees with the code's own value retunes the app for
+    // every user who never opens the page. Three preferences on these pages
+    // shipped that way: auto scale on, blend mode 'normal', and these.
+    const FC = readFileSync(
+      new URL('../../src/renderer/src/views/folder-compare.js', import.meta.url), 'utf-8')
+    const constant = (name) => {
+      const m = FC.match(new RegExp(`\\b${name}\\s*=\\s*(\\d+)`))
+      expect(m, `${name} is no longer a numeric constant`).toBeTruthy()
+      return Number(m[1])
+    }
+    expect(DEFAULT_PREFS.tweakConcurrency).toBe(constant('RULES_CONCURRENCY'))
+    expect(DEFAULT_PREFS.tweakVirtualOverscan).toBe(constant('OVERSCAN'))
+    expect(DEFAULT_PREFS.tweakPrefetchLimit).toBe(constant('MAX_VERSION_PREFETCH'))
   })
 
   it('does not resample one image to the other by default', () => {

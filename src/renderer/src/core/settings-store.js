@@ -132,9 +132,20 @@ export const DEFAULT_PREFS = {
   // Tweaks — the ceilings that used to be module constants only. Exposed
   // because the right value depends on the machine and the tree being
   // compared, and the failure mode of a too-low one is silent truncation.
-  tweakPrefetchLimit: 500,
-  tweakConcurrency: 4,
-  tweakVirtualOverscan: 10,
+  // Each of these matches the constant it overrides, so a user who never opens
+  // the page gets exactly today's behaviour. Picking a round number instead —
+  // 4 against a real concurrency of 8, 10 against an overscan of 4 — would
+  // have silently retuned the app for everyone, which is the mistake the
+  // picture defaults on this same page already made once.
+  //
+  // The prefetch value is a ceiling applied with min() to each column's own
+  // budget, not a replacement for it: the checksum column deliberately stops
+  // lower because every one of its reads hashes a whole file. So lowering this
+  // tightens every column and raising it never exceeds what a column can
+  // afford.
+  tweakPrefetchLimit: 2000,
+  tweakConcurrency: 8,
+  tweakVirtualOverscan: 4,
 }
 
 /**
