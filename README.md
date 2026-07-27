@@ -196,11 +196,17 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**1523 / 1523 unit tests passing**、**107 / 107 e2e tests passing**。
+目前覆蓋：**3018 / 3018 unit tests passing**、**243 / 243 e2e tests passing**。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、
-快照格式、壓縮檔（含 Zip Slip 與比例炸彈）、ID3 與 PE 解析、登錄檔格式等 52 個測試檔。
+快照格式、壓縮檔（含 Zip Slip 與比例炸彈）、ID3 與 PE 解析、登錄檔格式、
+SSH 傳輸層（對 paramiko 互通測試）、OAuth PKCE、文法系統的病態輸入防護等 102 個測試檔。
+
+其中四支專門防「實作完整但沒有呼叫端」——這個專案最常犯的錯，兩次稽核共找到九次：
+`preload-orphans`（每個 IPC 方法都有呼叫端）、`menu-wiring`（每個選單項目都有處理常式）、
+`text-menu-commands`（指令表、dispatch、選單三處一致）、
+`remote-kinds-offered`（設定介面提供的連線類型與後端支援的一致）。
 
 ### E2E 測試（Playwright + Electron）
 
