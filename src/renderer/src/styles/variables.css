@@ -47,6 +47,37 @@
   --color-warning:    #f0b429;
   --color-warning-strong: #e07800;
   --color-warning-bg: #fff8e1;
+
+  /* Names the per-view stylesheets actually ask for.
+   *
+   * The palette above was added to "avoid the ~30 hardcoded blues scattered
+   * through the per-view CSS" — but those stylesheets say `--accent-color`,
+   * not `--accent`, so every one of them silently fell through to its literal
+   * fallback and the tokenisation never took effect. Thirty-two `var()` calls
+   * across seven stylesheets referenced names nothing defined; an audit of
+   * defined-versus-used is what surfaced it, because a `var(x, fallback)` that
+   * always takes the fallback looks perfectly fine on screen.
+   *
+   * The visible consequence was two different blues in one app — #4a90d9 for
+   * selection and focus, #007acc for everything else — and hover and status
+   * colours that could not follow the theme.
+   *
+   * Defined here rather than by rewriting the call sites: one edit, and the
+   * fallbacks stay as the safety net they were meant to be. */
+  --accent-color:     var(--accent);
+  --bg-hover:         rgb(0 0 0 / 6%);
+  --hover-bg:         var(--bg-hover);
+  --bg-tertiary:      #ececec;
+  --color-danger:     var(--diff-delete-border);
+  --diff-change-bg:   var(--diff-replace-bg);
+  --status-different: var(--diff-delete-border);
+  --font-mono:        Consolas, 'Courier New', monospace;
+
+  /* Sizes the views ask for by name; kept at the values their fallbacks used,
+   * so this change is purely about where the number lives. */
+  --fc-row-height:    22px;
+  --hx-thumb-width:   12px;
+  --tc-thumb-width:   12px;
 }
 
 [data-theme="dark"] {
@@ -72,4 +103,10 @@
   --diff-unimportant-border: #0969da;
   --diff-char-insert: #1a4428;
   --diff-char-delete: #5c1a1a;
+
+  /* The two that need a genuinely different value in dark, rather than
+     resolving through a token that already flips. A 6% black wash is
+     invisible on a #1e1e1e background, and #ececec is a light-theme grey. */
+  --bg-hover:    rgb(255 255 255 / 8%);
+  --bg-tertiary: #2d2d2d;
 }

@@ -536,6 +536,38 @@
   flex-shrink: 0;
 }
 
+/* The readout switches sit on the panel title, pushed to its right edge. */
+.hx-details-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hx-readout-btn {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+}
+
+.hx-readout-btn:first-of-type {
+  margin-left: auto;
+}
+
+.hx-readout-btn:hover {
+  background: var(--bg-hover, var(--bg-toolbar));
+}
+
+.hx-readout-btn.active {
+  color: var(--text-primary);
+  border-color: var(--accent-color, var(--text-primary));
+  font-weight: 600;
+}
+
 .hx-details-body,
 .hx-fileinfo-body {
   flex: 1;

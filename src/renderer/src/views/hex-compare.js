@@ -766,6 +766,16 @@ function formatOffset(offset) {
  * @property {string} label      display label
  * @property {string} value      formatted value, or the reason it is unreadable
  * @property {boolean} available false when the file ends before the type fits
+ * @property {'le'|'be'|null} [endian] which endian group the row belongs to;
+ *   null/absent for readings where endianness does not apply (single bytes,
+ *   the address itself)
+ */
+
+/**
+ * @typedef {object} HexReadoutOptions
+ * @property {boolean} [showAddress=true]      BC View ▸ Current Byte Address
+ * @property {boolean} [littleEndian=true]     BC View ▸ Little Endian Values
+ * @property {boolean} [bigEndian=true]        BC View ▸ Big Endian Values
  */
 
 /**
@@ -803,11 +813,18 @@ function formatFloat(v) {
  * the shortfall spelled out — reading it from a zero-padded buffer would show
  * a number that is not in the file.
  *
+ * `opts` drops whole endian groups, mirroring BC's two View-menu switches. The
+ * filtering happens here rather than in CSS so that a hidden group is genuinely
+ * absent from the model the panel and the tests both read.
+ *
  * @param {Uint8Array|null} bytes
  * @param {number} offset
+ * @param {HexReadoutOptions} [opts]
  * @returns {HexDetailRow[]} empty when the offset is outside the data
  */
-export function hexDetailRows(bytes, offset) {
+export function hexDetailRows(bytes, offset, opts = {}) {
+  const wantLE = opts.littleEndian !== false
+  const wantBE = opts.bigEndian !== false
   const len = bytes ? bytes.length : 0
   const idx = Math.trunc(offset)
   if (!bytes || len === 0 || !Number.isFinite(idx) || idx < 0 || idx >= len) return []
@@ -826,44 +843,106 @@ export function hexDetailRows(bytes, offset) {
    * @param {string} label
    * @param {number} size
    * @param {() => string} read
+   * @param {'le'|'be'|null} [endian]
    */
-  const push = (key, label, size, read) => {
+  const push = (key, label, size, read, endian = null) => {
+    if (endian === 'le' && !wantLE) return
+    if (endian === 'be' && !wantBE) return
     rows.push(avail >= size
-      ? { key, label, value: read(), available: true }
-      : { key, label, value: `需要 ${size} 位元組，此位置只剩 ${avail}`, available: false })
+      ? { key, label, value: read(), available: true, endian }
+      : { key, label, value: `需要 ${size} 位元組，此位置只剩 ${avail}`, available: false, endian })
   }
 
   const b = bytes[idx]
-  rows.push({ key: 'hex', label: '位元組 (hex)', value: `0x${toHex(b)}`, available: true })
+  rows.push({ key: 'hex', label: '位元組 (hex)', value: `0x${toHex(b)}`, available: true, endian: null })
   rows.push({
     key: 'binary',
     label: '二進位',
     value: b.toString(2).padStart(8, '0').replace(/^(\d{4})(\d{4})$/, '$1 $2'),
     available: true,
+    endian: null,
   })
-  rows.push({ key: 'octal', label: '八進位', value: `0o${b.toString(8).padStart(3, '0')}`, available: true })
-  rows.push({ key: 'char', label: '字元', value: describeChar(b), available: true })
+  rows.push({ key: 'octal', label: '八進位', value: `0o${b.toString(8).padStart(3, '0')}`, available: true, endian: null })
+  rows.push({ key: 'char', label: '字元', value: describeChar(b), available: true, endian: null })
 
+  // Single bytes have no byte order, so they stay visible whichever endian
+  // group is switched off — hiding them with one of the groups would leave the
+  // panel blank for the exact case where byte order is meaningless.
   push('int8', 'int8', 1, () => String(view.getInt8(0)))
   push('uint8', 'uint8', 1, () => String(view.getUint8(0)))
-  push('int16le', 'int16 (LE)', 2, () => String(view.getInt16(0, true)))
-  push('int16be', 'int16 (BE)', 2, () => String(view.getInt16(0, false)))
-  push('uint16le', 'uint16 (LE)', 2, () => String(view.getUint16(0, true)))
-  push('uint16be', 'uint16 (BE)', 2, () => String(view.getUint16(0, false)))
-  push('int32le', 'int32 (LE)', 4, () => String(view.getInt32(0, true)))
-  push('int32be', 'int32 (BE)', 4, () => String(view.getInt32(0, false)))
-  push('uint32le', 'uint32 (LE)', 4, () => String(view.getUint32(0, true)))
-  push('uint32be', 'uint32 (BE)', 4, () => String(view.getUint32(0, false)))
-  push('int64le', 'int64 (LE)', 8, () => view.getBigInt64(0, true).toString())
-  push('int64be', 'int64 (BE)', 8, () => view.getBigInt64(0, false).toString())
-  push('uint64le', 'uint64 (LE)', 8, () => view.getBigUint64(0, true).toString())
-  push('uint64be', 'uint64 (BE)', 8, () => view.getBigUint64(0, false).toString())
-  push('float32le', 'float32 (LE)', 4, () => formatFloat(view.getFloat32(0, true)))
-  push('float32be', 'float32 (BE)', 4, () => formatFloat(view.getFloat32(0, false)))
-  push('float64le', 'float64 (LE)', 8, () => formatFloat(view.getFloat64(0, true)))
-  push('float64be', 'float64 (BE)', 8, () => formatFloat(view.getFloat64(0, false)))
+  push('int16le', 'int16 (LE)', 2, () => String(view.getInt16(0, true)), 'le')
+  push('int16be', 'int16 (BE)', 2, () => String(view.getInt16(0, false)), 'be')
+  push('uint16le', 'uint16 (LE)', 2, () => String(view.getUint16(0, true)), 'le')
+  push('uint16be', 'uint16 (BE)', 2, () => String(view.getUint16(0, false)), 'be')
+  push('int32le', 'int32 (LE)', 4, () => String(view.getInt32(0, true)), 'le')
+  push('int32be', 'int32 (BE)', 4, () => String(view.getInt32(0, false)), 'be')
+  push('uint32le', 'uint32 (LE)', 4, () => String(view.getUint32(0, true)), 'le')
+  push('uint32be', 'uint32 (BE)', 4, () => String(view.getUint32(0, false)), 'be')
+  // 64-bit readings go through BigInt end to end: a Number cannot represent
+  // every value in this range, and a hex dump is inspected precisely because
+  // the exact bits matter.
+  push('int64le', 'int64 (LE)', 8, () => view.getBigInt64(0, true).toString(), 'le')
+  push('int64be', 'int64 (BE)', 8, () => view.getBigInt64(0, false).toString(), 'be')
+  push('uint64le', 'uint64 (LE)', 8, () => view.getBigUint64(0, true).toString(), 'le')
+  push('uint64be', 'uint64 (BE)', 8, () => view.getBigUint64(0, false).toString(), 'be')
+  push('float32le', 'float32 (LE)', 4, () => formatFloat(view.getFloat32(0, true)), 'le')
+  push('float32be', 'float32 (BE)', 4, () => formatFloat(view.getFloat32(0, false)), 'be')
+  push('float64le', 'float64 (LE)', 8, () => formatFloat(view.getFloat64(0, true)), 'le')
+  push('float64be', 'float64 (BE)', 8, () => formatFloat(view.getFloat64(0, false)), 'be')
 
   return rows
+}
+
+/**
+ * BC's "Current Byte Address": where the cursor is, in both bases.
+ *
+ * Decimal as well as hex because file formats document offsets in whichever
+ * base their author preferred, and mentally converting an eight-digit hex
+ * number is exactly the chore this readout exists to remove.
+ *
+ * @param {number} offset
+ * @param {number} [totalLength] when given, the remaining byte count is shown too
+ * @returns {HexDetailRow[]}
+ */
+export function hexAddressRows(offset, totalLength) {
+  const idx = Math.trunc(offset)
+  if (!Number.isFinite(idx) || idx < 0) return []
+  /** @type {HexDetailRow[]} */
+  const rows = [
+    { key: 'addrHex', label: '位址 (hex)', value: `0x${formatOffset(idx)}`, available: true, endian: null },
+    { key: 'addrDec', label: '位址 (10 進位)', value: String(idx), available: true, endian: null },
+  ]
+  if (Number.isFinite(totalLength) && /** @type {number} */ (totalLength) >= 0) {
+    const total = Math.trunc(/** @type {number} */ (totalLength))
+    rows.push({
+      key: 'addrRemaining',
+      label: '剩餘位元組',
+      value: String(Math.max(0, total - idx)),
+      available: true,
+      endian: null,
+    })
+  }
+  return rows
+}
+
+/**
+ * The whole readout for one cursor position: address line then values,
+ * with each of BC's three View-menu switches applied.
+ *
+ * @param {Uint8Array|null} bytes
+ * @param {number} offset
+ * @param {HexReadoutOptions} [opts]
+ * @returns {HexDetailRow[]} empty when the offset is outside the data
+ */
+export function hexReadoutRows(bytes, offset, opts = {}) {
+  const values = hexDetailRows(bytes, offset, opts)
+  // An out-of-range offset yields nothing at all, address included: printing an
+  // address for a byte that is not in the file would be a confident lie.
+  if (values.length === 0) return []
+  const address = opts.showAddress === false
+    ? []
+    : hexAddressRows(offset, bytes ? bytes.length : 0)
+  return [...address, ...values]
 }
 
 /**
@@ -898,6 +977,9 @@ export class HexCompare {
    * @param {boolean} [options.showDetails=false]   顯示 Hex Details 面板
    * @param {boolean} [options.showFileInfo=false]  顯示 File Info 面板
    * @param {boolean} [options.showRuler=false]     顯示欄位標尺
+   * @param {boolean} [options.showByteAddress=true]  Details 內顯示位元組位址
+   * @param {boolean} [options.showLittleEndian=true] Details 內顯示 LE 數值
+   * @param {boolean} [options.showBigEndian=true]    Details 內顯示 BE 數值
    * @param {boolean} [options.showThumbnail=false] 顯示整檔差異縮圖
    * @param {'side-by-side'|'over-under'} [options.layout='side-by-side']
    */
@@ -1039,6 +1121,14 @@ export class HexCompare {
     this._showFileInfo = options.showFileInfo ?? false
     /** @type {boolean} 欄位標尺 */
     this._showRuler = options.showRuler ?? false
+    // BC's three View-menu switches over the readout. Default on: a details
+    // panel that opens empty teaches the user the feature is broken.
+    /** @type {boolean} 目前位元組位址 */
+    this._showByteAddress = options.showByteAddress ?? true
+    /** @type {boolean} Little Endian 數值群組 */
+    this._showLittleEndian = options.showLittleEndian ?? true
+    /** @type {boolean} Big Endian 數值群組 */
+    this._showBigEndian = options.showBigEndian ?? true
     /**
      * mtime per path, filled in lazily from read-dir. Cached because the panel
      * repaints on every cursor move and re-listing the folder each time would
@@ -1220,6 +1310,9 @@ export class HexCompare {
       diffAlgorithm: this._diffAlgorithm,
       showFilter: this._showFilter,
       showDetails: this._showDetails,
+      showByteAddress: this._showByteAddress,
+      showLittleEndian: this._showLittleEndian,
+      showBigEndian: this._showBigEndian,
       showFileInfo: this._showFileInfo,
       showRuler: this._showRuler,
       showThumbnail: this._showThumbnail,
@@ -1241,6 +1334,9 @@ export class HexCompare {
       this._showFilter = settings.showFilter
     }
     if (typeof settings.showDetails === 'boolean') this._showDetails = settings.showDetails
+    if (typeof settings.showByteAddress === 'boolean') this._showByteAddress = settings.showByteAddress
+    if (typeof settings.showLittleEndian === 'boolean') this._showLittleEndian = settings.showLittleEndian
+    if (typeof settings.showBigEndian === 'boolean') this._showBigEndian = settings.showBigEndian
     if (typeof settings.showFileInfo === 'boolean') this._showFileInfo = settings.showFileInfo
     if (typeof settings.showRuler === 'boolean') this._showRuler = settings.showRuler
     if (settings.layout === 'side-by-side' || settings.layout === 'over-under') {
@@ -2269,6 +2365,66 @@ ${body}
   // ── Private: keyboard editing ───────────────────────────────────────────────
 
   /**
+   * Cursor movement with no editing attached.
+   *
+   * Only the highlight is repainted, not the pane: the readout has to keep up
+   * with held-down arrow keys on a 10 MB file, and rebuilding the visible rows
+   * for a one-byte move would be the expensive way to move a class name.
+   *
+   * @param {KeyboardEvent} e
+   * @param {'left'|'right'} side
+   */
+  _onReadOnlyNavKeyDown(e, side) {
+    const cursor = this._cursor
+    // No cursor on this side means the user has not clicked into it; leave the
+    // arrow keys to the scroller.
+    if (!cursor || cursor.side !== side) return
+    const bpr = this._bytesPerRow
+    /** @type {number|null} */
+    let next = null
+    switch (e.key) {
+      case 'ArrowLeft':  next = cursor.offset - 1; break
+      case 'ArrowRight': next = cursor.offset + 1; break
+      case 'ArrowUp':    next = cursor.offset - bpr; break
+      case 'ArrowDown':  next = cursor.offset + bpr; break
+      case 'Home':       next = cursor.offset - (cursor.offset % bpr); break
+      case 'End':        next = cursor.offset - (cursor.offset % bpr) + bpr - 1; break
+      default: return
+    }
+    e.preventDefault()
+    this._moveCursorTo(side, next, cursor.field)
+    this._ensureCursorVisible()
+    this._paintCursorHighlight()
+  }
+
+  /**
+   * Move the cursor / selection classes to the byte the cursor is on.
+   *
+   * A no-op for a row the virtual scroller has thrown away — that row will be
+   * built from `_cursor` when it scrolls back into view.
+   */
+  _paintCursorHighlight() {
+    const scope = this._container ?? document
+    scope.querySelectorAll('.hx-selected, .hx-cursor')
+      .forEach((node) => node.classList.remove('hx-selected', 'hx-cursor', 'hx-cursor-n0', 'hx-cursor-n1'))
+    const cursor = this._cursor
+    if (!cursor) return
+    const pane = this._dom[`scroll_${cursor.side}`]
+    if (!pane) return
+    const rowIndex = Math.floor(cursor.offset / this._bytesPerRow)
+    const col = cursor.offset % this._bytesPerRow
+    const rowEl = pane.querySelector(`.hx-row[data-row="${rowIndex}"]`)
+    if (!rowEl) return
+    const hexSpan = rowEl.querySelectorAll('.hx-hex .hx-byte')[col]
+    const asciiSpan = rowEl.querySelectorAll('.hx-ascii .hx-ascii-char')[col]
+    hexSpan?.classList.add('hx-selected')
+    asciiSpan?.classList.add('hx-selected')
+    const target = cursor.field === 'ascii' ? asciiSpan : hexSpan
+    target?.classList.add('hx-cursor')
+    if (cursor.field === 'hex') hexSpan?.classList.add(`hx-cursor-n${cursor.nibble}`)
+  }
+
+  /**
    * Typing, navigation and insert/delete inside a pane.
    * @param {KeyboardEvent} e
    * @param {'left'|'right'} side
@@ -2277,7 +2433,10 @@ ${body}
     // Ctrl/Alt combinations belong to the document-level handler; handling them
     // here as well would run undo twice for one Ctrl+Z.
     if (e.ctrlKey || e.metaKey || e.altKey) return
-    if (!this._editMode) return
+    // Outside edit mode the arrow keys still walk the cursor, because the
+    // readout panel is only useful if the byte it describes can be moved
+    // without first putting the file at risk of being edited.
+    if (!this._editMode) { this._onReadOnlyNavKeyDown(e, side); return }
     const cursor = this._cursor
     if (!cursor || cursor.side !== side) return
 
@@ -2547,7 +2706,22 @@ ${body}
     const panels = el('div', { className: 'hx-panels' })
 
     const details = el('div', { className: 'hx-details' })
-    details.appendChild(el('div', { className: 'hx-panel-title' }, 'Hex Details'))
+    // BC keeps these three under the View menu; here they live on the panel they
+    // control, so they are only present when there is a readout to control.
+    const title = el('div', { className: 'hx-panel-title hx-details-title' }, 'Hex Details')
+    const btnByteAddress = el('button',
+      { className: 'hx-readout-btn', id: 'hx-btn-addr', title: '顯示 / 隱藏目前位元組位址' }, '位址')
+    const btnLittleEndian = el('button',
+      { className: 'hx-readout-btn', id: 'hx-btn-le', title: '顯示 / 隱藏 Little Endian 數值' }, 'LE')
+    const btnBigEndian = el('button',
+      { className: 'hx-readout-btn', id: 'hx-btn-be', title: '顯示 / 隱藏 Big Endian 數值' }, 'BE')
+    this._dom.btnByteAddress = btnByteAddress
+    this._dom.btnLittleEndian = btnLittleEndian
+    this._dom.btnBigEndian = btnBigEndian
+    title.appendChild(btnByteAddress)
+    title.appendChild(btnLittleEndian)
+    title.appendChild(btnBigEndian)
+    details.appendChild(title)
     const detailsBody = el('div', { className: 'hx-details-body' })
     this._dom.detailsBody = detailsBody
     details.appendChild(detailsBody)
@@ -3145,6 +3319,9 @@ ${body}
     btnDetails.addEventListener('click', () => this.toggleDetails())
     btnFileInfo.addEventListener('click', () => this.toggleFileInfo())
     btnRuler.addEventListener('click', () => this.toggleRuler())
+    this._dom.btnByteAddress?.addEventListener('click', () => this.toggleByteAddress())
+    this._dom.btnLittleEndian?.addEventListener('click', () => this.toggleLittleEndian())
+    this._dom.btnBigEndian?.addEventListener('click', () => this.toggleBigEndian())
     btnThumb.addEventListener('click', () => this.toggleThumbnail())
     btnLayout.addEventListener('click', () => this.toggleLayout())
     btnReload.addEventListener('click', () => void this.reloadAll())
@@ -4189,6 +4366,75 @@ ${body}
   /** @returns {boolean} */
   toggleDetails() { return this.setDetailsVisible(!this._showDetails) }
 
+  // ── BC View ▸ Current Byte Address / Little Endian / Big Endian ─────────────
+
+  /** @returns {boolean} */
+  isByteAddressVisible() { return this._showByteAddress }
+
+  /** @returns {boolean} */
+  isLittleEndianVisible() { return this._showLittleEndian }
+
+  /** @returns {boolean} */
+  isBigEndianVisible() { return this._showBigEndian }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setByteAddressVisible(on) {
+    this._showByteAddress = Boolean(on)
+    this._syncReadoutButtons()
+    this._updateDetailsPanel()
+    return this._showByteAddress
+  }
+
+  /** @returns {boolean} */
+  toggleByteAddress() { return this.setByteAddressVisible(!this._showByteAddress) }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setLittleEndianVisible(on) {
+    this._showLittleEndian = Boolean(on)
+    this._syncReadoutButtons()
+    this._updateDetailsPanel()
+    return this._showLittleEndian
+  }
+
+  /** @returns {boolean} */
+  toggleLittleEndian() { return this.setLittleEndianVisible(!this._showLittleEndian) }
+
+  /**
+   * @param {boolean} on
+   * @returns {boolean} the state now in effect
+   */
+  setBigEndianVisible(on) {
+    this._showBigEndian = Boolean(on)
+    this._syncReadoutButtons()
+    this._updateDetailsPanel()
+    return this._showBigEndian
+  }
+
+  /** @returns {boolean} */
+  toggleBigEndian() { return this.setBigEndianVisible(!this._showBigEndian) }
+
+  /** The readout options as `hexReadoutRows` wants them. */
+  _readoutOptions() {
+    return {
+      showAddress: this._showByteAddress,
+      littleEndian: this._showLittleEndian,
+      bigEndian: this._showBigEndian,
+    }
+  }
+
+  /** Reflect the three readout switches onto their toolbar buttons. */
+  _syncReadoutButtons() {
+    this._dom.btnByteAddress?.classList.toggle('active', this._showByteAddress)
+    this._dom.btnLittleEndian?.classList.toggle('active', this._showLittleEndian)
+    this._dom.btnBigEndian?.classList.toggle('active', this._showBigEndian)
+  }
+
   /**
    * @param {boolean} on
    * @returns {boolean} the state now in effect
@@ -4224,6 +4470,7 @@ ${body}
     btnDetails?.classList.toggle('active', this._showDetails)
     btnFileInfo?.classList.toggle('active', this._showFileInfo)
     btnRuler?.classList.toggle('active', this._showRuler)
+    this._syncReadoutButtons()
 
     for (const side of /** @type {const} */ (['left', 'right'])) {
       const ruler = this._dom[`ruler_${side}`]
@@ -4270,7 +4517,7 @@ ${body}
       return
     }
     const bytes = cursor.side === 'left' ? this._leftBytes : this._rightBytes
-    const rows = hexDetailRows(bytes, cursor.offset)
+    const rows = hexReadoutRows(bytes, cursor.offset, this._readoutOptions())
     if (rows.length === 0) {
       body.appendChild(el('div', { className: 'hx-panel-empty' }, '游標位置已超出檔案範圍'))
       return
@@ -4282,8 +4529,12 @@ ${body}
     const grid = el('div', { className: 'hx-detail-grid' })
     for (const row of rows) {
       grid.appendChild(el('span', { className: 'hx-detail-label' }, row.label))
-      grid.appendChild(el('span',
-        { className: `hx-detail-value${row.available ? '' : ' hx-detail-value--na'}` }, row.value))
+      // The key goes on the DOM so tests (and the user's own inspection) can
+      // address one reading without depending on the row order.
+      grid.appendChild(el('span', {
+        className: `hx-detail-value${row.available ? '' : ' hx-detail-value--na'}`,
+        'data-key': row.key,
+      }, row.value))
     }
     body.appendChild(grid)
   }

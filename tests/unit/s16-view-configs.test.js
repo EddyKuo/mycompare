@@ -35,6 +35,8 @@ describe('HexCompare config', () => {
       __v: 1, __view: 'hex', bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff',
       // P2-40: panel visibility travels with the config too.
       showDetails: false, showFileInfo: false, showRuler: false,
+      // BC View ▸ Current Byte Address / Little Endian / Big Endian.
+      showByteAddress: true, showLittleEndian: true, showBigEndian: true,
       // S24: so does the layout axis and the thumbnail.
       layout: 'over-under', showThumbnail: true,
     })
