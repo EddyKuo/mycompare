@@ -232,6 +232,13 @@
   transform-origin: 0 0;
 }
 
+/* Which pane the drop will land in decides which side is replaced, so the
+   pane under the cursor has to be identifiable before the mouse is released. */
+.ic-canvas-wrap.ic-drop-target {
+  outline: 2px dashed var(--accent-color, #4a90d9);
+  outline-offset: -2px;
+}
+
 .ic-canvas-wrap canvas {
   display: block;
   /* Canvas 尺寸由 JS 動態設定 */

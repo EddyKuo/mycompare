@@ -25,6 +25,7 @@ import { showContextMenu, closeContextMenu } from '../core/context-menu.js'
 import { isActive } from '../core/active-view.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
+import { renderTextTable, reportHeader } from '../core/report.js'
 import '../styles/image-compare.css'
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
@@ -451,6 +452,154 @@ export function formatDiffStats(diffCount, totalPixels, approximate = false) {
   return `差異像素 ${mark}${diffCount.toLocaleString()} / 總像素 ${totalPixels.toLocaleString()} (${mark}${pct}%)${suffix}`
 }
 
+// ── Report ────────────────────────────────────────────────────────────────────
+
+/**
+ * Everything a report says about an image comparison.
+ *
+ * @typedef {object} ImageReportInfo
+ * @property {string} leftPath
+ * @property {string} rightPath
+ * @property {{ w: number, h: number } | null} leftSize
+ * @property {{ w: number, h: number } | null} rightSize
+ * @property {number | null} diffCount   null when a side is missing
+ * @property {number | null} totalPixels
+ * @property {boolean} approximate
+ * @property {number} regionCount
+ * @property {number} threshold
+ * @property {'exact'|'tolerance'|'grayscale'} algorithm
+ * @property {boolean} autoScale
+ * @property {boolean} mismatchRange
+ * @property {'normal'|'difference'|'blend'} blendMode
+ * @property {string} highlightColor
+ */
+
+const ALGORITHM_LABELS = {
+  exact: '精確比對',
+  tolerance: '容差比對（±10）',
+  grayscale: '灰階比對',
+}
+
+const BLEND_LABELS = { normal: '無', difference: '差異', blend: '混合' }
+
+/**
+ * The comparison parameters, as label/value pairs.
+ *
+ * A pixel count means nothing without the threshold and algorithm that
+ * produced it, so the report carries them rather than only the verdict.
+ *
+ * @param {ImageReportInfo} info
+ * @returns {string[][]}
+ */
+export function imageReportParameters(info) {
+  const size = (s) => (s ? `${s.w}×${s.h}` : '（未載入）')
+  return [
+    ['左圖尺寸', size(info.leftSize)],
+    ['右圖尺寸', size(info.rightSize)],
+    ['差異閾值', Number(info.threshold ?? 0).toFixed(2)],
+    ['比對演算法', ALGORITHM_LABELS[info.algorithm] ?? String(info.algorithm)],
+    ['自動縮放對齊', info.autoScale ? '開' : '關'],
+    ['差異分級', info.mismatchRange ? '開' : '關'],
+    ['疊加模式', BLEND_LABELS[info.blendMode] ?? String(info.blendMode)],
+    ['標示色', HIGHLIGHT_COLORS[info.highlightColor]?.label ?? String(info.highlightColor)],
+    ['差異區塊數', String(info.regionCount ?? 0)],
+  ]
+}
+
+/**
+ * Plain-text image comparison report.
+ *
+ * @param {ImageReportInfo} info
+ * @param {{ generatedAt?: Date }} [opts]
+ * @returns {string}
+ */
+export function buildImageTextReport(info, opts = {}) {
+  const header = reportHeader({
+    title: '圖片比對報告',
+    leftPath: info.leftPath,
+    rightPath: info.rightPath,
+    generatedAt: opts.generatedAt,
+  })
+  const summary = (info.diffCount === null || info.totalPixels === null)
+    ? '尚未載入兩張圖片，無法計算差異'
+    : formatDiffStats(info.diffCount, info.totalPixels, info.approximate)
+  const table = renderTextTable(
+    [{ title: '項目' }, { title: '值' }],
+    imageReportParameters(info))
+  return `${header}${summary}\n\n${table}\n`
+}
+
+/**
+ * @param {string} s
+ * @returns {string}
+ */
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+/**
+ * Self-contained HTML image comparison report.
+ *
+ * Images are passed in as data URLs rather than read from the canvases here so
+ * the markup can be tested without a real canvas implementation; a side whose
+ * URL is empty is reported as unavailable rather than rendered as a broken
+ * image.
+ *
+ * @param {ImageReportInfo} info
+ * @param {{ left?: string, right?: string, diff?: string }} [images]
+ * @param {{ generatedAt?: Date }} [opts]
+ * @returns {string}
+ */
+export function buildImageHtmlReport(info, images = {}, opts = {}) {
+  const when = (opts.generatedAt ?? new Date()).toISOString().replace('T', ' ').slice(0, 19)
+  const summary = (info.diffCount === null || info.totalPixels === null)
+    ? '尚未載入兩張圖片，無法計算差異'
+    : formatDiffStats(info.diffCount, info.totalPixels, info.approximate)
+
+  const pane = (label, url) => `<figure class="pane">
+  <figcaption>${escapeHtml(label)}</figcaption>
+  ${url
+    ? `<img alt="${escapeHtml(label)}" src="${escapeHtml(url)}" />`
+    : '<p class="missing">（無法擷取影像）</p>'}
+</figure>`
+
+  const rows = imageReportParameters(info)
+    .map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`)
+    .join('\n')
+
+  return `<!DOCTYPE html><html lang="zh-TW"><head><meta charset="utf-8">
+<title>圖片比對報告</title>
+<style>
+body{font-family:system-ui,"Microsoft JhengHei",sans-serif;margin:16px;color:#222;background:#fff}
+h2{margin:0 0 8px}
+.paths{font-size:12px;color:#555;margin-bottom:8px;word-break:break-all}
+.summary{font-size:13px;margin-bottom:12px}
+.panes{display:flex;gap:12px;flex-wrap:wrap}
+.pane{margin:0;flex:1 1 280px}
+.pane figcaption{font-size:12px;color:#555;margin-bottom:4px}
+.pane img{max-width:100%;border:1px solid #ccc;background:#fff}
+.missing{font-size:12px;color:#a00}
+table{border-collapse:collapse;margin-top:14px}
+th,td{border:1px solid #ddd;padding:3px 8px;font-size:12px;text-align:left}
+@media print{body{margin:8mm}.no-print{display:none !important}}
+</style>
+</head><body>
+<h2>圖片比對報告</h2>
+<div class="paths">左：${escapeHtml(info.leftPath || '（未知）')} &nbsp;|&nbsp; 右：${escapeHtml(info.rightPath || '（未知）')}</div>
+<div class="summary">${escapeHtml(summary)}　生成時間：${escapeHtml(when)}</div>
+<div class="panes">
+${pane('左側', images.left ?? '')}
+${pane('右側', images.right ?? '')}
+${pane('差異', images.diff ?? '')}
+</div>
+<table><tbody>
+${rows}
+</tbody></table>
+</body></html>`
+}
+
 // ── Zoom/Pan sync ─────────────────────────────────────────────────────────────
 
 const MIN_ZOOM = 0.1
@@ -665,6 +814,16 @@ export class ImageCompare {
     this._pendingFirstDiff = false
 
     /**
+     * Last computed statistics, kept so a report states the same numbers the
+     * status bar shows rather than re-running the diff to find out.
+     * @type {{ diffCount: number|null, totalPixels: number|null, approximate: boolean }}
+     */
+    this._stats = { diffCount: null, totalPixels: null, approximate: false }
+
+    /** @type {(() => void) | null} removes the drag/drop listeners on destroy */
+    this._dropCleanup = null
+
+    /**
      * S16: user-selectable highlight colour key (see HIGHLIGHT_COLORS).
      * @type {string}
      */
@@ -854,6 +1013,8 @@ export class ImageCompare {
     this._unbindKeyboardShortcuts()
     this._magCleanup?.()
     this._magCleanup = null
+    this._dropCleanup?.()
+    this._dropCleanup = null
     if (this._syncTransform) {
       this._syncTransform.destroy()
       this._syncTransform = null
@@ -1108,6 +1269,113 @@ export class ImageCompare {
       right: path,
     })
     await this._runDiff()
+  }
+
+  // ── Reports ────────────────────────────────────────────────────────────────
+
+  /**
+   * Current state in the shape the report builders take.
+   * @returns {ImageReportInfo}
+   */
+  getReportInfo() {
+    const dim = (side) => (side?.img
+      ? { w: side.img.naturalWidth, h: side.img.naturalHeight }
+      : null)
+    return {
+      leftPath: this._left?.path ?? '',
+      rightPath: this._right?.path ?? '',
+      leftSize: dim(this._left),
+      rightSize: dim(this._right),
+      diffCount: this._stats.diffCount,
+      totalPixels: this._stats.totalPixels,
+      approximate: this._stats.approximate,
+      regionCount: this._diffRegions.length,
+      threshold: this._threshold,
+      algorithm: this._algorithm,
+      autoScale: this._autoScale,
+      mismatchRange: this._mismatchRange,
+      blendMode: this._blendMode,
+      highlightColor: this._highlightColor,
+    }
+  }
+
+  /**
+   * @param {{ generatedAt?: Date }} [opts]
+   * @returns {string}
+   */
+  buildTextReport(opts = {}) {
+    return buildImageTextReport(this.getReportInfo(), opts)
+  }
+
+  /**
+   * @param {{ generatedAt?: Date }} [opts]
+   * @returns {string}
+   */
+  buildHtmlReport(opts = {}) {
+    return buildImageHtmlReport(this.getReportInfo(), this._snapshotCanvases(), opts)
+  }
+
+  /**
+   * Data URLs for the three canvases.
+   *
+   * The decoded base64 is dropped after load to save memory, so the canvas is
+   * the only remaining copy of the pixels. A canvas that cannot be serialised
+   * yields '' and the report says the image was unavailable — better than an
+   * exception that loses the whole report.
+   *
+   * @returns {{ left: string, right: string, diff: string }}
+   */
+  _snapshotCanvases() {
+    const grab = (canvas) => {
+      if (!canvas || typeof canvas.toDataURL !== 'function' || !(canvas.width > 0)) return ''
+      try {
+        return canvas.toDataURL('image/png')
+      } catch (err) {
+        console.error('[image-compare] canvas snapshot failed:', err)
+        return ''
+      }
+    }
+    return {
+      left: grab(this._dom.canvasLeft),
+      right: grab(this._dom.canvasRight),
+      diff: grab(this._dom.canvasDiff),
+    }
+  }
+
+  /**
+   * Save the HTML report, or open it for printing.
+   * @param {{ print?: boolean }} [opts]
+   * @returns {Promise<void>}
+   */
+  async exportHtml(opts = {}) {
+    const html = this.buildHtmlReport()
+    if (opts.print) {
+      const blob = new Blob([html], { type: 'text/html' })
+      const url = URL.createObjectURL(blob)
+      const win = window.open(url, '_blank')
+      if (win) {
+        win.addEventListener('load', () => {
+          try { win.print() } catch { /* the user dismissed the print dialog */ }
+        })
+        return
+      }
+      // Pop-up blocked: saving still gets the user their report.
+    }
+    await window.electronAPI.saveFile(
+      'image-report.html',
+      html,
+      [{ name: 'HTML', extensions: ['html'] }, { name: '所有檔案', extensions: ['*'] }])
+  }
+
+  /**
+   * Save the plain-text report.
+   * @returns {Promise<void>}
+   */
+  async exportTextReport() {
+    await window.electronAPI.saveFile(
+      'image-report.txt',
+      this.buildTextReport(),
+      [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }])
   }
 
   /**
@@ -1627,6 +1895,8 @@ export class ImageCompare {
       this._dom.magOverlay?.remove()
     }
 
+    this._setupDropTargets()
+
     // Algorithm context menu on canvas panels
     const container = this._dom.root ?? this._container
     if (container) {
@@ -1641,6 +1911,123 @@ export class ImageCompare {
             action: () => { this._algorithm = 'grayscale'; this._runDiff() } },
         ]
         showContextMenu(e, menuItems)
+      })
+    }
+  }
+
+  // ── Private: Drag & drop ───────────────────────────────────────────────────
+
+  /**
+   * Accept images dropped onto either pane.
+   *
+   * Which pane took the drop chooses the side, so a user can replace one image
+   * without touching the other; dropping two files at once fills both.
+   */
+  _setupDropTargets() {
+    /** @type {Array<[HTMLElement, 'left'|'right'|'both']>} */
+    const targets = [
+      [this._dom.wrapLeft, 'left'],
+      [this._dom.wrapRight, 'right'],
+      [this._dom.wrapDiff, 'both'],
+    ].filter(([node]) => Boolean(node))
+
+    /** @type {Array<() => void>} */
+    const cleanups = []
+
+    for (const [node, side] of targets) {
+      const onOver = (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+        node.classList.add('ic-drop-target')
+      }
+      const onLeave = () => node.classList.remove('ic-drop-target')
+      const onDrop = (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        node.classList.remove('ic-drop-target')
+        void this._acceptDrop(e, side)
+      }
+      node.addEventListener('dragenter', onOver)
+      node.addEventListener('dragover', onOver)
+      node.addEventListener('dragleave', onLeave)
+      node.addEventListener('drop', onDrop)
+      cleanups.push(() => {
+        node.removeEventListener('dragenter', onOver)
+        node.removeEventListener('dragover', onOver)
+        node.removeEventListener('dragleave', onLeave)
+        node.removeEventListener('drop', onDrop)
+      })
+    }
+
+    this._dropCleanup = () => { for (const fn of cleanups) fn() }
+  }
+
+  /**
+   * @param {DragEvent} e
+   * @param {'left'|'right'|'both'} side  where the drop landed
+   * @returns {Promise<void>}
+   */
+  async _acceptDrop(e, side) {
+    const files = [...(e.dataTransfer?.files ?? [])]
+    if (!files.length) return
+
+    let entries
+    try {
+      // The File objects go across as they are: Electron 32 removed File.path,
+      // and letting the renderer name a path would be self-authorisation.
+      entries = await window.electronAPI?.acceptDroppedFiles?.(files)
+    } catch (err) {
+      this._emit('status', {
+        message: `無法接受拖放的檔案：${err instanceof Error ? err.message : String(err)}`,
+        level: 'error',
+      })
+      return
+    }
+
+    if (!entries?.length) {
+      // preload resolves a path only for a File the OS really handed over.
+      this._emit('status', { message: '無法取得拖放檔案的路徑', level: 'error' })
+      return
+    }
+
+    const usable = entries.filter((entry) => entry && !entry.isDirectory)
+    if (!usable.length) {
+      this._emit('status', { message: '請拖放圖片檔案，而非資料夾', level: 'error' })
+      return
+    }
+
+    const plan = side === 'both'
+      ? [['left', usable[0]], ['right', usable[1]]]
+      : usable.length > 1
+        ? [['left', usable[0]], ['right', usable[1]]]
+        : [[side, usable[0]]]
+
+    for (const [target, entry] of plan) {
+      if (!entry) continue
+      await this._loadDroppedImage(/** @type {'left'|'right'} */ (target), entry.path)
+    }
+  }
+
+  /**
+   * @param {'left'|'right'} side
+   * @param {string} path
+   * @returns {Promise<void>}
+   */
+  async _loadDroppedImage(side, path) {
+    try {
+      const result = await window.electronAPI.readFileBinary(path, MAX_IMAGE_BYTES)
+      if (!result) return
+      if (result.truncated) {
+        this._emit('status', { message: `圖片超過大小上限：${path}`, level: 'error' })
+        return
+      }
+      if (side === 'left') await this.setLeft(result.path, result.base64, result.ext)
+      else await this.setRight(result.path, result.base64, result.ext)
+    } catch (err) {
+      this._emit('status', {
+        message: `載入 ${path} 失敗：${err instanceof Error ? err.message : String(err)}`,
+        level: 'error',
       })
     }
   }
@@ -1804,6 +2191,7 @@ export class ImageCompare {
    * @param {boolean} [approximate] - 數字由縮圖比對外推而來
    */
   _updateStats(diffCount, totalPixels, approximate = false) {
+    this._stats = { diffCount, totalPixels, approximate }
     const stats = this._dom.stats
     if (!stats) return
 

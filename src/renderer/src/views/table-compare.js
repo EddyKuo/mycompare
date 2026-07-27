@@ -675,6 +675,10 @@ export class TableCompare {
     // T15: sort before compare
     this._sortBeforeCompare = false
 
+    // P1-9: pane arrangement, matching the other views' Side/Over toggle.
+    /** @type {'side-by-side'|'over-under'} */
+    this._layoutMode = options.layoutMode === 'over-under' ? 'over-under' : 'side-by-side'
+
     // T22: last compare timestamp (ms since epoch, or null before first compare)
     /** @type {number|null} */
     this._lastCompareTime = null
@@ -1043,12 +1047,82 @@ export class TableCompare {
 
   // ── T14: Export HTML ─────────────────────────────────────────────────────────
 
+  // ── P1-9: layout mode ────────────────────────────────────────────────────────
+
+  /** @returns {'side-by-side'|'over-under'} */
+  getLayoutMode() {
+    return this._layoutMode
+  }
+
+  /**
+   * Toggle between left/right panes and stacked panes.
+   * @returns {'side-by-side'|'over-under'} the mode now in effect
+   */
+  toggleLayout() {
+    this._layoutMode = this._layoutMode === 'side-by-side' ? 'over-under' : 'side-by-side'
+    this._applyLayout()
+    return this._layoutMode
+  }
+
+  /**
+   * @param {'side-by-side'|'over-under'} mode
+   * @returns {'side-by-side'|'over-under'}
+   */
+  setLayoutMode(mode) {
+    if (mode !== 'side-by-side' && mode !== 'over-under') return this._layoutMode
+    this._layoutMode = mode
+    this._applyLayout()
+    return this._layoutMode
+  }
+
+  /** Apply the layout mode as a class on .tc-body and refresh the row window. */
+  _applyLayout() {
+    const body = this._dom.body
+    const isOverUnder = this._layoutMode === 'over-under'
+    if (body) body.classList.toggle('over-under', isOverUnder)
+    const btn = this._dom.btnLayout
+    if (btn) {
+      btn.textContent = isOverUnder ? '⊟ Over' : '⬛ Side'
+      btn.classList.toggle('active', isOverUnder)
+    }
+    // Each pane is now roughly half as tall, so the virtual scroller's idea of
+    // how many rows fit is stale; forcing a rebuild avoids a half-empty pane.
+    this._windowFirst = null
+    this._windowLast = null
+    this._renderTableWindow()
+  }
+
   /**
    * 匯出比對結果為 self-contained HTML 檔案。
    * 呼叫 window.electronAPI.saveFile('table-report.html', html)。
+   * @param {{ print?: boolean }} [opts] print=true opens the report in a blob
+   *   window and calls print() instead of writing it to disk.
    * @returns {Promise<void>}
    */
-  async exportHtml() {
+  async exportHtml(opts = {}) {
+    const html = this.buildHtmlReport()
+    if (opts.print) {
+      const blob = new Blob([html], { type: 'text/html' })
+      const url = URL.createObjectURL(blob)
+      const win = window.open(url, '_blank')
+      if (win) {
+        win.addEventListener('load', () => {
+          try { win.print() } catch { /* 使用者取消列印 */ }
+        })
+        return
+      }
+      // Pop-up blocked — fall back to saving rather than doing nothing.
+      window.alert('無法開啟列印視窗，改為另存 HTML 報告')
+    }
+    await window.electronAPI.saveFile('table-report.html', html)
+  }
+
+  /**
+   * Build the self-contained HTML report string.
+   * Split out of exportHtml so print preview and disk export share one payload.
+   * @returns {string}
+   */
+  buildHtmlReport() {
     const statusColors = {
       same:        '#ffffff',
       different:   '#fffbe6',
@@ -1115,7 +1189,7 @@ export class TableCompare {
     const tableStyle = 'border-collapse:collapse;font-family:monospace;font-size:13px;width:100%'
     const thStyle = 'background:#f0f0f0;border-bottom:2px solid #aaa;padding:2px 6px;text-align:left'
 
-    const html = `<!DOCTYPE html>
+    return `<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
 <meta charset="UTF-8">
@@ -1128,6 +1202,14 @@ export class TableCompare {
   table { ${tableStyle} }
   th { ${thStyle} }
   td { border-bottom: 1px solid #eee; }
+  @media print {
+    body { padding: 0; margin: 8mm; font-size: 11px; }
+    .no-print { display: none !important; }
+    .tc-side { overflow-x: visible; }
+    table { page-break-inside: auto; }
+    tr { page-break-inside: avoid; page-break-after: auto; }
+    thead { display: table-header-group; }
+  }
 </style>
 </head>
 <body>
@@ -1150,8 +1232,6 @@ export class TableCompare {
 </div>
 </body>
 </html>`
-
-    await window.electronAPI.saveFile('table-report.html', html)
   }
 
   // ── T22: getStats ─────────────────────────────────────────────────────────────
@@ -1218,6 +1298,7 @@ export class TableCompare {
       // Measured widths are data-dependent, so only the on/off state travels;
       // applyConfig re-measures against whatever table is loaded.
       fitColumns: Boolean(this._colWidths.left || this._colWidths.right),
+      layoutMode: this._layoutMode,
     })
   }
 
@@ -1235,6 +1316,10 @@ export class TableCompare {
     if (settings.columnRules && typeof settings.columnRules === 'object') {
       this.setColumnRules(settings.columnRules)
     }
+    if (settings.layoutMode === 'side-by-side' || settings.layoutMode === 'over-under') {
+      this._layoutMode = settings.layoutMode
+    }
+    this._applyLayout()
     this._syncConfigControls()
     this.refresh()
     if (typeof settings.fitColumns === 'boolean') {
@@ -1377,6 +1462,7 @@ export class TableCompare {
     this._container.appendChild(root)
     this._dom.root = root
 
+    this._applyLayout()
     this._renderEmptyState()
   }
 
@@ -1460,6 +1546,11 @@ export class TableCompare {
     toolbar.appendChild(diffCount)
 
     // S16-T3: swap sides
+    // P1-9: Side-by-side ↔ Over-under
+    const btnLayout = el('button', { id: 'tc-btn-layout', className: 'tc-btn', title: '切換左右並排 / 上下堆疊' }, '⬛ Side')
+    this._dom.btnLayout = btnLayout
+    toolbar.appendChild(btnLayout)
+
     const btnSwap = el('button', { id: 'tc-btn-swap', className: 'tc-btn' }, '⇄ 交換')
     this._dom.btnSwap = btnSwap
     toolbar.appendChild(btnSwap)
@@ -1475,6 +1566,12 @@ export class TableCompare {
     toolbar.appendChild(btnExport)
 
     // T22: Export stats button
+    // P2-27: printing goes through the browser's own print dialog, so the HTML
+    // report doubles as the print layout rather than needing a second renderer.
+    const btnPrint = el('button', { id: 'tc-btn-print', className: 'tc-btn', title: '列印 / 匯出 PDF' }, '🖨 列印')
+    this._dom.btnPrint = btnPrint
+    toolbar.appendChild(btnPrint)
+
     const btnExportStats = el('button', { id: 'tc-btn-export-stats', className: 'tc-btn' }, '📋 統計')
     this._dom.btnExportStats = btnExportStats
     toolbar.appendChild(btnExportStats)
@@ -1692,7 +1789,11 @@ export class TableCompare {
     btnRefresh.addEventListener('click', () => this.refresh())
 
     // T14: export HTML
-    btnExport.addEventListener('click', () => this.exportHtml())
+    btnExport.addEventListener('click', () => void this.exportHtml())
+
+    // P2-27 / P1-9
+    this._dom.btnPrint.addEventListener('click', () => void this.exportHtml({ print: true }))
+    this._dom.btnLayout.addEventListener('click', () => this.toggleLayout())
 
     // T22: show stats
     btnExportStats.addEventListener('click', () => this._showStatsAlert())

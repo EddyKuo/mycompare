@@ -315,22 +315,87 @@
   </div>
 
   <!-- T75: Settings modal (custom shortcuts) -->
-  <div id="settings-modal" class="modal-overlay" style="display:none">
+  <div id="settings-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title" style="display:none">
     <div class="modal-box" style="width:640px;max-width:95vw">
       <div class="modal-header">
-        <span>自訂快捷鍵</span>
+        <span id="settings-modal-title">選項</span>
         <button id="btn-settings-modal-close" class="modal-close">✕</button>
       </div>
-      <div class="modal-body">
+      <div class="modal-body" style="max-height:70vh;overflow:auto">
+        <h4 class="settings-section-title">下一個差異</h4>
+        <div class="settings-prefs" id="settings-nav-prefs">
+          <label class="settings-check">
+            <input type="checkbox" id="chk-nav-wrap" />
+            <span>到達結尾時環繞回開頭</span>
+          </label>
+          <label class="settings-check">
+            <input type="checkbox" id="chk-nav-first-on-load" />
+            <span>載入檔案後跳到第一個差異</span>
+          </label>
+          <label class="settings-check">
+            <input type="checkbox" id="chk-nav-next-after-copy" />
+            <span>複製到另一側後前進到下一個差異</span>
+          </label>
+          <label class="settings-check">
+            <input type="checkbox" id="chk-nav-no-diff-message" />
+            <span>顯示「沒有更多差異」訊息</span>
+          </label>
+        </div>
+
+        <h4 class="settings-section-title">儲存前備份</h4>
+        <div class="settings-prefs" id="settings-backup-prefs">
+          <label class="settings-check">
+            <input type="checkbox" id="chk-backup-enabled" />
+            <span>覆寫檔案前先保留原檔備份</span>
+          </label>
+          <label class="settings-field">
+            <span>命名規則：</span>
+            <select id="sel-backup-naming"></select>
+          </label>
+          <label class="settings-field">
+            <span>備份資料夾：</span>
+            <code id="txt-backup-folder" class="settings-path">（與原檔同一資料夾）</code>
+            <button id="btn-backup-folder">選擇…</button>
+            <button id="btn-backup-folder-clear">清除</button>
+          </label>
+          <p class="settings-hint">
+            資料夾必須用「選擇…」挑選：主程序只接受使用者親自授權過的路徑。
+          </p>
+        </div>
+
+        <h4 class="settings-section-title">自訂快捷鍵</h4>
         <p style="margin:0 0 8px;color:var(--text-secondary);font-size:12px">
           點擊 [錄製] 然後按下想要的組合鍵；按 ESC 取消錄製。
         </p>
-        <div id="settings-shortcuts-list" style="max-height:60vh;overflow:auto"></div>
+        <div id="settings-shortcuts-list"></div>
         <div id="settings-modal-status" style="margin-top:8px;color:var(--text-secondary);font-size:12px"></div>
       </div>
       <div class="modal-footer">
         <button id="btn-settings-reset" class="danger">恢復預設</button>
         <button id="btn-settings-modal-cancel">關閉</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Report modal: one place to save or copy the active view's report -->
+  <div id="report-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="report-modal-title" style="display:none">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="report-modal-title">比對報告</h3>
+        <button id="btn-report-modal-close" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="report-modal-view" class="settings-hint"></div>
+        <div class="report-actions">
+          <button id="btn-report-save-html">另存 HTML…</button>
+          <button id="btn-report-save-text">另存純文字…</button>
+          <button id="btn-report-copy-html">複製 HTML 到剪貼簿</button>
+          <button id="btn-report-copy-text">複製純文字到剪貼簿</button>
+        </div>
+        <div id="report-modal-status" class="u-modal-status"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-report-modal-cancel">關閉</button>
       </div>
     </div>
   </div>

@@ -25,11 +25,11 @@ beforeEach(() => {
 describe('HexCompare config', () => {
   it('round-trips a snapshot', () => {
     const a = new HexCompare()
-    a.applyConfig({ bytesPerRow: 32, diffAlgorithm: 'complete' })
+    a.applyConfig({ bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff' })
     const b = new HexCompare()
     b.applyConfig(a.getConfig())
     expect(b.getConfig()).toEqual({
-      __v: 1, __view: 'hex', bytesPerRow: 32, diffAlgorithm: 'complete',
+      __v: 1, __view: 'hex', bytesPerRow: 32, diffAlgorithm: 'complete', showFilter: 'diff',
     })
   })
 

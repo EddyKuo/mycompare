@@ -235,6 +235,13 @@
   border-bottom: 1px solid var(--border-color);
 }
 
+/* P1-9: stacked panes. The grid axis flips; everything else is unchanged, so
+   the virtual scroller keeps working without knowing about the layout. */
+.tc-body.over-under {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
 .tc-pane {
   display: flex;
   flex-direction: column;
@@ -244,6 +251,21 @@
 
 .tc-pane:last-child {
   border-right: none;
+}
+
+.tc-body.over-under > .tc-pane {
+  border-right: none;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.tc-body.over-under > .tc-pane:last-child {
+  border-bottom: none;
+}
+
+.tc-toolbar .tc-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
 }
 
 /* ── Table header (sticky) ── */

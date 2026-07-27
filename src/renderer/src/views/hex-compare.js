@@ -19,7 +19,10 @@ import { isActive } from '../core/active-view.js'
 import { renderTextTable, reportHeader } from '../core/report.js'
 import { tagConfig, readConfig } from '../core/named-config-store.js'
 import { stepDiffIndex, navResult, getNavOptions } from '../core/diff-nav.js'
+import { SettingsStore } from '../core/settings-store.js'
 import '../styles/hex-compare.css'
+
+const _settings = new SettingsStore()
 
 /** @typedef {import('../core/diff-nav.js').NavResult} NavResult */
 
@@ -288,6 +291,24 @@ function base64ToBytes(b64) {
 }
 
 /**
+ * Bytes → a string whose char codes are the byte values, for a latin1 write.
+ *
+ * Chunked because `String.fromCharCode(...bytes)` spreads every byte onto the
+ * argument stack and overflows well before the view's 10 MB limit.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+export function bytesToLatin1(bytes) {
+  const CHUNK = 0x8000
+  let out = ''
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK))
+  }
+  return out
+}
+
+/**
  * 將 byte 值格式化為 2 位大寫 hex，例如 255 → "FF"
  * @param {number} byte
  * @returns {string}
@@ -394,6 +415,27 @@ export class HexCompare {
     this._currentDiffIdx = -1
     /** @type {boolean} set by setLeft/setRight, consumed after the next diff */
     this._pendingFirstDiff = false
+
+    // P2-36: Show filter. Rows are filtered in the data layer rather than
+    // hidden with CSS, because the virtual scroller derives both the scroll
+    // height and every row's `top` from the row index — a display:none row
+    // still occupies its slot in that arithmetic and would desynchronise the
+    // two panes.
+    /** @type {'all'|'diff'|'same'} */
+    this._showFilter = 'all'
+    /**
+     * Source row indices that survive the filter, ascending. `null` means the
+     * identity mapping, so the unfiltered case allocates nothing.
+     * @type {Int32Array|null}
+     */
+    this._filteredRows = null
+    /**
+     * Source row → visual index. Hidden rows map to the nearest visible row at
+     * or after them so that "go to offset" style jumps still land somewhere
+     * sensible instead of failing.
+     * @type {Int32Array|null}
+     */
+    this._rowToVisual = null
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -435,6 +477,8 @@ export class HexCompare {
     this._findCurrentIdx = -1
     this._diffRegions = []
     this._currentDiffIdx = -1
+    this._filteredRows = null
+    this._rowToVisual = null
   }
 
   /**
@@ -533,6 +577,7 @@ export class HexCompare {
     return tagConfig('hex', {
       bytesPerRow: this._bytesPerRow,
       diffAlgorithm: this._diffAlgorithm,
+      showFilter: this._showFilter,
     })
   }
 
@@ -546,6 +591,9 @@ export class HexCompare {
     if (settings.diffAlgorithm === 'fast' || settings.diffAlgorithm === 'complete') {
       this._diffAlgorithm = settings.diffAlgorithm
     }
+    if (['all', 'diff', 'same'].includes(settings.showFilter)) {
+      this._showFilter = settings.showFilter
+    }
     this._syncConfigControls()
     this.refresh()
   }
@@ -556,6 +604,7 @@ export class HexCompare {
     if (bpr) bpr.value = String(this._bytesPerRow)
     const algo = this._dom.algoSelect
     if (algo) algo.value = this._diffAlgorithm
+    this._syncShowButtons()
   }
 
   // ── Public: reports ─────────────────────────────────────────────────────────
@@ -635,12 +684,244 @@ export class HexCompare {
     return end - region.start > MAX ? `${hex} …` : hex
   }
 
+  /**
+   * Self-contained HTML report of the differing regions.
+   *
+   * Capped like the plain-text report, and for the same reason: a binary that
+   * differs throughout would otherwise emit a document larger than the inputs.
+   *
+   * @param {{ generatedAt?: Date, maxRegions?: number }} [opts]
+   * @returns {string}
+   */
+  buildHtmlReport(opts = {}) {
+    const maxRegions = opts.maxRegions ?? 500
+    const esc = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    const stats = this.getStats()
+    const timestamp = (opts.generatedAt ?? new Date()).toLocaleString('zh-TW')
+
+    const shown = (this._diffRegions ?? []).slice(0, maxRegions)
+    const rows = shown.map((r) => `<tr>
+  <td class="off">0x${r.start.toString(16).toUpperCase().padStart(8, '0')}</td>
+  <td class="len">${r.length}</td>
+  <td class="hex del">${esc(this._bytesPreview(this._leftBytes, r))}</td>
+  <td class="hex ins">${esc(this._bytesPreview(this._rightBytes, r))}</td>
+</tr>`).join('\n')
+
+    const omitted = (this._diffRegions?.length ?? 0) - shown.length
+    const note = omitted > 0
+      ? `<p class="note">另有 ${omitted} 個差異區塊未列出。</p>`
+      : ''
+    const body = rows
+      ? `<table>
+<thead><tr><th>Offset</th><th>長度</th><th>左</th><th>右</th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>${note}`
+      : '<p class="note">兩側內容相同。</p>'
+
+    return `<!DOCTYPE html>
+<html lang="zh-TW"><head><meta charset="UTF-8">
+<title>MyCompare — Hex 比對報告</title>
+<style>
+body{font-family:monospace;font-size:13px;background:#fff;color:#222;margin:16px}
+h2{font-family:sans-serif;margin-bottom:4px}
+.paths{font-family:sans-serif;font-size:12px;color:#666;margin-bottom:12px}
+.report-stats{font-family:sans-serif;font-size:12px;display:flex;flex-wrap:wrap;
+  gap:10px;padding:8px 12px;background:#f5f5f5;border:1px solid #ddd;
+  border-radius:4px;margin-bottom:12px}
+.report-stats .stat-mod{color:#996c00;font-weight:600}
+.report-stats .stat-eq{color:#666;font-weight:600}
+.report-stats .ts{margin-left:auto;color:#888}
+.note{font-family:sans-serif;font-size:12px;color:#666}
+table{border-collapse:collapse;width:100%}
+th{background:#f0f0f0;border-bottom:2px solid #aaa;padding:2px 6px;text-align:left}
+td{padding:1px 6px;border-bottom:1px solid #eee;white-space:pre-wrap;word-break:break-all}
+.off{color:#555}
+.len{text-align:right}
+.del{background:#ffd7d7}
+.ins{background:#d7ffd7}
+@media print{
+  body{margin:8mm;font-size:11px}
+  .no-print{display:none !important}
+  h2{font-size:14px}
+  .paths,.report-stats{font-size:10px}
+  table{page-break-inside:auto}
+  tr{page-break-inside:avoid;page-break-after:auto}
+}
+</style>
+</head><body>
+<h2>Hex 比對報告</h2>
+<div class="paths">左：${esc(this._leftPath || '（未知）')} &nbsp;|&nbsp; 右：${esc(this._rightPath || '（未知）')}</div>
+<div class="report-stats">
+  <div>差異區塊: <span class="stat-mod">${stats.regions}</span></div>
+  <div>差異位元組: <span class="stat-mod">${stats.diffBytes}</span></div>
+  <div>左側: <span class="stat-eq">${stats.leftBytes}</span> bytes</div>
+  <div>右側: <span class="stat-eq">${stats.rightBytes}</span> bytes</div>
+  <div class="ts">生成時間: ${esc(timestamp)}</div>
+</div>
+${body}
+</body></html>`
+  }
+
+  /**
+   * @param {{ print?: boolean }} [opts] print=true opens the report in a blob
+   *   window and calls print() instead of writing it to disk.
+   * @returns {Promise<void>}
+   */
+  async exportHtml(opts = {}) {
+    const html = this.buildHtmlReport()
+    if (opts.print) {
+      const blob = new Blob([html], { type: 'text/html' })
+      const url = URL.createObjectURL(blob)
+      const win = window.open(url, '_blank')
+      if (win) {
+        win.addEventListener('load', () => {
+          try { win.print() } catch { /* 使用者取消列印 */ }
+        })
+        return
+      }
+      // Pop-up blocked — fall back to saving rather than doing nothing.
+      this._notify('無法開啟列印視窗，改為另存報告', true)
+    }
+    await window.electronAPI.saveFile(
+      'hex-report.html', html,
+      [{ name: 'HTML', extensions: ['html'] }, { name: '所有檔案', extensions: ['*'] }])
+  }
+
   /** Save the plain-text report. */
   async exportTextReport() {
     await window.electronAPI.saveFile(
       'hex-report.txt',
       this.buildTextReport(),
       [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }])
+  }
+
+  // ── Public: copy a difference to the other side (P1-10) ─────────────────────
+
+  /**
+   * Overwrite the current difference region in the right-hand file with the
+   * bytes from the left-hand file.
+   * @returns {Promise<boolean>} true when the file was written
+   */
+  copyToRight() { return this._copyRegionToSide('right') }
+
+  /**
+   * Overwrite the current difference region in the left-hand file with the
+   * bytes from the right-hand file.
+   * @returns {Promise<boolean>} true when the file was written
+   */
+  copyToLeft() { return this._copyRegionToSide('left') }
+
+  /**
+   * Splice one side's bytes into the other at the same offsets.
+   *
+   * Pure so the byte arithmetic — which decides what gets written over a user's
+   * file — is testable without a DOM or an IPC bridge.
+   *
+   * @param {Uint8Array} target bytes being modified
+   * @param {Uint8Array} source bytes being copied from
+   * @param {{ start: number, end: number }} region
+   * @returns {Uint8Array}
+   */
+  static spliceRegion(target, source, region) {
+    const start = Math.min(region.start, target.length)
+    const end = Math.min(Math.max(region.end, start), target.length)
+    const srcStart = Math.min(region.start, source.length)
+    const srcEnd = Math.min(Math.max(region.end, srcStart), source.length)
+
+    const middle = source.subarray(srcStart, srcEnd)
+    const out = new Uint8Array(start + middle.length + (target.length - end))
+    out.set(target.subarray(0, start), 0)
+    out.set(middle, start)
+    out.set(target.subarray(end), start + middle.length)
+    return out
+  }
+
+  /**
+   * @param {'left'|'right'} targetSide
+   * @returns {Promise<boolean>}
+   */
+  async _copyRegionToSide(targetSide) {
+    const region = this._diffRegions[this._currentDiffIdx]
+    if (!region) {
+      this._notify('請先選取一個差異區塊（使用 ▲ / ▼ 導航）', true)
+      return false
+    }
+    const target = targetSide === 'left' ? this._leftBytes : this._rightBytes
+    const source = targetSide === 'left' ? this._rightBytes : this._leftBytes
+    const targetPath = targetSide === 'left' ? this._leftPath : this._rightPath
+    if (!target || !source) {
+      this._notify('兩側都必須先載入檔案才能複製', true)
+      return false
+    }
+    if (!targetPath) {
+      this._notify('目標側沒有檔案路徑，無法寫入', true)
+      return false
+    }
+    if (this._leftTruncated || this._rightTruncated) {
+      // The in-memory copy is only the first 10 MB; writing it back would
+      // silently discard the rest of the file.
+      this._notify('檔案超過 10 MB 已截斷顯示，為避免資料遺失禁止寫入', true)
+      return false
+    }
+
+    const sideName = targetSide === 'left' ? '左側' : '右側'
+    const length = Math.min(region.end, source.length) - Math.min(region.start, source.length)
+    const ok = window.confirm(
+      `即將以對側的 ${length} 個位元組覆寫${sideName}檔案：\n${targetPath}\n\n` +
+      `位移 0x${region.start.toString(16).toUpperCase().padStart(8, '0')}。此操作會寫入磁碟，是否繼續？`)
+    if (!ok) return false
+
+    const merged = HexCompare.spliceRegion(target, source, region)
+
+    let result
+    try {
+      result = await window.electronAPI.saveFile(
+        targetPath,
+        // latin1 round-trips every byte 0x00–0xFF unchanged; any text codec
+        // would mangle bytes that are not valid in it.
+        bytesToLatin1(merged),
+        [{ name: '所有檔案', extensions: ['*'] }],
+        'binary',
+        _settings.getPref('backupOnSave'))
+    } catch (err) {
+      this._notify(`寫入失敗：${err instanceof Error ? err.message : String(err)}`, true)
+      return false
+    }
+    // A cancelled save dialog returns falsy — treating it as success would
+    // leave the view showing bytes that were never written.
+    if (!result) return false
+
+    if (targetSide === 'left') this._leftBytes = merged
+    else this._rightBytes = merged
+    this._updateSizeInfo()
+    this.refresh()
+
+    const backup = result.backup
+    if (backup?.backedUp) this._notify(`已寫入${sideName}，備份於 ${backup.path}`, false)
+    else if (backup?.reason) this._notify(`已寫入${sideName}，但備份失敗：${backup.reason}`, true)
+    else this._notify(`已寫入${sideName}`, false)
+    return true
+  }
+
+  /**
+   * Show a message in the toolbar's status slot.
+   *
+   * Failures also raise an alert: this view has no status bar of its own, and a
+   * refused write that only tinted a label would read as a silent no-op.
+   *
+   * @param {string} message
+   * @param {boolean} isError
+   */
+  _notify(message, isError) {
+    const warning = this._dom.warning
+    if (warning) {
+      warning.style.display = ''
+      warning.textContent = isError ? `⚠ ${message}` : message
+    }
+    if (isError) window.alert(message)
   }
 
   // ── Public: difference navigation (S16) ─────────────────────────────────────
@@ -831,10 +1112,39 @@ export class HexCompare {
     navBar.appendChild(diffCount)
     toolbar.appendChild(navBar)
 
+    // ── P2-36: Show filter ─────────────────────────────────────────────────────
+    const showBar = el('div', { className: 'hx-show-bar' })
+    const btnShowAll  = el('button', { className: 'hx-show-btn active', title: '顯示全部位元組' }, '全部')
+    const btnShowDiff = el('button', { className: 'hx-show-btn', title: '只顯示含差異的列' }, '差異')
+    const btnShowSame = el('button', { className: 'hx-show-btn', title: '只顯示完全相同的列' }, '相同')
+    this._dom.btnShowAll  = btnShowAll
+    this._dom.btnShowDiff = btnShowDiff
+    this._dom.btnShowSame = btnShowSame
+    showBar.appendChild(btnShowAll)
+    showBar.appendChild(btnShowDiff)
+    showBar.appendChild(btnShowSame)
+    toolbar.appendChild(showBar)
+
+    // ── P1-10: copy the current difference to the other side ───────────────────
+    const btnCopyRight = el('button', { className: 'hx-btn-copy', title: '將目前差異區塊複製到右側檔案' }, '▶ 複製到右')
+    const btnCopyLeft  = el('button', { className: 'hx-btn-copy', title: '將目前差異區塊複製到左側檔案' }, '◀ 複製到左')
+    this._dom.btnCopyRight = btnCopyRight
+    this._dom.btnCopyLeft  = btnCopyLeft
+    toolbar.appendChild(btnCopyRight)
+    toolbar.appendChild(btnCopyLeft)
+
     // S16: Swap sides
     const btnSwap = el('button', { className: 'hx-btn-swap', title: '交換左右兩側' }, '⇄ 交換')
     this._dom.btnSwap = btnSwap
     toolbar.appendChild(btnSwap)
+
+    // P1-20: HTML report
+    const btnReport = el('button', { className: 'hx-btn-report', title: '匯出 HTML 報告' }, '⬇ HTML')
+    const btnPrint  = el('button', { className: 'hx-btn-report', title: '列印 / 匯出 PDF' }, '🖨 列印')
+    this._dom.btnReport = btnReport
+    this._dom.btnPrint  = btnPrint
+    toolbar.appendChild(btnReport)
+    toolbar.appendChild(btnPrint)
 
     // 大小資訊（動態更新）
     const sizeInfo = el('span', { className: 'hx-size-info' })
@@ -979,9 +1289,12 @@ export class HexCompare {
 
     bprSelect.addEventListener('change', () => {
       this._bytesPerRow = parseInt(bprSelect.value, 10)
+      // Row boundaries moved, so which rows are "all same" moved with them.
+      this._recomputeRowFilter()
       // Re-run search with new layout
       this._runFind()
-      this._refreshSync()
+      this._renderPaneContent('left')
+      this._renderPaneContent('right')
     })
 
     btnRefresh.addEventListener('click', () => this._refreshSync())
@@ -1082,6 +1395,18 @@ export class HexCompare {
     btnDiffNext.addEventListener('click',  () => this.nextDifference())
     btnDiffLast.addEventListener('click',  () => this.lastDifference())
     btnSwap.addEventListener('click',      () => this.swap())
+
+    const {
+      btnShowAll, btnShowDiff, btnShowSame,
+      btnCopyRight, btnCopyLeft, btnReport, btnPrint,
+    } = this._dom
+    btnShowAll.addEventListener('click',  () => this.setShowFilter('all'))
+    btnShowDiff.addEventListener('click', () => this.setShowFilter('diff'))
+    btnShowSame.addEventListener('click', () => this.setShowFilter('same'))
+    btnCopyRight.addEventListener('click', () => void this.copyToRight())
+    btnCopyLeft.addEventListener('click',  () => void this.copyToLeft())
+    btnReport.addEventListener('click', () => void this.exportHtml())
+    btnPrint.addEventListener('click',  () => void this.exportHtml({ print: true }))
 
     // Diff-navigation keys are owned solely by app.js's SettingsStore binding,
     // which routes to whichever view is active. Binding them here as well made
@@ -1246,7 +1571,7 @@ export class HexCompare {
   _scrollToMatch(matchIdx) {
     const match = this._findMatches[matchIdx]
     if (!match) return
-    const targetTop = match.rowIndex * ROW_HEIGHT
+    const targetTop = this._visualIndexOf(match.rowIndex) * ROW_HEIGHT
     for (const side of /** @type {('left'|'right')[]} */ (['left', 'right'])) {
       const scroll = this._dom[`scroll_${side}`]
       if (scroll) {
@@ -1276,7 +1601,7 @@ export class HexCompare {
     if (offset >= maxOffset) return
 
     const rowIndex = Math.floor(offset / this._bytesPerRow)
-    const targetTop = rowIndex * ROW_HEIGHT
+    const targetTop = this._visualIndexOf(rowIndex) * ROW_HEIGHT
 
     for (const side of /** @type {('left'|'right')[]} */ (['left', 'right'])) {
       const scroll = this._dom[`scroll_${side}`]
@@ -1304,8 +1629,121 @@ export class HexCompare {
     } else if (this._currentDiffIdx >= this._diffRegions.length) {
       this._currentDiffIdx = this._diffRegions.length - 1
     }
+    this._recomputeRowFilter()
     this._updateDiffCounter()
     this._consumePendingFirstDiff()
+  }
+
+  // ── Private: Show filter (P2-36) ──────────────────────────────────────────────
+
+  /**
+   * Rebuild the visible-row list from the current diff regions.
+   *
+   * A row counts as differing when any difference region overlaps it, so the
+   * filter agrees with the colouring and with difference navigation by
+   * construction rather than by a second, parallel comparison.
+   */
+  _recomputeRowFilter() {
+    if (this._showFilter === 'all') {
+      this._filteredRows = null
+      this._rowToVisual = null
+      return
+    }
+
+    const bpr = this._bytesPerRow
+    const maxRows = Math.max(this._totalRows('left'), this._totalRows('right'))
+    if (maxRows === 0) {
+      this._filteredRows = new Int32Array(0)
+      this._rowToVisual = new Int32Array(0)
+      return
+    }
+
+    const isDiffRow = new Uint8Array(maxRows)
+    for (const region of this._diffRegions) {
+      const from = Math.floor(region.start / bpr)
+      const to = Math.min(maxRows - 1, Math.floor((region.end - 1) / bpr))
+      for (let r = from; r <= to; r++) isDiffRow[r] = 1
+    }
+
+    const wantDiff = this._showFilter === 'diff'
+    const visible = new Int32Array(maxRows)
+    let count = 0
+    for (let r = 0; r < maxRows; r++) {
+      if ((isDiffRow[r] === 1) === wantDiff) visible[count++] = r
+    }
+    this._filteredRows = visible.slice(0, count)
+
+    // Walk backwards so each hidden row inherits the next visible row's index.
+    const toVisual = new Int32Array(maxRows)
+    let next = count - 1
+    for (let r = maxRows - 1; r >= 0; r--) {
+      if (next >= 0 && this._filteredRows[next] === r) {
+        toVisual[r] = next
+        next--
+      } else {
+        toVisual[r] = Math.max(0, next + 1)
+      }
+    }
+    this._rowToVisual = toVisual
+  }
+
+  /**
+   * Number of rows the scroller must account for on one side.
+   * @param {'left'|'right'} side
+   * @returns {number}
+   */
+  _visibleRowCount(side) {
+    return this._filteredRows ? this._filteredRows.length : this._totalRows(side)
+  }
+
+  /**
+   * @param {number} visualIdx
+   * @returns {number} source row index, or -1 when out of range
+   */
+  _sourceRowAt(visualIdx) {
+    if (!this._filteredRows) return visualIdx
+    return visualIdx >= 0 && visualIdx < this._filteredRows.length
+      ? this._filteredRows[visualIdx]
+      : -1
+  }
+
+  /**
+   * @param {number} sourceRow
+   * @returns {number} visual index used for scroll positioning
+   */
+  _visualIndexOf(sourceRow) {
+    const map = this._rowToVisual
+    if (!map) return sourceRow
+    if (map.length === 0) return 0
+    if (sourceRow < 0) return 0
+    return sourceRow < map.length ? map[sourceRow] : map.length - 1
+  }
+
+  /** @returns {'all'|'diff'|'same'} */
+  getShowFilter() {
+    return this._showFilter
+  }
+
+  /**
+   * @param {'all'|'diff'|'same'} mode
+   * @returns {'all'|'diff'|'same'} the mode actually in effect
+   */
+  setShowFilter(mode) {
+    if (mode !== 'all' && mode !== 'diff' && mode !== 'same') return this._showFilter
+    this._showFilter = mode
+    this._recomputeRowFilter()
+    this._syncShowButtons()
+    this._renderPaneContent('left')
+    this._renderPaneContent('right')
+    return this._showFilter
+  }
+
+  /** Reflect the active filter on the toolbar buttons. */
+  _syncShowButtons() {
+    for (const [mode, key] of [['all', 'btnShowAll'], ['diff', 'btnShowDiff'], ['same', 'btnShowSame']]) {
+      const btn = this._dom[key]
+      if (btn) btn.classList.toggle('active', this._showFilter === mode)
+    }
   }
 
   /**
@@ -1331,7 +1769,7 @@ export class HexCompare {
     this._currentDiffIdx = idx
     this._clearCurrentDiffHighlight()
 
-    const rowIndex = Math.floor(region.start / this._bytesPerRow)
+    const rowIndex = this._visualIndexOf(Math.floor(region.start / this._bytesPerRow))
     for (const side of /** @type {('left'|'right')[]} */ (['left', 'right'])) {
       const scroll = this._dom[`scroll_${side}`]
       if (!scroll) continue
@@ -1432,7 +1870,51 @@ export class HexCompare {
       },
     ]
 
+    // P1-10: writing to the other side acts on whichever difference region the
+    // clicked row belongs to, so the menu selects it before offering the copy.
+    const sourceRow = parseInt(rowEl.dataset.row ?? '', 10)
+    const regionIdx = Number.isNaN(sourceRow)
+      ? -1
+      : this._regionIndexAtRow(sourceRow)
+    if (regionIdx >= 0) {
+      items.push({ separator: true })
+      items.push({
+        label: '將此差異區塊複製到右側檔案…',
+        disabled: !this._rightPath,
+        action: () => { this._gotoDiff(regionIdx); void this.copyToRight() },
+      })
+      items.push({
+        label: '將此差異區塊複製到左側檔案…',
+        disabled: !this._leftPath,
+        action: () => { this._gotoDiff(regionIdx); void this.copyToLeft() },
+      })
+    }
+
+    // P0-5: every other view offers this; hex was the only one without it.
+    const path = side === 'left' ? this._leftPath : this._rightPath
+    items.push({ separator: true })
+    items.push({
+      label: '在檔案總管中顯示',
+      disabled: !path,
+      action: () => window.electronAPI.showInExplorer(path),
+    })
+
     showContextMenu(e, items)
+  }
+
+  /**
+   * @param {number} sourceRow
+   * @returns {number} index of the difference region covering that row, or -1
+   */
+  _regionIndexAtRow(sourceRow) {
+    const bpr = this._bytesPerRow
+    const rowStart = sourceRow * bpr
+    const rowEnd = rowStart + bpr
+    for (let i = 0; i < this._diffRegions.length; i++) {
+      const r = this._diffRegions[i]
+      if (r.start < rowEnd && r.end > rowStart) return i
+    }
+    return -1
   }
 
   // ── Private: Synchronized scroll ─────────────────────────────────────────────
@@ -1504,8 +1986,19 @@ export class HexCompare {
       return
     }
 
-    const totalRows = this._totalRows(side)
-    inner.style.height = `${totalRows * ROW_HEIGHT}px`
+    const visualRows = this._visibleRowCount(side)
+    if (visualRows === 0) {
+      inner.style.height = '100%'
+      inner.innerHTML = ''
+      inner.appendChild(
+        el('div', { className: 'hx-empty-state' },
+          el('span', { className: 'hx-empty-icon' }, '🔍'),
+          el('span', {}, this._showFilter === 'diff' ? '無差異列' : '無相同列'),
+        ),
+      )
+      return
+    }
+    inner.style.height = `${visualRows * ROW_HEIGHT}px`
     // 清除舊的 absolute 子節點（保留 empty-state 等非 hx-row 節點）
     inner.innerHTML = ''
 
@@ -1522,18 +2015,21 @@ export class HexCompare {
     const inner  = this._dom[`inner_${side}`]
     if (!bytes || bytes.byteLength === 0 || !inner) return
 
-    const totalRows   = this._totalRows(side)
+    const totalRows   = this._visibleRowCount(side)
     const viewHeight  = scroll.clientHeight || 300
     const scrollTop   = scroll.scrollTop
     const visibleRows = Math.ceil(viewHeight / ROW_HEIGHT)
 
+    // Indices here are *visual* (post-filter) positions; `data-row` keeps the
+    // source row index because the find and diff highlighters address rows by
+    // byte offset.
     const startRow = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 2)
     const endRow   = Math.min(totalRows - 1, startRow + visibleRows + 4)
 
     // 移除超出範圍的列（保留 [startRow, endRow]）
-    const existing = inner.querySelectorAll('.hx-row[data-row]')
+    const existing = inner.querySelectorAll('.hx-row[data-vrow]')
     for (const rowEl of existing) {
-      const idx = parseInt(rowEl.dataset.row, 10)
+      const idx = parseInt(rowEl.dataset.vrow, 10)
       if (idx < startRow || idx > endRow) {
         rowEl.remove()
       }
@@ -1541,16 +2037,22 @@ export class HexCompare {
 
     // 建立尚未存在的列
     const existingSet = new Set()
-    for (const rowEl of inner.querySelectorAll('.hx-row[data-row]')) {
-      existingSet.add(parseInt(rowEl.dataset.row, 10))
+    for (const rowEl of inner.querySelectorAll('.hx-row[data-vrow]')) {
+      existingSet.add(parseInt(rowEl.dataset.vrow, 10))
     }
 
+    const sideRows = this._totalRows(side)
     const fragment = document.createDocumentFragment()
     for (let i = startRow; i <= endRow; i++) {
       if (existingSet.has(i)) continue
-      const rowEl = this._buildHexRow(side, i, bytes)
+      const sourceRow = this._sourceRowAt(i)
+      // A filtered view is shared by both panes, so a row may exist on one side
+      // only; leaving its slot empty keeps the two panes aligned.
+      if (sourceRow < 0 || sourceRow >= sideRows) continue
+      const rowEl = this._buildHexRow(side, sourceRow, bytes)
       rowEl.style.top = `${i * ROW_HEIGHT}px`
-      rowEl.dataset.row = String(i)
+      rowEl.dataset.row = String(sourceRow)
+      rowEl.dataset.vrow = String(i)
       fragment.appendChild(rowEl)
     }
     inner.appendChild(fragment)

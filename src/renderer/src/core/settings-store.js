@@ -27,10 +27,42 @@ const KEY_SETTINGS = 'mycompare:settings'
 /**
  * @typedef {object} AppPreferences
  * @property {boolean} backupOnSave  keep a .bak copy before overwriting a file
+ * @property {BackupNaming} backupNaming  how that copy is named
+ * @property {string} backupFolder  absolute directory for backups; '' = alongside
  * @property {boolean} navWrapAround  next/prev wraps past the last difference
  * @property {boolean} navFirstDiffOnLoad  jump to the first difference on load
  * @property {boolean} navNextAfterCopy  advance after copying to the other side
  * @property {boolean} navShowNoDiffMessage  report "no more differences"
+ */
+
+/**
+ * @typedef {'suffix'|'replace'|'tilde'|'numbered'} BackupNaming
+ */
+
+/**
+ * The naming schemes the main process implements, with an example each so the
+ * settings dialog does not have to describe them in prose.
+ *
+ * Kept in step with `src/main/backup.js` BACKUP_NAMING by value; the two
+ * cannot import from one another across the process boundary.
+ *
+ * @type {ReadonlyArray<{ value: BackupNaming, label: string }>}
+ */
+export const BACKUP_NAMING_OPTIONS = Object.freeze([
+  { value: 'suffix',   label: '加上 .bak（report.txt → report.txt.bak）' },
+  { value: 'replace',  label: '取代副檔名（report.txt → report.bak）' },
+  { value: 'tilde',    label: '加上 ~（report.txt → report.txt~）' },
+  { value: 'numbered', label: '編號保留多份（report.txt → report.txt.1、.2 …）' },
+])
+
+/** @type {ReadonlyArray<BackupNaming>} */
+const BACKUP_NAMING_VALUES = Object.freeze(BACKUP_NAMING_OPTIONS.map((o) => o.value))
+
+/**
+ * @typedef {object} BackupOptions
+ * @property {boolean} enabled
+ * @property {BackupNaming} naming
+ * @property {string} folder
  */
 
 /**
@@ -46,6 +78,8 @@ const KEY_SETTINGS = 'mycompare:settings'
  */
 export const DEFAULT_PREFS = {
   backupOnSave: true,
+  backupNaming: 'suffix',
+  backupFolder: '',
   navWrapAround: false,
   navFirstDiffOnLoad: true,
   navNextAfterCopy: true,
@@ -147,6 +181,25 @@ export function keyComboMatches(event, combo) {
 }
 
 /**
+ * Actions already bound to `combo`, excluding `action` itself.
+ *
+ * Two actions on one key is not an error the store can refuse — the user may
+ * be mid-way through swapping a pair — but silently letting the later binding
+ * shadow the earlier one is how a shortcut "stops working" with no explanation,
+ * so the caller is given the names to show.
+ *
+ * @param {Record<string, string>} shortcuts  action → combo
+ * @param {string} action  the action being (re)bound
+ * @param {string} combo
+ * @returns {string[]} conflicting action names, in table order
+ */
+export function findShortcutConflicts(shortcuts, action, combo) {
+  if (typeof combo !== 'string' || combo.trim() === '') return []
+  return Object.keys(shortcuts ?? {})
+    .filter((a) => a !== action && shortcuts[a] === combo)
+}
+
+/**
  * @returns {AppSettings}
  */
 function readSettings() {
@@ -238,6 +291,28 @@ export class SettingsStore {
     const s = readSettings()
     s.prefs[name] = value
     writeSettings(s)
+  }
+
+  /**
+   * The backup settings in the shape the `save-file` / `copy-file` IPC expects.
+   *
+   * Stored values are re-validated here rather than trusted: a hand-edited
+   * localStorage entry naming an unknown scheme would otherwise be passed to
+   * the main process, which would fall back silently and leave the dialog
+   * showing something that never happens.
+   *
+   * @returns {BackupOptions}
+   */
+  getBackupOptions() {
+    const prefs = readSettings().prefs
+    const naming = BACKUP_NAMING_VALUES.includes(prefs.backupNaming)
+      ? prefs.backupNaming
+      : DEFAULT_PREFS.backupNaming
+    return {
+      enabled: prefs.backupOnSave !== false,
+      naming,
+      folder: typeof prefs.backupFolder === 'string' ? prefs.backupFolder : '',
+    }
   }
 
   /**

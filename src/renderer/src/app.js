@@ -14,7 +14,9 @@ import { setActiveView } from './core/active-view.js'
 import {
   SettingsStore,
   DEFAULT_SHORTCUTS,
+  BACKUP_NAMING_OPTIONS,
   eventToCombo,
+  findShortcutConflicts,
   keyComboMatches,
 } from './core/settings-store.js'
 
@@ -525,6 +527,11 @@ function showImageCompare() {
       el('path-right').textContent = right || '（未選擇）'
       updateToolbar()
     })
+    // A drop that fails has no other way to reach the user.
+    imageCompare.on('status', ({ message, level }) => {
+      if (level === 'error') showError(message)
+      else showStatus(message)
+    })
   }
   updateToolbar()
 }
@@ -884,10 +891,7 @@ function setupToolbarButtons() {
     // merge3 has its own open buttons; no global refresh needed
   })
 
-  el('btn-export').addEventListener('click', () => {
-    if (currentView === 'text') textCompare?.exportHtml()
-    else if (currentView === 'folder') folderCompare?.exportHtml()
-  })
+  el('btn-export').addEventListener('click', openReportModal)
 
   el('btn-ignore-rules').addEventListener('click', openIgnoreRulesModal)
   el('btn-modal-close').addEventListener('click', closeIgnoreRulesModal)
@@ -917,11 +921,166 @@ function setupToolbarButtons() {
   el('btn-config-modal-cancel')?.addEventListener('click', closeConfigModal)
   el('btn-config-save')?.addEventListener('click', handleConfigSave)
 
+  // Report dialog (save / copy)
+  el('btn-report-modal-close')?.addEventListener('click', closeReportModal)
+  el('btn-report-modal-cancel')?.addEventListener('click', closeReportModal)
+  el('btn-report-save-html')?.addEventListener('click', () => void runReportAction('save-html'))
+  el('btn-report-save-text')?.addEventListener('click', () => void runReportAction('save-text'))
+  el('btn-report-copy-html')?.addEventListener('click', () => void runReportAction('copy-html'))
+  el('btn-report-copy-text')?.addEventListener('click', () => void runReportAction('copy-text'))
+
   // T63: Workspaces
   el('btn-workspaces')?.addEventListener('click', openWorkspacesModal)
   el('btn-workspaces-modal-close')?.addEventListener('click', closeWorkspacesModal)
   el('btn-workspaces-modal-cancel')?.addEventListener('click', closeWorkspacesModal)
   el('btn-workspace-save')?.addEventListener('click', handleWorkspaceSave)
+}
+
+// ---------------------------------------------------------------------------
+// Report dialog — save or copy the active view's report
+// ---------------------------------------------------------------------------
+
+/** Human name per view, for the dialog's subtitle. */
+const REPORT_VIEW_LABELS = {
+  text: '文字比對', folder: '資料夾比對', table: '表格比對',
+  image: '圖片比對', hex: 'Hex 比對', merge3: '三向合併',
+}
+
+/**
+ * What the active view can produce.
+ *
+ * Duck-typed rather than table-driven: views gain report builders one at a
+ * time, and a table would silently keep a newly capable view greyed out.
+ *
+ * @returns {{ view: any, html: boolean, text: boolean, htmlFallback: boolean, textFallback: boolean }}
+ */
+function _activeReportSource() {
+  const view = {
+    text: textCompare, folder: folderCompare, table: tableCompare,
+    image: imageCompare, hex: hexCompare, merge3: mergeCompare,
+  }[currentView] ?? null
+  return {
+    view,
+    html: typeof view?.buildHtmlReport === 'function',
+    text: typeof view?.buildTextReport === 'function',
+    // Some views only expose the whole save-to-disk operation; that still
+    // covers "save", just not "copy".
+    htmlFallback: typeof view?.exportHtml === 'function',
+    textFallback: typeof view?.exportTextReport === 'function',
+  }
+}
+
+/**
+ * @param {ReturnType<typeof _activeReportSource>} src
+ * @returns {boolean}
+ */
+function _hasAnyReport(src) {
+  return Boolean(src.html || src.text || src.htmlFallback || src.textFallback)
+}
+
+function openReportModal() {
+  const overlay = el('report-modal')
+  if (!overlay) return
+  const src = _activeReportSource()
+
+  const subtitle = el('report-modal-view')
+  if (subtitle) {
+    subtitle.textContent = _hasAnyReport(src)
+      ? `目前視圖：${REPORT_VIEW_LABELS[currentView] ?? currentView}`
+      : '目前視圖不支援報告'
+  }
+  setDisabled('btn-report-save-html', !(src.html || src.htmlFallback))
+  setDisabled('btn-report-save-text', !(src.text || src.textFallback))
+  setDisabled('btn-report-copy-html', !src.html)
+  setDisabled('btn-report-copy-text', !src.text)
+
+  _setReportStatus('')
+  overlay.style.display = 'flex'
+}
+
+function closeReportModal() {
+  const overlay = el('report-modal')
+  if (overlay) overlay.style.display = 'none'
+}
+
+/**
+ * Report progress where the user is looking: inside the dialog when it is
+ * open, and in the status bar when the same action came from the menu.
+ *
+ * @param {string} msg
+ * @param {boolean} [isError]
+ */
+function _setReportStatus(msg, isError = false) {
+  const status = el('report-modal-status')
+  if (status) status.textContent = msg
+  const overlay = el('report-modal')
+  const modalVisible = overlay ? overlay.style.display !== 'none' : false
+  if (!modalVisible && msg) {
+    if (isError) showError(msg)
+    else showStatus(msg)
+  }
+}
+
+/**
+ * @param {'save-html'|'save-text'|'copy-html'|'copy-text'} action
+ * @returns {Promise<void>}
+ */
+async function runReportAction(action) {
+  const src = _activeReportSource()
+  if (!_hasAnyReport(src)) { _setReportStatus('目前視圖不支援報告', true); return }
+
+  try {
+    switch (action) {
+      case 'save-html':
+        if (src.html) {
+          await window.electronAPI.saveFile(
+            'compare-report.html',
+            src.view.buildHtmlReport(),
+            [{ name: 'HTML', extensions: ['html'] }, { name: '所有檔案', extensions: ['*'] }])
+        } else {
+          await src.view.exportHtml()
+        }
+        _setReportStatus('HTML 報告已處理')
+        return
+      case 'save-text':
+        if (src.text) {
+          await window.electronAPI.saveFile(
+            'compare-report.txt',
+            src.view.buildTextReport(),
+            [{ name: '純文字', extensions: ['txt'] }, { name: '所有檔案', extensions: ['*'] }])
+        } else {
+          await src.view.exportTextReport()
+        }
+        _setReportStatus('純文字報告已處理')
+        return
+      case 'copy-html':
+        await copyTextToClipboard(src.view.buildHtmlReport())
+        _setReportStatus('HTML 報告已複製到剪貼簿')
+        return
+      case 'copy-text':
+        await copyTextToClipboard(src.view.buildTextReport())
+        _setReportStatus('純文字報告已複製到剪貼簿')
+        return
+    }
+  } catch (err) {
+    // The dialog stays open: the user asked for a report and needs to know it
+    // did not happen, and why.
+    _setReportStatus(`報告失敗：${err instanceof Error ? err.message : String(err)}`, true)
+  }
+}
+
+/**
+ * Put text on the system clipboard.
+ *
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
+async function copyTextToClipboard(text) {
+  const write = navigator.clipboard?.writeText
+  if (typeof write !== 'function') {
+    throw new Error('此環境不提供剪貼簿寫入')
+  }
+  await navigator.clipboard.writeText(String(text ?? ''))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,8 +1092,7 @@ const workspaceStore = new WorkspaceStore()
 
 /**
  * Return the active view object that supports getConfig/applyConfig.
- * Currently only TextCompare implements the contract.
- * @returns {{ view: object, type: 'text' | null }}
+ * @returns {{ view: object | null, type: string | null }}
  */
 /**
  * The view whose settings the named-config modal should read and write.
@@ -949,6 +1107,9 @@ function _getActiveConfigurableView() {
     table: tableCompare,
     image: imageCompare,
     hex: hexCompare,
+    // merge3 implements the same contract but was left out of this table, so
+    // its settings could be neither saved nor loaded.
+    merge3: mergeCompare,
   }
   const view = byType[currentView]
   return view && typeof view.getConfig === 'function'
@@ -982,7 +1143,7 @@ function refreshConfigList() {
     const empty = document.createElement('div')
     empty.className = 'config-list-empty'
     empty.textContent = type === null
-      ? '（請先進入文字比對視圖以管理設定）'
+      ? '（目前視圖不支援設定管理）'
       : '（尚未儲存任何設定）'
     list.appendChild(empty)
     return
@@ -1348,7 +1509,6 @@ function setupPathBarButtons() {
 function updateToolbar() {
   const isHome = currentView === 'home'
   const isText = currentView === 'text'
-  const isFolder = currentView === 'folder'
   // merge3 doesn't use the toolbar diff controls
 
   // 取得 diff 資訊（僅 text 模式）
@@ -1374,7 +1534,9 @@ function updateToolbar() {
   // Swap / Refresh / Export
   setDisabled('btn-swap', !hasContent)
   setDisabled('btn-refresh', isHome)
-  setDisabled('btn-export', isHome || (isText && !textCompare?._diffResult?.length) && currentView !== 'folder')
+  // The export button now opens the report dialog, which every view with a
+  // report builder can use — not just text and folder.
+  setDisabled('btn-export', isHome || !_hasAnyReport(_activeReportSource()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,10 +2276,7 @@ function setupMenuActions() {
     },
     'file.saveLeft':  () => { if (currentView === 'text') void textCompare?.saveLeft() },
     'file.saveRight': () => { if (currentView === 'text') void textCompare?.saveRight() },
-    'file.exportHtml': () => {
-      if (currentView === 'text') void textCompare?.exportHtml()
-      else if (currentView === 'folder') void folderCompare?.exportHtml()
-    },
+    'file.exportHtml': () => void runReportAction('save-html'),
     'file.encoding.left.UTF-8': () => reloadEncoding('left', 'UTF-8'),
     'file.encoding.left.UTF-16LE': () => reloadEncoding('left', 'UTF-16LE'),
     'file.encoding.left.UTF-16BE': () => reloadEncoding('left', 'UTF-16BE'),
@@ -2141,12 +2300,7 @@ function setupMenuActions() {
     'file.encoding.right.windows-1252': () => reloadEncoding('right', 'windows-1252'),
     'file.encoding.right.ISO-8859-1': () => reloadEncoding('right', 'ISO-8859-1'),
 
-    'file.exportText': () => {
-      if (currentView === 'text') void textCompare?.exportTextReport()
-      else if (currentView === 'hex') void hexCompare?.exportTextReport()
-      else if (currentView === 'table') void tableCompare?.exportTextReport()
-      else showStatus('此視圖尚未支援純文字報告')
-    },
+    'file.exportText': () => void runReportAction('save-text'),
     'file.exportPatch': () => {
       if (currentView === 'text') void textCompare?.exportUnifiedDiff()
       else showStatus('Unified Diff 僅適用於文字比對')
@@ -2313,8 +2467,11 @@ function setupSettingsModal() {
     recording = null
   }
 
+  const renderPrefs = setupPreferenceControls(setStatus)
+
   function render() {
     list.replaceChildren()
+    const bindings = settings.load().shortcuts
     for (const action of Object.keys(DEFAULT_SHORTCUTS)) {
       const label = SHORTCUT_LABELS[action]
       if (!label) continue
@@ -2326,9 +2483,24 @@ function setupSettingsModal() {
       nameEl.className = 'settings-row-name'
       nameEl.textContent = label
 
+      const combo = settings.getShortcut(action)
       const comboEl = document.createElement('code')
       comboEl.className = 'settings-row-combo'
-      comboEl.textContent = settings.getShortcut(action) || '（未設定）'
+      comboEl.textContent = combo || '（未設定）'
+
+      // A clash is shown on every row that shares the key, not only on the one
+      // that was just recorded: the user may open this dialog long afterwards
+      // and needs to see why one of two identical bindings never fires.
+      const clashes = findShortcutConflicts(bindings, action, combo)
+      /** @type {HTMLElement | null} */
+      let warnEl = null
+      if (clashes.length) {
+        row.classList.add('settings-row--conflict')
+        warnEl = document.createElement('span')
+        warnEl.className = 'settings-row-conflict'
+        warnEl.textContent = `⚠ ${combo} 已被「${
+          clashes.map((a) => SHORTCUT_LABELS[a] ?? a).join('、')}」佔用`
+      }
 
       const btnRecord = document.createElement('button')
       btnRecord.textContent = '錄製'
@@ -2349,13 +2521,13 @@ function setupSettingsModal() {
           }
           const combo = eventToCombo(e)
           if (!combo) return // modifier-only press; keep waiting
-          const clash = Object.keys(DEFAULT_SHORTCUTS)
-            .find((a) => a !== action && settings.getShortcut(a) === combo)
+          const clashes = findShortcutConflicts(settings.load().shortcuts, action, combo)
           settings.setShortcut(action, combo)
           stopRecording()
           render()
-          setStatus(clash
-            ? `已設定 ${combo}，但與「${SHORTCUT_LABELS[clash] ?? clash}」衝突`
+          setStatus(clashes.length
+            ? `已設定 ${combo}，但「${
+              clashes.map((a) => SHORTCUT_LABELS[a] ?? a).join('、')}」也綁在這個鍵位上`
             : `已設定 ${combo}`)
         }
 
@@ -2375,11 +2547,12 @@ function setupSettingsModal() {
       })
 
       row.append(nameEl, comboEl, btnRecord, btnClear)
+      if (warnEl) row.appendChild(warnEl)
       list.appendChild(row)
     }
   }
 
-  const open = () => { render(); setStatus(''); modal.style.display = 'flex' }
+  const open = () => { render(); renderPrefs(); setStatus(''); modal.style.display = 'flex' }
   const close = () => { stopRecording(); modal.style.display = 'none' }
 
   el('btn-settings-modal')?.addEventListener('click', open)
@@ -2390,6 +2563,94 @@ function setupSettingsModal() {
     render()
     setStatus('已恢復預設')
   })
+}
+
+/**
+ * Wire the non-shortcut halves of the settings dialog: the Next-Difference
+ * options and the backup options.
+ *
+ * Both sets of preferences and every reader of them already existed; only the
+ * controls that write them were missing, so the stored values never moved off
+ * their defaults.
+ *
+ * @param {(msg: string) => void} setStatus
+ * @returns {() => void} re-reads the store into the controls
+ */
+function setupPreferenceControls(setStatus) {
+  /** @type {Array<[string, 'navWrapAround'|'navFirstDiffOnLoad'|'navNextAfterCopy'|'navShowNoDiffMessage'|'backupOnSave', string]>} */
+  const CHECKS = [
+    ['chk-nav-wrap',             'navWrapAround',        '環繞'],
+    ['chk-nav-first-on-load',    'navFirstDiffOnLoad',   '載入後跳到第一個差異'],
+    ['chk-nav-next-after-copy',  'navNextAfterCopy',     '複製後前進'],
+    ['chk-nav-no-diff-message',  'navShowNoDiffMessage', '無差異訊息'],
+    ['chk-backup-enabled',       'backupOnSave',         '儲存前備份'],
+  ]
+
+  const namingSel = el('sel-backup-naming')
+  if (namingSel instanceof HTMLSelectElement && namingSel.options.length === 0) {
+    for (const { value, label } of BACKUP_NAMING_OPTIONS) {
+      const opt = document.createElement('option')
+      opt.value = value
+      opt.textContent = label
+      namingSel.appendChild(opt)
+    }
+  }
+
+  const folderEl = el('txt-backup-folder')
+
+  const refresh = () => {
+    for (const [id, pref] of CHECKS) {
+      const node = el(id)
+      if (node instanceof HTMLInputElement) node.checked = Boolean(settings.getPref(pref))
+    }
+    const backup = settings.getBackupOptions()
+    if (namingSel instanceof HTMLSelectElement) {
+      namingSel.value = backup.naming
+      namingSel.disabled = !backup.enabled
+    }
+    if (folderEl) folderEl.textContent = backup.folder || '（與原檔同一資料夾）'
+  }
+
+  for (const [id, pref, label] of CHECKS) {
+    const node = el(id)
+    if (!(node instanceof HTMLInputElement)) continue
+    node.addEventListener('change', () => {
+      settings.setPref(pref, node.checked)
+      refresh()
+      setStatus(`${label}：${node.checked ? '開啟' : '關閉'}`)
+    })
+  }
+
+  if (namingSel instanceof HTMLSelectElement) {
+    namingSel.addEventListener('change', () => {
+      settings.setPref('backupNaming', namingSel.value)
+      refresh()
+      setStatus('已更新備份命名規則')
+    })
+  }
+
+  // The folder has to come from the dialog: the main process only reads under
+  // roots the user authorised, so a typed path would be rejected on first use
+  // rather than here, where the mistake is visible.
+  el('btn-backup-folder')?.addEventListener('click', async () => {
+    try {
+      const picked = await window.electronAPI?.openFolder?.()
+      if (!picked?.path) return
+      settings.setPref('backupFolder', picked.path)
+      refresh()
+      setStatus(`備份資料夾：${picked.path}`)
+    } catch (err) {
+      setStatus(`無法選擇資料夾：${err instanceof Error ? err.message : String(err)}`)
+    }
+  })
+
+  el('btn-backup-folder-clear')?.addEventListener('click', () => {
+    settings.setPref('backupFolder', '')
+    refresh()
+    setStatus('備份將放在原檔旁邊')
+  })
+
+  return refresh
 }
 
 // ---------------------------------------------------------------------------
