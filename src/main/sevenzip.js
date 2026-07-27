@@ -12,13 +12,12 @@
  *   Read-only, and only the coders that can be decoded here: Copy, LZMA, LZMA2
  *   and the x86 BCJ filter. Anything else is named rather than mis-decoded.
  *
- *   The per-stream CRCs the format carries are read but not verified, so
- *   corruption inside a packed stream surfaces as a decode failure when it
- *   breaks the coder and not at all when it does not. Checking them would close
- *   that gap; the structural checks below cover a damaged header.
+ *   Per-substream CRC32s are verified on extraction. Without that, corruption
+ *   that happens not to derail the coder produces wrong bytes that look
+ *   perfectly successful — the failure mode a checksum exists to catch.
  */
 
-import { decodeLzmaRaw, decodeLzma2Raw, LzmaError } from './lzma.js'
+import { decodeLzmaRaw, decodeLzma2Raw, LzmaError, crc32 } from './lzma.js'
 
 const SIGNATURE = [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]
 const SIGNATURE_HEADER_SIZE = 32
@@ -366,8 +365,10 @@ function readUnpackInfo(r) {
   for (;;) {
     const id = r.number()
     if (id === kEnd) break
-    if (id === kCRC) readDigests(r, numFolders)
-    else r.skipProperty()
+    if (id === kCRC) {
+      const crcs = readDigests(r, numFolders)
+      folders.forEach((f, i) => { f.crc = crcs[i] })
+    } else r.skipProperty()
   }
   return folders
 }
@@ -396,6 +397,8 @@ function readSubStreamsInfo(r, folders) {
   let numUnpackStreams = folders.map(() => 1)
   /** @type {number[][]} */
   let sizes = []
+  /** @type {(number|null)[][]} */
+  let crcs = []
 
   for (;;) {
     const id = r.number()
@@ -418,8 +421,17 @@ function readSubStreamsInfo(r, folders) {
         return out
       })
     } else if (id === kCRC) {
-      const total = numUnpackStreams.reduce((a, b) => a + b, 0)
-      readDigests(r, total)
+      // Digests appear only for substreams whose CRC is not already known: a
+      // folder holding exactly one substream reuses the folder digest, and
+      // reading a value for it here would desynchronise the whole table.
+      const wanted = folders.map((f, i) =>
+        (numUnpackStreams[i] === 1 && f.crc != null ? 0 : numUnpackStreams[i]))
+      const total = wanted.reduce((a, b) => a + b, 0)
+      const digests = readDigests(r, total)
+      let d = 0
+      crcs = folders.map((f, i) => (wanted[i] === 0
+        ? [f.crc]
+        : Array.from({ length: numUnpackStreams[i] }, () => digests[d++])))
     } else {
       r.skipProperty()
     }
@@ -428,7 +440,11 @@ function readSubStreamsInfo(r, folders) {
   if (!sizes.length) {
     sizes = folders.map((f, i) => (numUnpackStreams[i] ? [folderUnpackSize(f)] : []))
   }
-  return { numUnpackStreams, sizes }
+  if (!crcs.length) {
+    crcs = folders.map((f, i) => (numUnpackStreams[i] === 1 ? [f.crc ?? null]
+      : Array.from({ length: numUnpackStreams[i] }, () => null)))
+  }
+  return { numUnpackStreams, sizes, crcs }
 }
 
 /**
@@ -452,6 +468,7 @@ function readStreamsInfo(r) {
     subStreams = {
       numUnpackStreams: folders.map(() => 1),
       sizes: folders.map((f) => [folderUnpackSize(f)]),
+      crcs: folders.map((f) => [f.crc ?? null]),
     }
   }
   return { packInfo, folders, subStreams }
@@ -566,7 +583,7 @@ function readNames(r, size) {
   const raw = r.bytes(size - 1)
   // One UTF-16LE run of NUL-terminated names, back to back.
   const text = Buffer.from(raw).toString('utf16le')
-  const names = text.split(' ')
+  const names = text.split('\0')
   if (names.length && names[names.length - 1] === '') names.pop()
   return names
 }
@@ -699,10 +716,15 @@ export function parse7z(buf, opts = {}) {
   if (streams) {
     streams.subStreams.sizes.forEach((sizes, folderIdx) => {
       let offset = 0
-      for (const s of sizes) {
-        streamPositions.push({ folder: folderIdx, offset, size: s })
+      sizes.forEach((s, j) => {
+        streamPositions.push({
+          folder: folderIdx,
+          offset,
+          size: s,
+          crc: streams.subStreams.crcs?.[folderIdx]?.[j] ?? null,
+        })
         offset += s
-      }
+      })
     })
   }
 
@@ -712,7 +734,8 @@ export function parse7z(buf, opts = {}) {
     const mtime = filetimeToIso(files.mtimes?.[i] ?? null)
 
     if (hasStream) {
-      const pos = streamPositions[streamIdx++] ?? { folder: null, offset: 0, size: 0 }
+      const pos = streamPositions[streamIdx++]
+        ?? { folder: null, offset: 0, size: 0, crc: null }
       entries.push({
         path: name,
         size: pos.size,
@@ -720,6 +743,7 @@ export function parse7z(buf, opts = {}) {
         isDirectory: false,
         folderIndex: pos.folder,
         offsetInFolder: pos.offset,
+        crc: pos.crc,
       })
     } else {
       const isEmptyFile = Boolean(files.emptyFile?.[emptyIdx])
@@ -778,5 +802,10 @@ export function extract7zEntry(buf, parsed, path, opts = {}) {
   const folder = parsed.streams.folders[entry.folderIndex]
   const packed = folderPackedBytes(buf, parsed.streams, entry.folderIndex)
   const decoded = decodeFolder(packed, folder, maxBytes)
-  return decoded.subarray(entry.offsetInFolder, entry.offsetInFolder + entry.size)
+  const out = decoded.subarray(entry.offsetInFolder, entry.offsetInFolder + entry.size)
+
+  if (entry.crc != null && crc32(out) !== entry.crc) {
+    throw new SevenZipError(`7z 項目 CRC 不符，檔案可能已損毀：${path}`, 'corrupt')
+  }
+  return out
 }

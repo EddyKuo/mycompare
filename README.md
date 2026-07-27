@@ -40,7 +40,8 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - 深色 / 淺色主題（跟隨系統或手動切換）
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
-- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz
+- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz、7z
+- 遠端連線：FTP / FTPS / S3（連線設定檔、密碼以系統金鑰庫保存）
 - MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對
 - 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
@@ -50,10 +51,9 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ### 尚未實作
 
-- **SFTP**：需要完整的 SSH 傳輸層（金鑰交換、加密、MAC），無法只用 Node 內建模組實作
-- **Dropbox / OneDrive**：需要 OAuth 流程與各自的 API
-- **7z / RAR**：7z 需要額外的容器與 filter chain；RAR 為專有格式且無可自由重新實作的規格
-- **遠端 UI**：FTP / FTPS / S3 的傳輸層與連線設定檔已實作並測試，但尚未接上介面
+- **Dropbox / OneDrive**：需要 OAuth 流程與各自的 API，並須自行申請應用程式憑證
+- **RAR**：專有格式，無可自由重新實作的規格
+- **7z 部分編碼**：BCJ2 等多輸入 filter、以及加密壓縮檔會明確報錯而非誤解碼
 
 ---
 

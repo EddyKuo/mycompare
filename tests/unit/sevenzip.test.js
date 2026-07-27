@@ -101,6 +101,26 @@ describe('extract7zEntry', () => {
     expect(extract(BCJ_7Z, 'code.bin').equals(expected)).toBe(true)
   })
 
+  it('carries the archive-recorded CRC for each entry', () => {
+    for (const e of parse7z(DEFAULT_7Z).entries.filter((x) => !x.isDirectory)) {
+      expect(typeof e.crc).toBe('number')
+    }
+  })
+
+  it('rejects a payload whose bytes were altered', () => {
+    // The Copy coder makes the tamper survive decoding: the length is right and
+    // only the content is wrong, which is precisely what a checksum is for and
+    // what nothing else in the reader would notice.
+    const parsed = parse7z(COPY_7Z)
+    const good = extract(COPY_7Z, 'c.txt')
+    const at = COPY_7Z.indexOf(good[0])
+    expect(at).toBeGreaterThan(0)
+
+    const tampered = Uint8Array.from(COPY_7Z)
+    tampered[at] ^= 0xff
+    expect(() => extract7zEntry(tampered, parsed, 'c.txt')).toThrow(/CRC/)
+  })
+
   it('reports an entry that is not there', () => {
     expect(() => extract(DEFAULT_7Z, 'nope.txt')).toThrow(/找不到項目/)
   })

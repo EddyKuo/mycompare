@@ -524,7 +524,7 @@ const CRC32_TABLE = (() => {
  * @param {Uint8Array} data
  * @returns {number}
  */
-function crc32(data) {
+export function crc32(data) {
   let c = 0xffffffff
   for (let i = 0; i < data.length; i++) {
     c = CRC32_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8)
