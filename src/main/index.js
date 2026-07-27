@@ -1,7 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electron'
 import { join, extname, dirname, basename } from 'path'
-import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod, utimes } from 'fs/promises'
+import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod, utimes, rm } from 'fs/promises'
 import { watch, existsSync, mkdirSync, accessSync, constants as fsConstants } from 'fs'
+import { tmpdir } from 'os'
 import { execFile } from 'child_process'
 import { decodeBuffer, encodeContent } from './encoding.js'
 import { registerRoot, validatePath, validatePathPair } from './path-validator.js'
@@ -892,6 +893,81 @@ ipcMain.handle('mkdir-folder', async (_e, dirPath) => {
 })
 
 // IPC: T60 — 切換全螢幕模式
+/**
+ * Rebuild the application menu with the user's hidden commands removed.
+ *
+ * Command visibility was a renderer-only preference: toolbars honoured it and
+ * the menu bar did not, so a command the user had turned off was still one
+ * click away in the menu that shipped it. The list is rebuilt rather than
+ * items toggled because hiding one can empty a whole submenu, and the pruning
+ * that repairs separators has to see the finished template.
+ */
+ipcMain.handle('set-menu-visibility', (event, hidden) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  if (!win) return false
+  const ids = Array.isArray(hidden) ? hidden.filter((h) => typeof h === 'string') : []
+  buildAppMenu(win, ids)
+  return true
+})
+
+/**
+ * Print a finished report to PDF, with page numbers.
+ *
+ * The in-window print path cannot number pages: Chromium ignores `@page`
+ * margin boxes, so CSS counters have nowhere to render. `printToPDF` is the
+ * only route that takes a footer template, which is why this exists in main
+ * rather than being another `window.print()` call.
+ *
+ * The HTML goes through a temp file instead of a data URL — reports run to
+ * megabytes and a data URL of that size is silently truncated by the loader.
+ */
+let printSeq = 0
+
+ipcMain.handle('print-to-pdf', async (event, html, suggestedName) => {
+  if (typeof html !== 'string' || html.length === 0) {
+    throw new Error('沒有可列印的內容')
+  }
+
+  const parent = BrowserWindow.fromWebContents(event.sender)
+  const { canceled, filePath } = await dialog.showSaveDialog(parent ?? undefined, {
+    title: '匯出 PDF',
+    defaultPath: typeof suggestedName === 'string' && suggestedName ? suggestedName : 'report.pdf',
+    filters: [{ name: 'PDF', extensions: ['pdf'] }]
+  })
+  if (canceled || !filePath) return { saved: false, path: '' }
+
+  const tmpHtml = join(tmpdir(), `mycompare-print-${process.pid}-${printSeq++}.html`)
+  // Offscreen so printing never steals focus from the window the user is in.
+  const worker = new BrowserWindow({
+    show: false,
+    webPreferences: { offscreen: true, javascript: false, sandbox: true }
+  })
+
+  try {
+    await writeFile(tmpHtml, html, 'utf-8')
+    await worker.loadFile(tmpHtml)
+    const pdf = await worker.webContents.printToPDF({
+      printBackground: true,
+      displayHeaderFooter: true,
+      headerTemplate: '<span></span>',
+      footerTemplate:
+        '<div style="width:100%;font-size:9px;padding:0 12mm;color:#666;'
+        + 'display:flex;justify-content:space-between">'
+        + '<span class="title"></span>'
+        + '<span><span class="pageNumber"></span> / <span class="totalPages"></span></span>'
+        + '</div>',
+      margins: { top: 0.6, bottom: 0.6, left: 0.5, right: 0.5 }
+    })
+    await writeFile(filePath, pdf)
+    return { saved: true, path: filePath }
+  } finally {
+    // Both cleanups must run even when printing threw, or a failed export
+    // leaks an offscreen window and a temp file every attempt.
+    if (!worker.isDestroyed()) worker.destroy()
+    await rm(tmpHtml, { force: true }).catch(() => {})
+  }
+})
+
 ipcMain.handle('toggle-fullscreen', () => {
   const win = BrowserWindow.getFocusedWindow()
   if (!win) return false

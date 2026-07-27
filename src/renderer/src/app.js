@@ -1608,6 +1608,27 @@ function setupPrintPreview() {
     }
   })
 
+  // Printing from the frame cannot number pages — Chromium ignores `@page`
+  // margin boxes, so the CSS counters the pagination rules set up have nowhere
+  // to render. Main's printToPDF takes a footer template, which is the only
+  // route to "3 / 12" on the page.
+  el('btn-print-preview-pdf')?.addEventListener('click', () => {
+    void (async () => {
+      const src = _activeReportSource()
+      if (!src.html) { _setPrintPreviewStatus('目前視圖無法產生報告', true); return }
+      _setPrintPreviewStatus('正在輸出 PDF…')
+      try {
+        const html = withPrintPagination(src.view.buildHtmlReport())
+        const name = `mycompare-${currentView}.pdf`
+        const res = await window.electronAPI.printToPdf(html, name)
+        _setPrintPreviewStatus(res?.saved ? `已儲存：${res.path}` : '已取消')
+      } catch (err) {
+        _setPrintPreviewStatus(
+          `輸出 PDF 失敗：${err instanceof Error ? err.message : String(err)}`, true)
+      }
+    })()
+  })
+
   // Kept as an escape hatch: if the frame cannot render the report, the user
   // still has the path that worked before the preview existed.
   el('btn-print-preview-window')?.addEventListener('click', () => {
@@ -3848,6 +3869,27 @@ function applyCommandVisibility() {
     if (!node) continue
     node.style.display = settings.isCommandVisible(cmd.id) ? '' : 'none'
   }
+  syncMenuVisibility()
+}
+
+/**
+ * Hide the same commands in the menu bar.
+ *
+ * Visibility used to stop at the toolbar, so a command the user had switched
+ * off was still one click away in the menu that shipped it — which reads as
+ * the preference not working rather than as applying to toolbars only. Only
+ * commands carrying a `menuId` have a menu counterpart; the rest are toolbar
+ * buttons with no menu equivalent and simply have nothing to hide.
+ */
+function syncMenuVisibility() {
+  const hidden = TOOLBAR_COMMANDS
+    .filter((c) => c.menuId && !settings.isCommandVisible(c.id))
+    .map((c) => c.menuId)
+  // Best effort: failing to rebuild the menu must not take the toolbar update
+  // down with it, but it should still be visible rather than swallowed.
+  window.electronAPI?.setMenuVisibility?.(hidden)?.catch?.((err) => {
+    console.error('選單可見性同步失敗', err)
+  })
 }
 
 /**

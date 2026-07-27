@@ -452,8 +452,13 @@ describe('entry points', () => {
   })
 
   it('routes every printed report through the pagination pass', () => {
-    expect(APP).not.toMatch(/[^(]\bsrc\.view\.buildHtmlReport\(\)(?!\))/)
-    expect(APP.match(/withPrintPagination\(src\.view\.buildHtmlReport\(\)\)/g)).toHaveLength(3)
+    // The invariant is that no call escapes the pagination wrapper — not that
+    // there are exactly N of them. Pinning the count made adding a correctly
+    // wrapped call site (the PDF export) fail a test about something else.
+    const all = APP.match(/\bsrc\.view\.buildHtmlReport\(\)/g) ?? []
+    const wrapped = APP.match(/withPrintPagination\(src\.view\.buildHtmlReport\(\)\)/g) ?? []
+    expect(all.length).toBeGreaterThan(0)
+    expect(wrapped).toHaveLength(all.length)
   })
 
   it('carries the Options page and the portable readout in the markup', () => {

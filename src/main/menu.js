@@ -21,11 +21,50 @@ function send(win, command, payload) {
 }
 
 /**
+ * Drop hidden commands, then repair what their absence leaves behind.
+ *
+ * Removing an item is the easy half. A menu that loses its last command must
+ * not stay as an empty heading the user can open onto nothing, and separators
+ * around a removed item become leading, trailing, or doubled rules — visible
+ * damage that reads as a rendering bug rather than a preference.
+ *
+ * @param {import('electron').MenuItemConstructorOptions[]} items
+ * @param {Set<string>} hidden
+ * @returns {import('electron').MenuItemConstructorOptions[]}
+ */
+function pruneHidden(items, hidden) {
+  const kept = []
+  for (const it of items) {
+    if (typeof it.id === 'string' && hidden.has(it.id)) continue
+    if (Array.isArray(it.submenu)) {
+      const sub = pruneHidden(it.submenu, hidden)
+      // A submenu emptied by hiding takes its parent with it; one that still
+      // has commands is kept with the pruned contents.
+      if (sub.length === 0) continue
+      kept.push({ ...it, submenu: sub })
+      continue
+    }
+    kept.push(it)
+  }
+
+  const out = []
+  for (const it of kept) {
+    const isSep = it.type === 'separator'
+    // Skip a separator that would lead, or that follows another separator.
+    if (isSep && (out.length === 0 || out[out.length - 1].type === 'separator')) continue
+    out.push(it)
+  }
+  while (out.length && out[out.length - 1].type === 'separator') out.pop()
+  return out
+}
+
+/**
  * Build and install the application menu.
  * @param {import('electron').BrowserWindow} win
+ * @param {readonly string[]} [hiddenCommands] command ids the user turned off
  * @returns {import('electron').Menu}
  */
-export function buildAppMenu(win) {
+export function buildAppMenu(win, hiddenCommands = []) {
   const isMac = process.platform === 'darwin'
 
   /**
@@ -44,6 +83,7 @@ export function buildAppMenu(win) {
    * @returns {import('electron').MenuItemConstructorOptions}
    */
   const item = (label, command, accelerator) => ({
+    id: command,
     label,
     accelerator,
     registerAccelerator: false,
@@ -72,6 +112,10 @@ export function buildAppMenu(win) {
       label: '工作階段(&S)',
       submenu: [
         {
+          // The toolbar's 新增比對 button opens a chooser, so its menu
+          // counterpart is this whole group rather than any one entry. Hiding
+          // the command has to take the group with it, which needs an id here.
+          id: 'session.new',
           label: '新增工作階段',
           submenu: [
             item('文字比對', 'session.new.text'),
@@ -465,7 +509,7 @@ export function buildAppMenu(win) {
     }
   ]
 
-  const menu = Menu.buildFromTemplate(template)
+  const menu = Menu.buildFromTemplate(pruneHidden(template, new Set(hiddenCommands)))
   Menu.setApplicationMenu(menu)
   return menu
 }

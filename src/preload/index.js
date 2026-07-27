@@ -69,6 +69,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   remoteDisconnect: (profileId) => ipcRenderer.invoke('remote-disconnect', profileId),
   renameFile: (oldPath, newPath) => ipcRenderer.invoke('rename-file', oldPath, newPath),
   mkdirFolder: (dirPath) => ipcRenderer.invoke('mkdir-folder', dirPath),
+  setMenuVisibility: (hidden) => ipcRenderer.invoke('set-menu-visibility', hidden),
+  printToPdf: (html, suggestedName) => ipcRenderer.invoke('print-to-pdf', html, suggestedName),
   toggleFullScreen: () => ipcRenderer.invoke('toggle-fullscreen'),
   watchFile: (path) => ipcRenderer.invoke('watch-file', path),
   unwatchFile: (path) => ipcRenderer.invoke('unwatch-file', path),
