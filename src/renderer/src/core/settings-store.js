@@ -122,7 +122,12 @@ export const DEFAULT_PREFS = {
   // Archive Types — which containers the folder view will descend into.
   // Off by default for none of them; a container this build cannot read is
   // simply absent from the list rather than present and failing.
-  archiveEnabled: 'zip,tar,gz,bz2,xz,7z,cab',
+  // 'rar' is listed because stored RAR5 entries genuinely open. Compressed
+  // ones are refused by name at extraction, which is why it belongs here
+  // rather than being left out: the user gets the archive's contents and an
+  // explanation for the entries this build cannot decode, instead of a format
+  // that appears unsupported outright.
+  archiveEnabled: 'zip,tar,gz,bz2,xz,7z,cab,rar',
   archiveMaxEntryMB: 256,
 
   // Open With

@@ -123,6 +123,9 @@ test('封存檔說明只列出本版本讀得到的格式', async () => {
   await win.locator('#options-tab-archives').click()
   const hint = await win.locator('#archive-support-hint').innerText()
   expect(hint).toContain('cab')
-  // RAR 在別處是具名拒絕的；在這裡列出來等於承諾一個做不到的事。
-  expect(hint.toLowerCase()).not.toContain('rar')
+  // RAR 現在讀得到 stored 項目、壓縮項目具名報錯，所以說明裡必須同時交代
+  // 這兩件事——只寫「支援 RAR」等於承諾做不到的事，完全不提又會讓使用者
+  // 以為打不開。
+  expect(hint.toLowerCase()).toContain('rar')
+  expect(hint).toMatch(/stored|未壓縮/)
 })

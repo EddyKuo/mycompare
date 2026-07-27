@@ -198,11 +198,14 @@ describe('the defaults are the safe answer', () => {
 
   it('lists only archive formats this build can actually read', () => {
     const listed = String(DEFAULT_PREFS.archiveEnabled).split(',')
-    // RAR is refused by name elsewhere for want of a reference to verify
-    // against; offering it here would promise something that cannot work.
-    expect(listed).not.toContain('rar')
     expect(listed).toContain('cab')
     expect(listed).toContain('7z')
+    // 'rar' used to be excluded here on the grounds that RAR was refused
+    // outright. Stored RAR5 entries now open, and compressed ones are refused
+    // by name at extraction, so leaving it out would hide an archive the app
+    // can partly read. This gate is what caught the omission: the format
+    // worked and the preference still said otherwise.
+    expect(listed).toContain('rar')
   })
 
   it('passes external program arguments as a template, not a shell string', () => {
