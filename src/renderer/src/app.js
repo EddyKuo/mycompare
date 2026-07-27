@@ -2647,16 +2647,52 @@ ${summary}
   }
 }
 
-/** Collect a new profile from the user. */
+/** Remote kinds the profile editor can create, in the order it offers them. */
+const REMOTE_KINDS = Object.freeze(['ftp', 'ftps', 'sftp', 's3', 'dropbox', 'onedrive'])
+
+/** Kinds whose credential is an OAuth token obtained through the browser. */
+const REMOTE_OAUTH_KINDS = Object.freeze(['dropbox', 'onedrive'])
+
+/**
+ * Collect a new profile from the user.
+ *
+ * Every kind the main process can actually connect to is offered here. The
+ * list had been left at ftp/ftps/s3 while sftp, dropbox and onedrive were
+ * added behind it, so three working transports had no way to be created — the
+ * feature existed and no user could reach it.
+ */
 async function createRemoteProfile() {
-  const kind = prompt('連線類型（ftp / ftps / s3）：', 'ftp')?.trim().toLowerCase()
+  const kind = prompt(`連線類型（${REMOTE_KINDS.join(' / ')}）：`, 'ftp')?.trim().toLowerCase()
   if (!kind) return
+  if (!REMOTE_KINDS.includes(kind)) {
+    showError(`不支援的連線類型：${kind}`)
+    return
+  }
   const name = prompt('這個連線的名稱：')?.trim()
   if (!name) return
 
   /** @type {Record<string, unknown>} */
   const profile = { name, kind, saveSecret: false }
-  if (kind === 's3') {
+
+  if (REMOTE_OAUTH_KINDS.includes(kind)) {
+    // The client ID is the user's own registered application. It is not a
+    // secret — it is visible in the browser's address bar during sign-in — so
+    // it is an ordinary field, and the save error carries the registration
+    // instructions when it is missing or wrong.
+    profile.clientId = prompt(
+      [
+        `${kind} 需要你自己申請的應用程式 client ID。`,
+        '留空送出可看到申請步驟。',
+        '',
+        'client ID：',
+      ].join('\n'))?.trim() ?? ''
+    profile.path = prompt('起始路徑（可留空）：')?.trim() ?? ''
+    // The refresh token is obtained on first connect and stored the same way a
+    // password would be, so the same "only if the OS can encrypt it" rule
+    // applies rather than a second, weaker path.
+    profile.saveSecret = confirm(
+      '要記住授權嗎？（只會以作業系統加密後儲存；無法加密時每次都要重新授權）')
+  } else if (kind === 's3') {
     profile.bucket = prompt('Bucket：')?.trim()
     profile.region = prompt('Region（例如 us-east-1）：')?.trim()
     profile.user = prompt('Access Key ID：')?.trim()
@@ -2669,16 +2705,24 @@ async function createRemoteProfile() {
   // The password is deliberately not persisted unless asked for: it can only
   // be stored encrypted, and where the OS cannot encrypt it must not be stored
   // at all.
-  profile.saveSecret = confirm('要記住密碼嗎？（只會以作業系統加密後儲存；無法加密時不會儲存）')
-  if (profile.saveSecret) {
-    profile.secret = prompt(kind === 's3' ? 'Secret Access Key：' : '密碼：') ?? ''
+  if (!REMOTE_OAUTH_KINDS.includes(kind)) {
+    profile.saveSecret = confirm('要記住密碼嗎？（只會以作業系統加密後儲存；無法加密時不會儲存）')
+    if (profile.saveSecret) {
+      profile.secret = prompt(kind === 's3' ? 'Secret Access Key：' : '密碼：') ?? ''
+    }
   }
 
   try {
     const saved = await window.electronAPI.remoteSaveProfile(profile)
-    showStatus(`已儲存連線「${saved.name}」`)
+    const note = REMOTE_OAUTH_KINDS.includes(kind)
+      ? '；第一次連線會開啟瀏覽器完成授權'
+      : ''
+    showStatus(`已儲存連線「${saved.profile?.name ?? saved.name ?? name}」${note}`)
   } catch (err) {
-    showStatus(`儲存失敗：${err.message}`)
+    // Shown verbatim: for the OAuth kinds this message is where the client-ID
+    // registration steps live, so trimming it would remove the only
+    // instructions the user gets.
+    showError(`儲存失敗：${err.message}`, err)
   }
 }
 
