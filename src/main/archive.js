@@ -4,8 +4,8 @@
  *
  *   Beyond Compare can browse archives as if they were folders. This module
  *   provides the same for every container format reachable with Node's own
- *   `zlib` plus the JSZip dependency already in the project — no external
- *   binary, no new npm package.
+ *   `zlib`, the JSZip dependency already in the project, and the in-tree
+ *   bzip2 decoder — no external binary, no new npm package.
  *
  *   Everything an archive contains is attacker-controlled data: entry names,
  *   declared sizes and compression ratios all come from the file. The parsers
@@ -16,6 +16,9 @@
 import { readFile } from 'fs/promises'
 import { basename } from 'path'
 import { gunzipSync } from 'zlib'
+
+import { bunzip2, isBzip2, Bzip2Error } from './bzip2.js'
+import { decodeXz, isXz, LzmaError } from './lzma.js'
 
 /**
  * @typedef {Object} ArchiveEntry
@@ -34,7 +37,7 @@ import { gunzipSync } from 'zlib'
  */
 
 /**
- * @typedef {'tar'|'gzip'|'tar.gz'|'zip'} ArchiveFormat
+ * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'} ArchiveFormat
  */
 
 /**
@@ -345,22 +348,66 @@ export function isGzip(buf) {
   return Buffer.isBuffer(buf) && buf.length >= 3 && buf[0] === 0x1f && buf[1] === 0x8b && buf[2] === 0x08
 }
 
+export { isBzip2 }
+
 /** @param {Buffer} buf @returns {boolean} */
 export function isZip(buf) {
   return Buffer.isBuffer(buf) && buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b
 }
 
-/** @param {Buffer} buf @returns {boolean} */
-function isBzip2(buf) {
-  return Buffer.isBuffer(buf) && buf.length >= 3 && buf[0] === 0x42 && buf[1] === 0x5a && buf[2] === 0x68
+/**
+ * Decompress a bzip2 stream.
+ *
+ * The in-tree decoder already caps its own output, so the cap is simply passed
+ * through; its errors are re-thrown as {@link ArchiveError} so callers keep
+ * seeing exactly one error type from this module.
+ *
+ * @param {Buffer} buf
+ * @param {number} [maxBytes]
+ * @returns {Buffer}
+ * @throws {ArchiveError}
+ */
+export function bunzip(buf, maxBytes = DEFAULT_LIMITS.maxTotalBytes) {
+  try {
+    return bunzip2(buf, maxBytes)
+  } catch (err) {
+    if (err instanceof Bzip2Error) {
+      const code = err.code === 'limit' ? 'limit' : err.code === 'unsupported' ? 'unsupported' : 'corrupt'
+      throw new ArchiveError(err.message, code)
+    }
+    throw new ArchiveError(`Corrupt bzip2 stream: ${err instanceof Error ? err.message : err}`, 'corrupt')
+  }
+}
+
+/**
+ * Decompress an xz stream, translating decoder failures into archive errors so
+ * callers see one error shape regardless of format.
+ *
+ * @param {Buffer} buf
+ * @param {number} [maxBytes]
+ * @returns {Buffer}
+ */
+export function unxz(buf, maxBytes = DEFAULT_LIMITS.maxTotalBytes) {
+  try {
+    return Buffer.from(decodeXz(buf, { maxBytes }))
+  } catch (err) {
+    if (err instanceof LzmaError) {
+      const code = /大小上限/.test(err.message)
+        ? 'limit'
+        : /不支援|filter/.test(err.message) ? 'unsupported' : 'corrupt'
+      throw new ArchiveError(err.message, code)
+    }
+    throw new ArchiveError(`Corrupt xz stream: ${err instanceof Error ? err.message : err}`, 'corrupt')
+  }
 }
 
 /**
  * Identify the container.
  *
  * Content sniffing wins over the extension because an archive's name is the
- * least trustworthy thing about it; the extension only breaks the tie for
- * gzip (a lone `.gz` versus a `.tar.gz`), which needs the inflated bytes.
+ * least trustworthy thing about it; the extension only breaks the tie for the
+ * solid compressors (a lone `.gz`/`.bz2` versus a `.tar.gz`/`.tar.bz2`), which
+ * would otherwise need the decompressed bytes to tell apart.
  *
  * @param {string} filePath
  * @param {Buffer} buf
@@ -370,12 +417,8 @@ function isBzip2(buf) {
 export function detectFormat(filePath, buf) {
   if (isZip(buf)) return 'zip'
   if (isGzip(buf)) return /\.(tgz|tar\.gz)$/i.test(filePath) ? 'tar.gz' : 'gzip'
-  if (isBzip2(buf)) {
-    throw new ArchiveError('bzip2 archives are not supported (no built-in decoder)', 'unsupported')
-  }
-  if (buf.length >= 6 && buf.toString('hex', 0, 6) === 'fd377a585a00') {
-    throw new ArchiveError('xz archives are not supported (no built-in decoder)', 'unsupported')
-  }
+  if (isBzip2(buf)) return /\.(tbz|tbz2|tar\.bz2)$/i.test(filePath) ? 'tar.bz2' : 'bzip2'
+  if (isXz(buf)) return /\.(txz|tar\.xz)$/i.test(filePath) ? 'tar.xz' : 'xz'
   if (buf.length >= 6 && buf.toString('hex', 0, 6) === '377abcaf271c') {
     throw new ArchiveError('7z archives are not supported (no built-in decoder)', 'unsupported')
   }
@@ -454,6 +497,29 @@ function gzipMemberName(filePath) {
 }
 
 /**
+ * Same convention as {@link gzipMemberName}, for the bzip2 extensions.
+ *
+ * @param {string} filePath
+ * @returns {string}
+ */
+function bzip2MemberName(filePath) {
+  return basename(filePath).replace(/\.(bz2|bz)$/i, '') || 'content'
+}
+
+/**
+ * The single-member name a solid-compressed container exposes.
+ *
+ * @param {ArchiveFormat} format
+ * @param {string} filePath
+ * @returns {string}
+ */
+function soloMemberName(format, filePath) {
+  if (format === 'bzip2') return bzip2MemberName(filePath)
+  if (format === 'xz') return basename(filePath).replace(/\.xz$/i, '') || 'content'
+  return gzipMemberName(filePath)
+}
+
+/**
  * Read an archive and return a uniform listing.
  *
  * @param {string} archivePath absolute, already validated by the caller
@@ -474,11 +540,18 @@ export async function readArchive(archivePath, limits = {}) {
     entries = parseTar(buf, lim).map(stripOffset)
   } else if (format === 'tar.gz') {
     entries = parseTar(gunzip(buf, lim.maxTotalBytes), lim).map(stripOffset)
+  } else if (format === 'tar.bz2') {
+    entries = parseTar(bunzip(buf, lim.maxTotalBytes), lim).map(stripOffset)
+  } else if (format === 'tar.xz') {
+    entries = parseTar(unxz(buf, lim.maxTotalBytes), lim).map(stripOffset)
   } else {
-    const inflated = gunzip(buf, Math.min(lim.maxEntryBytes, lim.maxTotalBytes))
+    const cap = Math.min(lim.maxEntryBytes, lim.maxTotalBytes)
+    const inflated = format === 'bzip2' ? bunzip(buf, cap)
+      : format === 'xz' ? unxz(buf, cap)
+        : gunzip(buf, cap)
     entries = [
       {
-        path: sanitizeEntryPath(gzipMemberName(archivePath)),
+        path: sanitizeEntryPath(soloMemberName(format, archivePath)),
         size: inflated.length,
         mtime: new Date(0).toISOString(),
         isDirectory: false,
@@ -538,14 +611,23 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
     return Buffer.from(await file.async('nodebuffer'))
   }
 
-  if (format === 'gzip') {
-    if (wanted !== sanitizeEntryPath(gzipMemberName(archivePath))) {
+  if (format === 'gzip' || format === 'bzip2' || format === 'xz') {
+    if (wanted !== sanitizeEntryPath(soloMemberName(format, archivePath))) {
       throw new ArchiveError(`No such entry: ${wanted}`, 'notfound')
     }
+    if (format === 'bzip2') return bunzip(buf, lim.maxEntryBytes)
+    if (format === 'xz') return unxz(buf, lim.maxEntryBytes)
     return gunzip(buf, lim.maxEntryBytes)
   }
 
-  const tar = format === 'tar.gz' ? gunzip(buf, lim.maxTotalBytes) : buf
+  const tar =
+    format === 'tar.gz'
+      ? gunzip(buf, lim.maxTotalBytes)
+      : format === 'tar.bz2'
+        ? bunzip(buf, lim.maxTotalBytes)
+        : format === 'tar.xz'
+          ? unxz(buf, lim.maxTotalBytes)
+          : buf
   const entry = parseTar(tar, lim).find((e) => !e.isDirectory && e.path === wanted)
   if (!entry) throw new ArchiveError(`No such entry: ${wanted}`, 'notfound')
   if (entry.size > lim.maxEntryBytes) {

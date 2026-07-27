@@ -308,12 +308,30 @@ describe('detectFormat', () => {
     }
   })
 
+  it('recognises bzip2, which src/main/bzip2.js now decodes in-tree', () => {
+    const bz = Buffer.from('BZh91AY&SY')
+    expect(detectFormat('/x/a.bin', bz)).toBe('bzip2')
+    expect(detectFormat('/x/a.bz2', bz)).toBe('bzip2')
+    for (const name of ['a.tbz', 'a.tbz2', 'a.tar.bz2']) {
+      expect(detectFormat(`/x/${name}`, bz)).toBe('tar.bz2')
+    }
+  })
+
+  it('recognises xz by content, and tar.xz by extension', () => {
+    const xz = Buffer.from('fd377a585a0000', 'hex')
+    expect(detectFormat('/x/a.bin', xz)).toBe('xz')
+    expect(detectFormat('/x/a.xz', xz)).toBe('xz')
+    for (const name of ['a.txz', 'a.tar.xz']) {
+      expect(detectFormat(`/x/${name}`, xz)).toBe('tar.xz')
+    }
+  })
+
   it.each([
-    ['bzip2', Buffer.from('BZh91AY&SY')],
-    ['xz', Buffer.from('fd377a585a0000', 'hex')],
     ['7z', Buffer.from('377abcaf271c0004', 'hex')],
     ['rar', Buffer.from('Rar!\x1a\x07\x00')],
   ])('reports %s as unsupported', (_label, buf) => {
+    // These need a decoder Node does not ship and that would take a
+    // dependency; saying so beats failing as "unrecognised".
     const err = grab(() => detectFormat('/x/a.bin', buf))
     expect(err.code).toBe('unsupported')
   })
@@ -421,10 +439,20 @@ describe('readArchive / readArchiveEntry', () => {
   })
 
   it('refuses an unsupported container', async () => {
-    const p = put('x.bz2', Buffer.from('BZh91AY&SY-not-really'))
+    const p = put('x.7z', Buffer.concat([Buffer.from('377abcaf271c0004', 'hex'), Buffer.alloc(32)]))
     const err = await grabAsync(() => readArchive(p))
     expect(err.code).toBe('unsupported')
-    expect(err.message).toMatch(/bzip2/)
+    expect(err.message).toMatch(/7z/)
+  })
+
+  it('treats a damaged bzip2 payload as corrupt, not unsupported', async () => {
+    // Valid stream header and block magic, then garbage — now that bzip2 is
+    // decoded in-tree this is a broken file of a known format, not an
+    // unreadable one.
+    const p = put('x.bz2', Buffer.from('BZh91AY&SY-not-really'))
+    const err = await grabAsync(() => readArchive(p))
+    expect(err).toBeInstanceOf(ArchiveError)
+    expect(err.code).toBe('corrupt')
   })
 
   it('reports a corrupt archive rather than throwing something opaque', async () => {
@@ -486,3 +514,89 @@ async function grabAsync(fn) {
   }
   throw new Error('expected the call to reject')
 }
+
+// ── xz containers ───────────────────────────────────────────────────────────
+//
+// Fixtures are real streams from Python's stdlib (tarfile + lzma), embedded as
+// base64 so the tests stay self-contained:
+//   python -c "import tarfile,lzma,io,base64; ..."
+
+describe('xz archives', () => {
+  /** @type {string} */
+  let xzDir
+
+  // tar containing a.txt='alpha' and dir/b.txt='beta'*100
+  const TARXZ = Buffer.from(
+    '/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4Cf/AHxdADCLiofEDvKXpPh1PcWp7dmXqh+bSp6krW04vBYHqqCPKVTvjXvM/CinOmbCwa2KjyRtTomSv/XOf6SLcIKC+BMk4NmUZh09s3RYXDdcFhWWehP/CJRINNF17FOq/GYKh/0wTsvIs25455OR18xVr6Ryn3wb03NHkv2RzgAA8ET6i40tQP8AAZgBgFAAAMjx5Y6xxGf7AgAAAAAEWVo=',
+    'base64')
+  // b'just one file'
+  const SOLO = Buffer.from(
+    '/Td6WFoAAATm1rRGAgAhARYAAAB0L+WjAQAManVzdCBvbmUgZmlsZQAAAADiPo6+mk+nOQABJQ1xGcS2H7bzfQEAAAAABFla',
+    'base64')
+
+  beforeAll(() => {
+    xzDir = mkdtempSync(join(tmpdir(), 'mycompare-xz-'))
+  })
+
+  afterAll(() => {
+    rmSync(xzDir, { recursive: true, force: true })
+  })
+
+  /** @param {string} name @param {Buffer} data */
+  const write = (name, data) => {
+    const p = join(xzDir, name)
+    writeFileSync(p, data)
+    return p
+  }
+
+  it('lists a tar.xz', async () => {
+    const p = write('sample.tar.xz', TARXZ)
+    const { format, entries } = await readArchive(p)
+    expect(format).toBe('tar.xz')
+    const names = entries.map((e) => e.path.split('::')[1]).sort()
+    expect(names).toContain('a.txt')
+    expect(names).toContain('dir/b.txt')
+  })
+
+  it('reads an entry out of a tar.xz', async () => {
+    const p = write('sample2.tar.xz', TARXZ)
+    expect((await readArchiveEntry(p, 'a.txt')).toString()).toBe('alpha')
+    expect((await readArchiveEntry(p, 'dir/b.txt')).toString())
+      .toBe('beta'.repeat(100))
+  })
+
+  it('exposes a lone .xz as a single member named after the file', async () => {
+    const p = write('solo.xz', SOLO)
+    const { format, entries } = await readArchive(p)
+    expect(format).toBe('xz')
+    expect(entries).toHaveLength(1)
+    expect(entries[0].path.endsWith('::solo')).toBe(true)
+    expect((await readArchiveEntry(p, 'solo')).toString()).toBe('just one file')
+  })
+
+  it('still refuses a traversing entry name', async () => {
+    const p = write('trav.tar.xz', TARXZ)
+    const err = await grabAsync(() => readArchiveEntry(p, '../escape'))
+    expect(err.code).toBe('traversal')
+  })
+
+  it('reports a missing entry', async () => {
+    const p = write('missing.tar.xz', TARXZ)
+    const err = await grabAsync(() => readArchiveEntry(p, 'nope.txt'))
+    expect(err.code).toBe('notfound')
+  })
+
+  it('enforces the total size limit', async () => {
+    const p = write('limit.tar.xz', TARXZ)
+    const err = await grabAsync(() => readArchive(p, { maxTotalBytes: 8 }))
+    expect(err.code).toBe('limit')
+  })
+
+  it('reports a corrupt xz rather than returning garbage', async () => {
+    const bad = Buffer.from(TARXZ)
+    bad[40] ^= 0xff
+    const p = write('bad.tar.xz', bad)
+    const err = await grabAsync(() => readArchive(p))
+    expect(['corrupt', 'limit']).toContain(err.code)
+  })
+})
