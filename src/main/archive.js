@@ -21,6 +21,7 @@ import { bunzip2, isBzip2, Bzip2Error } from './bzip2.js'
 import { decodeXz, isXz, LzmaError } from './lzma.js'
 import { is7z, parse7z, extract7zEntry, SevenZipError } from './sevenzip.js'
 import { isCab, parseCab, extractCabEntry, CabError } from './cab.js'
+import { rarGeneration, parseRar, extractRarEntry, RarError } from './rar.js'
 
 /**
  * @typedef {Object} ArchiveEntry
@@ -39,7 +40,7 @@ import { isCab, parseCab, extractCabEntry, CabError } from './cab.js'
  */
 
 /**
- * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'|'7z'|'cab'} ArchiveFormat
+ * @typedef {'tar'|'gzip'|'tar.gz'|'zip'|'bzip2'|'tar.bz2'|'xz'|'tar.xz'|'7z'|'cab'|'rar'} ArchiveFormat
  */
 
 /**
@@ -425,6 +426,25 @@ function withCabErrors(fn) {
   }
 }
 
+/**
+ * Re-throw a RAR failure as an archive failure, keeping its reason.
+ *
+ * `encrypted` collapses to `unsupported` the same way 7z's does, so callers
+ * keep one small set of codes; the message still names the cause.
+ *
+ * @template T @param {() => T} fn @returns {T}
+ */
+function withRarErrors(fn) {
+  try {
+    return fn()
+  } catch (err) {
+    if (err instanceof RarError) {
+      throw new ArchiveError(err.message, err.code === 'encrypted' ? 'unsupported' : err.code)
+    }
+    throw new ArchiveError(`Corrupt rar archive: ${err instanceof Error ? err.message : err}`, 'corrupt')
+  }
+}
+
 function with7zErrors(fn) {
   try {
     return fn()
@@ -459,9 +479,22 @@ export function detectFormat(filePath, buf) {
   if (isXz(buf)) return /\.(txz|tar\.xz)$/i.test(filePath) ? 'tar.xz' : 'xz'
   if (is7z(buf)) return '7z'
   if (isCab(buf)) return 'cab'
-  if (buf.length >= 4 && buf.toString('ascii', 0, 4) === 'Rar!') {
-    throw new ArchiveError('RAR archives are not supported (no built-in decoder)', 'unsupported')
+  // RAR 5 stored entries are read in-tree; the compressed methods refuse
+  // themselves by name from inside rar.js, at extraction, so a listing still
+  // shows the user what the archive holds instead of an empty folder.
+  //
+  // RAR 4 is a different container generation and is refused here, at the
+  // earliest point: nothing on this machine can produce one, so a parser for
+  // it could only be graded by its own author's reading of the spec.
+  const rar = rarGeneration(buf)
+  if (rar === 'rar4') {
+    throw new ArchiveError(
+      'RAR 4（含）以前的封存格式與 RAR 5 的容器結構不同，本版本不支援；'
+      + '請以 RAR 5 格式重新封存',
+      'unsupported',
+    )
   }
+  if (rar === 'rar5') return 'rar'
   // ustar magic sits at 257; older v7 tars have none, so fall back to the
   // header checksum, which is what actually proves it is a tar.
   if (buf.length >= TAR_BLOCK && (readString(buf, 257, 5) === 'ustar' || tarChecksumValid(buf.subarray(0, TAR_BLOCK)))) {
@@ -594,6 +627,20 @@ export async function readArchive(archivePath, limits = {}) {
       }
       return { path: sanitizeEntryPath(e.path), size: e.size, mtime: e.mtime, isDirectory: false }
     })
+  } else if (format === 'rar') {
+    // rar.js applies the same three ceilings while walking the blocks, so the
+    // caps are enforced before a declared size is ever believed.
+    const parsed = withRarErrors(() => parseRar(buf, {
+      maxEntries: lim.maxEntries,
+      maxEntryBytes: lim.maxEntryBytes,
+      maxBytes: lim.maxTotalBytes,
+    }))
+    entries = parsed.entries.map((e) => ({
+      path: sanitizeEntryPath(e.path),
+      size: e.size,
+      mtime: e.mtime,
+      isDirectory: e.isDirectory,
+    }))
   } else if (format === '7z') {
     const parsed = with7zErrors(() => parse7z(buf, { maxBytes: lim.maxTotalBytes }))
     let total = 0
@@ -743,6 +790,21 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
     }
     return Buffer.from(withCabErrors(() =>
       extractCabEntry(buf, parsed, hit.path, { maxBytes: lim.maxTotalBytes })))
+  }
+
+  if (format === 'rar') {
+    const parsed = withRarErrors(() => parseRar(buf, {
+      maxEntries: lim.maxEntries,
+      maxEntryBytes: lim.maxEntryBytes,
+      maxBytes: lim.maxTotalBytes,
+    }))
+    const hit = parsed.entries.find((e) => !e.isDirectory && safeName(e.path) === wanted)
+    if (!hit) throw new ArchiveError(`No such entry: ${wanted}`, 'notfound')
+    if (hit.size > lim.maxEntryBytes) {
+      throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
+    }
+    return Buffer.from(withRarErrors(() =>
+      extractRarEntry(buf, parsed, hit.path, { maxBytes: lim.maxEntryBytes })))
   }
 
   if (format === '7z') {
