@@ -23,8 +23,9 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | 比對類型 | 說明 |
 |----------|------|
 | **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則（含手動逐行標記）、文法感知比對、編輯模式、可逆摺疊、書籤、Find & Replace、Patch 檢視器 |
-| **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、封存檔瀏覽、移動／互換／Touch、版本欄位、上下層導覽 |
-| **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、行內編輯與 undo/redo、18 種數值判讀面板、標尺、差異篩選 |
+| **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、三向資料夾合併、封存檔瀏覽、移動／互換／Touch、版本／檢查碼／版本控制狀態／擁有者欄位、Source Control 子選單（git）、上下層導覽 |
+| **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、行內編輯與 undo/redo、18 種數值判讀面板（大小端各一組，64 位元以 BigInt 計算）、位址讀數、標尺、差異篩選 |
+| **中繼資料比對** | MP3 的 ID3 標籤與 Windows PE 版本資源，逐欄位並排比對；`.mp3` 自動路由，`.exe`／`.dll` 會問要用 Hex 還是版本資源 |
 | **圖片比對** | 像素級差異、Auto Scale 尺寸對齊、差異強度分級、旋轉翻轉、同步縮放 |
 | **表格比對** | CSV / Excel 多工作表 / HTML 表格、虛擬捲動、儲存格編輯與 undo/redo、數值與日期容差比對、多欄複合 key、欄位顯示與排除 |
 | **三向合併** | 3-way merge、八種顯示篩選、可調脈絡行數、Favor Left/Right、演算法選擇、衝突導航、批次解決 |
@@ -37,16 +38,22 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - 資料夾快照（記錄結構與時間戳供日後比對，可選內容雜湊）
 - Session 資料夾分類
 - 多分頁（tab）工作區與工作區儲存
-- 統一的選項對話框（一般 / 顯示 / 差異導航 / 備份 / 快捷鍵 / 色彩與字型）
+- 統一的選項對話框（一般 / 顯示 / 差異導航 / 備份 / 快捷鍵 / 色彩與字型 /
+  資料夾檢視 / 圖片比對 / 文字編輯 / 封存檔類型 / 開啟方式 / 進階調整）
 - 深色 / 淺色主題（跟隨系統或手動切換），差異色彩與字型可自訂
 - 設定匯出／匯入（快捷鍵、偏好、色彩、具名設定、工作區、Session；不含任何密碼）
 - 刪除預設走資源回收桶；備份支援四種命名規則與自訂位置
 - HTML / 純文字報告匯出、Unified Diff、列印與 PDF
 - 檔案遮罩篩選（BeyondCompare 語法：`;` 多重、`-` 排除、`[a-z]`、`...\` 等）
-- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz、7z
-- 遠端連線：FTP / FTPS / SFTP / S3（連線設定檔、密碼以系統金鑰庫保存）。
-  SFTP 一定會驗證主機金鑰：沒見過的金鑰會顯示指紋讓你確認，金鑰變更則直接拒絕連線
-- MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對
+- 壓縮檔瀏覽：zip / jar / war / ear、tar、gzip、tar.gz、bzip2、tar.bz2、xz、tar.xz、
+  7z（含 BCJ2）、cab（MSZIP / LZX / 未壓縮）、rar（RAR4 與 RAR5）
+- 遠端連線：FTP / FTPS / SFTP / S3 / Dropbox / OneDrive（連線設定檔、密碼與 refresh token
+  以系統金鑰庫保存）。SFTP 一定會驗證主機金鑰：沒見過的金鑰會顯示指紋讓你確認，
+  金鑰變更則直接拒絕連線。Dropbox 與 OneDrive 走 OAuth 2.0 + PKCE，需自行申請應用程式
+  憑證（這是這類服務的規定，介面內有申請說明）
+- MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對：可在資料夾比對中作為內容判定，
+  也有獨立的逐欄位比對視圖
+- 多視窗：可開新視窗，分頁能以右鍵移出或直接拖曳到另一個視窗（拖到視窗外會另開新視窗）
 - 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
 - 可自訂鍵盤快捷鍵
@@ -55,10 +62,16 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ### 尚未實作
 
-- **Dropbox / OneDrive**：需要 OAuth 流程與各自的 API，並須自行申請應用程式憑證
-- **RAR**：RARLAB 公開的只有封存結構，壓縮演算法本身是專有的。更關鍵的是這台機器上
-  沒有任何 RAR 工具可以產生測試檔——無法對照參考實作驗證的二進位解析器，比不做更糟
-- **7z 部分編碼**：BCJ2 等多輸入 filter、以及加密壓縮檔會明確報錯而非誤解碼
+- **CAB Quantum**：這是唯一還缺的壓縮方法。產生器（Diamond.exe ≤ 1.00.0530）在 1996 年
+  就被 Microsoft 移除，`makecab` 與 1997 年 Cabinet SDK 的工具都拒絕這個選項，本機 686 個
+  cab、cabextract 自身的測試語料裡也沒有任何一個。拿不到樣本就無法對照參考實作驗證，
+  而只跟自己對得起來的解碼器會回傳看似正確的錯誤位元組——因此明確具名拒絕，不誤解碼
+- **RAR 的壓縮演算法**：容器（RAR4 / RAR5）本身已支援，未壓縮（stored）項目由本程式直接
+  讀取。壓縮過的項目若機器上裝了 WinRAR／UnRAR 就交給它解壓並驗證 CRC，沒裝則列出內容
+  並具名報錯。不自行實作解壓器的理由是授權：RAR 壓縮沒有公開規格，唯一的描述是 UnRAR
+  原始碼，而其授權禁止用該原始碼做出相容 RAR 的軟體
+- **加密壓縮檔**：7z 與 RAR 的加密封存、以及 BCJ2 套在本版本沒有解碼器的 sub-coder 上，
+  一律具名報錯
 
 ---
 
@@ -85,7 +98,16 @@ electron-builder 26  — 打包與安裝程式產生
 MyCompare/
 ├── src/
 │   ├── main/
-│   │   └── index.js          # Electron main process（IPC handlers、native menu）
+│   │   ├── index.js          # Electron main process（IPC handlers、native menu）
+│   │   ├── archive.js        # 壓縮檔統一入口（格式偵測、上限、路徑穿越防護）
+│   │   ├── cab.js  rar.js    # 手寫解碼器：CAB（MSZIP/LZX）、RAR4/RAR5 容器
+│   │   ├── sevenzip.js       # 7z（含 BCJ2 多輸入 filter）
+│   │   ├── bzip2.js lzma.js  # bzip2、LZMA/LZMA2/xz
+│   │   ├── unrar-tool.js     # 選用：把 RAR 壓縮項目交給已安裝的 UnRAR
+│   │   ├── ssh-transport.js  # 手寫 SSH-2 傳輸層
+│   │   ├── remote-*.js       # FTP / FTPS / SFTP / S3 / Dropbox / OneDrive
+│   │   ├── vcs.js            # git 狀態與 Source Control 操作
+│   │   └── metadata.js       # ID3 與 PE 版本資源解析
 │   ├── preload/
 │   │   └── index.js          # contextBridge（electronAPI 暴露給 renderer）
 │   └── renderer/
@@ -93,13 +115,14 @@ MyCompare/
 │       └── src/
 │           ├── main.js        # renderer 入口
 │           ├── app.js         # 視圖路由、toolbar、tab 管理
-│           ├── core/          # diff 引擎、session 管理、工具函式
+│           ├── core/          # diff 引擎、session 管理、對話框、視窗管理、工具函式
 │           └── views/         # 各比對視圖元件
 │               ├── text-compare.js
 │               ├── folder-compare.js
 │               ├── hex-compare.js
 │               ├── image-compare.js
 │               ├── table-compare.js
+│               ├── metadata-compare.js
 │               └── three-way-compare.js
 ├── tests/
 │   ├── unit/                  # Vitest 單元測試
@@ -196,17 +219,32 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**3018 / 3018 unit tests passing**、**243 / 243 e2e tests passing**。
+目前覆蓋：**4209 / 4209 unit tests passing**、**384 / 384 e2e tests passing**，
+共 148 個單元測試檔與 57 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、
 快照格式、壓縮檔（含 Zip Slip 與比例炸彈）、ID3 與 PE 解析、登錄檔格式、
-SSH 傳輸層（對 paramiko 互通測試）、OAuth PKCE、文法系統的病態輸入防護等 102 個測試檔。
+SSH 傳輸層、OAuth PKCE、文法系統的病態輸入防護等。
 
-其中四支專門防「實作完整但沒有呼叫端」——這個專案最常犯的錯，兩次稽核共找到九次：
-`preload-orphans`（每個 IPC 方法都有呼叫端）、`menu-wiring`（每個選單項目都有處理常式）、
-`text-menu-commands`（指令表、dispatch、選單三處一致）、
-`remote-kinds-offered`（設定介面提供的連線類型與後端支援的一致）。
+**手寫的解析器一律對外部參考驗證，不跟自己的假資料對答案。**
+SSH 對 paramiko 互通測試；CAB 對 `makecab` 與 `expand.exe`；7z / BCJ2 對 `7z.exe`；
+RAR 對 RARLAB 自己的 `Rar.exe`；壓縮格式的 fixture 由 Python 的 `bz2` / `lzma` /
+`tarfile` 產生；PE 版本資源對 Windows 的版本 API 比對 772 個真實 binary；
+CRC 與雜湊對公開測試向量。CAB 解析另外對本機 686 個真實 cab 抽樣，逐位元組比對 7-Zip 的輸出。
+
+另有一組測試專防「實作完整但沒有呼叫端」——這個專案最常犯的錯，歷次稽核共找到十次以上：
+
+| 測試 | 防的是什麼 |
+|------|-----------|
+| `preload-orphans` | IPC 方法**雙向**都要接上：暴露了沒人呼叫是死碼，呼叫了沒暴露是執行期 TypeError |
+| （同上，模組層） | 沒有任何檔案 import 的模組——它會讓上面那條檢查失效，因為模組本身就會「提到」那些方法名 |
+| `options-bc-pages` | 每個偏好設定都要有**讀取端**，不能只有寫入的控制項 |
+| `css-variables` | 每個 `var(--x)` 都要有定義；`var(--x, fallback)` 永遠取 fallback 時畫面看起來完全正常 |
+| `modal-prompt-wiring` | 沒有任何一處還在呼叫全域 `prompt()`——它在 Electron 會直接拋例外 |
+| `menu-wiring` / `menu-accelerators` / `menu-window-target` | 選單項目有處理常式、顯示的快捷鍵真的有人綁、指令送到**目前聚焦**的視窗 |
+| `text-menu-commands` | 指令表、dispatch、選單三處一致 |
+| `remote-kinds-offered` | 設定介面提供的連線類型與後端支援的一致 |
 
 ### E2E 測試（Playwright + Electron）
 
@@ -214,7 +252,15 @@ SSH 傳輸層（對 paramiko 互通測試）、OAuth PKCE、文法系統的病�
 npm run test:e2e
 ```
 
-E2E 測試會先執行 `npm run build`，再對生產版本執行 Playwright 測試（透過 `window.__testAPI` 注入資料，繞過 file dialog）。涵蓋 text / folder / hex / image / table / three-way / smoke / theme 等視圖。
+E2E 測試會先執行 `npm run build`，再對生產版本執行 Playwright 測試（透過 `window.__testAPI` 注入資料，繞過 file dialog）。涵蓋 text / folder / hex / image / table / three-way / metadata / smoke / theme 等視圖。
+
+每個 worker 使用獨立的 Electron profile（`--user-data-dir` 指向暫存目錄）。在此之前所有 e2e
+共用開發者本人的 profile：一條測試改掉的設定會留給下一條、留到下一次執行、也留給實際的
+應用程式。除了讓測試相依於執行順序，它還曾經蓋掉一個真的 bug——改好的預設值讀出來仍是舊的，
+因為舊值已被前一次執行寫進儲存，而儲存的設定優先於預設值。
+
+另有一支 `packaged-smoke` 直接啟動 `dist/win-unpacked` 裡打包好的執行檔，檢查 asar 與 preload
+在打包後仍然正常（其餘 e2e 跑的是 `out/`，不是使用者實際安裝的東西）。沒有 `dist/` 時自動跳過。
 
 ### Lint
 
@@ -241,6 +287,11 @@ npm run lint
 | `Ctrl+Shift+S` | 儲存右側檔案 |
 | `Ctrl+F` | 開啟搜尋列（各視圖內） |
 | `F5` | 重新整理 |
+| `Ctrl+Shift+R` | 從磁碟重新載入目前視圖 |
+| `F11` | 全螢幕 |
+
+以上為預設值，全部可在「選項 → 快捷鍵」重新綁定。原生選單列顯示的快捷鍵只是提示，
+實際按鍵一律由 renderer 處理，因此重新綁定後選單上的提示也會跟著更新，不會兩邊各按一次。
 
 ---
 
