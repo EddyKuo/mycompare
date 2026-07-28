@@ -226,6 +226,44 @@ test('a live registry key loads as one side', async () => {
   expect(stats['right-only']).toBe(0)
 })
 
+test('a key on another computer loads through the remote path', async () => {
+  // Naming this computer takes exactly the remote code path — reg.exe cannot
+  // export remotely, so this side goes through the registry API instead — and
+  // is the only way to run it without a second machine. Remote reads serve
+  // HKLM and HKU only, which is Windows' restriction, not this program's.
+  const me = process.env.COMPUTERNAME
+  test.skip(!me, 'no COMPUTERNAME to address')
+
+  await win.evaluate((p) => window.__testAPI.openComparison({
+    type: 'registry', leftPath: p, rightPath: '',
+  }), regPath)
+  await win.waitForFunction(() => window.__testAPI.currentView() === 'registry')
+
+  await win.evaluate((m) => window.__testAPI.regSetLiveKey(
+    'right', `\\\\${m}\\HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts`), me)
+
+  const rows = await win.evaluate(() => window.__testAPI.regRowsForSide('right'))
+  expect(rows.length).toBeGreaterThan(0)
+  expect(rows.every((r) => r.path.startsWith('HKEY_LOCAL_MACHINE'))).toBe(true)
+  // Font entries are REG_SZ filenames; a mangled read would not look like this.
+  expect(rows.some((r) => /\.ttf$/i.test(r.value))).toBe(true)
+})
+
+test('a remote target naming a root Windows will not serve is refused', async () => {
+  const me = process.env.COMPUTERNAME
+  test.skip(!me, 'no COMPUTERNAME to address')
+
+  await win.evaluate((p) => window.__testAPI.openComparison({
+    type: 'registry', leftPath: p, rightPath: '',
+  }), regPath)
+  await win.waitForFunction(() => window.__testAPI.currentView() === 'registry')
+
+  await win.evaluate((m) =>
+    window.__testAPI.regSetLiveKey('right', `\\\\${m}\\HKCU\\Environment`), me)
+  const rows = await win.evaluate(() => window.__testAPI.regRowsForSide('right'))
+  expect(rows).toHaveLength(0)
+})
+
 test('an unsafe key path never reaches reg.exe through the live loader', async () => {
   // Start from a known state: one side loaded, the other deliberately empty.
   await win.evaluate((p) => window.__testAPI.openComparison({

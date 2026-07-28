@@ -1033,12 +1033,26 @@ ipcMain.handle('export-registry-key', async (event, { keyPath } = {}) => {
  * reloading re-exports rather than re-reading the file.
  */
 ipcMain.handle('snapshot-registry-key', async (_event, { keyPath, replaces } = {}) => {
-  const { exportRegistryKey, validateRegistryPath } = await import('./registry.js')
-  const safeKey = validateRegistryPath(keyPath)
-  const name = `mycompare-key-${safeKey.replace(/[^A-Za-z0-9]+/g, '-').slice(0, 60)}`
+  const { exportRegistryKey, validateRegistryPath, buildRegFile, flattenRegistry } =
+    await import('./registry.js')
+  const { parseRegistryTarget, queryRemoteKey } = await import('./registry-query.js')
+
+  // `\\Machine\HKLM\...` selects another computer. reg.exe cannot
+  // remotely — its own help says "local machine only" — so that side is read
+  // through the registry API and written out here, which keeps one
+  // representation downstream instead of two.
+  const { machine, keyPath: key } = parseRegistryTarget(keyPath)
+  const label = machine ? `${machine}-${key}` : key
+  const name = `mycompare-key-${label.replace(/[^A-Za-z0-9]+/g, '-').slice(0, 60)}`
   const out = join(tmpdir(), `${name}-${Date.now()}-${process.pid}.reg`)
   registerRoot(out)
-  await exportRegistryKey(safeKey, out)
+
+  if (machine) {
+    const parsed = await queryRemoteKey(machine, key)
+    await writeFile(out, `﻿${buildRegFile(flattenRegistry(parsed))}`, 'utf16le')
+  } else {
+    await exportRegistryKey(validateRegistryPath(key), out)
+  }
   // Release the snapshot this one replaces, named by the caller. Matching on
   // the key name instead would delete the wrong file whenever both sides show
   // the same key — loading the right side would pull the left side's export
@@ -1048,7 +1062,7 @@ ipcMain.handle('snapshot-registry-key', async (_event, { keyPath, replaces } = {
     _registrySnapshots.delete(replaces)
   }
   _registrySnapshots.add(out)
-  return { path: out, keyPath: safeKey }
+  return { path: out, keyPath: machine ? `\\\\${machine}\\${key}` : key }
 })
 
 /**

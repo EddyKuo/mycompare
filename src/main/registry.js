@@ -151,7 +151,11 @@ export function parseRegValue(token) {
   const dword = raw.match(/^dword:([0-9a-fA-F]+)$/)
   if (dword) {
     const n = parseInt(dword[1], 16)
-    return { type: 'REG_DWORD', value: `0x${dword[1].toLowerCase()} (${n})` }
+    // Padded to eight digits so this matches what `reg query` reports for the
+    // same value. A .reg file writes 0x00001388 and reg query prints 0x1388;
+    // comparing a remote key against an exported one would otherwise call
+    // every DWORD different — 62 of them on two ordinary keys when measured.
+    return { type: 'REG_DWORD', value: `0x${dword[1].toLowerCase().padStart(8, '0')} (${n})` }
   }
   const qword = raw.match(/^hex\(b\):(.*)$/)
   if (qword) {
@@ -161,6 +165,10 @@ export function parseRegValue(token) {
   if (hexTyped) {
     const kind = parseInt(hexTyped[1], 16)
     const type = {
+      // 0 is REG_NONE. Leaving it unnamed made it read as REG_TYPE_0 here and
+      // REG_NONE from `reg query`, so the same value compared across the two
+      // sources looked like a type change — thousands of them on this machine.
+      0: 'REG_NONE',
       1: 'REG_SZ', 2: 'REG_EXPAND_SZ', 3: 'REG_BINARY',
       4: 'REG_DWORD', 7: 'REG_MULTI_SZ', 11: 'REG_QWORD',
     }[kind] ?? `REG_TYPE_${kind}`
@@ -349,6 +357,11 @@ export function formatRegValue(row) {
       return `hex(b):${toCommaHex(value)}`
     case 'REG_BINARY':
       return `hex:${toCommaHex(value)}`
+    case 'REG_NONE':
+      // Type 0. Needed because a remote read is written to a .reg file before
+      // anything compares it, and without this the bytes would be written as
+      // a bare token that reads back as something else.
+      return `hex(0):${toCommaHex(value)}`
     case 'REG_EXPAND_SZ':
       return `hex(2):${toCommaHex(utf16Bytes(value, false))}`
     case 'REG_MULTI_SZ':

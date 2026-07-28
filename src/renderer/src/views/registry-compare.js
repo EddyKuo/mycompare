@@ -251,7 +251,8 @@ export class RegistryCompare {
   async promptLiveKey(side) {
     const keyPath = await promptDialog({
       title: side === 'left' ? '左側：即時登錄機碼' : '右側：即時登錄機碼',
-      message: '機碼路徑',
+      message: '機碼路徑。要讀另一台電腦，寫成 \\\\電腦名稱\\HKLM\\…'
+        + '（遠端只能存取 HKLM 與 HKU，這是 Windows 的限制，不是本程式的）',
       defaultValue: (side === 'left' ? this._leftLiveKey : this._rightLiveKey)
         || 'HKEY_CURRENT_USER\\Software',
     })
