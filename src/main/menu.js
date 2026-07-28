@@ -437,6 +437,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
               ]
             },
             item('標尺', 'view.text.ruler'),
+            item('以網頁方式檢視', 'view.text.webpages'),
             item('檔案資訊', 'view.text.fileInfo'),
             item('說明欄', 'view.text.description'),
             { type: 'separator' },

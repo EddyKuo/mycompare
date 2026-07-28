@@ -3951,6 +3951,9 @@ function setupMenuActions() {
       () => _textView((v) => v.gotoBookmark(i + 1), '書籤'),
     ])),
 
+    // The toolbar button was the only way in, so turning it off in the
+    // command-visibility page left the mode unreachable.
+    'view.text.webpages': () => { textCompare?.toggleWebpageMode?.() },
     'view.text.ruler':       () => _textPanel((v) => showStatus(v.toggleRuler() ? '已顯示欄位標尺' : '已隱藏欄位標尺')),
     'view.text.fileInfo':    () => _textPanel((v) => showStatus(v.toggleFileInfo() ? '已顯示檔案資訊' : '已隱藏檔案資訊')),
     'view.text.description': () => _textPanel((v) => showStatus(v.toggleDescription() ? '已顯示說明欄' : '已隱藏說明欄')),
@@ -4354,7 +4357,7 @@ function setupCommandControls(setStatus) {
       if (cmd.menuId) {
         const note = document.createElement('span')
         note.className = 'settings-row-conflict'
-        note.textContent = `選單（${cmd.menuId}）：尚未支援`
+        note.textContent = `也會從選單移除（${cmd.menuId}）`
         row.appendChild(note)
       }
       list.appendChild(row)

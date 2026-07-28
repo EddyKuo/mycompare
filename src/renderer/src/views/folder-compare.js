@@ -1899,7 +1899,7 @@ export function listFolderConfigs() {
  * virtual path before `::`.
  */
 const ARCHIVE_EXT =
-  /\.(zip|jar|war|ear|7z|tar|tgz|tbz2?|txz|gz|bz2|xz)$/i
+  /\.(zip|jar|war|ear|7z|rar|cab|tar|tgz|tbz2?|txz|gz|bz2|xz)$/i
 
 /**
  * Open-dialog filters for every format `main/archive.js` can decode.
@@ -1911,12 +1911,17 @@ const ARCHIVE_EXT =
 export const ARCHIVE_DIALOG_FILTERS = [
   {
     name: '封存檔',
-    extensions: ['zip', 'jar', 'war', 'ear', '7z', 'tar', 'tgz', 'tbz', 'tbz2', 'txz', 'gz', 'bz2', 'xz'],
+    extensions: [
+      'zip', 'jar', 'war', 'ear', '7z', 'rar', 'cab',
+      'tar', 'tgz', 'tbz', 'tbz2', 'txz', 'gz', 'bz2', 'xz',
+    ],
   },
   { name: 'Zip 家族 (zip/jar/war/ear)', extensions: ['zip', 'jar', 'war', 'ear'] },
   { name: 'Tar 家族 (tar/tgz/tbz2/txz)', extensions: ['tar', 'tgz', 'tbz', 'tbz2', 'txz'] },
   { name: '單檔壓縮 (gz/bz2/xz)', extensions: ['gz', 'bz2', 'xz'] },
   { name: '7-Zip (7z)', extensions: ['7z'] },
+  { name: 'RAR (rar)', extensions: ['rar'] },
+  { name: 'Cabinet (cab)', extensions: ['cab'] },
   { name: '所有檔案', extensions: ['*'] },
 ]
 

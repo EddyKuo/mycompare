@@ -27,6 +27,44 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ---
 
+## 對 Beyond Compare 的覆蓋率
+
+**約 69%**，以 BC4 官方命令參考的 **897 條指令**加權計算。
+
+分母是逐頁從 BC4 線上說明數出來的命令條目數，不是估的。BC4 有 15 個命令頁，
+本專案對其中 **13 個**有對應的視圖類型；那 13 個佔 BC 指令總數的 90%，其中覆蓋 73%。
+
+| BC4 視圖類型 | BC 指令數 | 本專案覆蓋 |
+|---|---:|---:|
+| Folder Compare | 105 | 72% |
+| Text Merge | 102 | 70% |
+| Text Compare | 101 | 78% |
+| Folder Merge | 87 | 60% |
+| Registry Compare | 64 | 85% |
+| Table Compare | 63 | 85% |
+| Hex Compare | 58 | 65% |
+| **Text Edit** | 53 | 25% |
+| Picture Compare | 48 | 85% |
+| Folder Sync | 47 | 60% |
+| MP3 Compare | 47 | 70% |
+| Version Compare | 45 | 70% |
+| Common（跨視圖） | 39 | 85% |
+| **Text Patch** | 35 | 40% |
+| Home | 3 | 100% |
+
+整個沒做的是 **Text Edit**（BC 的獨立編輯器視圖，含 Find in Files；本專案只有
+文字比對內的 Ctrl+E 編輯模式）與 **Text Patch** 的獨立視圖（可讀 unified diff，
+但注入文字比對，沒有逐檔逐 hunk 瀏覽）。另外未實作 **Clipboard Compare**、
+Explorer 殼層整合、MTP 行動裝置與 `http://` 來源，以及 SCC 相容的版本控制整合
+（本專案只支援 git）。
+
+九個主要領域的 153 個功能點，逐項對程式碼查證後是
+**101 完成 / 22 部分 / 30 未實作**，且**沒有任何「實作了但沒有入口」的孤兒**。
+
+完整推導見 `.claude/research/coverage-v5.md`。**任何清單都會過期；判斷現況請讀程式碼。**
+
+---
+
 ## 功能特色
 
 | 比對類型 | 說明 |
@@ -38,6 +76,7 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | **圖片比對** | 像素級差異、Auto Scale 尺寸對齊、差異強度分級、旋轉翻轉、同步縮放 |
 | **表格比對** | CSV / Excel 多工作表 / HTML 表格、虛擬捲動、儲存格編輯與 undo/redo、數值與日期容差比對、多欄複合 key、欄位顯示與排除 |
 | **三向合併** | 3-way merge、八種顯示篩選、可調脈絡行數、Favor Left/Right、演算法選擇、衝突導航、批次解決 |
+| **登錄檔比對** | 鍵值格狀樹、逐值型別與「只存在於一側」、虛擬捲動、編輯／複製／刪除／改名／新增、寫出 .reg 或套用回登錄檔、基準機碼對齊兩把不同名的機碼（僅 Windows） |
 
 其他功能：
 
@@ -63,11 +102,8 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對：可在資料夾比對中作為內容判定，
   也有獨立的逐欄位比對視圖
 - 多視窗：可開新視窗，分頁能以右鍵移出或直接拖曳到另一個視窗（拖到視窗外會另開新視窗）
-- 登錄檔比對：鍵值格狀檢視，逐值標示型別與「只存在於一側」，可修改、複製到另一側、
-  刪除、重新命名、新增機碼與值，寫出成 .reg 或直接套用回登錄檔（僅 Windows）。
-  三種來源任意配對：本機即時機碼、**另一台電腦的登錄檔**（`\\電腦名稱\HKLM\…`，
-  遠端限 HKLM 與 HKU，這是 Windows 的限制）、.reg 檔。
-  可設定基準機碼（單側／兩側／另一側）與上一層，用來對齊兩把名稱不同的機碼
+- 登錄檔的三種來源任意配對：本機即時機碼、**另一台電腦的登錄檔**
+  （`\\電腦名稱\HKLM\…`；遠端限 HKLM 與 HKU，這是 Windows 的限制，不是本程式的）、.reg 檔
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
 - 可自訂鍵盤快捷鍵
 - 拖放檔案或資料夾即可開始比對
@@ -133,6 +169,8 @@ MyCompare/
 │   │   ├── ssh-transport.js  # 手寫 SSH-2 傳輸層
 │   │   ├── remote-*.js       # FTP / FTPS / SFTP / S3 / Dropbox / OneDrive
 │   │   ├── vcs.js            # git 狀態與 Source Control 操作
+│   │   ├── registry.js       # .reg 解析／組裝、逐值比對
+│   │   ├── registry-query.js # 遠端電腦的登錄檔（.NET 登錄檔 API）
 │   │   └── metadata.js       # ID3 與 PE 版本資源解析
 │   ├── preload/
 │   │   └── index.js          # contextBridge（electronAPI 暴露給 renderer）
@@ -142,18 +180,20 @@ MyCompare/
 │           ├── main.js        # renderer 入口
 │           ├── app.js         # 視圖路由、toolbar、tab 管理
 │           ├── core/          # diff 引擎、session 管理、對話框、視窗管理、工具函式
-│           └── views/         # 各比對視圖元件
+│           └── views/         # 八種比對視圖元件
 │               ├── text-compare.js
 │               ├── folder-compare.js
 │               ├── hex-compare.js
 │               ├── image-compare.js
 │               ├── table-compare.js
 │               ├── metadata-compare.js
+│               ├── registry-compare.js
 │               └── three-way-compare.js
 ├── tests/
 │   ├── unit/                  # Vitest 單元測試
 │   └── e2e/                   # Playwright E2E 測試
 ├── resources/                 # 應用程式圖示
+├── .github/workflows/         # 三平台 release 建置
 ├── electron.vite.config.js
 ├── vitest.config.js
 └── package.json
@@ -245,7 +285,7 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4301 / 4301 unit tests passing**、**396 / 396 e2e tests passing**，
+目前覆蓋：**4302 / 4302 unit tests passing**、**396 / 396 e2e tests passing**，
 共 152 個單元測試檔與 58 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、

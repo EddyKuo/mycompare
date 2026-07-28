@@ -8,6 +8,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { readFileSync } from 'fs'
+import { resolve } from 'path'
 
 import {
   FolderCompare,
@@ -24,6 +26,31 @@ describe('sourceKindOf', () => {
     expect(sourceKindOf('snapshot://src/a.txt')).toBe('snapshot')
     expect(sourceKindOf('remote://p1/pub/a.txt')).toBe('remote')
     expect(sourceKindOf(null)).toBe('fs')
+  })
+
+  it('recognises every container the main process can actually decode', () => {
+    // The two halves drifted apart: main gained RAR and CAB, the renderer's
+    // extension list never learned about them, so `x.rar::entry` classified as
+    // an ordinary file and the read went to the file API with a `::` path.
+    // Listing a RAR worked; opening anything inside it did not.
+    //
+    // Pinned against the source of truth rather than a hand-copied list,
+    // because a hand-copied list is what drifted.
+    // A plain path, not a URL: this file runs under jsdom, which replaces the
+    // global URL with its own and readFileSync will not accept that object.
+    const mainSource = readFileSync(
+      resolve(process.cwd(), 'src/main/archive.js'), 'utf-8')
+    const decodable = [...mainSource.matchAll(/return '([a-z0-9]+)'/g)]
+      .map((m) => m[1])
+      .filter((f) => f !== 'unknown')
+
+    expect(decodable.length).toBeGreaterThan(4)
+    for (const format of new Set(decodable)) {
+      // gzip/bzip2 are decoder names; the paths carry the usual extensions.
+      const ext = { gzip: 'gz', bzip2: 'bz2' }[format] ?? format
+      expect(sourceKindOf(`C:\\tmp\\x.${ext}::inner/a.txt`), `.${ext}`)
+        .toBe('archive')
+    }
   })
 })
 
