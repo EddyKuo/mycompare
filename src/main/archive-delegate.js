@@ -1,7 +1,7 @@
 /**
- * @file rar-delegate.js
+ * @file archive-delegate.js
  * @description Optional delegation to an already-installed archiver, for the
- *   RAR compression methods this project does not implement.
+ *   compression methods this project does not implement itself.
  *
  *   **Why delegate rather than decode.** RAR's compression has no public
  *   specification. The only description of it is UnRAR's source, whose licence
@@ -39,35 +39,40 @@ import { existsSync } from 'fs'
  * @type {Array<{path: string, kind: '7zip'|'unrar'}>}
  */
 const CANDIDATES = [
-  { path: 'C:\\Program Files\\7-Zip\\7z.exe', kind: '7zip' },
-  { path: 'C:\\Program Files (x86)\\7-Zip\\7z.exe', kind: '7zip' },
-  { path: '7z', kind: '7zip' },
-  { path: 'C:\\Program Files\\WinRAR\\UnRAR.exe', kind: 'unrar' },
-  { path: 'C:\\Program Files\\WinRAR\\Rar.exe', kind: 'unrar' },
-  { path: 'C:\\Program Files (x86)\\WinRAR\\UnRAR.exe', kind: 'unrar' },
-  { path: 'unrar', kind: 'unrar' },
+  { path: 'C:\\Program Files\\7-Zip\\7z.exe', kind: '7zip', formats: ['rar', 'cab'] },
+  { path: 'C:\\Program Files (x86)\\7-Zip\\7z.exe', kind: '7zip', formats: ['rar', 'cab'] },
+  { path: '7z', kind: '7zip', formats: ['rar', 'cab'] },
+  { path: 'C:\\Program Files\\WinRAR\\UnRAR.exe', kind: 'unrar', formats: ['rar'] },
+  { path: 'C:\\Program Files\\WinRAR\\Rar.exe', kind: 'unrar', formats: ['rar'] },
+  { path: 'C:\\Program Files (x86)\\WinRAR\\UnRAR.exe', kind: 'unrar', formats: ['rar'] },
+  { path: 'unrar', kind: 'unrar', formats: ['rar'] },
 ]
 
 /**
- * Resolved once. A miss is cached too — probing every absent path on each
- * entry of a large archive is a cost for no information.
- * @type {RarTool|null|undefined}
+ * Resolved once per format. A miss is cached too — probing every absent path
+ * on each entry of a large archive is a cost for no information.
+ * @type {Record<string, RarTool|null>}
  */
-let cached
+let cached = {}
 
-/** Forget the cached probe. Tests only. */
-export function _resetRarToolProbe() { cached = undefined }
+/** Forget the cached probes. Tests only. */
+export function _resetToolProbe() { cached = {} }
 
 /**
- * The archiver to use, or null when there is none.
+ * The archiver to use for a format, or null when there is none.
  *
- * @param {Array<{path: string, kind: '7zip'|'unrar'}>} [candidates] for tests
+ * @param {'rar'|'cab'} [format]
+ * @param {Array<{path: string, kind: '7zip'|'unrar', formats?: string[]}>} [candidates] for tests
  * @returns {RarTool|null}
  */
-export function findRarTool(candidates = CANDIDATES) {
-  if (cached !== undefined && candidates === CANDIDATES) return cached
+export function findTool(format = 'rar', candidates = CANDIDATES) {
+  const usable = candidates.filter((c) => !c.formats || c.formats.includes(format))
+  // Only the default lookup is cached, and only per format: UnRAR answers for
+  // RAR and not for CAB, so one cached answer for both would hand a CAB to a
+  // tool that cannot read it.
+  if (candidates === CANDIDATES && cached && cached[format] !== undefined) return cached[format]
   let found = null
-  for (const c of candidates) {
+  for (const c of usable) {
     if (c.path.includes('\\') || c.path.includes('/')) {
       if (existsSync(c.path)) { found = { exe: c.path, kind: c.kind }; break }
       continue
@@ -77,16 +82,24 @@ export function findRarTool(candidates = CANDIDATES) {
     // meant a machine with no archiver got "spawn 7z ENOENT" where it should
     // have got the plain explanation that the method needs a decoder this
     // build does not have.
-    const probe = spawnSync(c.path, ['--help'], { windowsHide: true, timeout: 5000 })
+    // Generous, because this is a one-off probe whose only failure mode that
+    // matters is a false negative: timing out on a loaded machine would report
+    // "no archiver installed" and refuse an archive the user can actually
+    // open. It only runs when no absolute path matched, and the answer is
+    // cached, so the cost is paid at most once per format.
+    const probe = spawnSync(c.path, ['--help'], { windowsHide: true, timeout: 30000 })
     if (!probe.error) { found = { exe: c.path, kind: c.kind }; break }
   }
-  if (candidates === CANDIDATES) cached = found
+  if (candidates === CANDIDATES) cached[format] = found
   return found
 }
 
-/** Whether compressed entries can be read at all on this machine. */
-export function canExtractCompressed() {
-  return findRarTool() !== null
+/**
+ * Whether a method this build cannot decode can be read at all on this machine.
+ * @param {'rar'|'cab'} [format]
+ */
+export function canExtractCompressed(format = 'rar') {
+  return findTool(format) !== null
 }
 
 /**
@@ -123,8 +136,10 @@ export function buildArgs(tool, archivePath, entryPath) {
  * @param {number} [args.timeoutMs]
  * @returns {Promise<Buffer>}
  */
-export function extractWithTool({ archivePath, entryPath, maxBytes, timeoutMs = 120000 }) {
-  const tool = findRarTool()
+export function extractWithTool({
+  archivePath, entryPath, maxBytes, format = 'rar', expectedSize, timeoutMs = 120000,
+}) {
+  const tool = findTool(format)
   if (!tool) return Promise.reject(new Error('這台機器上找不到 7-Zip 或 UnRAR'))
 
   return new Promise((resolve, reject) => {
@@ -148,7 +163,18 @@ export function extractWithTool({ archivePath, entryPath, maxBytes, timeoutMs = 
             + `${why || err.message}`))
           return
         }
-        resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? ''))
+        const out = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? '')
+        // 7-Zip exits 0 with empty output when the named entry is not in the
+        // archive, so success alone does not mean the right bytes came back.
+        // The caller knows the declared size; checking it here keeps the
+        // guarantee with the call rather than leaving each caller to
+        // re-implement it, and an entry that really is empty still passes.
+        if (typeof expectedSize === 'number' && out.length !== expectedSize) {
+          reject(new Error(
+            `解壓「${entryPath}」得到 ${out.length} 位元組，但封存檔宣告 ${expectedSize}`))
+          return
+        }
+        resolve(out)
       },
     )
   })

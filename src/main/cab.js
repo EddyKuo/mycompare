@@ -34,11 +34,16 @@
  *       1 LZX. No Quantum there either, which is the strongest single signal:
  *       the project best placed to publish one does not.
  *
- *   So no Quantum cabinet can be produced or found here, and a decoder could
- *   only ever be checked against itself. One that agrees only with itself is
- *   worse than an honest refusal. If a genuine Quantum cabinet ever turns up,
- *   7-Zip reads the format and would serve as the reference, and libmspack's
- *   qtmd.c is the same kind of guide lzxd.c was for LZX above.
+ *   So no Quantum cabinet can be produced or found here, and a decoder written
+ *   in this file could only ever be checked against itself. One that agrees
+ *   only with itself is worse than an honest refusal.
+ *
+ *   That is why this file does not decode it — and why it no longer has to.
+ *   `archive.js` catches this refusal and hands the entry to 7-Zip, which does
+ *   read Quantum. The unverifiable step disappears: nothing here guesses at
+ *   bytes it cannot check, and a machine with 7-Zip installed opens the
+ *   cabinet anyway. Without any archiver the refusal below is what the user
+ *   gets, which is still the honest answer.
  *
  *   Say that carefully, because LZX carried the identical stated reason and
  *   it was simply false — `makecab /D CompressionType=LZX` works. Two more

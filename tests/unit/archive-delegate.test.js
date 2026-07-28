@@ -19,16 +19,16 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import {
-  findRarTool, canExtractCompressed, buildArgs, _resetRarToolProbe,
-} from '../../src/main/rar-delegate.js'
+  findTool, canExtractCompressed, buildArgs, _resetToolProbe,
+} from '../../src/main/archive-delegate.js'
 
-beforeEach(() => { _resetRarToolProbe() })
+beforeEach(() => { _resetToolProbe() })
 
 describe('choosing the tool', () => {
   it('prefers 7-Zip over UnRAR when both exist', () => {
     // The whole reason this module changed shape: most people have 7-Zip and
     // not WinRAR, and 7-Zip reads RAR perfectly well.
-    const picked = findRarTool([
+    const picked = findTool('rar', [
       { path: process.execPath, kind: '7zip' },
       { path: process.execPath, kind: 'unrar' },
     ])
@@ -36,7 +36,7 @@ describe('choosing the tool', () => {
   })
 
   it('falls back to UnRAR when 7-Zip is absent', () => {
-    const picked = findRarTool([
+    const picked = findTool('rar', [
       { path: 'C:\\nope\\7z.exe', kind: '7zip' },
       { path: process.execPath, kind: 'unrar' },
     ])
@@ -45,7 +45,7 @@ describe('choosing the tool', () => {
   })
 
   it('returns null when neither is installed', () => {
-    expect(findRarTool([
+    expect(findTool('rar', [
       { path: 'C:\\nope\\7z.exe', kind: '7zip' },
       { path: 'C:\\nope\\unrar.exe', kind: 'unrar' },
     ])).toBeNull()
@@ -55,18 +55,18 @@ describe('choosing the tool', () => {
     // Assuming it worked meant canExtractCompressed() was always true, and a
     // machine with no archiver got "spawn 7z ENOENT" instead of the plain
     // explanation that the method needs a decoder this build lacks.
-    expect(findRarTool([
+    expect(findTool('rar', [
       { path: 'definitely-not-a-real-command-xyzzy', kind: '7zip' },
     ])).toBeNull()
   })
 
   it('accepts a bare name that does resolve', () => {
     // `node` is on PATH by definition here, since this runs under it.
-    expect(findRarTool([{ path: 'node', kind: '7zip' }])?.exe).toBe('node')
+    expect(findTool('rar', [{ path: 'node', kind: '7zip' }])?.exe).toBe('node')
   })
 
   it('agrees with canExtractCompressed', () => {
-    expect(canExtractCompressed()).toBe(findRarTool() !== null)
+    expect(canExtractCompressed()).toBe(findTool() !== null)
   })
 })
 
@@ -106,7 +106,7 @@ describe('the argv for each tool', () => {
 })
 
 describe('no shell is ever involved', () => {
-  const src = readFileSync(new URL('../../src/main/rar-delegate.js', import.meta.url), 'utf-8')
+  const src = readFileSync(new URL('../../src/main/archive-delegate.js', import.meta.url), 'utf-8')
 
   it('uses execFile with an argument array', () => {
     // Entry names come from the archive, which is attacker-controlled data.

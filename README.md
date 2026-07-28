@@ -62,10 +62,11 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ### 尚未實作
 
-- **CAB Quantum**：這是唯一還缺的壓縮方法。產生器（Diamond.exe ≤ 1.00.0530）在 1996 年
+- **CAB Quantum**：本程式自己不解這個方法。它的產生器（Diamond.exe ≤ 1.00.0530）在 1996 年
   就被 Microsoft 移除，`makecab` 與 1997 年 Cabinet SDK 的工具都拒絕這個選項，本機 686 個
-  cab、cabextract 自身的測試語料裡也沒有任何一個。拿不到樣本就無法對照參考實作驗證，
-  而只跟自己對得起來的解碼器會回傳看似正確的錯誤位元組——因此明確具名拒絕，不誤解碼
+  cab、cabextract 自身的測試語料裡也沒有一個——拿不到樣本就無法驗證自己寫的解碼器。
+  改為**在裝有 7-Zip 時交給它解壓**（7-Zip 讀得懂 Quantum），沒裝則具名報錯。
+  這樣就不必猜測無法查證的位元組
 - **RAR 的壓縮演算法**：容器（RAR4 / RAR5）本身已支援，未壓縮（stored）項目由本程式直接
   讀取。壓縮過的項目若機器上裝了 **7-Zip**（或 WinRAR）就交給它解壓並驗證 CRC，沒裝則
   列出內容並具名報錯。優先用 7-Zip 是因為它讀得懂兩代 RAR，而且安裝率遠高於 WinRAR——
@@ -105,7 +106,7 @@ MyCompare/
 │   │   ├── cab.js  rar.js    # 手寫解碼器：CAB（MSZIP/LZX）、RAR4/RAR5 容器
 │   │   ├── sevenzip.js       # 7z（含 BCJ2 多輸入 filter）
 │   │   ├── bzip2.js lzma.js  # bzip2、LZMA/LZMA2/xz
-│   │   ├── unrar-tool.js     # 選用：把 RAR 壓縮項目交給已安裝的 UnRAR
+│   │   ├── archive-delegate.js # 選用：把自己不解的方法交給已安裝的 7-Zip／UnRAR
 │   │   ├── ssh-transport.js  # 手寫 SSH-2 傳輸層
 │   │   ├── remote-*.js       # FTP / FTPS / SFTP / S3 / Dropbox / OneDrive
 │   │   ├── vcs.js            # git 狀態與 Source Control 操作
@@ -221,8 +222,8 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4209 / 4209 unit tests passing**、**384 / 384 e2e tests passing**，
-共 148 個單元測試檔與 57 個 e2e 檔。
+目前覆蓋：**4218 / 4218 unit tests passing**、**384 / 384 e2e tests passing**，
+共 149 個單元測試檔與 57 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、

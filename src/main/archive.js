@@ -777,8 +777,38 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
     if (hit.size > lim.maxEntryBytes) {
       throw new ArchiveError(`Entry "${wanted}" is over the ${lim.maxEntryBytes} byte limit`, 'limit')
     }
-    return Buffer.from(withCabErrors(() =>
-      extractCabEntry(buf, parsed, hit.path, { maxBytes: lim.maxTotalBytes })))
+    try {
+      return Buffer.from(withCabErrors(() =>
+        extractCabEntry(buf, parsed, hit.path, { maxBytes: lim.maxTotalBytes })))
+    } catch (err) {
+      // Quantum is the one CAB method this build has no decoder for, and the
+      // reason has always been that no Quantum cabinet can be produced or
+      // found here — so a hand-written decoder could only agree with itself.
+      // Delegating removes that problem entirely: 7-Zip reads the method, and
+      // nothing here has to guess at bytes it cannot check.
+      //
+      // UnRAR is deliberately not a candidate for CAB; it cannot read one.
+      if (!(err instanceof ArchiveError) || err.code !== 'unsupported') throw err
+
+      const { canExtractCompressed, extractWithTool } = await import('./archive-delegate.js')
+      if (!canExtractCompressed('cab')) throw err
+
+      const out = await extractWithTool({
+        archivePath,
+        entryPath: hit.path,
+        maxBytes: lim.maxEntryBytes,
+        format: 'cab',
+        expectedSize: hit.size,
+      })
+      // CAB has no per-file CRC — its checksums are per data block and are the
+      // tool's business — so the declared size is what can be checked here. A
+      // short read would otherwise pass as a truncated file.
+      if (out.length !== hit.size) {
+        throw new ArchiveError(
+          `外部解壓工具回傳 ${out.length} 位元組，但「${hit.path}」宣告 ${hit.size}`, 'corrupt')
+      }
+      return out
+    }
   }
 
   if (format === 'rar') {
@@ -803,13 +833,15 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
       if (!(err instanceof ArchiveError) || err.code !== 'unsupported'
         || hit.method === 0 || hit.redirect) throw err
 
-      const { canExtractCompressed, extractWithTool } = await import('./rar-delegate.js')
-      if (!canExtractCompressed()) throw err
+      const { canExtractCompressed, extractWithTool } = await import('./archive-delegate.js')
+      if (!canExtractCompressed('rar')) throw err
 
       const out = await extractWithTool({
         archivePath,
         entryPath: hit.path,
         maxBytes: lim.maxEntryBytes,
+        format: 'rar',
+        expectedSize: hit.size,
       })
       // The tool is trusted to decompress, not to have been handed the right
       // archive: the header's own CRC-32 is what says these bytes belong to
