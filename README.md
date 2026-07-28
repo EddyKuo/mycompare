@@ -11,8 +11,18 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | 平台 | 檔案 |
 |------|------|
 | Windows x64 | `MyCompare-Setup-X.Y.Z.exe`（NSIS 安裝程式） |
-| macOS | 尚未提供（可自行 `npm run dist` 建置 DMG） |
-| Linux | 尚未提供（可自行 `npm run dist` 建置 AppImage） |
+| macOS | `MyCompare-X.Y.Z.dmg`（Intel 與 Apple Silicon 各一份） |
+| Linux | `MyCompare-X.Y.Z.AppImage`、`.tar.gz` |
+
+三個平台的安裝檔由 GitHub Actions 在各自的 runner 上建置（`.github/workflows/release.yml`，
+推 `v*` tag 觸發）。這不是偏好問題：electron-builder 只在 macOS 上產得出 macOS 安裝檔，
+而 Linux 的 AppImage 需要 `mksquashfs`，那個工具沒有 Windows 版本。
+
+單元測試只在 Windows 這一格跑。測試裡有很大一部分在驅動 `reg.exe`、`makecab` 與 `7z.exe`，
+其他 runner 上根本沒有這些工具——在那裡宣稱跑過測試是假的綠燈，不是額外覆蓋。
+
+**macOS 與 Windows 的安裝檔都沒有簽章。** macOS 首次開啟需在「系統設定 → 隱私權與安全性」
+按「仍要打開」。
 
 > **Windows SmartScreen 警告**：目前未做 code-signing，首次執行 Windows 會跳出「已保護您的電腦」。點「其他資訊 → 仍要執行」即可。
 

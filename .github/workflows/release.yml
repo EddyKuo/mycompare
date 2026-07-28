@@ -1,0 +1,100 @@
+name: Release
+
+# macOS installers can only be produced on macOS — electron-builder refuses
+# outright anywhere else — and the Linux AppImage needs mksquashfs, which is
+# not shipped for Windows. So each platform is built on its own runner and the
+# results are collected into one release.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+            args: --win nsis --x64
+          - os: macos-latest
+            name: macos
+            args: --mac dmg --x64 --arm64
+          - os: ubuntu-latest
+            name: linux
+            args: --linux AppImage tar.gz --x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # The unit suite is gated on Windows only, and deliberately so: a large
+      # part of it drives reg.exe, makecab and 7z.exe, which do not exist on
+      # the other runners. Claiming to have run it there would be a false
+      # green, not extra coverage.
+      - name: Unit tests
+        if: matrix.os == 'windows-latest'
+        run: npm test
+
+      - name: Build installers
+        run: |
+          npm run build
+          npx electron-builder ${{ matrix.args }} --publish never
+        env:
+          # Unsigned builds. Setting this stops electron-builder trying to
+          # reach a keychain that is not there and failing late.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.name }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.tar.gz
+            dist/*.blockmap
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -lh artifacts
+
+      # One job uploads everything, rather than three racing to attach files to
+      # the same release.
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" artifacts/* --clobber

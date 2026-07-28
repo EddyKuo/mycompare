@@ -1,6 +1,6 @@
 {
   "name": "mycompare",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "BeyondCompare clone built with Electron + Vite",
   "author": "Eddy Kuo <itsuki520@gmail.com>",
   "type": "module",
