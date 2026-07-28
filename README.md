@@ -21,10 +21,9 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 單元測試只在 Windows 這一格跑。測試裡有很大一部分在驅動 `reg.exe`、`makecab` 與 `7z.exe`，
 其他 runner 上根本沒有這些工具——在那裡宣稱跑過測試是假的綠燈，不是額外覆蓋。
 
-**macOS 與 Windows 的安裝檔都沒有簽章。** macOS 首次開啟需在「系統設定 → 隱私權與安全性」
-按「仍要打開」。
-
-> **Windows SmartScreen 警告**：目前未做 code-signing，首次執行 Windows 會跳出「已保護您的電腦」。點「其他資訊 → 仍要執行」即可。
+> **未簽章**：三個平台的安裝檔都沒有 code-signing。
+> Windows 首次執行會跳出 SmartScreen「已保護您的電腦」，點「其他資訊 → 仍要執行」；
+> macOS 首次開啟需到「系統設定 → 隱私權與安全性」按「仍要打開」。
 
 ---
 
