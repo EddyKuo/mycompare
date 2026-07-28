@@ -148,6 +148,11 @@
             <span class="label">文字編輯</span>
             <span class="desc">單檔編輯與 Find in Files</span>
           </button>
+          <button class="session-type-btn" data-type="textpatch">
+            <span class="icon">✇</span>
+            <span class="label">Patch 檢視</span>
+            <span class="desc">讀 .patch / .diff 並套用</span>
+          </button>
           <button class="session-type-btn" data-type="merge3">
             <span class="icon">🔀</span>
             <span class="label">三向合併</span>
@@ -176,6 +181,9 @@
 
       <!-- Text Edit View (standalone editor) -->
       <div id="view-textedit" class="u-flex-fill" style="display:none"></div>
+
+      <!-- Text Patch View (unified diff viewer) -->
+      <div id="view-textpatch" class="u-flex-fill" style="display:none"></div>
 
       <!-- 3-Way Merge View -->
       <div id="view-merge3" class="u-flex-fill" style="display:none"></div>

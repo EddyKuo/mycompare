@@ -1,0 +1,160 @@
+/*
+ * Text Patch.
+ *
+ * The row height is fixed and duplicated in text-patch.js as ROW_HEIGHT: the
+ * virtual scroller turns a scroll offset into a row index by dividing by it.
+ * Change one and the other has to change with it, or the rows drift away from
+ * the pointer.
+ */
+:root {
+  --tp-row-height: 18px;
+}
+
+.text-patch {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  font-size: 12px;
+}
+
+.tp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+
+.tp-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tp-btn:hover { background: var(--bg-hover); }
+
+.tp-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--border-color);
+}
+
+.tp-head,
+.tp-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.tp-head {
+  flex: 0 0 auto;
+  height: var(--tp-row-height);
+  align-items: center;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-weight: 600;
+}
+
+.tp-side { padding: 0 6px; }
+
+.tp-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+}
+
+.tp-spacer { position: relative; }
+
+.tp-body {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.tp-row {
+  height: var(--tp-row-height);
+  align-items: center;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.tp-row:hover { background: var(--bg-hover); }
+
+.tp-current {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
+}
+
+.tp-cell {
+  display: flex;
+  gap: 6px;
+  overflow: hidden;
+  padding: 0 6px;
+}
+
+.tp-right { border-left: 1px solid var(--border-color); }
+
+.tp-no {
+  flex: 0 0 auto;
+  min-width: 42px;
+  text-align: right;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.tp-no-nums .tp-no { display: none; }
+
+.tp-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Status colours — the project-wide meanings ───────────────────────────── */
+
+.tp-delete .tp-left { background: var(--diff-delete-bg); }
+.tp-insert .tp-right { background: var(--diff-insert-bg); }
+
+/* A side with nothing on it reads as absence, not as an empty string. */
+.tp-empty { background: var(--diff-equal-bg); opacity: 0.35; }
+
+.tp-file {
+  font-weight: 600;
+  background: var(--bg-secondary);
+}
+
+.tp-hunk {
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+}
+
+/* ── Over-under ──────────────────────────────────────────────────────────── */
+
+.tp-over .tp-head,
+.tp-over .tp-row {
+  grid-template-columns: 1fr;
+  grid-auto-rows: var(--tp-row-height);
+  height: auto;
+}
+
+.tp-over .tp-right { border-left: 0; border-top: 1px dotted var(--border-color); }
+
+.tp-status {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+}

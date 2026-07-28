@@ -46,6 +46,7 @@ export function typeIcon(type) {
     metadata:       '🏷️',
     registry:       '🗝️',
     textedit:       '✏️',
+    textpatch:      '✇',
     merge3:         '🔀',
     merge:          '🔀',
   }

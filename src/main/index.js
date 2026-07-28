@@ -500,6 +500,20 @@ ipcMain.handle('delete-file', async (_event, filePath, options) => {
 })
 
 // IPC: 儲存檔案（顯示 Save 對話框）
+/**
+ * IPC: write to a path the caller already knows, with no dialog.
+ *
+ * Applying a patch writes to the files the patch names, so there is no dialog
+ * to pick them. The path still goes through the allow-list, and the existing
+ * backup machinery still runs — this is a real overwrite of somebody's file.
+ */
+ipcMain.handle('write-file-at', async (_event, { path, content, encoding, backup } = {}) => {
+  const safe = validatePath(path)
+  const backupResult = await backupExisting(safe, backup)
+  await writeFile(safe, encodeContent(content, encoding))
+  return { saved: true, path: safe, backup: backupResult }
+})
+
 ipcMain.handle('save-file', async (event, { defaultPath, content, filters, encoding, backup }) => {
   const win = BrowserWindow.fromWebContents(event.sender)
   const opts = {

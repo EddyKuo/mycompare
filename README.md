@@ -29,10 +29,10 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ## 對 Beyond Compare 的覆蓋率
 
-**約 72%**，以 BC4 官方命令參考的 **897 條指令**加權計算。
+**約 74%**，以 BC4 官方命令參考的 **897 條指令**加權計算。
 
 分母是逐頁從 BC4 線上說明數出來的命令條目數，不是估的。BC4 有 15 個命令頁，
-本專案對其中 **14 個**有對應的視圖類型；那 14 個佔 BC 指令總數的 96%，其中覆蓋 74%。
+本專案對 **15 個全部**都有對應的視圖類型，其中覆蓋 74%。
 
 | BC4 視圖類型 | BC 指令數 | 本專案覆蓋 |
 |---|---:|---:|
@@ -49,13 +49,12 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | MP3 Compare | 47 | 70% |
 | Version Compare | 45 | 70% |
 | Common（跨視圖） | 39 | 85% |
-| **Text Patch** | 35 | 40% |
+| Text Patch | 35 | 75% |
 | Home | 3 | 100% |
 
-整個沒做的只剩 **Text Patch** 的獨立視圖（可讀 unified diff，但注入文字比對，
-沒有逐檔逐 hunk 瀏覽）。另外未實作 **Clipboard Compare**、
-Explorer 殼層整合、MTP 行動裝置與 `http://` 來源，以及 SCC 相容的版本控制整合
-（本專案只支援 git）。
+**BC4 的 15 個視圖類型現在全部都有對應實作**，剩下的差距在各類型內部的深度。
+視圖之外未實作的是 **Clipboard Compare**（常駐監看剪貼簿）、Explorer 殼層整合、
+MTP 行動裝置與 `http://` 來源，以及 SCC 相容的版本控制整合（本專案只支援 git）。
 
 九個主要領域的 153 個功能點，逐項對程式碼查證後是
 **101 完成 / 22 部分 / 30 未實作**，且**沒有任何「實作了但沒有入口」的孤兒**。
@@ -75,6 +74,7 @@ Explorer 殼層整合、MTP 行動裝置與 `http://` 來源，以及 SCC 相容
 | **圖片比對** | 像素級差異、Auto Scale 尺寸對齊、差異強度分級、旋轉翻轉、同步縮放 |
 | **表格比對** | CSV / Excel 多工作表 / HTML 表格、虛擬捲動、儲存格編輯與 undo/redo、數值與日期容差比對、多欄複合 key、欄位顯示與排除 |
 | **文字編輯** | 單檔編輯器：行號、語法高亮、可見空白、undo/redo、行／字刪除與插入、縮排、書籤、Convert File、行尾符號、以及 **Find in Files**（跨檔搜尋，支援 BC 檔案遮罩） |
+| **Patch 檢視** | 讀 unified / context diff 並還原成兩側比對：逐檔、逐區塊、逐差異導航，虛擬捲動，Apply Patch 寫回磁碟（每個檔案全有或全無） |
 | **三向合併** | 3-way merge、八種顯示篩選、可調脈絡行數、Favor Left/Right、演算法選擇、衝突導航、批次解決 |
 | **登錄檔比對** | 鍵值格狀樹、逐值型別與「只存在於一側」、虛擬捲動、編輯／複製／刪除／改名／新增、寫出 .reg 或套用回登錄檔、基準機碼對齊兩把不同名的機碼（僅 Windows） |
 
@@ -181,7 +181,7 @@ MyCompare/
 │           ├── main.js        # renderer 入口
 │           ├── app.js         # 視圖路由、toolbar、tab 管理
 │           ├── core/          # diff 引擎、session 管理、對話框、視窗管理、工具函式
-│           └── views/         # 九種視圖元件
+│           └── views/         # 十種視圖元件
 │               ├── text-compare.js
 │               ├── folder-compare.js
 │               ├── hex-compare.js
@@ -190,6 +190,7 @@ MyCompare/
 │               ├── metadata-compare.js
 │               ├── registry-compare.js
 │               ├── text-edit.js      # 單檔編輯器 + Find in Files
+│               ├── text-patch.js     # unified diff 檢視與套用
 │               └── three-way-compare.js
 ├── tests/
 │   ├── unit/                  # Vitest 單元測試
@@ -287,8 +288,8 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4355 / 4355 unit tests passing**、**403 / 403 e2e tests passing**，
-共 154 個單元測試檔與 59 個 e2e 檔。
+目前覆蓋：**4371 / 4371 unit tests passing**、**408 / 408 e2e tests passing**，
+共 155 個單元測試檔與 60 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、

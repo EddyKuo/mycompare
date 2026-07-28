@@ -6,6 +6,7 @@ import { HexCompare } from './views/hex-compare.js'
 import { MetadataCompare } from './views/metadata-compare.js'
 import { RegistryCompare } from './views/registry-compare.js'
 import { TextEdit } from './views/text-edit.js'
+import { TextPatch } from './views/text-patch.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { createSession, updateSession } from './core/session.js'
@@ -337,7 +338,7 @@ let _openOptionsPane = () => showStatus('選項對話框尚未初始化')
 // ---------------------------------------------------------------------------
 // 視圖狀態
 // ---------------------------------------------------------------------------
-/** @type {'home'|'text'|'folder'|'table'|'image'|'hex'|'metadata'|'registry'|'textedit'|'merge3'} */
+/** @type {'home'|'text'|'folder'|'table'|'image'|'hex'|'metadata'|'registry'|'textedit'|'textpatch'|'merge3'} */
 let currentView = 'home'; setActiveView('home')
 /** @type {TextCompare | null} */
 let textCompare = null
@@ -355,6 +356,8 @@ let metadataCompare = null
 let registryCompare = null
 /** @type {TextEdit | null} */
 let textEdit = null
+/** @type {TextPatch | null} */
+let textPatch = null
 /** @type {ThreeWayCompare | null} */
 let mergeCompare = null
 
@@ -512,6 +515,22 @@ export function initApp() {
       if (typeof textEdit[method] !== 'function') throw new Error(`沒有這個指令：${method}`)
       return textEdit[method](...args)
     },
+    patchSet: (path, text) => {
+      if (!textPatch) throw new Error('Patch 檢視尚未建立，請先切換到該視圖')
+      return textPatch.setPatch(path, text)
+    },
+    patchStats: () => textPatch?.getStats() ?? null,
+    patchRowCount: () => document.querySelectorAll('#view-textpatch .tp-row').length,
+    patchRows: () => textPatch?.getRows().length ?? 0,
+    patchRun: (method, ...args) => {
+      if (!textPatch) throw new Error('Patch 檢視尚未建立，請先切換到該視圖')
+      return textPatch[method](...args)
+    },
+    patchPreview: async (root) => {
+      if (!textPatch) throw new Error('Patch 檢視尚未建立，請先切換到該視圖')
+      const plan = await textPatch.previewApply(root)
+      return plan.map((p) => ({ path: p.path, ok: p.ok, reason: p.reason }))
+    },
     editFindInFiles: async (opts) => {
       if (!textEdit) throw new Error('文字編輯尚未建立，請先切換到該視圖')
       return textEdit.findInFiles(opts)
@@ -652,6 +671,7 @@ function showHome() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -674,6 +694,7 @@ function showTextCompare() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-text').style.display = 'flex'
   el('path-bar').style.display = ''
@@ -749,6 +770,7 @@ function showFolderCompare() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-folder').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -788,6 +810,7 @@ function showTableCompare() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-table').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -820,6 +843,7 @@ function showImageCompare() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-image').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -853,6 +877,7 @@ function showHexCompare() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-hex').style.display = 'flex'
   el('path-bar').style.display = ''
   el('diff-counter').style.display = 'none'
@@ -886,6 +911,7 @@ function showMetadataCompare() {
   el('view-metadata').style.display = 'flex'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   // The view carries its own path row, like the image and folder views do.
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -918,6 +944,7 @@ function showRegistryCompare() {
   el('view-merge3').style.display = 'none'
   el('view-registry').style.display = 'flex'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   // The grid carries its own toolbar and status line, like the table view.
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -949,6 +976,7 @@ function showTextEdit() {
   el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-textedit').style.display = 'flex'
+  el('view-textpatch').style.display = 'none'
   // One file, so the two-sided path bar and the difference counter mean
   // nothing here; the view carries its own toolbar and status line.
   el('path-bar').style.display = 'none'
@@ -968,6 +996,36 @@ function showTextEdit() {
   updateToolbar()
 }
 
+function showTextPatch() {
+  currentView = 'textpatch'; setActiveView('textpatch')
+  el('session-home').style.display = 'none'
+  el('view-text').style.display = 'none'
+  el('view-folder').style.display = 'none'
+  el('view-table').style.display = 'none'
+  el('view-image').style.display = 'none'
+  el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
+  el('view-merge3').style.display = 'none'
+  el('view-textpatch').style.display = 'flex'
+  el('path-bar').style.display = 'none'
+  el('diff-counter').style.display = 'none'
+
+  if (!textPatch) {
+    textPatch = new TextPatch()
+    textPatch.mount(el('view-textpatch'))
+    textPatch.on('status', _viewStatus)
+    textPatch.on('paths-changed', ({ left }) => {
+      recordSession('textpatch', { leftPath: left ?? '', rightPath: '' })
+      el('path-left').textContent = left || '（未選擇）'
+      _syncActiveTabPaths(left, '')
+      updateToolbar()
+    })
+  }
+  updateToolbar()
+}
+
 function showMerge3() {
   currentView = 'merge3'; setActiveView('merge3')
   el('session-home').style.display = 'none'
@@ -979,6 +1037,7 @@ function showMerge3() {
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
   el('view-textedit').style.display = 'none'
+  el('view-textpatch').style.display = 'none'
   el('view-merge3').style.display = 'flex'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -1186,6 +1245,9 @@ function _handleActivateTab(id, force = false) {
     case 'textedit':
       showTextEdit()
       break
+    case 'textpatch':
+      showTextPatch()
+      break
     case 'merge3':
       showMerge3()
       break
@@ -1367,6 +1429,10 @@ function newSession(type, labelText) {
       tabMgr.addTab('textedit', '文字編輯')
       showTextEdit()
       break
+    case 'textpatch':
+      tabMgr.addTab('textpatch', 'Patch 檢視')
+      showTextPatch()
+      break
     case 'merge3':
       tabMgr.addTab('merge3', '三向合併')
       showMerge3()
@@ -1490,7 +1556,8 @@ function _activeViewInstance() {
   return {
     text: textCompare, folder: folderCompare, table: tableCompare,
     image: imageCompare, hex: hexCompare, metadata: metadataCompare,
-    registry: registryCompare, textedit: textEdit, merge3: mergeCompare,
+    registry: registryCompare, textedit: textEdit, textpatch: textPatch,
+    merge3: mergeCompare,
   }[currentView] ?? null
 }
 
@@ -2497,6 +2564,7 @@ function _defaultTitleForType(type) {
     case 'metadata': return '中繼資料比對'
     case 'registry': return '登錄檔比對'
     case 'textedit': return '文字編輯'
+    case 'textpatch': return 'Patch 檢視'
     case 'merge3': return '三向合併'
     default:       return '分頁'
   }
@@ -2510,7 +2578,7 @@ function _defaultTitleForType(type) {
 const VIEW_TYPE_LABELS = Object.freeze({
   text: '文字比對', folder: '資料夾比對', table: '表格比對',
   image: '圖片比對', hex: 'Hex 比對', metadata: '中繼資料比對',
-  registry: '登錄檔比對', textedit: '文字編輯', merge3: '三向合併',
+  registry: '登錄檔比對', textedit: '文字編輯', textpatch: 'Patch 檢視', merge3: '三向合併',
 })
 
 /**
@@ -3749,6 +3817,7 @@ function setupMenuActions() {
     'session.new.metadata': () => newSession('metadata'),
     'session.new.registry': () => newSession('registry'),
     'session.new.textedit': () => newSession('textedit'),
+    'session.new.textpatch': () => newSession('textpatch'),
     'session.new.merge3': () => newSession('merge3'),
     'session.home':       () => showHome(),
     'session.settings':   () => openConfigModal(),
