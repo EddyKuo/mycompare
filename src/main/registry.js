@@ -468,6 +468,41 @@ function wrapRegLine(line) {
 }
 
 /**
+ * The path every base-keyed row is rooted at.
+ *
+ * Both sides have to agree on it or nothing would line up: the point of a base
+ * key is to compare `HKLM\A` against `HKLM\B`, and those only match once the
+ * differing prefixes are gone. The real key each side came from is reported
+ * separately, for display.
+ */
+export const BASE_ROOT = '(基準機碼)'
+
+/**
+ * Restrict rows to one subtree and re-root them at {@link BASE_ROOT}.
+ *
+ * @param {ReturnType<typeof flattenRegistry>} rows
+ * @param {string} base  absolute key path; '' leaves the rows untouched
+ * @returns {ReturnType<typeof flattenRegistry>}
+ */
+export function applyBaseKey(rows, base) {
+  const prefix = String(base ?? '').trim()
+  if (!prefix) return rows ?? []
+
+  const lower = prefix.toLowerCase()
+  const out = []
+  for (const row of rows ?? []) {
+    const path = String(row.path ?? '')
+    const lp = path.toLowerCase()
+    // The key itself, or something beneath it. The separator check matters:
+    // without it `HKLM\Foo` would also capture `HKLM\FooBar`.
+    if (lp !== lower && !lp.startsWith(`${lower}\\`)) continue
+    const rest = path.slice(prefix.length)
+    out.push({ ...row, path: `${BASE_ROOT}${rest}` })
+  }
+  return out
+}
+
+/**
  * Compare two flattened registry exports.
  *
  * @param {ReturnType<typeof flattenRegistry>} left

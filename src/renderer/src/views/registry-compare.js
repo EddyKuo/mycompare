@@ -98,6 +98,19 @@ export class RegistryCompare {
     this._leftSnapshot = ''
     /** @type {string} */
     this._rightSnapshot = ''
+    /**
+     * Base keys: the subtree each side is compared from.
+     *
+     * BC calls this Set as Base Key. It is applied before the comparison, not
+     * after, because it changes what counts as the same value — comparing one
+     * key against a differently named one only lines up once both are rooted
+     * at the same place.
+     *
+     * @type {{ left: string, right: string }}
+     */
+    this._base = { left: '', right: '' }
+    /** @type {string} the token main re-roots base-keyed rows at */
+    this._baseRoot = ''
 
     /** @type {import('../core/registry-tree.js').RegNode[]} */
     this._roots = []
@@ -288,6 +301,9 @@ export class RegistryCompare {
     const leftSnap = this._leftSnapshot
     this._leftSnapshot = this._rightSnapshot
     this._rightSnapshot = leftSnap
+    const leftBase = this._base.left
+    this._base.left = this._base.right
+    this._base.right = leftBase
     await this._reload()
   }
 
@@ -301,8 +317,10 @@ export class RegistryCompare {
       if (typeof api?.compareRegFiles !== 'function') {
         throw new Error('此環境沒有提供 compareRegFiles')
       }
-      const result = await api.compareRegFiles(this._leftPath, this._rightPath)
+      const result = await api.compareRegFiles(
+        this._leftPath, this._rightPath, this._base.left, this._base.right)
       this._format = result?.format ?? ''
+      this._baseRoot = result?.baseRoot ?? this._baseRoot
       this._roots = buildRegistryTree(result?.rows ?? [])
       this._dirty = false
       this._removed = { left: [], right: [] }
@@ -320,6 +338,110 @@ export class RegistryCompare {
         level: 'error',
       })
     }
+  }
+
+  // ── Base keys (BC: Set as Base Key / Up One Level) ─────────────────────────
+
+  /**
+   * The real key path a displayed node came from, on one side.
+   *
+   * Once a base key is set, rows arrive re-rooted at a shared token, so the
+   * node's own path is relative. Turning it back into something that can be
+   * used as the next base needs the side's current base put back on the front.
+   *
+   * @param {'left'|'right'} side
+   * @param {string} nodePath
+   * @returns {string}
+   */
+  absoluteKeyPath(side, nodePath) {
+    const base = this._base[side]
+    if (!base) return nodePath
+    const root = this._baseRoot
+    if (!root || !nodePath.startsWith(root)) return base
+    return `${base}${nodePath.slice(root.length)}`
+  }
+
+  /** @returns {{ left: string, right: string }} */
+  getBaseKeys() { return { ...this._base } }
+
+  /**
+   * Compare from this key down, on one side or both.
+   *
+   * @param {'left'|'right'|'both'} which
+   * @param {string} nodePath  a path as the grid shows it
+   * @returns {Promise<void>}
+   */
+  async setBaseKey(which, nodePath) {
+    if (!nodePath) return
+    if (which === 'both') {
+      // Each side resolves the path against its own base: with different bases
+      // already in force, the same displayed node means two different keys.
+      this._base = {
+        left: this.absoluteKeyPath('left', nodePath),
+        right: this.absoluteKeyPath('right', nodePath),
+      }
+    } else {
+      this._base[which] = this.absoluteKeyPath(which, nodePath)
+    }
+    await this._reload()
+  }
+
+  /**
+   * Use this side's key as the *other* side's base — BC's "Set as Base Key on
+   * Other Side", which is how two differently named keys get lined up.
+   *
+   * @param {'left'|'right'} side  the side the node was picked on
+   * @param {string} nodePath
+   * @returns {Promise<void>}
+   */
+  async setBaseKeyOnOtherSide(side, nodePath) {
+    if (!nodePath) return
+    this._base[side === 'left' ? 'right' : 'left'] = this.absoluteKeyPath(side, nodePath)
+    await this._reload()
+  }
+
+  /**
+   * Move a side's base one key towards the root.
+   *
+   * With no base set there is nothing above within the loaded data, so a side
+   * reading a live key re-reads its parent instead; a side reading a file says
+   * so rather than appearing to do nothing.
+   *
+   * @param {'left'|'right'|'both'} which
+   * @returns {Promise<void>}
+   */
+  async upOneLevel(which) {
+    const sides = which === 'both' ? ['left', 'right'] : [which]
+    let liveMoved = false
+
+    for (const side of sides) {
+      if (this._base[side]) {
+        this._base[side] = parentOf(this._base[side])
+        continue
+      }
+      const live = side === 'left' ? this._leftLiveKey : this._rightLiveKey
+      const parent = parentOf(live)
+      if (live && parent) {
+        await this.setSideToLiveKey(side, parent)
+        liveMoved = true
+      } else if (!live) {
+        this._emit('status', {
+          message: `${side === 'left' ? '左' : '右'}側讀的是 .reg 檔，已經在最上層`,
+          level: 'warn',
+        })
+      } else {
+        this._emit('status', { message: '已經在根機碼，沒有上一層', level: 'warn' })
+      }
+    }
+    // A live re-read already reloaded; reloading again would just re-export.
+    if (!liveMoved) await this._reload()
+  }
+
+  /** Drop both base keys and compare the whole of each side again. */
+  async clearBaseKeys() {
+    if (!this._base.left && !this._base.right) return
+    this._base = { left: '', right: '' }
+    await this._reload()
   }
 
   /**
@@ -933,6 +1055,12 @@ tr.different{background:#fff8c5}tr.left-only{background:#e6ffec}tr.right-only{ba
       () => { void this.promptLiveKey('right') })
 
     bar.appendChild(el('span', { className: 'rc-sep' }))
+    button('↰ 上一層', '兩側都往上一層機碼', () => { void this.upOneLevel('both') })
+    const btnClear = button('✕ 基準', '清除基準機碼，比對整份',
+      () => { void this.clearBaseKeys() })
+    this._dom.btnClearBase = btnClear
+
+    bar.appendChild(el('span', { className: 'rc-sep' }))
     button('⇄ 交換', '交換左右兩側', () => { void this.swap() })
     button('⟳ 重新讀取', '從磁碟重新讀取', () => { void this.refresh() })
 
@@ -1063,8 +1191,14 @@ tr.different{background:#fff8c5}tr.left-only{background:#e6ffec}tr.right-only{ba
     const counts = this.getStats()
     const total = this.getDiffCount()
     const at = this._currentDiffIdx >= 0 ? `　差異 ${this._currentDiffIdx + 1} / ${total}` : ''
-    bar.textContent = `${reportSummary(counts, STATUS_LABEL)}${at}`
+    const base = this._base.left || this._base.right
+      ? `　基準：左 ${this._base.left || '（全部）'}　右 ${this._base.right || '（全部）'}`
+      : ''
+    bar.textContent = `${reportSummary(counts, STATUS_LABEL)}${at}${base}`
       + (this._dirty ? '　●　有未寫回的變更' : '')
+    // The button only means anything while a base is in force.
+    const clear = this._dom.btnClearBase
+    if (clear) clear.toggleAttribute('disabled', !this._base.left && !this._base.right)
   }
 
   // ── Pointer ────────────────────────────────────────────────────────────────
@@ -1152,6 +1286,25 @@ tr.different{background:#fff8c5}tr.left-only{background:#e6ffec}tr.right-only{ba
     } else {
       items.push({ label: '新增值…', action: () => void this._promptNewValue(node) })
       items.push({ label: '新增子機碼…', action: () => void this._promptNewKey(node) })
+      items.push({ separator: true })
+      // BC's Set as Base Keys group: compare from this key down. Setting only
+      // one side is how two differently named keys get lined up.
+      items.push({
+        label: '設為兩側的基準機碼',
+        action: () => void this.setBaseKey('both', node.path),
+      })
+      items.push({
+        label: '設為左側的基準機碼',
+        action: () => void this.setBaseKey('left', node.path),
+      })
+      items.push({
+        label: '設為右側的基準機碼',
+        action: () => void this.setBaseKey('right', node.path),
+      })
+      items.push({
+        label: '設為另一側的基準機碼',
+        action: () => void this.setBaseKeyOnOtherSide('left', node.path),
+      })
       items.push({ separator: true })
     }
 
@@ -1304,6 +1457,20 @@ tr.different{background:#fff8c5}tr.left-only{background:#e6ffec}tr.right-only{ba
  * @param {{ type: string, value: string }|null} right
  * @returns {'same'|'different'|'left-only'|'right-only'}
  */
+/**
+ * The parent of a key path, or '' when there is none left.
+ *
+ * @param {string} keyPath
+ * @returns {string}
+ */
+export function parentOf(keyPath) {
+  const p = String(keyPath ?? '').trim()
+  const cut = p.lastIndexOf('\\')
+  // A root on its own — HKEY_LOCAL_MACHINE — has no parent worth going to.
+  if (cut <= 0) return ''
+  return p.slice(0, cut)
+}
+
 export function computeStatus(left, right) {
   if (!right) return 'left-only'
   if (!left) return 'right-only'

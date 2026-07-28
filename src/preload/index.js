@@ -57,8 +57,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   exportRegistryKey: (keyPath) => ipcRenderer.invoke('export-registry-key', { keyPath }),
   snapshotRegistryKey: (keyPath, replaces) =>
     ipcRenderer.invoke('snapshot-registry-key', { keyPath, replaces }),
-  compareRegFiles: (leftPath, rightPath) =>
-    ipcRenderer.invoke('compare-reg-files', { leftPath, rightPath }),
+  compareRegFiles: (leftPath, rightPath, leftBase, rightBase) =>
+    ipcRenderer.invoke('compare-reg-files', { leftPath, rightPath, leftBase, rightBase }),
   exportRegFile: (rows, format, defaultName) =>
     ipcRenderer.invoke('export-reg-file', { rows, format, defaultName }),
   applyRegFile: (rows, format) => ipcRenderer.invoke('apply-reg-file', { rows, format }),

@@ -498,6 +498,19 @@ export function initApp() {
       await registryCompare.setSideToLiveKey(side, keyPath)
     },
     regExpandAll: () => registryCompare?.expandAll?.(),
+    regSetBase: async (side, keyPath) => {
+      if (!registryCompare) throw new Error('登錄檔比對尚未建立，請先切換到該視圖')
+      await registryCompare.setBaseKey(side, keyPath)
+    },
+    regClearBase: async () => {
+      if (!registryCompare) throw new Error('登錄檔比對尚未建立，請先切換到該視圖')
+      await registryCompare.clearBaseKeys()
+    },
+    regGetBase: () => registryCompare?.getBaseKeys?.() ?? null,
+    regUpOneLevel: async (which) => {
+      if (!registryCompare) throw new Error('登錄檔比對尚未建立，請先切換到該視圖')
+      await registryCompare.upOneLevel(which)
+    },
     metaSetRight: async (path) => {
       if (!metadataCompare) throw new Error('中繼資料比對尚未建立，請先切換到該視圖')
       await metadataCompare.setRight(path)

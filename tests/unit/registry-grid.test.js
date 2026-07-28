@@ -13,9 +13,10 @@ import {
 import {
   parseRegFile, flattenRegistry, diffRegistry, diffRegistryForDisplay,
   buildRegFile, formatRegValue, refuseTruncatedRows, MAX_TRANSFER_VALUE_CHARS,
+  applyBaseKey, BASE_ROOT,
 } from '../../src/main/registry.js'
 import {
-  RegistryCompare, computeStatus, cellText, sideText,
+  RegistryCompare, computeStatus, cellText, sideText, parentOf,
 } from '../../src/renderer/src/views/registry-compare.js'
 
 const ROOT = 'HKEY_CURRENT_USER\\Software\\T'
@@ -324,6 +325,57 @@ describe('what a cell prints', () => {
 
   it('prints nothing for a side that has no value', () => {
     expect(sideText(null)).toBe('')
+  })
+})
+
+describe('base keys', () => {
+  const rows = [
+    { path: `${ROOT}\\A`, name: 'x', type: 'REG_SZ', value: '1' },
+    { path: `${ROOT}\\A\\Deep`, name: 'y', type: 'REG_SZ', value: '2' },
+    { path: `${ROOT}\\AB`, name: 'z', type: 'REG_SZ', value: '3' },
+    { path: `${ROOT}\\B`, name: 'w', type: 'REG_SZ', value: '4' },
+  ]
+
+  it('keeps the subtree and drops everything else', () => {
+    const out = applyBaseKey(rows, `${ROOT}\\A`)
+    expect(out.map((r) => r.name).sort()).toEqual(['x', 'y'])
+  })
+
+  it('does not treat a name that merely starts the same as a child', () => {
+    // Without the separator check, a base of HKLM\Foo also swallows HKLM\FooBar.
+    const out = applyBaseKey(rows, `${ROOT}\\A`)
+    expect(out.some((r) => r.name === 'z')).toBe(false)
+  })
+
+  it('re-roots both sides at the same token so different keys line up', () => {
+    // This is the point of the feature: comparing A against B only works once
+    // the differing prefixes are gone.
+    const left = applyBaseKey(rows, `${ROOT}\\A`)
+    const right = applyBaseKey(
+      [{ path: `${ROOT}\\B`, name: 'x', type: 'REG_SZ', value: '1' }], `${ROOT}\\B`)
+    expect(left[0].path).toBe(BASE_ROOT)
+    expect(right[0].path).toBe(BASE_ROOT)
+    expect(diffRegistry(left, right)[0].status).toBe('same')
+  })
+
+  it('keeps relative depth below the base', () => {
+    const out = applyBaseKey(rows, `${ROOT}\\A`)
+    expect(out.find((r) => r.name === 'y').path).toBe(`${BASE_ROOT}\\Deep`)
+  })
+
+  it('leaves the rows alone when no base is set', () => {
+    expect(applyBaseKey(rows, '')).toBe(rows)
+  })
+})
+
+describe('walking up a key path', () => {
+  it('drops the last segment', () => {
+    expect(parentOf('HKEY_LOCAL_MACHINE\\SOFTWARE\\A')).toBe('HKEY_LOCAL_MACHINE\\SOFTWARE')
+  })
+
+  it('stops at a root rather than returning half of one', () => {
+    expect(parentOf('HKEY_LOCAL_MACHINE')).toBe('')
+    expect(parentOf('')).toBe('')
   })
 })
 

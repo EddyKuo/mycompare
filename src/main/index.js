@@ -1074,8 +1074,11 @@ ipcMain.handle('snapshot-registry-key', async (_event, { keyPath, replaces } = {
  *
  * Either side may be omitted, which is how a one-sided load is shown.
  */
-ipcMain.handle('compare-reg-files', async (_event, { leftPath, rightPath } = {}) => {
-  const { readRegFile, diffRegistryForDisplay } = await import('./registry.js')
+ipcMain.handle('compare-reg-files', async (
+  _event, { leftPath, rightPath, leftBase, rightBase } = {},
+) => {
+  const { readRegFile, diffRegistryForDisplay, applyBaseKey, BASE_ROOT } =
+    await import('./registry.js')
 
   const readSide = async (p) => {
     if (!p) return { path: '', format: '', rows: [] }
@@ -1085,11 +1088,20 @@ ipcMain.handle('compare-reg-files', async (_event, { leftPath, rightPath } = {})
   }
   const [left, right] = await Promise.all([readSide(leftPath), readSide(rightPath)])
 
+  // Base keys are applied before the comparison, not after: they change what
+  // counts as the same value. Comparing HKLM\A against HKLM\B only lines up
+  // once both are rooted at the same place.
+  const l = applyBaseKey(left.rows, leftBase)
+  const r = applyBaseKey(right.rows, rightBase)
+
   return {
     leftPath: left.path,
     rightPath: right.path,
     format: left.format || right.format,
-    rows: diffRegistryForDisplay(left.rows, right.rows),
+    // The token both sides are re-rooted at travels with the result, so the
+    // view never has to hard-code a string the comparison depends on.
+    baseRoot: BASE_ROOT,
+    rows: diffRegistryForDisplay(l, r),
   }
 })
 

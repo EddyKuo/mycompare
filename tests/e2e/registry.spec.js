@@ -25,6 +25,10 @@ let bigPath
 let manyLeft
 /** @type {string} */
 let manyRight
+/** @type {string} */
+let baseA
+/** @type {string} */
+let baseB
 
 const SAMPLE = [
   'Windows Registry Editor Version 5.00',
@@ -76,18 +80,38 @@ function manySample(n, suffix) {
   return lines.join('\r\n')
 }
 
+/**
+ * The same values under a given key name. Two of these with different names is
+ * what a base key has to line up.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+function baseSample(name) {
+  return [
+    'Windows Registry Editor Version 5.00', '',
+    `[HKEY_CURRENT_USER\\Software\\MyCompareTest\\${name}]`,
+    '"same"="value"', '"n"=dword:00000007',
+  ].join('\r\n')
+}
+
 test.beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'mycompare-reg-'))
   regPath = join(dir, 'sample.reg')
   bigPath = join(dir, 'big.reg')
   manyLeft = join(dir, 'many-left.reg')
   manyRight = join(dir, 'many-right.reg')
+  baseA = join(dir, 'base-a.reg')
+  baseB = join(dir, 'base-b.reg')
   await writeFile(regPath, `\uFEFF${SAMPLE}`, 'utf16le')
   await writeFile(bigPath, bigSample(), 'utf-8')
   await writeFile(manyLeft, manySample(5000, ''), 'utf-8')
   await writeFile(manyRight, manySample(5000, ' changed'), 'utf-8')
+  await writeFile(baseA, baseSample('Alpha'), 'utf-8')
+  await writeFile(baseB, baseSample('Beta'), 'utf-8')
   // Authorised on the command line: the renderer has no way to add a root.
-  ;({ app, win } = await launchApp([regPath, bigPath, manyLeft, manyRight]))
+  ;({ app, win } = await launchApp(
+    [regPath, bigPath, manyLeft, manyRight, baseA, baseB]))
 })
 
 test.afterAll(async () => {
@@ -262,6 +286,37 @@ test('a remote target naming a root Windows will not serve is refused', async ()
     window.__testAPI.regSetLiveKey('right', `\\\\${m}\\HKCU\\Environment`), me)
   const rows = await win.evaluate(() => window.__testAPI.regRowsForSide('right'))
   expect(rows).toHaveLength(0)
+})
+
+test('a base key lines up two differently named keys', async () => {
+  // BC's Set as Base Key. The two files below hold the same values under
+  // different key names, so without a base every value is an orphan; with one
+  // on each side they all match. Nothing but running it shows that the base is
+  // applied before the comparison rather than filtering its result.
+  await win.evaluate(([l, r]) => window.__testAPI.openComparison({
+    type: 'registry', leftPath: l, rightPath: r,
+  }), [baseA, baseB])
+  await win.waitForFunction(() => window.__testAPI.currentView() === 'registry')
+
+  const before = await win.evaluate(() => window.__testAPI.regStats())
+  expect(before.same).toBe(0)
+  expect(before['left-only'] + before['right-only']).toBeGreaterThan(0)
+
+  await win.evaluate(() => window.__testAPI.regSetBase(
+    'left', 'HKEY_CURRENT_USER\\Software\\MyCompareTest\\Alpha'))
+  await win.evaluate(() => window.__testAPI.regSetBase(
+    'right', 'HKEY_CURRENT_USER\\Software\\MyCompareTest\\Beta'))
+
+  const after = await win.evaluate(() => window.__testAPI.regStats())
+  expect(after.same).toBe(2)
+  expect(after.different).toBe(0)
+  expect(after['left-only'] + after['right-only']).toBe(0)
+
+  // Clearing puts it back, so the base is a view onto the data, not a filter
+  // that discarded it.
+  await win.evaluate(() => window.__testAPI.regClearBase())
+  const cleared = await win.evaluate(() => window.__testAPI.regStats())
+  expect(cleared.same).toBe(0)
 })
 
 test('an unsafe key path never reaches reg.exe through the live loader', async () => {
