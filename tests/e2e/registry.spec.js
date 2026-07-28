@@ -19,6 +19,8 @@ let win
 let dir
 /** @type {string} */
 let regPath
+/** @type {string} */
+let bigPath
 
 const SAMPLE = [
   'Windows Registry Editor Version 5.00',
@@ -29,12 +31,36 @@ const SAMPLE = [
   '"Count"=dword:0000002a',
 ].join('\r\n')
 
+/**
+ * A .reg holding one binary value of the size real ones reach.
+ *
+ * reg.exe wraps binary data at ~80 columns, so a multi-megabyte value arrives
+ * as tens of thousands of continuation lines.
+ *
+ * @returns {string}
+ */
+function bigSample() {
+  const lines = [
+    'Windows Registry Editor Version 5.00',
+    '',
+    '[HKEY_CURRENT_USER\\Software\\MyCompareTest\\Big]',
+    '"Blob"=hex:\\',
+  ]
+  for (let i = 0; i < 60_000; i++) {
+    lines.push('  00,11,22,33,44,55,66,77,88,99,aa,bb,cc,dd,ee,ff,\\')
+  }
+  lines.push('  00')
+  return lines.join('\r\n')
+}
+
 test.beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'mycompare-reg-'))
   regPath = join(dir, 'sample.reg')
+  bigPath = join(dir, 'big.reg')
   await writeFile(regPath, `\uFEFF${SAMPLE}`, 'utf16le')
+  await writeFile(bigPath, bigSample(), 'utf-8')
   // Authorised on the command line: the renderer has no way to add a root.
-  ;({ app, win } = await launchApp([regPath]))
+  ;({ app, win } = await launchApp([regPath, bigPath]))
 })
 
 test.afterAll(async () => {
@@ -60,6 +86,26 @@ test('a UTF-16 .reg file parses through the real handler', async () => {
   expect(byName.Count.type).toBe('REG_DWORD')
   expect(byName.Count.value).toContain('42')
   expect(byName[''].value).toBe('default')
+})
+
+test('a multi-megabyte value comes back instead of freezing the app', async () => {
+  // Parsing happens in the main process, so a stall here is not a slow view —
+  // every window stops responding and there is no way back. The export of
+  // HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion on a stock Windows 11
+  // install holds a value this size, so it is an ordinary key to compare, not
+  // a contrived one. The unit tests cover the joining function directly; this
+  // is the only check that the whole IPC path stays responsive.
+  const started = Date.now()
+  const result = await win.evaluate(
+    (p) => window.electronAPI.readRegFile(p), bigPath)
+  const elapsed = Date.now() - started
+
+  const blob = result.rows.find((r) => r.name === 'Blob')
+  expect(blob?.type).toBe('REG_BINARY')
+  // The value survived intact — a fast wrong answer would pass a timing check.
+  expect(blob.value.startsWith('00 11 22 33')).toBe(true)
+  expect(blob.value.length).toBeGreaterThan(2_000_000)
+  expect(elapsed).toBeLessThan(15_000)
 })
 
 test('an unauthorised .reg path is refused', async () => {

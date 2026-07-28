@@ -74,19 +74,62 @@ export function decodeRegBuffer(buf) {
  */
 export function joinContinuations(text) {
   const out = []
-  let pending = null
+  /** @type {string[]|null} */
+  let parts = null
+
+  // Collect the pieces instead of growing one string. The marker only ever
+  // sits at the tail, so testing the whole accumulation for it was quadratic:
+  // reg.exe wraps binary data at ~80 columns, so the 4 MB value that
+  // HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion really does hold arrives
+  // as ~54,000 physical lines, and each one rescanned every byte joined so
+  // far. This runs in the main process, so the cost was not a slow view — it
+  // was the whole application frozen with no way back.
   for (const raw of String(text ?? '').split(/\r?\n/)) {
-    const line = pending === null ? raw : raw.trimStart()
-    const combined = pending === null ? line : pending + line
-    if (/\\\s*$/.test(combined)) {
-      pending = combined.replace(/\\\s*$/, '')
-      continue
-    }
-    pending = null
-    out.push(combined)
+    const line = parts === null ? raw : raw.trimStart()
+    if (parts === null) parts = []
+    parts.push(line)
+
+    if (stripTrailingMarker(parts)) continue
+    out.push(parts.join(''))
+    parts = null
   }
-  if (pending !== null) out.push(pending)
+
+  if (parts !== null) out.push(parts.join(''))
   return out
+}
+
+/**
+ * Remove a trailing continuation marker — one backslash followed by nothing
+ * but whitespace — from the collected pieces, reporting whether there was one.
+ *
+ * It has to look across pieces, not just the last one. Stripping the marker
+ * from a line ending in two backslashes leaves the tail still ending in a
+ * backslash, so the next marker can begin several pieces back with only blank
+ * lines in between. Pieces the marker consumes are dropped, so the backward
+ * walk never covers the same ground twice.
+ *
+ * That accounts for the walk but not for the repeated `slice` when one piece
+ * holds a long run of backslashes unwound a line at a time. Measured, that
+ * shape stays linear because V8 slices long strings by reference rather than
+ * copying — a property of the runtime, not something argued from the code. It
+ * is left alone because no .reg file produces that shape; reg.exe ends a
+ * wrapped line with exactly one backslash.
+ *
+ * @param {string[]} parts  mutated in place
+ * @returns {boolean}
+ */
+function stripTrailingMarker(parts) {
+  for (let p = parts.length - 1; p >= 0; p--) {
+    const piece = parts[p]
+    let i = piece.length - 1
+    while (i >= 0 && /\s/.test(piece[i])) i--
+    if (i < 0) continue // blank piece: the tail carries on into the one before
+    if (piece[i] !== '\\') return false
+    parts.length = p + 1
+    parts[p] = piece.slice(0, i)
+    return true
+  }
+  return false // nothing but whitespace, which is not a marker
 }
 
 /**
