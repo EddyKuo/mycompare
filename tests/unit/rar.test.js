@@ -683,8 +683,13 @@ describe('RAR refusals by name', () => {
     // The listing succeeds, so the user sees the file rather than an empty folder.
     const listing = await readArchive(p)
     expect(listing.entries.map((e) => e.path)).toEqual([`${p}::packed.bin`])
+    // Either outcome is correct, and which one happens depends on the machine:
+    // with no archiver installed this is our named refusal; with 7-Zip or
+    // WinRAR present the delegation runs and reports a data error, because
+    // this fixture's "compressed" payload is fabricated rather than really
+    // packed. What must never happen is bytes coming back.
     await expect(readArchiveEntry(p, `${p}::packed.bin`))
-      .rejects.toThrow(/RAR 壓縮方法 3.*不支援/)
+      .rejects.toThrow(/RAR 壓縮方法 3.*不支援|7-Zip|UnRAR/)
   })
 
   it('surfaces a RAR 4 compressed-method refusal through the app path', async () => {
@@ -694,7 +699,7 @@ describe('RAR refusals by name', () => {
     const listing = await readArchive(p)
     expect(listing.entries.map((e) => e.path)).toEqual([`${p}::packed4.bin`])
     await expect(readArchiveEntry(p, `${p}::packed4.bin`))
-      .rejects.toThrow(/RAR 壓縮方法 3.*不支援/)
+      .rejects.toThrow(/RAR 壓縮方法 3.*不支援|7-Zip|UnRAR/)
   })
 
   it('refuses an encrypted entry by name', () => {

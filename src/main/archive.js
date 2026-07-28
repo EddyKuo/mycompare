@@ -796,17 +796,17 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
       return Buffer.from(withRarErrors(() =>
         extractRarEntry(buf, parsed, hit.path, { maxBytes: lim.maxEntryBytes })))
     } catch (err) {
-      // A compressed entry is the one refusal an installed UnRAR can answer.
-      // Links stay refused whatever is installed — their "contents" are a
-      // target, not data — and an encrypted archive never reaches here, since
-      // parseRar rejects it. So the fallback is narrow by construction.
+      // A compressed entry is the one refusal an installed archiver can
+      // answer. Links stay refused whatever is installed — their "contents"
+      // are a target, not data — and an encrypted archive never reaches here,
+      // since parseRar rejects it. So the fallback is narrow by construction.
       if (!(err instanceof ArchiveError) || err.code !== 'unsupported'
         || hit.method === 0 || hit.redirect) throw err
 
-      const { canExtractCompressed, extractWithUnrar } = await import('./unrar-tool.js')
+      const { canExtractCompressed, extractWithTool } = await import('./rar-delegate.js')
       if (!canExtractCompressed()) throw err
 
-      const out = await extractWithUnrar({
+      const out = await extractWithTool({
         archivePath,
         entryPath: hit.path,
         maxBytes: lim.maxEntryBytes,
@@ -816,7 +816,7 @@ export async function readArchiveEntry(archivePath, entryPath, limits = {}) {
       // this entry. Without it a silently truncated stdout would pass.
       if (out.length !== hit.size) {
         throw new ArchiveError(
-          `UnRAR 回傳 ${out.length} 位元組，但「${hit.path}」宣告 ${hit.size}`, 'corrupt')
+          `外部解壓工具回傳 ${out.length} 位元組，但「${hit.path}」宣告 ${hit.size}`, 'corrupt')
       }
       if (hit.crc !== null && hit.crc !== undefined && crc32(out) !== hit.crc) {
         throw new ArchiveError(`「${hit.path}」的 CRC32 與封存檔記載不符`, 'corrupt')
