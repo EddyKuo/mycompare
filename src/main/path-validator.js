@@ -31,16 +31,29 @@ import { existsSync, statSync, realpathSync } from 'fs'
 function _realpath(p) {
   try {
     return realpathSync.native(p)
-  } catch {
-    // Missing leaf: resolve the deepest existing ancestor instead, so a link
-    // higher up the chain still cannot smuggle the target out of the root.
-    const parent = dirname(p)
-    if (parent === p) return p
+  } catch { /* the path does not exist yet — fall through */ }
+
+  // Resolve the deepest ancestor that does exist and re-attach the rest, so a
+  // link higher up the chain still cannot smuggle the target out of the root.
+  //
+  // The walk has to keep going until something exists, not stop after one
+  // level. On Windows an existing ancestor is also what expands an 8.3 short
+  // name, and a root is always registered in resolved form: give up early and
+  // `C:\Users\RUNNER~1\...` never shares a prefix with `C:\Users\runneradmin\...`,
+  // so a perfectly legitimate path inside an opened root is refused. That does
+  // not show up on a machine whose profile name is short enough to need no 8.3
+  // alias, which is why it took a different machine to surface it.
+  /** @type {string[]} */
+  const missing = []
+  let cur = p
+  for (;;) {
+    const parent = dirname(cur)
+    if (parent === cur) return p // reached the volume root; nothing existed
+    missing.unshift(cur.slice(parent.length + 1))
     try {
-      return resolve(realpathSync.native(parent), p.slice(parent.length + 1))
-    } catch {
-      return p
-    }
+      return resolve(realpathSync.native(parent), ...missing)
+    } catch { /* this one is missing too; keep walking up */ }
+    cur = parent
   }
 }
 

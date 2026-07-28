@@ -11,7 +11,7 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | 平台 | 檔案 |
 |------|------|
 | Windows x64 | `MyCompare-Setup-X.Y.Z.exe`（NSIS 安裝程式） |
-| macOS | `MyCompare-X.Y.Z.dmg`（Intel 與 Apple Silicon 各一份） |
+| macOS | `MyCompare-X.Y.Z-x64.dmg`（Intel）、`MyCompare-X.Y.Z-arm64.dmg`（Apple Silicon） |
 | Linux | `MyCompare-X.Y.Z.AppImage`、`.tar.gz` |
 
 三個平台的安裝檔由 GitHub Actions 在各自的 runner 上建置（`.github/workflows/release.yml`，
@@ -245,7 +245,7 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4298 / 4298 unit tests passing**、**396 / 396 e2e tests passing**，
+目前覆蓋：**4301 / 4301 unit tests passing**、**396 / 396 e2e tests passing**，
 共 152 個單元測試檔與 58 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
