@@ -69,6 +69,7 @@
 
       <!-- T50: Layout toggle -->
       <button class="toolbar-btn tc-btn-toggle" id="btn-layout-toggle" title="切換 Side-by-Side / Over-Under">⬛ Side</button>
+      <button class="toolbar-btn tc-btn-toggle" id="btn-webpage-toggle" title="以網頁方式檢視 HTML（不執行指令碼、不連外）">🌐 原始碼</button>
       <div class="toolbar-separator"></div>
 
       <!-- Export & Ignore Rules -->
@@ -137,6 +138,11 @@
             <span class="label">中繼資料比對</span>
             <span class="desc">MP3 標籤 / 版本資源</span>
           </button>
+          <button class="session-type-btn" data-type="registry">
+            <span class="icon">🗝️</span>
+            <span class="label">登錄檔比對</span>
+            <span class="desc">.reg 鍵值格狀檢視</span>
+          </button>
           <button class="session-type-btn" data-type="merge3">
             <span class="icon">🔀</span>
             <span class="label">三向合併</span>
@@ -159,6 +165,9 @@
 
       <!-- Metadata Compare View (MP3 tags / PE version resources) -->
       <div id="view-metadata" class="u-flex-fill" style="display:none"></div>
+
+      <!-- Registry Compare View (key/value grid) -->
+      <div id="view-registry" class="u-flex-fill" style="display:none"></div>
 
       <!-- 3-Way Merge View -->
       <div id="view-merge3" class="u-flex-fill" style="display:none"></div>

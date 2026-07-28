@@ -68,6 +68,107 @@ describe('joinContinuations', () => {
   it('emits a dangling continuation rather than dropping it', () => {
     expect(joinContinuations('"a"=hex:01,\\')).toEqual(['"a"=hex:01,'])
   })
+
+  it('ends the value at a blank line', () => {
+    // A continuation line is trimmed of its leading whitespace, so a blank one
+    // contributes nothing and the marker is gone — the value stops there. That
+    // is long-standing behaviour, pinned because a tail can otherwise reach
+    // back across blank lines and the two readings are easy to confuse.
+    const text = ['"a"=hex:01,\\', '   ', '  02'].join('\r\n')
+    expect(joinContinuations(text)).toEqual(['"a"=hex:01,', '  02'])
+  })
+
+  it('keeps consuming when stripping one marker exposes another', () => {
+    // A line ending in two backslashes loses one to the marker and still ends
+    // in a backslash, so the value continues — and the next marker can begin
+    // several lines back with only blank ones in between.
+    const text = ['double\\\\', '\\', '   ', 'tail'].join('\r\n')
+    expect(joinContinuations(text)).toEqual(['doubletail'])
+  })
+})
+
+describe('joinContinuations at the size real exports reach', () => {
+  /**
+   * The implementation this replaced, kept only as an oracle.
+   *
+   * It was correct and quadratic. Checking the current one against it is what
+   * makes the rewrite safe to believe — the four cases above all use three-line
+   * values and would agree with almost any implementation.
+   *
+   * @param {string} text
+   * @returns {string[]}
+   */
+  function joinContinuationsReference(text) {
+    const out = []
+    let pending = null
+    for (const raw of String(text ?? '').split(/\r?\n/)) {
+      const line = pending === null ? raw : raw.trimStart()
+      const combined = pending === null ? line : pending + line
+      if (/\\\s*$/.test(combined)) {
+        pending = combined.replace(/\\\s*$/, '')
+        continue
+      }
+      pending = null
+      out.push(combined)
+    }
+    if (pending !== null) out.push(pending)
+    return out
+  }
+
+  /** Deterministic generator, so a failure is reproducible. */
+  function lcg(seed) {
+    let s = seed >>> 0
+    return () => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0
+      return s / 4294967296
+    }
+  }
+
+  it('agrees with the previous implementation on awkward shapes', () => {
+    const rand = lcg(20260728)
+    const pieces = [
+      '"a"=hex:01,', '  02,03', '', '   ', '[HKEY_CURRENT_USER\\Test]',
+      '"n"=dword:00000001', 'trailing\\', 'double\\\\', '\\', 'plain text',
+      '"q"="a=b"', '  ', 'tab\there\\',
+    ]
+    for (let i = 0; i < 400; i++) {
+      const n = 1 + Math.floor(rand() * 12)
+      const lines = []
+      for (let j = 0; j < n; j++) lines.push(pieces[Math.floor(rand() * pieces.length)])
+      const text = lines.join(rand() < 0.5 ? '\r\n' : '\n')
+      expect(joinContinuations(text), `input: ${JSON.stringify(text)}`)
+        .toEqual(joinContinuationsReference(text))
+    }
+  })
+
+  it('handles a multi-megabyte binary value without stalling', () => {
+    // HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion on a stock Windows 11
+    // install holds a single value of over four million characters. reg.exe
+    // wraps binary data at ~80 columns, so that value reaches the parser as
+    // roughly 54,000 physical continuation lines.
+    //
+    // This ran in the main process, so the cost was not a slow view — it was
+    // the whole application frozen with no way back. Every existing test above
+    // used three-line values and so measured none of it.
+    const lines = ['"Blob"=hex:\\']
+    for (let i = 0; i < 60_000; i++) {
+      lines.push('  00,11,22,33,44,55,66,77,88,99,aa,bb,cc,dd,ee,ff,\\')
+    }
+    lines.push('  00')
+    const text = lines.join('\r\n')
+
+    const started = Date.now()
+    const out = joinContinuations(text)
+    const elapsed = Date.now() - started
+
+    expect(out).toHaveLength(1)
+    expect(out[0].startsWith('"Blob"=hex:00,11,22')).toBe(true)
+    expect(out[0].endsWith('ff,00')).toBe(true)
+    // Generous by two orders of magnitude against the ~30 ms this takes, so it
+    // reports the growth returning rather than ordinary machine noise. The
+    // shape it guards against took over two minutes on this exact input.
+    expect(elapsed).toBeLessThan(5000)
+  })
 })
 
 describe('parseRegValue', () => {

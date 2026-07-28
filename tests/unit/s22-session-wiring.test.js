@@ -302,12 +302,13 @@ describe('three-way merge hand-offs the view cannot service itself', () => {
   })
 })
 
-describe('table, image, hex and metadata tabs record their paths', () => {
-  it('all four sync the active tab', () => {
+describe('table, image, hex, metadata and registry tabs record their paths', () => {
+  it('all five sync the active tab', () => {
     // Only text and folder did, so a saved workspace restored the others
     // blank and nothing could ask "which files is this tab showing?".
     // Call sites only — the declaration line starts with `function`.
+    // The count moves with each view that gains one; registry is the fifth.
     const occurrences = [...APP.matchAll(/^\s+_syncActiveTabPaths\(left, right\)$/gm)]
-    expect(occurrences.length).toBe(4)
+    expect(occurrences.length).toBe(5)
   })
 })

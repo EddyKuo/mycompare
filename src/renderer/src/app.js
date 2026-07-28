@@ -4,6 +4,7 @@ import { TableCompare } from './views/table-compare.js'
 import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
 import { HexCompare } from './views/hex-compare.js'
 import { MetadataCompare } from './views/metadata-compare.js'
+import { RegistryCompare } from './views/registry-compare.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { createSession, updateSession } from './core/session.js'
@@ -335,7 +336,7 @@ let _openOptionsPane = () => showStatus('選項對話框尚未初始化')
 // ---------------------------------------------------------------------------
 // 視圖狀態
 // ---------------------------------------------------------------------------
-/** @type {'home' | 'text' | 'folder' | 'table' | 'image' | 'hex' | 'metadata' | 'merge3'} */
+/** @type {'home' | 'text' | 'folder' | 'table' | 'image' | 'hex' | 'metadata' | 'registry' | 'merge3'} */
 let currentView = 'home'; setActiveView('home')
 /** @type {TextCompare | null} */
 let textCompare = null
@@ -349,6 +350,8 @@ let imageCompare = null
 let hexCompare = null
 /** @type {MetadataCompare | null} */
 let metadataCompare = null
+/** @type {RegistryCompare | null} */
+let registryCompare = null
 /** @type {ThreeWayCompare | null} */
 let mergeCompare = null
 
@@ -481,6 +484,20 @@ export function initApp() {
       if (!metadataCompare) throw new Error('中繼資料比對尚未建立，請先切換到該視圖')
       await metadataCompare.setLeft(path)
     },
+    regSetBoth: async (leftPath, rightPath) => {
+      if (!registryCompare) throw new Error('登錄檔比對尚未建立，請先切換到該視圖')
+      await registryCompare.setBoth(leftPath, rightPath)
+    },
+    regRowCount: () => document.querySelectorAll('.rc-row').length,
+    regVisibleCount: () => registryCompare?.getVisibleRows?.().length ?? 0,
+    regStats: () => registryCompare?.getStats?.() ?? null,
+    regRowsForSide: (side) => registryCompare?.rowsForSide?.(side) ?? [],
+    regSetFilter: (mode) => registryCompare?.setShowFilter?.(mode),
+    regSetLiveKey: async (side, keyPath) => {
+      if (!registryCompare) throw new Error('登錄檔比對尚未建立，請先切換到該視圖')
+      await registryCompare.setSideToLiveKey(side, keyPath)
+    },
+    regExpandAll: () => registryCompare?.expandAll?.(),
     metaSetRight: async (path) => {
       if (!metadataCompare) throw new Error('中繼資料比對尚未建立，請先切換到該視圖')
       await metadataCompare.setRight(path)
@@ -514,6 +531,7 @@ export function initApp() {
       const view = {
         text: textCompare, hex: hexCompare, table: tableCompare,
         image: imageCompare, folder: folderCompare, metadata: metadataCompare,
+        registry: registryCompare,
       }[currentView]
       if (currentView === 'merge3') return mergeCompare?.getCurrentConflictIndex?.() ?? -1
       if (currentView === 'text') return textCompare?._currentDiff ?? -1
@@ -601,6 +619,7 @@ function showHome() {
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -621,6 +640,7 @@ function showTextCompare() {
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-text').style.display = 'flex'
   el('path-bar').style.display = ''
@@ -694,6 +714,7 @@ function showFolderCompare() {
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-folder').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -731,6 +752,7 @@ function showTableCompare() {
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-table').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -761,6 +783,7 @@ function showImageCompare() {
   el('view-table').style.display = 'none'
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-image').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -792,6 +815,7 @@ function showHexCompare() {
   el('view-image').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-hex').style.display = 'flex'
   el('path-bar').style.display = ''
   el('diff-counter').style.display = 'none'
@@ -823,6 +847,7 @@ function showMetadataCompare() {
   el('view-hex').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-metadata').style.display = 'flex'
+  el('view-registry').style.display = 'none'
   // The view carries its own path row, like the image and folder views do.
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -843,6 +868,36 @@ function showMetadataCompare() {
   updateToolbar()
 }
 
+function showRegistryCompare() {
+  currentView = 'registry'; setActiveView('registry')
+  el('session-home').style.display = 'none'
+  el('view-text').style.display = 'none'
+  el('view-folder').style.display = 'none'
+  el('view-table').style.display = 'none'
+  el('view-image').style.display = 'none'
+  el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
+  el('view-merge3').style.display = 'none'
+  el('view-registry').style.display = 'flex'
+  // The grid carries its own toolbar and status line, like the table view.
+  el('path-bar').style.display = 'none'
+  el('diff-counter').style.display = 'none'
+
+  if (!registryCompare) {
+    registryCompare = new RegistryCompare()
+    registryCompare.mount(el('view-registry'))
+    registryCompare.on('status', _viewStatus)
+    registryCompare.on('paths-changed', ({ left, right }) => {
+      recordSession('registry', { leftPath: left ?? '', rightPath: right ?? '' })
+      el('path-left').textContent = left || '（未選擇）'
+      el('path-right').textContent = right || '（未選擇）'
+      _syncActiveTabPaths(left, right)
+      updateToolbar()
+    })
+  }
+  updateToolbar()
+}
+
 function showMerge3() {
   currentView = 'merge3'; setActiveView('merge3')
   el('session-home').style.display = 'none'
@@ -852,6 +907,7 @@ function showMerge3() {
   el('view-image').style.display = 'none'
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
   el('view-merge3').style.display = 'flex'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -1053,6 +1109,9 @@ function _handleActivateTab(id, force = false) {
     case 'metadata':
       showMetadataCompare()
       break
+    case 'registry':
+      showRegistryCompare()
+      break
     case 'merge3':
       showMerge3()
       break
@@ -1226,6 +1285,10 @@ function newSession(type, labelText) {
       tabMgr.addTab('metadata', '中繼資料比對')
       showMetadataCompare()
       break
+    case 'registry':
+      tabMgr.addTab('registry', '登錄檔比對')
+      showRegistryCompare()
+      break
     case 'merge3':
       tabMgr.addTab('merge3', '三向合併')
       showMerge3()
@@ -1349,7 +1412,7 @@ function _activeViewInstance() {
   return {
     text: textCompare, folder: folderCompare, table: tableCompare,
     image: imageCompare, hex: hexCompare, metadata: metadataCompare,
-    merge3: mergeCompare,
+    registry: registryCompare, merge3: mergeCompare,
   }[currentView] ?? null
 }
 
@@ -1790,7 +1853,7 @@ function _isViewPrintButton(target) {
  * button's own handler sees it.
  */
 function setupViewPrintInterception() {
-  for (const id of ['view-hex', 'view-table']) {
+  for (const id of ['view-hex', 'view-table', 'view-registry']) {
     el(id)?.addEventListener('click', (e) => {
       if (!_isViewPrintButton(e.target)) return
       e.preventDefault()
@@ -1931,6 +1994,7 @@ function _getActiveConfigurableView() {
     image: imageCompare,
     hex: hexCompare,
     metadata: metadataCompare,
+    registry: registryCompare,
     // merge3 implements the same contract but was left out of this table, so
     // its settings could be neither saved nor loaded.
     merge3: mergeCompare,
@@ -2316,6 +2380,16 @@ async function _restoreOneWorkspaceTab(saved) {
       }
       break
     }
+    case 'registry': {
+      tabMgr.addTab('registry', title)
+      tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath })
+      showRegistryCompare()
+      // Both sides go in one call: the view compares on every load, so setting
+      // them separately would read and diff the left side twice.
+      await registryCompare?.setBoth(saved.leftPath ?? '', saved.rightPath ?? '')
+        .catch(() => {})
+      break
+    }
     case 'merge3': {
       tabMgr.addTab('merge3', title)
       tabMgr.updateActivePaths({ leftPath: saved.leftPath, rightPath: saved.rightPath, basePath: saved.basePath })
@@ -2343,6 +2417,7 @@ function _defaultTitleForType(type) {
     case 'image':  return '圖片比對'
     case 'hex':    return 'Hex 比對'
     case 'metadata': return '中繼資料比對'
+    case 'registry': return '登錄檔比對'
     case 'merge3': return '三向合併'
     default:       return '分頁'
   }
@@ -2356,7 +2431,7 @@ function _defaultTitleForType(type) {
 const VIEW_TYPE_LABELS = Object.freeze({
   text: '文字比對', folder: '資料夾比對', table: '表格比對',
   image: '圖片比對', hex: 'Hex 比對', metadata: '中繼資料比對',
-  merge3: '三向合併',
+  registry: '登錄檔比對', merge3: '三向合併',
 })
 
 /**
@@ -2952,6 +3027,15 @@ async function openComparison({ type, leftPath, rightPath, basePath, leftContent
     return
   }
 
+  if (viewType === 'registry') {
+    tabMgr.addTab('registry', '登錄檔比對')
+    showRegistryCompare()
+    // Both sides in one call: the view compares on every load, so two calls
+    // would read and diff the left side twice.
+    await registryCompare?.setBoth(leftPath ?? '', rightPath ?? '')
+    return
+  }
+
   if (viewType === 'hex') {
     tabMgr.addTab('hex', 'Hex 比對')
     showHexCompare()
@@ -3339,51 +3423,43 @@ async function openRegFile() {
 }
 
 /**
- * Compare two .reg exports as text.
+ * Start a comparison of two live registry keys.
  *
- * The text view is the right carrier: a registry export is a sorted list of
- * `key\name = value` triples, and once both sides are rendered in that canonical
- * form the existing line diff answers the question the user actually has.
+ * BC compares live keys directly; this exports each one first, because reading
+ * the registry from Node would need a native binding. The user is asked for
+ * both sides in turn, and either can be left blank to load only one — the same
+ * as opening a single .reg.
+ *
+ * @returns {Promise<void>}
+ */
+async function openLiveRegistryCompare() {
+  tabMgr.addTab('registry', '登錄檔比對')
+  showRegistryCompare()
+  await registryCompare?.promptLiveKey('left')
+  await registryCompare?.promptLiveKey('right')
+}
+
+/**
+ * Compare two .reg exports in the registry grid.
+ *
+ * This used to flatten both sides into `key\name = value` lines and hand them
+ * to the text differ. That reads well but throws away the two things a
+ * registry diff is about: the value's type, and whether a value is missing on
+ * one side rather than merely different — a line differ can only say the line
+ * changed. The grid keeps both, and the comparison itself now happens in the
+ * main process so there is one definition of equality.
  *
  * @param {string} leftPath
  * @param {string} [rightPath]
  */
 async function openRegCompare(leftPath, rightPath) {
-  const api = window.electronAPI
-  const [left, right] = await Promise.all([
-    leftPath ? api.readRegFile(leftPath) : Promise.resolve(null),
-    rightPath ? api.readRegFile(rightPath) : Promise.resolve(null),
-  ])
-
-  tabMgr.addTab('text', '登錄檔比對')
-  showTextCompare()
-  textCompare?.setLeft(leftPath ?? '', formatRegRows(left?.rows))
-  textCompare?.setRight(rightPath ?? '', formatRegRows(right?.rows))
-  showStatus(
-    `登錄檔比對：左 ${left?.rows?.length ?? 0} 項` +
-    (right ? `，右 ${right.rows.length} 項` : '（未選擇右側）'))
-}
-
-/**
- * Render flattened registry rows as one comparable line per value.
- *
- * @param {Array<{ path: string, name: string, type: string, value: string }>|null|undefined} rows
- * @returns {string}
- */
-function formatRegRows(rows) {
-  if (!rows?.length) return ''
-  const out = []
-  let currentKey = null
-  for (const row of rows) {
-    if (row.path !== currentKey) {
-      if (currentKey !== null) out.push('')
-      out.push(`[${row.path}]`)
-      currentKey = row.path
-    }
-    if (row.type === 'KEY') continue
-    out.push(`${row.name === '' ? '@' : `"${row.name}"`} = ${row.type}: ${row.value}`)
-  }
-  return `${out.join('\n')}\n`
+  tabMgr.addTab('registry', '登錄檔比對')
+  showRegistryCompare()
+  await registryCompare?.setBoth(leftPath ?? '', rightPath ?? '')
+  const counts = registryCompare?.getStats?.() ?? {}
+  const total = Object.values(counts).reduce((a, b) => a + b, 0)
+  showStatus(`登錄檔比對：共 ${total} 個值`
+    + (rightPath ? '' : '（未選擇右側）'))
 }
 
 /** Load a snapshot file and compare it against a folder. */
@@ -3450,6 +3526,7 @@ function navigateDiff(where) {
       image: imageCompare,
       folder: folderCompare,
       metadata: metadataCompare,
+      registry: registryCompare,
     }[currentView]
     result = view?.[`${where}Difference`]?.() ?? null
   }
@@ -3591,6 +3668,7 @@ function setupMenuActions() {
     'session.new.hex':    () => newSession('hex'),
     'session.new.image':  () => newSession('image'),
     'session.new.metadata': () => newSession('metadata'),
+    'session.new.registry': () => newSession('registry'),
     'session.new.merge3': () => newSession('merge3'),
     'session.home':       () => showHome(),
     'session.settings':   () => openConfigModal(),
@@ -3600,6 +3678,7 @@ function setupMenuActions() {
     'session.snapshot.open':      () => void openSnapshot(),
     'session.registry.export':    () => void exportRegistry(),
     'session.registry.open':      () => void openRegFile(),
+    'session.registry.live':      () => void openLiveRegistryCompare(),
     'session.remote.profiles':    () => void manageRemoteProfiles(),
     'session.remote.open':        () => void openRemoteFolder(),
 
@@ -3607,6 +3686,7 @@ function setupMenuActions() {
       const view = {
         text: textCompare, folder: folderCompare, hex: hexCompare,
         table: tableCompare, image: imageCompare, metadata: metadataCompare,
+        registry: registryCompare,
       }[currentView]
       void view?.swap?.()
     },

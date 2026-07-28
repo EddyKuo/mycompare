@@ -131,6 +131,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
             item('十六進位比對', 'session.new.hex'),
             item('圖片比對', 'session.new.image'),
             item('中繼資料比對', 'session.new.metadata'),
+            item('登錄檔比對', 'session.new.registry'),
             item('三向合併', 'session.new.merge3')
           ]
         },
@@ -145,6 +146,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
         { type: 'separator' },
         item('匯出登錄機碼…', 'session.registry.export'),
         item('開啟 .reg 檔比對…', 'session.registry.open'),
+        item('比對即時登錄機碼…', 'session.registry.live'),
         { type: 'separator' },
         item('遠端連線設定…', 'session.remote.profiles'),
         item('開啟遠端資料夾…', 'session.remote.open'),

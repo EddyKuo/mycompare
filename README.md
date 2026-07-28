@@ -22,7 +22,7 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 | 比對類型 | 說明 |
 |----------|------|
-| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則（含手動逐行標記）、文法感知比對、編輯模式、可逆摺疊、書籤、Find & Replace、Patch 檢視器 |
+| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則（含手動逐行標記）、文法感知比對、編輯模式、可逆摺疊、書籤、Find & Replace、Patch 檢視器、HTML 網頁檢視 |
 | **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、三向資料夾合併、封存檔瀏覽、移動／互換／Touch、版本／檢查碼／版本控制狀態／擁有者欄位、Source Control 子選單（git）、上下層導覽 |
 | **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、行內編輯與 undo/redo、18 種數值判讀面板（大小端各一組，64 位元以 BigInt 計算）、位址讀數、標尺、差異篩選 |
 | **中繼資料比對** | MP3 的 ID3 標籤與 Windows PE 版本資源，逐欄位並排比對；`.mp3` 自動路由，`.exe`／`.dll` 會問要用 Hex 還是版本資源 |
@@ -54,11 +54,24 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對：可在資料夾比對中作為內容判定，
   也有獨立的逐欄位比對視圖
 - 多視窗：可開新視窗，分頁能以右鍵移出或直接拖曳到另一個視窗（拖到視窗外會另開新視窗）
-- 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
+- 登錄檔比對：鍵值格狀檢視，逐值標示型別與「只存在於一側」，可修改、複製到另一側、
+  刪除、重新命名、新增機碼與值，寫出成 .reg 或直接套用回登錄檔（僅 Windows）。
+  三種來源任意配對：本機即時機碼、**另一台電腦的登錄檔**（`\電腦名稱\HKLM\…`，
+  遠端限 HKLM 與 HKU，這是 Windows 的限制）、.reg 檔
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
 - 可自訂鍵盤快捷鍵
 - 拖放檔案或資料夾即可開始比對
 - 右鍵快捷選單
+
+### 壓縮格式的驗收範圍
+
+**zip 與 7z 即為達標**，其餘格式是額外的。實際會遇到的封存檔幾乎都是這兩種，
+而且大多數人只裝 7-Zip；為了冷門格式投入與其使用率不成比例的工夫並不划算。
+
+以這個標準衡量，目前的支援已經超出：zip、7z（含 BCJ2）、tar、gzip、bzip2、xz
+及其 tar 組合、cab（MSZIP／LZX／未壓縮）、rar（RAR4 與 RAR5 容器）。
+
+下面列的是**這條線以外**的殘餘項目，記錄下來是為了誠實，不是待辦清單。
 
 ### 尚未實作
 
@@ -222,8 +235,8 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4219 / 4219 unit tests passing**、**384 / 384 e2e tests passing**，
-共 149 個單元測試檔與 57 個 e2e 檔。
+目前覆蓋：**4291 / 4291 unit tests passing**、**395 / 395 e2e tests passing**，
+共 152 個單元測試檔與 58 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、

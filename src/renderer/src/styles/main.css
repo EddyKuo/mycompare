@@ -1414,3 +1414,12 @@ body {
 }
 .tc-details__align dt { color: var(--text-secondary); }
 .tc-details__align dd { margin: 0; color: var(--text-primary); }
+
+/* BC's View > Webpages. The frame fills the pane it replaces; the source view
+   is hidden rather than removed so switching back costs no re-render. */
+.tc-webpage-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #ffffff;
+}

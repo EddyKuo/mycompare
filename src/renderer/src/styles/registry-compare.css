@@ -1,0 +1,161 @@
+/*
+ * Registry compare grid.
+ *
+ * The row height is fixed and duplicated in registry-compare.js as ROW_HEIGHT,
+ * because the virtual scroller converts a scroll offset into a row index. If
+ * one changes the other has to change with it, or the rows drift away from the
+ * pointer.
+ */
+:root {
+  --rc-row-height: 22px;
+}
+
+.registry-compare {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  font-size: 12px;
+}
+
+/* ── Toolbar ─────────────────────────────────────────────────────────────── */
+
+.rc-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.rc-btn {
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rc-btn:hover { background: var(--bg-hover); }
+
+.rc-btn.active {
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+  color: #fff;
+}
+
+.rc-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--border-color);
+}
+
+.rc-find {
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  min-width: 140px;
+}
+
+/* ── Grid ────────────────────────────────────────────────────────────────── */
+
+.rc-head,
+.rc-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) 110px minmax(160px, 2fr) minmax(160px, 2fr);
+  align-items: center;
+}
+
+.rc-head {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-weight: 600;
+  height: var(--rc-row-height);
+}
+
+.rc-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  position: relative;
+}
+
+/* Holds the full scroll height while only the visible rows exist in the DOM. */
+.rc-spacer { position: relative; }
+
+.rc-body {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.rc-row {
+  height: var(--rc-row-height);
+  border-bottom: 1px solid transparent;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.rc-row:hover { background: var(--bg-hover); }
+
+.rc-row--key { font-weight: 600; }
+
+.rc-row--current {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
+}
+
+.rc-cell {
+  padding: 0 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.rc-cell-type { color: var(--text-secondary); }
+
+.rc-cell-data { border-left: 1px solid var(--border-color); }
+
+.rc-twisty {
+  display: inline-block;
+  width: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.rc-label { user-select: text; }
+
+/* A value the user changed but has not written back yet. */
+.rc-edited {
+  font-style: italic;
+  text-decoration: underline dotted;
+}
+
+/* ── Status colours — the project-wide meanings, not new ones ────────────── */
+
+.rc-row.different { background: var(--diff-replace-bg); }
+.rc-row.left-only { background: var(--diff-insert-bg); }
+.rc-row.right-only { background: var(--diff-delete-bg); }
+
+.rc-status {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 11px;
+}

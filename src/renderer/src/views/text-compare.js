@@ -1947,6 +1947,10 @@ export class TextCompare {
     // T50: Layout mode toggle
     /** @type {'side-by-side' | 'over-under'} */
     this._layoutMode = 'side-by-side';
+    /** BC's View > Webpages: render the two sides instead of showing source. */
+    this._webpageMode = false;
+    /** @type {{left: string|null, right: string|null}} blob URLs in use */
+    this._webpageUrls = { left: null, right: null };
 
     // T64: Undo/Redo stack for copy operations
     /** @type {Array<{ left: string, right: string }>} */
@@ -2439,6 +2443,11 @@ export class TextCompare {
 
     // ── T50: Layout toggle button ──
     const btnLayout = document.getElementById('btn-layout-toggle');
+    this._btnWebpage = document.getElementById('btn-webpage-toggle');
+    if (this._btnWebpage) {
+      this._onWebpageToggle = () => this.toggleWebpageMode();
+      this._btnWebpage.addEventListener('click', this._onWebpageToggle);
+    }
     if (btnLayout) {
       this._on(btnLayout, 'click', () => this.toggleLayout());
     }
@@ -2551,6 +2560,13 @@ export class TextCompare {
   /** Remove all event listeners. */
   destroy() {
     if (!this._mounted) return;
+
+    // Blob URLs outlive the element that used them, so a view opened and
+    // closed repeatedly would pin every document it ever rendered.
+    this._revokeWebpageUrls();
+    if (this._btnWebpage && this._onWebpageToggle) {
+      this._btnWebpage.removeEventListener('click', this._onWebpageToggle);
+    }
 
     this._contentLeft?.removeEventListener('scroll', this._onScrollLeft);
     this._contentRight?.removeEventListener('scroll', this._onScrollRight);
@@ -3263,6 +3279,7 @@ export class TextCompare {
     this._encodingGuessLeft = typeof confidence === 'number'
       && confidence > 0 && confidence < LOW_CONFIDENCE;
     this._eolLeft = detectEol(content); // T01
+    this._syncWebpageButton();
     this._resolveGrammars();
     if (this._pathLeft) this._pathLeft.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
@@ -3315,6 +3332,7 @@ export class TextCompare {
     this._encodingGuessRight = typeof confidence === 'number'
       && confidence > 0 && confidence < LOW_CONFIDENCE;
     this._eolRight = detectEol(content); // T01
+    this._syncWebpageButton();
     this._resolveGrammars();
     if (this._pathRight) this._pathRight.textContent = path || '（未選擇）';
     this._emit('paths-changed', { left: this._leftPath, right: this._rightPath });
@@ -5301,6 +5319,7 @@ ${rows}
       // P2-52…P2-60
       whitespaceMode:      this.getWhitespaceMode(),
       syntaxHighlight:     this._syntaxHighlight,
+      webpageMode:         this.isWebpageMode(),
       orphansAlwaysImportant: this._opts.orphansAlwaysImportant,
       neverAlignPatterns:  [...this._opts.neverAlignPatterns],
       // 1.7 Alignment tab + 1.9 Text options page.
@@ -5391,6 +5410,9 @@ ${rows}
     // P2-52…P2-60. Assigned rather than routed through the setters so a
     // snapshot costs one re-diff at the end, not one per option.
     if (typeof settings.syntaxHighlight === 'boolean') this._syntaxHighlight = settings.syntaxHighlight
+    // Routed through the setter, which refuses when neither side is markup —
+    // a stored `true` must not leave two blank frames over a plain text file.
+    if (typeof settings.webpageMode === 'boolean') this.setWebpageMode(settings.webpageMode)
     if (typeof settings.orphansAlwaysImportant === 'boolean') {
       this._opts.orphansAlwaysImportant = settings.orphansAlwaysImportant
     }
@@ -7128,6 +7150,147 @@ ${rows}
     }
     // Gutter canvas must be redrawn after layout changes
     this._drawGutter();
+  }
+
+  // -------------------------------------------------------------------------
+  // Webpages view (BC's View ▸ Webpages)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether either side looks like markup worth rendering.
+   *
+   * Sniffed from the content rather than the extension: a `.txt` holding a
+   * page is still a page, and an `.html` holding a template fragment is still
+   * worth rendering. The button stays disabled otherwise, because rendering
+   * plain prose as a document shows the same text with the diff colouring
+   * removed — strictly worse than the source view.
+   *
+   * @returns {boolean}
+   */
+  canRenderWebpage() {
+    const looksLikeMarkup = (s) => typeof s === 'string'
+      && /<\s*(!doctype\s+html|html|body|div|p|table|h[1-6]|span|a\s)/i.test(s);
+    return looksLikeMarkup(this._leftContent) || looksLikeMarkup(this._rightContent);
+  }
+
+  /** @returns {boolean} */
+  isWebpageMode() { return this._webpageMode === true; }
+
+  /**
+   * Show the two sides as rendered pages instead of as source.
+   *
+   * @param {boolean} on
+   * @returns {boolean} the mode actually in effect
+   */
+  setWebpageMode(on) {
+    const next = !!on && this.canRenderWebpage();
+    if (next === this.isWebpageMode()) return this._webpageMode === true;
+    this._webpageMode = next;
+    this._applyWebpageMode();
+    return this._webpageMode;
+  }
+
+  /** @returns {boolean} */
+  toggleWebpageMode() { return this.setWebpageMode(!this.isWebpageMode()); }
+
+  /**
+   * Wrap a document so it cannot reach the network.
+   *
+   * This is the part that matters. A compared file is somebody else's HTML,
+   * and an ordinary page references remote images, fonts, stylesheets and
+   * trackers — so merely rendering one would announce to a third party that
+   * this file was opened, which a local diff tool has no business doing.
+   * The injected policy allows inline styles and data: images and nothing
+   * else, so a page renders roughly as intended while every off-machine
+   * request is refused.
+   *
+   * Scripts are blocked twice over: by this policy and by the frame's sandbox
+   * attribute, which omits allow-scripts. Two independent locks, because a
+   * document that runs script inside the app's own window is the one failure
+   * that would matter.
+   *
+   * @param {string} html
+   * @returns {string}
+   */
+  static wrapWebpageHtml(html) {
+    const policy = "<meta http-equiv=\"Content-Security-Policy\" content=\""
+      + "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:\">";
+    const source = typeof html === 'string' ? html : '';
+    // Placed at the very start of <head> when there is one, so it governs
+    // everything that follows; a fragment with no head gets a document built
+    // around it.
+    if (/<head[^>]*>/i.test(source)) {
+      return source.replace(/<head[^>]*>/i, (m) => `${m}${policy}`);
+    }
+    return `<!doctype html><html><head>${policy}</head><body>${source}</body></html>`;
+  }
+
+  /** Drop any blob URLs the rendered frames were using. */
+  _revokeWebpageUrls() {
+    for (const key of ['left', 'right']) {
+      const url = this._webpageUrls?.[key];
+      if (url) URL.revokeObjectURL(url);
+    }
+    this._webpageUrls = { left: null, right: null };
+  }
+
+  /** Build or tear down the rendered frames. */
+  _applyWebpageMode() {
+    const on = this.isWebpageMode();
+    if (this._btnWebpage) {
+      this._btnWebpage.textContent = on ? '🌐 網頁' : '🌐 原始碼';
+      this._btnWebpage.classList.toggle('active', on);
+    }
+
+    this._revokeWebpageUrls();
+    this._webpageUrls = { left: null, right: null };
+
+    for (const side of ['left', 'right']) {
+      const pane = document.getElementById(side === 'left' ? 'pane-left' : 'pane-right');
+      if (!pane) continue;
+      const existing = pane.querySelector('.tc-webpage-frame');
+      if (existing) existing.remove();
+      const content = side === 'left' ? this._contentLeft : this._contentRight;
+      if (content) content.style.display = on ? 'none' : '';
+      if (!on) continue;
+
+      const frame = document.createElement('iframe');
+      frame.className = 'tc-webpage-frame';
+      // No allow-scripts and no allow-same-origin: the document cannot run
+      // code, reach this window, or read anything of the app's.
+      frame.setAttribute('sandbox', '');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.title = side === 'left' ? '左側網頁預覽' : '右側網頁預覽';
+      const html = TextCompare.wrapWebpageHtml(
+        side === 'left' ? this._leftContent : this._rightContent);
+      // A blob URL rather than srcdoc: the app's own CSP allows frame-src
+      // blob: and nothing else, which the print preview already relies on.
+      const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      this._webpageUrls[side] = url;
+      frame.src = url;
+      pane.appendChild(frame);
+    }
+  }
+
+  /** Enable or disable the toggle to match what is loaded. */
+  _syncWebpageButton() {
+    if (!this._btnWebpage) return;
+    const usable = this.canRenderWebpage();
+    this._btnWebpage.disabled = !usable;
+    this._btnWebpage.title = usable
+      ? '以網頁方式檢視 HTML（不執行指令碼、不連外）'
+      : '兩側都不是 HTML，無法以網頁方式檢視';
+    // Falling back to source when the content stops being markup, rather than
+    // leaving two blank frames behind.
+    if (!usable && this.isWebpageMode()) {
+      this.setWebpageMode(false);
+      return;
+    }
+    // Still markup, still in this mode, but the content just changed — so the
+    // frames are showing the previous file. Rebuilding is not optional: a
+    // rendered page that silently belongs to the file you had open before is
+    // worse than no preview at all, because nothing on screen says so.
+    if (usable && this.isWebpageMode()) this._applyWebpageMode();
   }
 
   // -------------------------------------------------------------------------

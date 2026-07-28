@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } from 'electron'
 import { join, extname, dirname, basename } from 'path'
 import { readFile, readdir, stat, copyFile, unlink, mkdir, writeFile, rename, open, chmod, utimes, rm } from 'fs/promises'
-import { watch, existsSync, mkdirSync, accessSync, constants as fsConstants } from 'fs'
+import { watch, existsSync, mkdirSync, accessSync, unlinkSync, constants as fsConstants } from 'fs'
 import { tmpdir } from 'os'
 import { execFile } from 'child_process'
 import { decodeBuffer, encodeContent } from './encoding.js'
@@ -289,6 +289,25 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+/**
+ * Temporary .reg exports taken from live registry keys.
+ *
+ * They cannot be deleted as soon as they are read: the comparison keeps the
+ * path and re-reads it when the user reloads. So they are tracked and removed
+ * when the process ends — a registry export can carry paths and credentials,
+ * and leaving one in the temp directory outlives any reason to have it.
+ *
+ * @type {Set<string>}
+ */
+const _registrySnapshots = new Set()
+
+app.on('will-quit', () => {
+  for (const path of _registrySnapshots) {
+    try { unlinkSync(path) } catch { /* already gone, or in use */ }
+  }
+  _registrySnapshots.clear()
 })
 
 // ---------------------------------------------------------------------------
@@ -1001,12 +1020,135 @@ ipcMain.handle('export-registry-key', async (event, { keyPath } = {}) => {
   return { path: filePath, format: parsed.format, rows: parsed.rows }
 })
 
-// IPC: 讀取 .reg 檔
-ipcMain.handle('read-reg-file', async (_event, filePath) => {
-  const safe = validatePath(filePath)
-  const { readRegFile } = await import('./registry.js')
-  const parsed = await readRegFile(safe)
-  return { path: safe, format: parsed.format, rows: parsed.rows }
+/**
+ * IPC: snapshot a live registry key to a temporary .reg file.
+ *
+ * BC compares live keys directly. There is no way to read the registry from
+ * Node without a native binding, so the live key is exported first and the
+ * same parser handles it — which also means a live key and a file the user
+ * already has compare through exactly one code path.
+ *
+ * The file lands in the temp directory and is registered as a readable root so
+ * the comparison can open it; it is the caller's snapshot, not a live view, so
+ * reloading re-exports rather than re-reading the file.
+ */
+ipcMain.handle('snapshot-registry-key', async (_event, { keyPath, replaces } = {}) => {
+  const { exportRegistryKey, validateRegistryPath, buildRegFile, flattenRegistry } =
+    await import('./registry.js')
+  const { parseRegistryTarget, queryRemoteKey } = await import('./registry-query.js')
+
+  // `\\Machine\HKLM\...` selects another computer. reg.exe cannot
+  // remotely — its own help says "local machine only" — so that side is read
+  // through the registry API and written out here, which keeps one
+  // representation downstream instead of two.
+  const { machine, keyPath: key } = parseRegistryTarget(keyPath)
+  const label = machine ? `${machine}-${key}` : key
+  const name = `mycompare-key-${label.replace(/[^A-Za-z0-9]+/g, '-').slice(0, 60)}`
+  const out = join(tmpdir(), `${name}-${Date.now()}-${process.pid}.reg`)
+  registerRoot(out)
+
+  if (machine) {
+    const parsed = await queryRemoteKey(machine, key)
+    await writeFile(out, `﻿${buildRegFile(flattenRegistry(parsed))}`, 'utf16le')
+  } else {
+    await exportRegistryKey(validateRegistryPath(key), out)
+  }
+  // Release the snapshot this one replaces, named by the caller. Matching on
+  // the key name instead would delete the wrong file whenever both sides show
+  // the same key — loading the right side would pull the left side's export
+  // out from under it.
+  if (typeof replaces === 'string' && _registrySnapshots.has(replaces)) {
+    try { unlinkSync(replaces) } catch { /* still open, or already gone */ }
+    _registrySnapshots.delete(replaces)
+  }
+  _registrySnapshots.add(out)
+  return { path: out, keyPath: machine ? `\\\\${machine}\\${key}` : key }
+})
+
+/**
+ * IPC: compare two .reg files and return the per-value result.
+ *
+ * The comparison lives here rather than in the view so there is one definition
+ * of what makes two values equal. It also halves the traffic: the alternative
+ * is shipping both full exports across and diffing them again on the far side.
+ *
+ * Either side may be omitted, which is how a one-sided load is shown.
+ */
+ipcMain.handle('compare-reg-files', async (_event, { leftPath, rightPath } = {}) => {
+  const { readRegFile, diffRegistryForDisplay } = await import('./registry.js')
+
+  const readSide = async (p) => {
+    if (!p) return { path: '', format: '', rows: [] }
+    const safe = validatePath(p)
+    const parsed = await readRegFile(safe)
+    return { path: safe, format: parsed.format, rows: parsed.rows }
+  }
+  const [left, right] = await Promise.all([readSide(leftPath), readSide(rightPath)])
+
+  return {
+    leftPath: left.path,
+    rightPath: right.path,
+    format: left.format || right.format,
+    rows: diffRegistryForDisplay(left.rows, right.rows),
+  }
+})
+
+/**
+ * IPC: write edited registry rows out as a .reg file the user picks.
+ *
+ * Every key path is validated even though nothing here reaches a command line:
+ * the rows become `[path]` headers, and a path carrying a newline or a leading
+ * '-' would turn one key into several, or into a deletion.
+ */
+ipcMain.handle('export-reg-file', async (event, { rows, format, defaultName } = {}) => {
+  const { buildRegFile, validateRegistryPath, refuseTruncatedRows } =
+    await import('./registry.js')
+  const list = Array.isArray(rows) ? rows : []
+  for (const row of list) validateRegistryPath(row?.path)
+  refuseTruncatedRows(list)
+
+  const win = BrowserWindow.fromWebContents(event.sender)
+  const opts = {
+    defaultPath: typeof defaultName === 'string' && defaultName ? defaultName : 'registry-export.reg',
+    filters: [{ name: '登錄檔', extensions: ['reg'] }],
+  }
+  const { canceled, filePath } = win
+    ? await dialog.showSaveDialog(win, opts)
+    : await dialog.showSaveDialog(opts)
+  if (canceled || !filePath) return null
+
+  registerRoot(filePath)
+  // UTF-16LE with a BOM is what regedit writes, and what Windows tools expect
+  // for a version 5 file containing non-ASCII value names.
+  await writeFile(filePath, `﻿${buildRegFile(list, { format })}`, 'utf16le')
+  return { path: filePath, count: list.length }
+})
+
+/**
+ * IPC: apply edited registry rows to the live registry.
+ *
+ * Destructive and not undoable. The renderer confirms with the user before
+ * calling; this handler does not ask again, but it does refuse to write
+ * anything it cannot name a known root for. The temporary file is removed
+ * whatever happens, so an aborted import does not leave registry contents
+ * sitting in the temp directory.
+ */
+ipcMain.handle('apply-reg-file', async (_event, { rows, format } = {}) => {
+  const { buildRegFile, validateRegistryPath, importRegFile, refuseTruncatedRows } =
+    await import('./registry.js')
+  const list = Array.isArray(rows) ? rows : []
+  if (!list.length) throw new Error('沒有可套用的項目')
+  for (const row of list) validateRegistryPath(row?.path)
+  refuseTruncatedRows(list)
+
+  const tmp = join(tmpdir(), `mycompare-apply-${Date.now()}-${process.pid}.reg`)
+  try {
+    await writeFile(tmp, `﻿${buildRegFile(list, { format })}`, 'utf16le')
+    await importRegFile(tmp)
+  } finally {
+    await unlink(tmp).catch(() => {})
+  }
+  return { count: list.length }
 })
 
 // IPC: 讀取資料夾內容（一層）
