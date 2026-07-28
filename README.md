@@ -29,10 +29,10 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 ## 對 Beyond Compare 的覆蓋率
 
-**約 69%**，以 BC4 官方命令參考的 **897 條指令**加權計算。
+**約 72%**，以 BC4 官方命令參考的 **897 條指令**加權計算。
 
 分母是逐頁從 BC4 線上說明數出來的命令條目數，不是估的。BC4 有 15 個命令頁，
-本專案對其中 **13 個**有對應的視圖類型；那 13 個佔 BC 指令總數的 90%，其中覆蓋 73%。
+本專案對其中 **14 個**有對應的視圖類型；那 14 個佔 BC 指令總數的 96%，其中覆蓋 74%。
 
 | BC4 視圖類型 | BC 指令數 | 本專案覆蓋 |
 |---|---:|---:|
@@ -43,7 +43,7 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | Registry Compare | 64 | 85% |
 | Table Compare | 63 | 85% |
 | Hex Compare | 58 | 65% |
-| **Text Edit** | 53 | 25% |
+| Text Edit | 53 | 80% |
 | Picture Compare | 48 | 85% |
 | Folder Sync | 47 | 60% |
 | MP3 Compare | 47 | 70% |
@@ -52,9 +52,8 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 | **Text Patch** | 35 | 40% |
 | Home | 3 | 100% |
 
-整個沒做的是 **Text Edit**（BC 的獨立編輯器視圖，含 Find in Files；本專案只有
-文字比對內的 Ctrl+E 編輯模式）與 **Text Patch** 的獨立視圖（可讀 unified diff，
-但注入文字比對，沒有逐檔逐 hunk 瀏覽）。另外未實作 **Clipboard Compare**、
+整個沒做的只剩 **Text Patch** 的獨立視圖（可讀 unified diff，但注入文字比對，
+沒有逐檔逐 hunk 瀏覽）。另外未實作 **Clipboard Compare**、
 Explorer 殼層整合、MTP 行動裝置與 `http://` 來源，以及 SCC 相容的版本控制整合
 （本專案只支援 git）。
 
@@ -75,6 +74,7 @@ Explorer 殼層整合、MTP 行動裝置與 `http://` 來源，以及 SCC 相容
 | **中繼資料比對** | MP3 的 ID3 標籤與 Windows PE 版本資源，逐欄位並排比對；`.mp3` 自動路由，`.exe`／`.dll` 會問要用 Hex 還是版本資源 |
 | **圖片比對** | 像素級差異、Auto Scale 尺寸對齊、差異強度分級、旋轉翻轉、同步縮放 |
 | **表格比對** | CSV / Excel 多工作表 / HTML 表格、虛擬捲動、儲存格編輯與 undo/redo、數值與日期容差比對、多欄複合 key、欄位顯示與排除 |
+| **文字編輯** | 單檔編輯器：行號、語法高亮、可見空白、undo/redo、行／字刪除與插入、縮排、書籤、Convert File、行尾符號、以及 **Find in Files**（跨檔搜尋，支援 BC 檔案遮罩） |
 | **三向合併** | 3-way merge、八種顯示篩選、可調脈絡行數、Favor Left/Right、演算法選擇、衝突導航、批次解決 |
 | **登錄檔比對** | 鍵值格狀樹、逐值型別與「只存在於一側」、虛擬捲動、編輯／複製／刪除／改名／新增、寫出 .reg 或套用回登錄檔、基準機碼對齊兩把不同名的機碼（僅 Windows） |
 
@@ -171,6 +171,7 @@ MyCompare/
 │   │   ├── vcs.js            # git 狀態與 Source Control 操作
 │   │   ├── registry.js       # .reg 解析／組裝、逐值比對
 │   │   ├── registry-query.js # 遠端電腦的登錄檔（.NET 登錄檔 API）
+│   │   ├── find-in-files.js  # 跨檔搜尋（遮罩、二進位跳過、上限回報）
 │   │   └── metadata.js       # ID3 與 PE 版本資源解析
 │   ├── preload/
 │   │   └── index.js          # contextBridge（electronAPI 暴露給 renderer）
@@ -180,7 +181,7 @@ MyCompare/
 │           ├── main.js        # renderer 入口
 │           ├── app.js         # 視圖路由、toolbar、tab 管理
 │           ├── core/          # diff 引擎、session 管理、對話框、視窗管理、工具函式
-│           └── views/         # 八種比對視圖元件
+│           └── views/         # 九種視圖元件
 │               ├── text-compare.js
 │               ├── folder-compare.js
 │               ├── hex-compare.js
@@ -188,6 +189,7 @@ MyCompare/
 │               ├── table-compare.js
 │               ├── metadata-compare.js
 │               ├── registry-compare.js
+│               ├── text-edit.js      # 單檔編輯器 + Find in Files
 │               └── three-way-compare.js
 ├── tests/
 │   ├── unit/                  # Vitest 單元測試
@@ -285,8 +287,8 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4302 / 4302 unit tests passing**、**396 / 396 e2e tests passing**，
-共 152 個單元測試檔與 58 個 e2e 檔。
+目前覆蓋：**4355 / 4355 unit tests passing**、**403 / 403 e2e tests passing**，
+共 154 個單元測試檔與 59 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、

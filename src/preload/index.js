@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openFile: (options) => ipcRenderer.invoke('open-file', options),
   openFolder: () => ipcRenderer.invoke('open-folder'),
   readDir: (path, options) => ipcRenderer.invoke('read-dir', path, options),
+  findInFiles: (opts) => ipcRenderer.invoke('find-in-files', opts),
   createSnapshot: (folderPath, crc) => ipcRenderer.invoke('create-snapshot', { folderPath, crc }),
   loadSnapshot: () => ipcRenderer.invoke('load-snapshot'),
   readSnapshotDir: (snapshotPath, relDir) =>

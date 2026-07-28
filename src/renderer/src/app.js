@@ -5,6 +5,7 @@ import { ImageCompare, MAX_IMAGE_BYTES } from './views/image-compare.js'
 import { HexCompare } from './views/hex-compare.js'
 import { MetadataCompare } from './views/metadata-compare.js'
 import { RegistryCompare } from './views/registry-compare.js'
+import { TextEdit } from './views/text-edit.js'
 import { ThreeWayCompare } from './views/three-way-compare.js'
 import { renderRecentSessions, store } from './core/session-home-ui.js'
 import { createSession, updateSession } from './core/session.js'
@@ -336,7 +337,7 @@ let _openOptionsPane = () => showStatus('選項對話框尚未初始化')
 // ---------------------------------------------------------------------------
 // 視圖狀態
 // ---------------------------------------------------------------------------
-/** @type {'home' | 'text' | 'folder' | 'table' | 'image' | 'hex' | 'metadata' | 'registry' | 'merge3'} */
+/** @type {'home'|'text'|'folder'|'table'|'image'|'hex'|'metadata'|'registry'|'textedit'|'merge3'} */
 let currentView = 'home'; setActiveView('home')
 /** @type {TextCompare | null} */
 let textCompare = null
@@ -352,6 +353,8 @@ let hexCompare = null
 let metadataCompare = null
 /** @type {RegistryCompare | null} */
 let registryCompare = null
+/** @type {TextEdit | null} */
+let textEdit = null
 /** @type {ThreeWayCompare | null} */
 let mergeCompare = null
 
@@ -498,6 +501,21 @@ export function initApp() {
       await registryCompare.setSideToLiveKey(side, keyPath)
     },
     regExpandAll: () => registryCompare?.expandAll?.(),
+    editSetContent: (path, content, encoding) => {
+      if (!textEdit) throw new Error('文字編輯尚未建立，請先切換到該視圖')
+      textEdit.setContent(path, content, encoding)
+    },
+    editGetContent: () => textEdit?.getContent() ?? null,
+    editIsModified: () => textEdit?.isModified() ?? null,
+    editRun: (method, ...args) => {
+      if (!textEdit) throw new Error('文字編輯尚未建立，請先切換到該視圖')
+      if (typeof textEdit[method] !== 'function') throw new Error(`沒有這個指令：${method}`)
+      return textEdit[method](...args)
+    },
+    editFindInFiles: async (opts) => {
+      if (!textEdit) throw new Error('文字編輯尚未建立，請先切換到該視圖')
+      return textEdit.findInFiles(opts)
+    },
     regSetBase: async (side, keyPath) => {
       if (!registryCompare) throw new Error('登錄檔比對尚未建立，請先切換到該視圖')
       await registryCompare.setBaseKey(side, keyPath)
@@ -633,6 +651,7 @@ function showHome() {
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -654,6 +673,7 @@ function showTextCompare() {
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-text').style.display = 'flex'
   el('path-bar').style.display = ''
@@ -728,6 +748,7 @@ function showFolderCompare() {
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-folder').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -766,6 +787,7 @@ function showTableCompare() {
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-table').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -797,6 +819,7 @@ function showImageCompare() {
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-image').style.display = 'flex'
   el('path-bar').style.display = 'none'
@@ -829,6 +852,7 @@ function showHexCompare() {
   el('view-merge3').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-hex').style.display = 'flex'
   el('path-bar').style.display = ''
   el('diff-counter').style.display = 'none'
@@ -861,6 +885,7 @@ function showMetadataCompare() {
   el('view-merge3').style.display = 'none'
   el('view-metadata').style.display = 'flex'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   // The view carries its own path row, like the image and folder views do.
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -892,6 +917,7 @@ function showRegistryCompare() {
   el('view-metadata').style.display = 'none'
   el('view-merge3').style.display = 'none'
   el('view-registry').style.display = 'flex'
+  el('view-textedit').style.display = 'none'
   // The grid carries its own toolbar and status line, like the table view.
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -911,6 +937,37 @@ function showRegistryCompare() {
   updateToolbar()
 }
 
+function showTextEdit() {
+  currentView = 'textedit'; setActiveView('textedit')
+  el('session-home').style.display = 'none'
+  el('view-text').style.display = 'none'
+  el('view-folder').style.display = 'none'
+  el('view-table').style.display = 'none'
+  el('view-image').style.display = 'none'
+  el('view-hex').style.display = 'none'
+  el('view-metadata').style.display = 'none'
+  el('view-registry').style.display = 'none'
+  el('view-merge3').style.display = 'none'
+  el('view-textedit').style.display = 'flex'
+  // One file, so the two-sided path bar and the difference counter mean
+  // nothing here; the view carries its own toolbar and status line.
+  el('path-bar').style.display = 'none'
+  el('diff-counter').style.display = 'none'
+
+  if (!textEdit) {
+    textEdit = new TextEdit()
+    textEdit.mount(el('view-textedit'))
+    textEdit.on('status', _viewStatus)
+    textEdit.on('paths-changed', ({ left }) => {
+      recordSession('textedit', { leftPath: left ?? '', rightPath: '' })
+      el('path-left').textContent = left || '（未選擇）'
+      _syncActiveTabPaths(left, '')
+      updateToolbar()
+    })
+  }
+  updateToolbar()
+}
+
 function showMerge3() {
   currentView = 'merge3'; setActiveView('merge3')
   el('session-home').style.display = 'none'
@@ -921,6 +978,7 @@ function showMerge3() {
   el('view-hex').style.display = 'none'
   el('view-metadata').style.display = 'none'
   el('view-registry').style.display = 'none'
+  el('view-textedit').style.display = 'none'
   el('view-merge3').style.display = 'flex'
   el('path-bar').style.display = 'none'
   el('diff-counter').style.display = 'none'
@@ -1125,6 +1183,9 @@ function _handleActivateTab(id, force = false) {
     case 'registry':
       showRegistryCompare()
       break
+    case 'textedit':
+      showTextEdit()
+      break
     case 'merge3':
       showMerge3()
       break
@@ -1302,6 +1363,10 @@ function newSession(type, labelText) {
       tabMgr.addTab('registry', '登錄檔比對')
       showRegistryCompare()
       break
+    case 'textedit':
+      tabMgr.addTab('textedit', '文字編輯')
+      showTextEdit()
+      break
     case 'merge3':
       tabMgr.addTab('merge3', '三向合併')
       showMerge3()
@@ -1425,7 +1490,7 @@ function _activeViewInstance() {
   return {
     text: textCompare, folder: folderCompare, table: tableCompare,
     image: imageCompare, hex: hexCompare, metadata: metadataCompare,
-    registry: registryCompare, merge3: mergeCompare,
+    registry: registryCompare, textedit: textEdit, merge3: mergeCompare,
   }[currentView] ?? null
 }
 
@@ -2431,6 +2496,7 @@ function _defaultTitleForType(type) {
     case 'hex':    return 'Hex 比對'
     case 'metadata': return '中繼資料比對'
     case 'registry': return '登錄檔比對'
+    case 'textedit': return '文字編輯'
     case 'merge3': return '三向合併'
     default:       return '分頁'
   }
@@ -2444,7 +2510,7 @@ function _defaultTitleForType(type) {
 const VIEW_TYPE_LABELS = Object.freeze({
   text: '文字比對', folder: '資料夾比對', table: '表格比對',
   image: '圖片比對', hex: 'Hex 比對', metadata: '中繼資料比對',
-  registry: '登錄檔比對', merge3: '三向合併',
+  registry: '登錄檔比對', textedit: '文字編輯', merge3: '三向合併',
 })
 
 /**
@@ -3682,6 +3748,7 @@ function setupMenuActions() {
     'session.new.image':  () => newSession('image'),
     'session.new.metadata': () => newSession('metadata'),
     'session.new.registry': () => newSession('registry'),
+    'session.new.textedit': () => newSession('textedit'),
     'session.new.merge3': () => newSession('merge3'),
     'session.home':       () => showHome(),
     'session.settings':   () => openConfigModal(),

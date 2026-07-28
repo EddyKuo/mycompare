@@ -132,6 +132,7 @@ export function buildAppMenu(win, hiddenCommands = []) {
             item('圖片比對', 'session.new.image'),
             item('中繼資料比對', 'session.new.metadata'),
             item('登錄檔比對', 'session.new.registry'),
+            item('文字編輯', 'session.new.textedit'),
             item('三向合併', 'session.new.merge3')
           ]
         },

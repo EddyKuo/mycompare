@@ -1163,6 +1163,19 @@ ipcMain.handle('apply-reg-file', async (_event, { rows, format } = {}) => {
   return { count: list.length }
 })
 
+/**
+ * IPC: search a folder tree for text — BC's Find in Files.
+ *
+ * The root goes through the same allow-list every other path does; a search is
+ * a read of every file beneath it, so it must not be able to start outside a
+ * folder the user opened.
+ */
+ipcMain.handle('find-in-files', async (_event, opts = {}) => {
+  const safeRoot = validatePath(opts.root)
+  const { findInFiles } = await import('./find-in-files.js')
+  return findInFiles({ ...opts, root: safeRoot })
+})
+
 // IPC: 讀取資料夾內容（一層）
 ipcMain.handle('read-dir', async (_event, dirPath, options) => {
   const safe = validatePath(dirPath)
