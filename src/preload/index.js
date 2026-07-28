@@ -55,7 +55,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readExcel: (path) => ipcRenderer.invoke('read-excel', path),
   readMetadata: (path) => ipcRenderer.invoke('read-metadata', path),
   exportRegistryKey: (keyPath) => ipcRenderer.invoke('export-registry-key', { keyPath }),
-  readRegFile: (path) => ipcRenderer.invoke('read-reg-file', path),
+  snapshotRegistryKey: (keyPath, replaces) =>
+    ipcRenderer.invoke('snapshot-registry-key', { keyPath, replaces }),
+  compareRegFiles: (leftPath, rightPath) =>
+    ipcRenderer.invoke('compare-reg-files', { leftPath, rightPath }),
+  exportRegFile: (rows, format, defaultName) =>
+    ipcRenderer.invoke('export-reg-file', { rows, format, defaultName }),
+  applyRegFile: (rows, format) => ipcRenderer.invoke('apply-reg-file', { rows, format }),
 
   // Remote connections. Each call names a profile the user created; nothing
   // here reaches the network on its own.

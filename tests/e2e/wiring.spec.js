@@ -152,20 +152,33 @@ test('a snapshot opens as one side of a folder comparison', async () => {
   expect(rows.find((r) => r.name === 'a.txt').leftPath).toContain('snapshot://')
 })
 
-test('two .reg files compare as normalised text', async () => {
+test('two .reg files compare in the key/value grid', async () => {
   await resetTabs()
   await win.evaluate(([l, r]) => window.__testAPI.openRegCompare(l, r),
     [join(dir, 'left.reg'), join(dir, 'right.reg')])
 
-  await win.waitForFunction(() => window.__testAPI.currentView() === 'text')
-  const contents = await win.evaluate(() => window.__testAPI.textGetContents())
-  expect(contents.left).toContain('[HKEY_CURRENT_USER\\Software\\MyCompareWiring]')
-  expect(contents.left).toContain('Alice')
-  expect(contents.right).toContain('Bob')
-  // The shared DWORD must line up, so exactly the changed value stands out.
-  const stats = await win.evaluate(() => window.__testAPI.textGetStats())
-  expect(stats.equal).toBeGreaterThan(0)
-  expect(stats.replace + stats.insert + stats.delete).toBeGreaterThan(0)
+  await win.waitForFunction(() => window.__testAPI.currentView() === 'registry')
+  await win.evaluate(() => window.__testAPI.regExpandAll())
+
+  // The grid is virtual, so the DOM only ever holds a window onto the model.
+  // The row count check just shows something was drawn; the assertions that
+  // matter are about the model.
+  await expect
+    .poll(() => win.evaluate(() => window.__testAPI.regRowCount()))
+    .toBeGreaterThan(0)
+
+  // A value present on both sides with different data is a difference, and the
+  // shared one is a match. The text view could not tell either of those from
+  // "this line changed", which is why the grid replaced it.
+  const stats = await win.evaluate(() => window.__testAPI.regStats())
+  expect(stats.different).toBeGreaterThan(0)
+  expect(stats.same).toBeGreaterThan(0)
+
+  const left = await win.evaluate(() => window.__testAPI.regRowsForSide('left'))
+  const right = await win.evaluate(() => window.__testAPI.regRowsForSide('right'))
+  expect(left.some((r) => r.value === 'Alice')).toBe(true)
+  expect(right.some((r) => r.value === 'Bob')).toBe(true)
+  expect(left.every((r) => r.path.startsWith('HKEY_CURRENT_USER'))).toBe(true)
 })
 
 test('the attributes column reports read-only and the real hidden state', async () => {

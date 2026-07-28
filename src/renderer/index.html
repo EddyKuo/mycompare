@@ -138,6 +138,11 @@
             <span class="label">中繼資料比對</span>
             <span class="desc">MP3 標籤 / 版本資源</span>
           </button>
+          <button class="session-type-btn" data-type="registry">
+            <span class="icon">🗝️</span>
+            <span class="label">登錄檔比對</span>
+            <span class="desc">.reg 鍵值格狀檢視</span>
+          </button>
           <button class="session-type-btn" data-type="merge3">
             <span class="icon">🔀</span>
             <span class="label">三向合併</span>
@@ -160,6 +165,9 @@
 
       <!-- Metadata Compare View (MP3 tags / PE version resources) -->
       <div id="view-metadata" class="u-flex-fill" style="display:none"></div>
+
+      <!-- Registry Compare View (key/value grid) -->
+      <div id="view-registry" class="u-flex-fill" style="display:none"></div>
 
       <!-- 3-Way Merge View -->
       <div id="view-merge3" class="u-flex-fill" style="display:none"></div>

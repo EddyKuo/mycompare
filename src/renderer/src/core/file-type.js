@@ -33,9 +33,13 @@ const METADATA_EXTS = new Set(['mp3'])
  *
  * 同理，一個 .exe 既是二進位檔（hex）也帶有版本資源（metadata）：兩種讀法都
  * 誠實，所以照樣問，而不是替使用者選一個。預設維持 hex，與過去一致。
- * @type {Map<string, Array<'text'|'image'|'table'|'hex'|'metadata'>>}
+ *
+ * 一份 .reg 同時是純文字，也是可以逐值比對的登錄檔匯出。BC 兩種都給，
+ * 而值的型別與「只存在於一側」這兩件事只有格狀檢視看得見，所以預設為它。
+ * @type {Map<string, Array<'text'|'image'|'table'|'hex'|'metadata'|'registry'>>}
  */
 const AMBIGUOUS_EXTS = new Map([
+  ['reg',  ['registry', 'text']],
   ['html', ['text', 'table']],
   ['htm',  ['text', 'table']],
   ['exe',  ['hex', 'metadata']],
@@ -66,7 +70,7 @@ function extensionOf(path) {
  * 應先用 {@link getViewChoicesForPath} 判斷。
  *
  * @param {string|null|undefined} path - 檔案路徑
- * @returns {'text'|'image'|'table'|'hex'|'metadata'} 視圖類型
+ * @returns {'text'|'image'|'table'|'hex'|'metadata'|'registry'} 視圖類型
  */
 export function getViewTypeForPath(path) {
   const ext = extensionOf(path)
@@ -86,7 +90,7 @@ export function getViewTypeForPath(path) {
  * 這個路徑有哪些同樣合理的視圖類型（第一個為預設）。
  *
  * @param {string|null|undefined} path
- * @returns {Array<'text'|'image'|'table'|'hex'|'metadata'>} 只有單一解讀時回傳空陣列
+ * @returns {Array<'text'|'image'|'table'|'hex'|'metadata'|'registry'>} 只有單一解讀時回傳空陣列
  */
 export function getViewChoicesForPath(path) {
   const choices = AMBIGUOUS_EXTS.get(extensionOf(path))

@@ -43,6 +43,8 @@ export function typeIcon(type) {
     'hex-compare':  '🔢',
     image:          '🖼️',
     table:          '📊',
+    metadata:       '🏷️',
+    registry:       '🗝️',
     merge3:         '🔀',
     merge:          '🔀',
   }

@@ -54,7 +54,9 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 - MP3 標籤（ID3v1 / v2.3 / v2.4）與 Windows 版本資源比對：可在資料夾比對中作為內容判定，
   也有獨立的逐欄位比對視圖
 - 多視窗：可開新視窗，分頁能以右鍵移出或直接拖曳到另一個視窗（拖到視窗外會另開新視窗）
-- 登錄檔比對（.reg 檔，或以 reg.exe 匯出即時機碼；僅 Windows）
+- 登錄檔比對：鍵值格狀檢視，逐值標示型別與「只存在於一側」，可修改、複製到另一側、
+  刪除、重新命名、新增機碼與值，寫出成 .reg 或直接套用回登錄檔（僅 Windows）。
+  兩側都可以是本機即時機碼或 .reg 檔，任意配對；不支援遠端電腦的登錄檔
 - 手動指定檔案編碼；存檔時保留原始編碼並自動備份
 - 可自訂鍵盤快捷鍵
 - 拖放檔案或資料夾即可開始比對
@@ -232,8 +234,8 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4238 / 4238 unit tests passing**、**389 / 389 e2e tests passing**，
-共 150 個單元測試檔與 58 個 e2e 檔。
+目前覆蓋：**4275 / 4275 unit tests passing**、**393 / 393 e2e tests passing**，
+共 151 個單元測試檔與 58 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、
