@@ -67,3 +67,25 @@ export async function launchApp(extraArgs = []) {
 export async function closeApp(app) {
   await app.close()
 }
+
+/**
+ * Reach a folder-compare toolbar control wherever it currently lives.
+ *
+ * The toolbar no longer scrolls: what does not fit is moved into the `⋯` menu,
+ * and which controls those are depends on the window width. A test that clicks
+ * a bare selector is therefore asserting something about the window size it
+ * never meant to assert. This opens the menu first when the control is in it.
+ *
+ * @param {import('@playwright/test').Page} win
+ * @param {string} selector
+ * @returns {Promise<import('@playwright/test').Locator>}
+ */
+export async function toolbarItem(win, selector) {
+  const inMenu = await win.locator(`.fc-overflow-menu ${selector}`).count()
+  if (inMenu > 0) {
+    const menu = win.locator('.fc-overflow-menu')
+    if (!(await menu.isVisible())) await win.locator('.fc-btn-overflow').click()
+    return menu.locator(selector).first()
+  }
+  return win.locator(selector).first()
+}

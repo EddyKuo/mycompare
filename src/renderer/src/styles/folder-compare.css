@@ -25,7 +25,83 @@
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
   flex-wrap: nowrap;
-  overflow-x: auto;
+  /* Was `overflow-x: auto`. A toolbar you have to scroll hides its own
+     controls, and which ones are hidden depends on where you last dragged it —
+     with 37 items in a 1350px window, two fifths sat past the right edge. Worse,
+     `overflow-x: auto` makes overflow-y `auto` as well, so the dropdown menus
+     anchored to the buttons out there were clipped to the 36px strip and
+     unreachable: the batch menu measured at x=2236 in a 1384px window, with
+     nothing hit-testable at that point.
+
+     What does not fit is now moved into the `⋯` menu by _layoutToolbar(), so
+     nothing is left past the edge. Overflow stays visible so the dropdowns can
+     open downward out of the strip; .folder-compare's own `overflow: hidden` is
+     the backstop if the fit calculation is ever off by a pixel. */
+  overflow: visible;
+}
+
+/* Natural widths, so the measurement in _layoutToolbar() is of what the items
+   actually want rather than of what flex squeezed them into. */
+.fc-toolbar > * {
+  flex-shrink: 0;
+}
+
+/* ── Overflow menu ── */
+
+.fc-overflow-wrap {
+  position: relative;
+  margin-left: auto;
+}
+
+.fc-btn-overflow {
+  height: 24px;
+  min-width: 26px;
+  padding: 0 6px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.fc-btn-overflow:hover {
+  background: var(--bg-hover, rgb(128 128 128 / 18%));
+}
+
+.fc-overflow-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  /* Anchored to the right: the button sits at the right edge, so a menu that
+     opened rightwards would open off the window. */
+  right: 0;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 180px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 25%);
+}
+
+/* Toolbar items are laid out in a row; in the menu they are a list, so they
+   fill the width and read left-aligned instead of sitting centred. */
+.fc-overflow-menu > * {
+  justify-content: flex-start;
+  width: 100%;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.fc-overflow-menu > label {
+  padding: 3px 4px;
 }
 
 .fc-compare-mode {
@@ -81,7 +157,10 @@
   cursor: pointer;
   height: 24px;
   white-space: nowrap;
-  margin-left: auto;
+  /* No `margin-left: auto` any more. It used to shove refresh and everything
+     after it to the right edge, which only made sense while the toolbar
+     overflowed anyway; now that it fits, the free space belongs to the `⋯`
+     button alone and the rest packs left. */
 }
 
 .fc-btn-refresh:hover {
@@ -1825,4 +1904,18 @@
 .fc-toolbar label.fc-cb--unavailable {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Applied by _placeMenu() when a left-anchored dropdown would open past the
+   view's right edge. Which buttons sit near that edge changes with the window
+   width now that the toolbar collapses into the `⋯` menu, so it is decided from
+   the measured position instead of being hard-coded per menu.
+
+   Last in the file on purpose: .fc-menu--right and .fc-batch-menu have the same
+   specificity, so the one declared later wins. Placed higher up it lost to
+   .fc-batch-menu's `left: 0` and did nothing at all — the class was on the
+   element and the menu still hung 84px past the window. */
+.fc-menu--right {
+  left: auto;
+  right: 0;
 }

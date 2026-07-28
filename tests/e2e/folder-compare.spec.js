@@ -8,7 +8,7 @@
  * Prerequisite: npm run build
  */
 import { test, expect } from '@playwright/test'
-import { launchApp, closeApp } from './helpers/electron-app.js'
+import { launchApp, closeApp, toolbarItem } from './helpers/electron-app.js'
 
 /** @type {import('@playwright/test').ElectronApplication} */
 let app
@@ -159,7 +159,7 @@ test('T55: 存在 Right Newer toggle 按鈕（data-filter="right-newer"）', asy
 
 test('T55: 點擊 Left Newer toggle 切換 active 狀態', async () => {
   await goToFolderCompare(win)
-  const btn = win.locator('[data-filter="left-newer"]')
+  const btn = await toolbarItem(win, '[data-filter="left-newer"]')
 
   // Should start as active
   await expect(btn).toHaveClass(/fc-btn-filter-toggle--active/)
@@ -229,16 +229,16 @@ test('S21: 批次操作選單含「移動」與「互換」', async () => {
 
 test('S21: 規則面板有「比對屬性」核取方塊', async () => {
   await goToFolderCompare(win)
-  await win.locator('.fc-btn-rules').click()
+  await (await toolbarItem(win, '.fc-btn-rules')).click()
   const panel = win.locator('.fc-rules-panel')
   await expect(panel).toBeVisible({ timeout: 2000 })
   await expect(panel.locator('.fc-compare-attrs')).toBeAttached()
-  await win.locator('.fc-btn-rules').click()
+  await (await toolbarItem(win, '.fc-btn-rules')).click()
 })
 
 test('S21: ⚙ 設定開啟對話框並提供兩種套用範圍', async () => {
   await goToFolderCompare(win)
-  await win.locator('.fc-btn-settings').click()
+  await (await toolbarItem(win, '.fc-btn-settings')).click()
   const dialog = win.locator('.fc-settings-backdrop')
   await expect(dialog).toBeVisible({ timeout: 2000 })
   await expect(dialog.locator('input[value="view"]')).toBeAttached()
@@ -249,13 +249,13 @@ test('S21: ⚙ 設定開啟對話框並提供兩種套用範圍', async () => {
 
 test('S21: 欄位選單可切換「版本」欄', async () => {
   await goToFolderCompare(win)
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   const item = win.locator('.ctx-item', { hasText: '版本' }).first()
   await expect(item).toBeVisible({ timeout: 2000 })
   await item.click()
   await expect(win.locator('.fc-header')).toContainText('版本', { timeout: 2000 })
   // Restore, so later tests see the default column set.
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   await win.locator('.ctx-item', { hasText: '版本' }).first().click()
 })
 
@@ -269,7 +269,7 @@ test('S21: 欄位選單可切換「版本」欄', async () => {
 
 test('S26: 欄位選單列出建立時間 / 完整路徑 / 檢查碼', async () => {
   await goToFolderCompare(win)
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   for (const label of ['建立時間', '完整路徑', '檢查碼']) {
     await expect(win.locator('.ctx-item', { hasText: label }).first())
       .toBeVisible({ timeout: 2000 })
@@ -279,7 +279,7 @@ test('S26: 欄位選單列出建立時間 / 完整路徑 / 檢查碼', async () 
 
 test('S26: 欄位選單可切換檢查碼欄，表頭標出實際的演算法', async () => {
   await goToFolderCompare(win)
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   await win.locator('.ctx-item', { hasText: '檢查碼' }).first().click()
 
   // 表頭寫的是實際演算法，不是籠統的「檢查碼」。這一欄的值會被拿去跟
@@ -287,22 +287,24 @@ test('S26: 欄位選單可切換檢查碼欄，表頭標出實際的演算法', 
   await expect(win.locator('.fc-header')).toContainText('CRC-32', { timeout: 2000 })
 
   // 切成 MD5，表頭要跟著改；不改的話兩種演算法會共用同一個標題。
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   await win.locator('.ctx-item', { hasText: '檢查碼：MD5' }).first().click()
   await expect(win.locator('.fc-header')).toContainText('MD5', { timeout: 2000 })
   await expect(win.locator('.fc-header')).not.toContainText('CRC-32')
 
   // 還原，讓後面的測試看到預設狀態。
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   await win.locator('.ctx-item', { hasText: '檢查碼：CRC-32' }).first().click()
-  await win.locator('.fc-btn-columns').click()
+  await (await toolbarItem(win, '.fc-btn-columns')).click()
   await win.locator('.ctx-item', { hasText: '檢查碼' }).first().click()
 })
 
 test('S26: 工具列有左孤兒 / 右孤兒獨立開關，且下拉會標成「自訂組合」', async () => {
   await goToFolderCompare(win)
-  const leftOrphan = win.locator('[data-filter="left-orphan"]')
-  const rightOrphan = win.locator('[data-filter="right-orphan"]')
+  // Reached through the `⋯` menu at this window width; visible either way, but
+  // asserting on the bare selector would be asserting on the window size.
+  const leftOrphan = await toolbarItem(win, '[data-filter="left-orphan"]')
+  const rightOrphan = await toolbarItem(win, '[data-filter="right-orphan"]')
   await expect(leftOrphan).toBeVisible()
   await expect(rightOrphan).toBeVisible()
 
@@ -317,7 +319,7 @@ test('S26: 工具列有左孤兒 / 右孤兒獨立開關，且下拉會標成「
 
 test('S26: 規則面板有時間位移、檔名大小寫與檔名對齊三項條件', async () => {
   await goToFolderCompare(win)
-  await win.locator('.fc-btn-rules').click()
+  await (await toolbarItem(win, '.fc-btn-rules')).click()
   const panel = win.locator('.fc-rules-panel')
   await expect(panel).toBeVisible({ timeout: 2000 })
   await expect(panel.locator('.fc-rules-time-shift')).toBeAttached()
@@ -331,7 +333,7 @@ test('S26: 規則面板有時間位移、檔名大小寫與檔名對齊三項條
   await expect(panel.locator('.fc-rules-time-shift')).toHaveValue('dst')
   await panel.locator('.fc-rules-time-shift').selectOption('none')
   await panel.locator('.fc-rules-apply').click()
-  await win.locator('.fc-btn-rules').click()
+  await (await toolbarItem(win, '.fc-btn-rules')).click()
 })
 
 test('S26: 「比對 ▾」下拉含 Compare To 與 Quick Compare 四項', async () => {

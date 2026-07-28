@@ -10,7 +10,7 @@
  * Prerequisite: npm run build
  */
 import { test, expect } from '@playwright/test'
-import { launchApp, closeApp } from './helpers/electron-app.js'
+import { launchApp, closeApp, toolbarItem } from './helpers/electron-app.js'
 
 /** @type {import('@playwright/test').ElectronApplication} */
 let app
@@ -40,7 +40,7 @@ async function goToFolderCompare(page) {
 test('工具列的三向合併按鈕存在且可切換出三個窗格', async () => {
   await goToFolderCompare(win)
 
-  const btn = win.locator('.fc-btn-merge').first()
+  const btn = await toolbarItem(win, '.fc-btn-merge')
   await expect(btn).toBeVisible()
   await expect(win.locator('.fc-header-side')).toHaveCount(2)
 
@@ -54,7 +54,7 @@ test('工具列的三向合併按鈕存在且可切換出三個窗格', async ()
 test('合併面板提供輸出資料夾、衝突導航、批次決議與預覽／執行', async () => {
   await goToFolderCompare(win)
   if (!(await win.locator('.folder-compare--merge').isVisible())) {
-    await win.locator('.fc-btn-merge').first().click()
+    await (await toolbarItem(win, '.fc-btn-merge')).click()
   }
   const panel = win.locator('.merge-panel')
   await expect(panel).toBeVisible()
@@ -70,10 +70,10 @@ test('合併面板提供輸出資料夾、衝突導航、批次決議與預覽�
 test('再按一次回到兩窗格的資料夾比對', async () => {
   await goToFolderCompare(win)
   if (!(await win.locator('.folder-compare--merge').isVisible())) {
-    await win.locator('.fc-btn-merge').first().click()
+    await (await toolbarItem(win, '.fc-btn-merge')).click()
     await expect(win.locator('.folder-compare--merge')).toBeVisible()
   }
-  await win.locator('.fc-btn-merge').first().click()
+  await (await toolbarItem(win, '.fc-btn-merge')).click()
   await expect(win.locator('.folder-compare--merge')).toHaveCount(0)
   await expect(win.locator('.merge-panel')).toHaveCount(0)
   await expect(win.locator('.fc-header-side')).toHaveCount(2)

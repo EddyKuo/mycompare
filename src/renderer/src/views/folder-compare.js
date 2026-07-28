@@ -321,6 +321,55 @@ export const VIEW_PRESET_LABELS = [
 export const CUSTOM_VIEW_PRESET = 'custom'
 
 /**
+ * The order in which toolbar items give up their place, least useful first.
+ *
+ * The toolbar carries 37 controls and wants 2318px; a default window gives it
+ * about 1350, so two fifths of it used to sit past the right edge behind a
+ * horizontal scrollbar. Scrolling a toolbar is the worst of both worlds — the
+ * controls are neither visible nor grouped, and which ones you can see depends
+ * on where you last dragged it.
+ *
+ * The ones named here move into the `⋯` menu when there is no room, in this
+ * order, and come back out as the window widens. Anything **not** named is
+ * pinned: the navigation buttons, the two mode dropdowns, and the three
+ * controls that own a dropdown of their own (a menu opening inside the `⋯`
+ * panel would be clipped by the panel's own scrolling).
+ *
+ * @type {string[]}
+ */
+export const TOOLBAR_OVERFLOW_ORDER = [
+  '.fc-btn-log',
+  '.fc-btn-legend',
+  '.fc-btn-settings',
+  '.fc-btn-info',
+  '#fc-always-folders',
+  '#fc-suppress-filters',
+  '#fc-flat-mode',
+  '#fc-files-only',
+  '#fc-filter-regex',
+  '.fc-btn-merge',
+  '.fc-btn-columns',
+  '.fc-btn-rules',
+  '#fc-ignore-unimportant',
+  '.fc-btn-collapse-all',
+  '.fc-btn-expand-all',
+  '[data-filter="right-orphan"]',
+  '[data-filter="left-orphan"]',
+  '[data-filter="right-newer"]',
+  '[data-filter="left-newer"]',
+  '#fc-show-orphan',
+  '#fc-show-diff',
+  '#fc-show-same',
+  '.fc-btn-sync',
+  // Last resort. The window's minimum is 800px and the genuinely pinned set
+  // alone wants about 970, so without these three the toolbar would still be
+  // cut off at the smallest size the window is allowed to take.
+  '.fc-btn-refresh',
+  '.fc-btn-filter',
+  '.fc-filter',
+]
+
+/**
  * Decide whether a row passes a set of view flags.
  *
  * Pure so the preset table can be verified without a DOM.
@@ -3915,7 +3964,14 @@ export class FolderCompare {
 
   /** @param {string} text */
   _setScanStatus(text) {
-    if (this._dom.scanStatus) this._dom.scanStatus.textContent = text
+    if (this._dom.scanStatus) {
+      const had = !!this._dom.scanStatus.textContent
+      this._dom.scanStatus.textContent = text
+      // Only when it appears or disappears: its width also creeps as the item
+      // count gains digits, and reshuffling the toolbar on every tick would
+      // make the buttons jitter for the whole scan.
+      if (had !== !!text) this._layoutToolbar()
+    }
     // The status line is where every scan error is reported, and it is
     // overwritten by the next message before most users have read it.
     if (!text || isProgressMessage(text)) return
@@ -7607,6 +7663,8 @@ ${rows}
       this._versionTimer = 0
     }
     this._versionQueue = []
+    this._toolbarObserver?.disconnect()
+    this._toolbarObserver = null
     if (this._crcTimer) {
       clearTimeout(this._crcTimer)
       this._crcTimer = 0
@@ -7707,8 +7765,36 @@ ${rows}
     this._container.appendChild(root)
     this._dom.root = root
 
+    this._observeToolbarWidth()
+
     // Render initial empty state
     this._renderList()
+  }
+
+  /**
+   * Re-run the overflow decision whenever the toolbar's width changes.
+   *
+   * A resize observer rather than a window listener: the toolbar also changes
+   * width when a tab is switched to, when the merge panel opens, and when the
+   * window is snapped — none of which are window resize events.
+   */
+  _observeToolbarWidth() {
+    this._toolbarObserver?.disconnect()
+    this._toolbarObserver = null
+    const toolbar = this._dom.toolbar
+    if (!toolbar || typeof ResizeObserver === 'undefined') return
+
+    let last = -1
+    this._toolbarObserver = new ResizeObserver(() => {
+      const w = toolbar.clientWidth
+      // Moving items in and out changes the toolbar's own content size, which
+      // would fire the observer again; only a real width change is acted on.
+      if (w === last) return
+      last = w
+      this._layoutToolbar()
+    })
+    this._toolbarObserver.observe(toolbar)
+    this._layoutToolbar()
   }
 
   _buildToolbar() {
@@ -8027,7 +8113,129 @@ ${rows}
     batchWrap.appendChild(batchMenu)
     toolbar.appendChild(batchWrap)
 
+    // ── Overflow ──────────────────────────────────────────────────────────────
+    // Recorded before the `⋯` control is added so it never tries to overflow
+    // itself, and added last so it sits at the right edge.
+    this._toolbarItems = /** @type {HTMLElement[]} */ ([...toolbar.children])
+
+    const overflowWrap = el('div', { className: 'fc-overflow-wrap', style: 'display:none' })
+    const btnOverflow = el('button', {
+      className: 'fc-btn-overflow',
+      title: '放不下的工具列項目',
+      'aria-haspopup': 'true',
+      'aria-expanded': 'false',
+    }, '⋯')
+    const overflowMenu = el('div', { className: 'fc-overflow-menu', style: 'display:none' })
+    overflowWrap.append(btnOverflow, overflowMenu)
+    this._dom.toolbar = toolbar
+    this._dom.overflowWrap = overflowWrap
+    this._dom.btnOverflow = btnOverflow
+    this._dom.overflowMenu = overflowMenu
+    toolbar.appendChild(overflowWrap)
+
+    // Resolve each selector to the toolbar child that *contains* it: the
+    // checkboxes carry their id on the `<input>`, not on the `<label>` that is
+    // the actual flex item.
+    this._overflowItems = TOOLBAR_OVERFLOW_ORDER
+      .map((sel) => {
+        let node = toolbar.querySelector(sel)
+        while (node && node.parentElement !== toolbar) node = node.parentElement
+        return /** @type {HTMLElement|null} */ (node)
+      })
+      .filter((node) => !!node && this._toolbarItems.includes(node))
+
     return toolbar
+  }
+
+  /**
+   * Decide what fits and move the rest into the `⋯` menu.
+   *
+   * Everything goes home first so the measurement is of the toolbar as it
+   * really is, not of whatever happened to fit last time — measuring the
+   * already-collapsed state is how a toolbar gets stuck collapsed after the
+   * window is widened again.
+   */
+  _layoutToolbar() {
+    const toolbar = this._dom.toolbar
+    const wrap = this._dom.overflowWrap
+    const menu = this._dom.overflowMenu
+    if (!toolbar || !wrap || !menu || !toolbar.isConnected) return
+    // Not laid out: a hidden tab, or jsdom, which has no layout at all.
+    // Treating a zero width as "nothing fits" would bury the whole toolbar.
+    if (!toolbar.clientWidth) return
+
+    for (const item of this._toolbarItems) toolbar.appendChild(item)
+    toolbar.appendChild(wrap)
+    this._closeOverflowMenu()
+    wrap.style.display = ''
+
+    const cs = getComputedStyle(toolbar)
+    const gap = parseFloat(cs.columnGap) || parseFloat(cs.gap) || 0
+    const pad = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0)
+    // The scan indicator's text grows a digit at a time while a scan runs; the
+    // margin absorbs that instead of reshuffling the toolbar on every tick.
+    const avail = toolbar.clientWidth - pad - 8
+
+    const width = new Map()
+    let total = 0
+    let shown = 0
+    for (const item of this._toolbarItems) {
+      const w = item.offsetWidth
+      width.set(item, w)
+      // Zero-width items are the hidden scan controls: no width, and no gap
+      // either, since a flex gap either side of nothing is not drawn.
+      if (w > 0) { total += w; shown++ }
+    }
+    if (shown > 1) total += gap * (shown - 1)
+
+    let overflowing = false
+    if (total > avail) {
+      // Once anything overflows, the `⋯` button has to fit too, so it comes
+      // out of the budget rather than being free.
+      const budget = avail - (wrap.offsetWidth + gap)
+      for (const item of this._overflowItems) {
+        if (total <= budget) break
+        const w = width.get(item) ?? 0
+        menu.appendChild(item)
+        if (w > 0) total -= w + gap
+        overflowing = true
+      }
+    }
+
+    wrap.style.display = overflowing ? '' : 'none'
+  }
+
+  /**
+   * Flip a dropdown to right-anchored if it would open past the view's edge.
+   *
+   * The toolbar's contents move between the bar and the `⋯` menu as the window
+   * is resized, so a button that opens comfortably rightwards at one width sits
+   * at the very edge at another. Deciding from the measured position saves
+   * having to guess per menu.
+   *
+   * @param {HTMLElement|null|undefined} menu
+   */
+  _placeMenu(menu) {
+    if (!menu || menu.style.display === 'none' || !menu.isConnected) return
+    menu.classList.remove('fc-menu--right')
+    const limit = (this._dom.root ?? document.body).getBoundingClientRect().right
+    if (menu.getBoundingClientRect().right > limit) menu.classList.add('fc-menu--right')
+  }
+
+  _closeOverflowMenu() {
+    const menu = this._dom.overflowMenu
+    if (menu) menu.style.display = 'none'
+    this._dom.btnOverflow?.setAttribute('aria-expanded', 'false')
+  }
+
+  /** @returns {boolean} whether the menu ended up open */
+  toggleOverflowMenu() {
+    const menu = this._dom.overflowMenu
+    if (!menu) return false
+    const open = menu.style.display === 'none'
+    menu.style.display = open ? 'block' : 'none'
+    this._dom.btnOverflow?.setAttribute('aria-expanded', String(open))
+    return open
   }
 
   /**
@@ -8821,6 +9029,7 @@ ${rows}
       if (selectMenu) {
         const isVisible = selectMenu.style.display !== 'none'
         selectMenu.style.display = isVisible ? 'none' : 'block'
+        this._placeMenu(selectMenu)
       }
     })
 
@@ -8843,6 +9052,7 @@ ${rows}
       e.stopPropagation()
       const menu = this._dom.compareMenu
       if (menu) menu.style.display = menu.style.display === 'none' ? 'block' : 'none'
+      this._placeMenu(menu)
     })
 
     this._dom.compareMenu?.addEventListener('click', (e) => {
@@ -8893,6 +9103,7 @@ ${rows}
       if (batchMenu) {
         const isVisible = batchMenu.style.display !== 'none'
         batchMenu.style.display = isVisible ? 'none' : 'block'
+        this._placeMenu(batchMenu)
       }
     })
 
@@ -8916,11 +9127,20 @@ ${rows}
       else if (action === 'quick-compare') this.quickCompareSelected()
     })
 
+    this._dom.btnOverflow?.addEventListener('click', (e) => {
+      e.stopPropagation()
+      this.toggleOverflowMenu()
+    })
+    // A click on a control inside the menu must not also count as the outside
+    // click that closes it, or a checkbox would shut the menu on every toggle.
+    this._dom.overflowMenu?.addEventListener('click', (e) => e.stopPropagation())
+
     // S14-M02: store handler refs so destroy() can remove them.
     this._onDocumentClick = () => {
       if (batchMenu) batchMenu.style.display = 'none'
       if (selectMenu) selectMenu.style.display = 'none'
       if (this._dom.compareMenu) this._dom.compareMenu.style.display = 'none'
+      this._closeOverflowMenu()
     }
     document.addEventListener('click', this._onDocumentClick)
 
