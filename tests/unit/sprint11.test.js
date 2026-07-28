@@ -60,6 +60,9 @@ const TEXT_CONFIG_DEFAULTS = {
   // and both snapshots below set ignoreWhitespace, hence 'amount'.
   whitespaceMode: 'amount',
   syntaxHighlight: true,
+  // BC's View > Webpages. Off by default, and the setter refuses to turn it on
+  // unless a side actually holds markup.
+  webpageMode: false,
   orphansAlwaysImportant: false,
   neverAlignPatterns: [],
   // 1.7 Alignment tab + 1.9 Text options: all default to the behaviour that

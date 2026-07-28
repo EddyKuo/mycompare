@@ -22,7 +22,7 @@ BeyondCompare 的開源複製品，以 **Electron + Vite + Vanilla JavaScript** 
 
 | 比對類型 | 說明 |
 |----------|------|
-| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則（含手動逐行標記）、文法感知比對、編輯模式、可逆摺疊、書籤、Find & Replace、Patch 檢視器 |
+| **文字比對** | Myers / Patience / Histogram 演算法、字元級差異、忽略規則（含手動逐行標記）、文法感知比對、編輯模式、可逆摺疊、書籤、Find & Replace、Patch 檢視器、HTML 網頁檢視 |
 | **資料夾比對** | 遞迴目錄樹、11 種顯示模式、欄位選擇與排序、虛擬捲動、同步模式、三向資料夾合併、封存檔瀏覽、移動／互換／Touch、版本／檢查碼／版本控制狀態／擁有者欄位、Source Control 子選單（git）、上下層導覽 |
 | **Hex 比對** | 虛擬捲動、Fast / Complete 兩種 byte diff、行內編輯與 undo/redo、18 種數值判讀面板（大小端各一組，64 位元以 BigInt 計算）、位址讀數、標尺、差異篩選 |
 | **中繼資料比對** | MP3 的 ID3 標籤與 Windows PE 版本資源，逐欄位並排比對；`.mp3` 自動路由，`.exe`／`.dll` 會問要用 Hex 還是版本資源 |
@@ -232,8 +232,8 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4219 / 4219 unit tests passing**、**384 / 384 e2e tests passing**，
-共 149 個單元測試檔與 57 個 e2e 檔。
+目前覆蓋：**4234 / 4234 unit tests passing**、**388 / 388 e2e tests passing**，
+共 150 個單元測試檔與 58 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
 各視圖邏輯與導航、欄位比對規則、路徑沙箱（含 symlink 逃逸）、命令列與腳本語法、
