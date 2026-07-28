@@ -20,7 +20,7 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest'
 import { execFileSync } from 'child_process'
-import { mkdtempSync, copyFileSync, readFileSync, existsSync, rmSync } from 'fs'
+import { mkdtempSync, copyFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { findTool, canExtractCompressed, extractWithTool, _resetToolProbe }
@@ -123,6 +123,89 @@ describe('the delegation path, on a real cabinet', () => {
       format: 'cab',
     })).rejects.toThrow(/上限|maxBuffer|ENOBUFS/i)
   }, 60000)
+})
+
+describe('a real Quantum cabinet, if one ever appears', () => {
+  /**
+   * Every cabinet this machine has, checked for compression type 2.
+   *
+   * Today this finds nothing — that is the whole reason Quantum is delegated
+   * rather than decoded. The test exists anyway so the verification is dormant
+   * rather than absent: drop a genuine Quantum cabinet anywhere under the
+   * search roots and it runs, comparing our path against 7-Zip's own output.
+   * A missing check that nobody remembers to write is how a gap outlives the
+   * reason for it.
+   *
+   * @returns {string|null}
+   */
+  function findQuantumCab() {
+    const roots = ['C:\\Windows', 'C:\\ProgramData', join(tmpdir(), 'quantum-fixtures')]
+    /** @param {string} dir @param {number} depth @returns {string|null} */
+    const walk = (dir, depth) => {
+      if (depth > 3) return null
+      let names = []
+      try { names = readdirSync(dir) } catch { return null }
+      for (const n of names) {
+        const full = join(dir, n)
+        let st
+        try { st = statSync(full) } catch { continue }
+        if (st.isDirectory()) {
+          const hit = walk(full, depth + 1)
+          if (hit) return hit
+          continue
+        }
+        if (!/\.cab$/i.test(n)) continue
+        try {
+          const b = readFileSync(full)
+          if (b.length < 44 || b.toString('ascii', 0, 4) !== 'MSCF') continue
+          const flags = b.readUInt16LE(30)
+          let off = 36
+          if (flags & 0x0004) off = 36 + 4 + b.readUInt16LE(36)
+          if (flags & 0x0001) { while (b[off]) off++; off++; while (b[off]) off++; off++ }
+          if (flags & 0x0002) { while (b[off]) off++; off++; while (b[off]) off++; off++ }
+          if ((b.readUInt16LE(off + 6) & 0x0f) === 2) return full
+        } catch { /* unreadable */ }
+      }
+      return null
+    }
+    for (const r of roots) {
+      const hit = walk(r, 0)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  it('extracts it the same way 7-Zip does, when one exists', async () => {
+    if (!haveTool) return
+    const cab = findQuantumCab()
+    if (!cab) {
+      console.warn('no Quantum cabinet on this machine, as expected; '
+        + 'this check stays dormant until one appears')
+      return
+    }
+
+    const { readArchive, readArchiveEntry } = await import('../../src/main/archive.js')
+    const listing = await readArchive(cab)
+    const entries = (listing.entries ?? listing).slice(0, 3)
+    expect(entries.length).toBeGreaterThan(0)
+
+    const refDir = mkdtempSync(join(tmpdir(), 'quantum-ref-'))
+    execFileSync(SEVENZIP, ['x', '-y', cab, '-o' + refDir], { stdio: 'ignore' })
+
+    let compared = 0
+    for (const e of entries) {
+      const full = String(e.path ?? e.name)
+      const name = full.includes('::') ? full.split('::').pop() : full
+      const refPath = join(refDir, ...name.split('/'))
+      if (!existsSync(refPath)) continue
+      const ours = await readArchiveEntry(cab, name)
+      expect(Buffer.compare(ours, readFileSync(refPath)), name).toBe(0)
+      compared++
+    }
+    rmSync(refDir, { recursive: true, force: true })
+    expect(compared, 'a Quantum cabinet was found but nothing was compared')
+      .toBeGreaterThan(0)
+  }, 120000)
 })
 
 describe('what this machine can actually do', () => {

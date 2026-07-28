@@ -222,7 +222,7 @@ npm run test:watch
 npm run test:coverage
 ```
 
-目前覆蓋：**4218 / 4218 unit tests passing**、**384 / 384 e2e tests passing**，
+目前覆蓋：**4219 / 4219 unit tests passing**、**384 / 384 e2e tests passing**，
 共 149 個單元測試檔與 57 個 e2e 檔。
 
 涵蓋範圍包含 diff 引擎、session CRUD、smart routing、編碼偵測與往返、檔案遮罩、
